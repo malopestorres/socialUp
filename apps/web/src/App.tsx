@@ -43,6 +43,7 @@ type Job = {
   companyId: string;
   filePath: string;
   caption: string | null;
+  locationName: string | null;
   publicationType:
     | "instagram_story"
     | "instagram_reel"
@@ -83,6 +84,7 @@ type MediaEntry = {
   companyId: string;
   previewUrl: string;
   caption: string | null;
+  publicationType: Job["publicationType"];
   lastUsedAt: string;
   usageCount: number;
   lastStatus: string;
@@ -115,6 +117,13 @@ const navItems: Array<{ key: ViewKey; label: string; eyebrow?: string }> = [
   { key: "companies", label: "Unidades" },
 ];
 
+const whatsappTextEmojiGroups: Array<{ label: string; emojis: string[] }> = [
+  { label: "Atendimento", emojis: ["💬", "📞", "🫶", "🙏", "😊", "🤝"] },
+  { label: "Promoção", emojis: ["🔥", "🎯", "💥", "💖", "🛍️", "📣"] },
+  { label: "Localização", emojis: ["📍", "🗺️", "🚗", "🏥", "🏬", "📌"] },
+  { label: "Comemoração", emojis: ["🎉", "🥳", "✨", "🎊", "🍾", "🎈"] },
+];
+
 function formatDate(value: string | null | undefined): string {
   if (!value) {
     return "Nao definido";
@@ -145,6 +154,31 @@ function publicationTypeLabel(publicationType: Job["publicationType"]): string {
     case "whatsapp_status_texto":
       return "WhatsApp Status (texto)";
   }
+}
+
+function jobStatusLabel(status: string): string {
+  switch (status) {
+    case "PENDING":
+      return "Pendente";
+    case "RUNNING":
+      return "Executando";
+    case "COMPLETED":
+      return "Concluído";
+    case "FAILED":
+      return "Falhou";
+    case "WAITING_LOGIN":
+      return "Aguardando login";
+    default:
+      return status;
+  }
+}
+
+function isInstagramPublication(publicationType: Job["publicationType"]): boolean {
+  return (
+    publicationType === "instagram_post" ||
+    publicationType === "instagram_reel" ||
+    publicationType === "instagram_story"
+  );
 }
 
 function App() {
@@ -180,11 +214,24 @@ function App() {
   const [uploadedFilePath, setUploadedFilePath] = useState("");
   const [jobCompanyId, setJobCompanyId] = useState("");
   const [caption, setCaption] = useState("");
+  const [locationName, setLocationName] = useState("");
   const [publicationType, setPublicationType] = useState<Job["publicationType"]>("instagram_reel");
   const [dataPostagem, setDataPostagem] = useState("");
   const [editingJobId, setEditingJobId] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const [schedulerInfo, setSchedulerInfo] = useState("");
+  const [submittingJob, setSubmittingJob] = useState(false);
   const requiresMediaUpload = publicationType !== "whatsapp_status_texto";
+  const requiresInstagramMetadata = isInstagramPublication(publicationType);
+  const captionLabel = publicationType === "whatsapp_status_texto" ? "Texto do status (aceita emojis)" : "Legenda da postagem";
+  const captionPlaceholder =
+    publicationType === "whatsapp_status_texto"
+      ? "Digite o texto do status do WhatsApp. Emojis sao aceitos normalmente."
+      : "Legenda da postagem";
+  const captionTitle =
+    publicationType === "whatsapp_status_texto"
+      ? "Digite o texto do status do WhatsApp. Este campo aceita emojis e e obrigatório nesse tipo de publicação."
+      : "Preencha a legenda da postagem. Para Instagram e WhatsApp Status em texto, este campo é obrigatório.";
 
   const companyNameMap = useMemo(
     () => Object.fromEntries(companies.map((company) => [company.id, company.name])),
@@ -221,6 +268,7 @@ function App() {
           companyId: job.companyId,
           previewUrl: `${api.baseUrl}${job.filePath}`,
           caption: job.caption,
+          publicationType: job.publicationType,
           lastUsedAt: job.dataPostagem,
           usageCount: 1,
           lastStatus: job.status,
@@ -231,6 +279,7 @@ function App() {
       existing.usageCount += 1;
       if (new Date(job.dataPostagem).getTime() >= new Date(existing.lastUsedAt).getTime()) {
         existing.caption = job.caption;
+        existing.publicationType = job.publicationType;
         existing.lastUsedAt = job.dataPostagem;
         existing.lastStatus = job.status;
       }
@@ -424,6 +473,7 @@ function App() {
       const result = await api.postFile("/upload", file);
       setUploadedFilePath(result.filePath);
       setError("");
+      setSchedulerInfo("Midia enviada com sucesso.");
     } catch (uploadError) {
       setError(uploadError instanceof Error ? uploadError.message : "Falha no upload.");
     } finally {
@@ -433,26 +483,40 @@ function App() {
 
   async function createJob(event: FormEvent) {
     event.preventDefault();
+    setSubmittingJob(true);
+    setError("");
+    setSchedulerInfo(editingJobId ? "Salvando alterações..." : "Agendando postagem...");
+
     const payload = {
       companyId: jobCompanyId,
       filePath: uploadedFilePath,
       caption,
+      locationName: requiresInstagramMetadata ? locationName : "",
       publicationType,
       dataPostagem: new Date(dataPostagem).toISOString(),
     };
 
-    if (editingJobId) {
-      await api.putJson(`/jobs/${editingJobId}`, payload);
-    } else {
-      await api.postJson("/jobs", payload);
-    }
+    try {
+      if (editingJobId) {
+        await api.putJson(`/jobs/${editingJobId}`, payload);
+      } else {
+        await api.postJson("/jobs", payload);
+      }
 
-    resetSchedulerForm();
-    await loadAll();
+      resetSchedulerForm();
+      setSchedulerInfo(editingJobId ? "Postagem atualizada com sucesso." : "Postagem agendada com sucesso.");
+      await loadAll();
+    } catch (jobError) {
+      setError(jobError instanceof Error ? jobError.message : "Falha ao agendar postagem.");
+      setSchedulerInfo("");
+    } finally {
+      setSubmittingJob(false);
+    }
   }
 
   function resetSchedulerForm() {
     setCaption("");
+    setLocationName("");
     setUploadedFilePath("");
     setDataPostagem("");
     setPublicationType("instagram_reel");
@@ -460,10 +524,12 @@ function App() {
   }
 
   function startEditJob(job: Job) {
+    setSchedulerInfo("");
     setEditingJobId(job.id);
     setJobCompanyId(job.companyId);
     setUploadedFilePath(job.filePath);
     setCaption(job.caption ?? "");
+    setLocationName(job.locationName ?? "");
     setPublicationType(job.publicationType);
     setDataPostagem(toDateTimeLocal(job.dataPostagem));
     setActiveView("scheduler");
@@ -564,7 +630,14 @@ function App() {
     if (media.caption) {
       setCaption(media.caption);
     }
+    if (media.companyId !== jobCompanyId) {
+      setLocationName("");
+    }
     setActiveView("scheduler");
+  }
+
+  function appendEmojiToCaption(emoji: string) {
+    setCaption((current) => `${current}${emoji}`);
   }
 
   function renderAuthScreen() {
@@ -732,11 +805,14 @@ function App() {
                   <div key={job.id} className="row-card">
                     <div>
                       <strong>{job.caption || "Midia sem titulo"}</strong>
-                      <span>{companyNameMap[job.companyId] || "Unidade removida"}</span>
+                      <span className="publication-pill">{publicationTypeLabel(job.publicationType)}</span>
+                      <span className="unit-pill">
+                        {`Unidade: ${companyNameMap[job.companyId] || "Unidade removida"}`}
+                      </span>
                     </div>
                     <div>
                       <span>{formatDate(job.dataPostagem)}</span>
-                      <span className={`status-pill status-${job.status.toLowerCase()}`}>{job.status}</span>
+                      <span className={`status-pill status-${job.status.toLowerCase()}`}>{jobStatusLabel(job.status)}</span>
                     </div>
                   </div>
                 ))
@@ -958,12 +1034,12 @@ function App() {
                   </button>
                 ) : null}
                 <button type="button" className="danger-button" onClick={() => deleteAgent(agent.id)}>
-                  Excluir agent
+                  Excluir Agente
                 </button>
               </div>
             </div>
           ))}
-          {filteredAgents.length === 0 ? <div className="empty-state">Nenhum agent para este filtro.</div> : null}
+          {filteredAgents.length === 0 ? <div className="empty-state">Nenhum agente para este filtro.</div> : null}
         </div>
       </section>
     );
@@ -986,6 +1062,7 @@ function App() {
             ) : null}
           </div>
         </div>
+        {schedulerInfo ? <div className="info-banner">{schedulerInfo}</div> : null}
         <form onSubmit={createJob} className="form-stack">
           <div className="form-grid form-grid-two">
             <select value={jobCompanyId} onChange={(event) => setJobCompanyId(event.target.value)} required>
@@ -1011,6 +1088,7 @@ function App() {
               type="file"
               onChange={uploadMedia}
               accept="image/*,video/*"
+              disabled={submittingJob}
               required={requiresMediaUpload && !uploadedFilePath}
               title="Selecione um arquivo de imagem ou vídeo para a postagem."
             />
@@ -1023,19 +1101,60 @@ function App() {
             </small>
           </label>
 
-          <textarea
-            value={caption}
-            onChange={(event) => setCaption(event.target.value)}
-            placeholder="Descricao ou titulo da postagem"
-            rows={4}
-            maxLength={2000}
-            required={publicationType === "whatsapp_status_texto"}
-            title="Preencha a descrição da postagem. Para WhatsApp Status em texto, este campo é obrigatório."
+          <label className="field-shell">
+            <span>{captionLabel}</span>
+            <textarea
+              value={caption}
+              onChange={(event) => setCaption(event.target.value)}
+              disabled={submittingJob}
+              placeholder={captionPlaceholder}
+              rows={publicationType === "whatsapp_status_texto" ? 5 : 4}
+              maxLength={2000}
+              required={requiresInstagramMetadata || publicationType === "whatsapp_status_texto"}
+              title={captionTitle}
+            />
+          </label>
+
+          {caption.trim().length > 0 || publicationType === "whatsapp_status_midia" || publicationType === "whatsapp_status_texto" || requiresInstagramMetadata ? (
+            <div className="emoji-picker-shell">
+              <span>Emojis rápidos</span>
+              <div className="emoji-group-list">
+                {whatsappTextEmojiGroups.map((group) => (
+                  <div key={group.label} className="emoji-group-card">
+                    <strong>{group.label}</strong>
+                    <div className="emoji-picker-grid">
+                      {group.emojis.map((emoji) => (
+                        <button
+                          key={`${group.label}-${emoji}`}
+                          type="button"
+                          className="emoji-chip"
+                          disabled={submittingJob}
+                          onClick={() => appendEmojiToCaption(emoji)}
+                        >
+                          {emoji}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          <input
+            value={locationName}
+            onChange={(event) => setLocationName(event.target.value)}
+            disabled={!requiresInstagramMetadata || submittingJob}
+            placeholder="Localização"
+            maxLength={120}
+            required={requiresInstagramMetadata}
+            title="Preencha a localização da postagem. Para Instagram, este campo é obrigatório."
           />
 
           <select
             value={publicationType}
             onChange={(event) => setPublicationType(event.target.value as Job["publicationType"])}
+            disabled={submittingJob}
           >
             <option value="instagram_reel">Instagram Reel</option>
             <option value="instagram_post">Instagram Post</option>
@@ -1044,8 +1163,14 @@ function App() {
             <option value="whatsapp_status_texto">WhatsApp Status (texto)</option>
           </select>
 
-          <button type="submit" disabled={requiresMediaUpload && !uploadedFilePath}>
-            {editingJobId ? "Salvar alteracoes" : "Agendar Postagem"}
+          <button type="submit" disabled={submittingJob || (requiresMediaUpload && !uploadedFilePath)}>
+            {submittingJob
+              ? editingJobId
+                ? "Salvando..."
+                : "Agendando..."
+              : editingJobId
+                ? "Salvar alteracoes"
+                : "Agendar Postagem"}
           </button>
         </form>
       </section>
@@ -1077,10 +1202,13 @@ function App() {
               </div>
               <div className="media-meta">
                 <strong>{media.caption || "Midia sem titulo"}</strong>
-                <span>{companyNameMap[media.companyId] || "Unidade removida"}</span>
+                <span className="publication-pill">{publicationTypeLabel(media.publicationType)}</span>
+                <span className="unit-pill">{`Unidade: ${companyNameMap[media.companyId] || "Unidade removida"}`}</span>
                 <span>Ultimo uso: {formatDate(media.lastUsedAt)}</span>
                 <span>Usada {media.usageCount}x</span>
-                <span className={`status-pill status-${media.lastStatus.toLowerCase()}`}>{media.lastStatus}</span>
+                <span className={`status-pill status-${media.lastStatus.toLowerCase()}`}>
+                  {jobStatusLabel(media.lastStatus)}
+                </span>
               </div>
               <div className="inline-actions">
                 <a href={media.previewUrl} target="_blank" rel="noreferrer" className="link-chip">
@@ -1116,13 +1244,14 @@ function App() {
             <div key={job.id} className="row-card">
               <div>
                 <strong>{job.caption || "Midia sem titulo"}</strong>
-                <span>{companyNameMap[job.companyId] || "Unidade removida"}</span>
-                <span>{publicationTypeLabel(job.publicationType)}</span>
+                <span className="publication-pill">{publicationTypeLabel(job.publicationType)}</span>
+                <span className="unit-pill">{`Unidade: ${companyNameMap[job.companyId] || "Unidade removida"}`}</span>
+                {job.locationName ? <span>Localização: {job.locationName}</span> : null}
                 <span>{formatDate(job.dataPostagem)}</span>
                 <span>{job.lastError ?? "Sem erro"}</span>
               </div>
               <div className="inline-actions">
-                <span className={`status-pill status-${job.status.toLowerCase()}`}>{job.status}</span>
+                <span className={`status-pill status-${job.status.toLowerCase()}`}>{jobStatusLabel(job.status)}</span>
                 {job.filePath ? (
                   <a href={`${api.baseUrl}${job.filePath}`} target="_blank" rel="noreferrer" className="link-chip">
                     Midia
@@ -1256,7 +1385,7 @@ function App() {
               <span>Midias</span>
               <strong>{mediaLibrary.length}</strong>
             </div>
-            <button type="button" className="ghost-button" onClick={() => void logout()}>
+            <button type="button" className="danger-button" onClick={() => void logout()}>
               Sair
             </button>
           </div>

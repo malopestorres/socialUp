@@ -66,6 +66,7 @@ model Job {
   companyId     String
   filePath     String
   caption      String?
+  locationName String?
   publicationType String @default("instagram_reel")
   postStory    Boolean  @default(false)
   postReel     Boolean  @default(false)
