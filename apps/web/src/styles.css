@@ -596,7 +596,12 @@ button {
 
 .row-card > div:first-child {
   display: grid;
-  gap: 4px;
+  gap: 8px;
+}
+
+.row-card > div:first-child > strong,
+.row-card > div:first-child > span {
+  display: block;
 }
 
 .inline-actions {
@@ -753,8 +758,22 @@ code {
 
 .media-meta {
   display: grid;
-  gap: 6px;
+  gap: 10px;
   padding: 14px;
+}
+
+.media-card .inline-actions {
+  padding: 0 14px 14px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  align-items: stretch;
+}
+
+.media-card .inline-actions .link-chip,
+.media-card .inline-actions .ghost-button {
+  width: 100%;
+  justify-content: center;
 }
 
 .upload-shell {
@@ -770,6 +789,97 @@ code {
   background: transparent;
   padding: 0;
   border: none;
+}
+
+.field-shell {
+  display: grid;
+  gap: 8px;
+}
+
+.field-shell span {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--pink-deep);
+}
+
+.emoji-picker-shell {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border-radius: 20px;
+  background: #fff7fb;
+  border: 1px solid #f4bfd8;
+}
+
+.emoji-picker-shell span {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--pink-deep);
+}
+
+.emoji-group-list {
+  display: grid;
+  gap: 10px;
+}
+
+.emoji-group-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 16px;
+  background: #ffffff;
+  border: 1px solid #f6d1e1;
+}
+
+.emoji-group-card strong {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--pink-deep);
+}
+
+.emoji-picker-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.emoji-chip {
+  width: auto;
+  min-width: 46px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid #f4bfd8;
+  background: #fff1f7;
+  color: #1f1720;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.publication-pill {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  margin-top: 2px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: #fdf2f8;
+  color: #be123c;
+  border: 1px solid #fbcfe8;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.unit-pill {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: #fff7fb;
+  color: #9d174d;
+  border: 1px solid #f4bfd8;
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .toggle-grid {

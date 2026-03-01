@@ -44,6 +44,7 @@ export interface JobDto {
   companyId: string;
   filePath: string;
   caption: string | null;
+  locationName: string | null;
   publicationType: PublicationType;
   postStory: boolean;
   postReel: boolean;

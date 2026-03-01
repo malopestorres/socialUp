@@ -76,6 +76,7 @@ const createJobSchema = z.object({
   companyId: z.string().min(1),
   filePath: z.string().optional().nullable(),
   caption: z.string().optional().nullable(),
+  locationName: z.string().optional().nullable(),
   publicationType: z.enum([
     "instagram_story",
     "instagram_reel",
@@ -90,6 +91,7 @@ const updateJobSchema = z.object({
   companyId: z.string().min(1),
   filePath: z.string().optional().nullable(),
   caption: z.string().optional().nullable(),
+  locationName: z.string().optional().nullable(),
   publicationType: z.enum([
     "instagram_story",
     "instagram_reel",
@@ -172,6 +174,65 @@ function ensureFilePathForPublication(publicationType: PublicationType, filePath
   }
 
   return filePath;
+}
+
+function isInstagramPublication(publicationType: PublicationType): boolean {
+  return (
+    publicationType === "instagram_post" ||
+    publicationType === "instagram_reel" ||
+    publicationType === "instagram_story"
+  );
+}
+
+function publicationExecutionPriority(publicationType: PublicationType): number {
+  switch (publicationType) {
+    case "instagram_story":
+      return 1;
+    case "instagram_post":
+      return 2;
+    case "instagram_reel":
+      return 3;
+    case "whatsapp_status_texto":
+      return 4;
+    case "whatsapp_status_midia":
+      return 5;
+  }
+}
+
+function ensureInstagramMetadata(
+  publicationType: PublicationType,
+  caption?: string | null,
+  locationName?: string | null,
+): { caption: string | null; locationName: string | null } {
+  const normalizedCaption = caption?.trim() || null;
+  const normalizedLocation = locationName?.trim() || null;
+
+  if (isInstagramPublication(publicationType)) {
+    if (!normalizedCaption) {
+      throw new z.ZodError([
+        {
+          code: "custom",
+          path: ["caption"],
+          message: "Legenda obrigatoria para publicacoes do Instagram.",
+        },
+      ]);
+    }
+
+    if (!normalizedLocation) {
+      throw new z.ZodError([
+        {
+          code: "custom",
+          path: ["locationName"],
+          message: "Localizacao obrigatoria para publicacoes do Instagram.",
+        },
+      ]);
+    }
+  }
+
+  return {
+    caption: normalizedCaption,
+    locationName: normalizedLocation,
+  };
 }
 
 function createAgentToken(): string {
@@ -570,6 +631,7 @@ app.get("/jobs", async (request, response) => {
       companyId: job.companyId,
       filePath: job.filePath,
       caption: job.caption,
+      locationName: job.locationName,
       publicationType: normalizePublicationType(job),
       postStory: job.postStory,
       postReel: job.postReel,
@@ -590,11 +652,13 @@ app.post("/jobs", async (request, response) => {
   const payload = createJobSchema.parse(request.body);
   const legacyFields = deriveLegacyJobFields(payload.publicationType);
   const filePath = ensureFilePathForPublication(payload.publicationType, payload.filePath);
+  const metadata = ensureInstagramMetadata(payload.publicationType, payload.caption, payload.locationName);
   const job = await prisma.job.create({
     data: {
       companyId: payload.companyId,
       filePath,
-      caption: payload.caption ?? null,
+      caption: metadata.caption,
+      locationName: metadata.locationName,
       publicationType: payload.publicationType,
       postStory: legacyFields.postStory,
       postReel: legacyFields.postReel,
@@ -615,6 +679,7 @@ app.put("/jobs/:id", async (request, response) => {
   const payload = updateJobSchema.parse(request.body);
   const legacyFields = deriveLegacyJobFields(payload.publicationType);
   const filePath = ensureFilePathForPublication(payload.publicationType, payload.filePath);
+  const metadata = ensureInstagramMetadata(payload.publicationType, payload.caption, payload.locationName);
   const existingJob = await prisma.job.findUnique({ where: { id: request.params.id } });
 
   if (!existingJob) {
@@ -627,7 +692,8 @@ app.put("/jobs/:id", async (request, response) => {
     data: {
       companyId: payload.companyId,
       filePath,
-      caption: payload.caption ?? null,
+      caption: metadata.caption,
+      locationName: metadata.locationName,
       publicationType: payload.publicationType,
       postStory: legacyFields.postStory,
       postReel: legacyFields.postReel,
@@ -800,7 +866,7 @@ app.get("/agent/jobs/next", agentAuthMiddleware, async (request, response) => {
   const agent = request.agentAuth!;
   const now = new Date();
   const job = await prisma.$transaction(async (transaction) => {
-    const nextJob = await transaction.job.findFirst({
+    const pendingJobs = await transaction.job.findMany({
       where: {
         companyId: agent.companyId,
         status: {
@@ -808,8 +874,30 @@ app.get("/agent/jobs/next", agentAuthMiddleware, async (request, response) => {
         },
         dataPostagem: { lte: now },
       },
-      orderBy: { dataPostagem: "asc" },
+      orderBy: [{ dataPostagem: "asc" }, { criadoEm: "asc" }],
+      take: 20,
     });
+
+    const nextJob = pendingJobs
+      .map((candidate) => ({
+        candidate,
+        publicationType: normalizePublicationType(candidate),
+      }))
+      .sort((left, right) => {
+        const dateDiff =
+          new Date(left.candidate.dataPostagem).getTime() - new Date(right.candidate.dataPostagem).getTime();
+        if (dateDiff !== 0) {
+          return dateDiff;
+        }
+
+        const priorityDiff =
+          publicationExecutionPriority(left.publicationType) - publicationExecutionPriority(right.publicationType);
+        if (priorityDiff !== 0) {
+          return priorityDiff;
+        }
+
+        return new Date(left.candidate.criadoEm).getTime() - new Date(right.candidate.criadoEm).getTime();
+      })[0]?.candidate;
 
     if (!nextJob) {
       return null;
@@ -848,6 +936,7 @@ app.get("/agent/jobs/next", agentAuthMiddleware, async (request, response) => {
       companyId: job.companyId,
       filePath: job.filePath,
       caption: job.caption,
+      locationName: job.locationName,
       publicationType: normalizePublicationType(job),
       postStory: job.postStory,
       postReel: job.postReel,
