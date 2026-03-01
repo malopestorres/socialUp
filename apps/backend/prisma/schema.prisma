@@ -1,0 +1,93 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model Organization {
+  id        String    @id @default(cuid())
+  name      String
+  createdAt DateTime  @default(now())
+  companies Company[]
+}
+
+model User {
+  id             String   @id @default(cuid())
+  name           String
+  username       String   @unique
+  passwordHash   String
+  role           String   @default("ADMIN")
+  sessionToken   String?  @unique
+  sessionIssuedAt DateTime?
+  createdAt      DateTime @default(now())
+}
+
+model SetupInvite {
+  id        String   @id @default(cuid())
+  inviteKey String   @unique
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+}
+
+model Company {
+  id             String          @id @default(cuid())
+  name           String
+  organizationId String
+  createdAt      DateTime        @default(now())
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  agents         Agent[]
+  jobs           Job[]
+  logs           AgentLog[]
+}
+
+model Agent {
+  id                  String     @id @default(cuid())
+  name                String
+  companyId           String
+  token               String     @unique
+  activationCode      String?    @unique
+  activationStatus    String     @default("PENDING")
+  activationIssuedAt  DateTime?
+  activationUsedAt    DateTime?
+  deviceId            String?
+  deviceName          String?
+  revokedAt           DateTime?
+  createdAt           DateTime   @default(now())
+  lastSeenAt          DateTime?
+  company             Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  logs                AgentLog[]
+}
+
+model Job {
+  id           String   @id @default(cuid())
+  companyId     String
+  filePath     String
+  caption      String?
+  publicationType String @default("instagram_reel")
+  postStory    Boolean  @default(false)
+  postReel     Boolean  @default(false)
+  postWhatsapp Boolean  @default(false)
+  modoWhatsapp String
+  dataPostagem DateTime
+  status       String   @default("PENDING")
+  tentativas   Int      @default(0)
+  criadoEm     DateTime @default(now())
+  startedAt    DateTime?
+  completedAt  DateTime?
+  lastError    String?
+  company      Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+}
+
+model AgentLog {
+  id        String   @id @default(cuid())
+  companyId  String
+  agentId    String?
+  level     String
+  message   String
+  createdAt DateTime @default(now())
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  agent     Agent?   @relation(fields: [agentId], references: [id], onDelete: SetNull)
+}
