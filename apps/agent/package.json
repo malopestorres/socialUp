@@ -1,0 +1,61 @@
+{
+  "name": "@socialup/agent",
+  "version": "1.0.0",
+  "private": true,
+  "main": "dist/main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "NODE_OPTIONS='--import tsx' electron src/main.ts",
+    "build": "tsc -p tsconfig.json && node ./scripts/copy-assets.mjs",
+    "dist": "npm run build && electron-builder --dir",
+    "dist:mac": "npm run build && electron-builder --mac",
+    "dist:win": "npm run build && electron-builder --win",
+    "dist:linux": "npm run build && electron-builder --linux"
+  },
+  "dependencies": {
+    "@socialup/shared": "1.0.0",
+    "electron": "^35.0.0",
+    "playwright": "^1.51.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "electron-builder": "^26.0.12",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  },
+  "build": {
+    "appId": "local.socialup.agent",
+    "productName": "SocialUp Agent",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/playwright/**/*",
+      "node_modules/playwright-core/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.business",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "tar.gz"
+      ],
+      "category": "Utility"
+    }
+  }
+}
