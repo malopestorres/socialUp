@@ -6,15 +6,13 @@ const tokenInput = document.getElementById("token");
 const statusNode = document.getElementById("status");
 const pairStateNode = document.getElementById("pair-state");
 const testConnectionButton = document.getElementById("test-connection");
-const openBothButton = document.getElementById("open-both");
-const openInstagramButton = document.getElementById("open-instagram");
-const openWhatsappButton = document.getElementById("open-whatsapp");
 const pollOnceButton = document.getElementById("poll-once");
 const addWhatsappButton = document.getElementById("add-whatsapp");
 const addInstagramButton = document.getElementById("add-instagram");
 const platformListNode = document.getElementById("platform-list");
 const exportBackupButton = document.getElementById("export-backup");
 const importBackupButton = document.getElementById("import-backup");
+const pendingButtons = new WeakSet();
 
 function setStatus(message) {
   statusNode.textContent = message;
@@ -32,6 +30,22 @@ function updatePlatformButtons(config) {
   addInstagramButton.disabled = instagramEnabled;
   addInstagramButton.textContent = instagramEnabled ? "Instagram habilitado" : "Habilitar Instagram";
   addInstagramButton.className = instagramEnabled ? "enabled-button" : "secondary";
+}
+
+async function runWithButtonLock(button, task) {
+  if (!button || pendingButtons.has(button)) {
+    return;
+  }
+
+  pendingButtons.add(button);
+  button.disabled = true;
+
+  try {
+    await task();
+  } finally {
+    pendingButtons.delete(button);
+    applyState(await ipcRenderer.invoke("agent:get-state"));
+  }
 }
 
 function applyState(state) {
@@ -72,41 +86,48 @@ function renderPlatforms(config) {
   for (const platform of config.enabledPlatforms) {
     const item = document.createElement("div");
     item.className = "platform-item";
+    const loginRequired = (config.loginRequiredPlatforms ?? []).includes(platform);
 
     const info = document.createElement("div");
-    info.innerHTML = `<strong>${platformLabel(platform)}</strong><span class="muted">Canal habilitado neste computador</span>`;
+    info.innerHTML = `<strong>${platformLabel(platform)}</strong><span class="muted">${loginRequired ? "Login pendente neste canal" : "Canal habilitado e pronto para execução"}</span>`;
 
     const actions = document.createElement("div");
     actions.className = "platform-actions";
 
-    const openButton = document.createElement("button");
-    openButton.type = "button";
-    openButton.className = "secondary";
-    openButton.textContent = "Abrir";
-    openButton.addEventListener("click", async () => {
-      try {
-        await ipcRenderer.invoke("agent:open-platform", { platform });
-        setStatus(`${platformLabel(platform)} aberto para login manual.`);
-      } catch (error) {
-        setStatus(error instanceof Error ? error.message : "Falha ao abrir canal");
-      }
-    });
+    if (loginRequired) {
+      const openButton = document.createElement("button");
+      openButton.type = "button";
+      openButton.className = "secondary";
+      openButton.textContent = "Abrir para login";
+      openButton.addEventListener("click", () =>
+        runWithButtonLock(openButton, async () => {
+          try {
+            await ipcRenderer.invoke("agent:open-platform", { platform });
+            setStatus(`${platformLabel(platform)} aberto para login manual.`);
+          } catch (error) {
+            setStatus(error instanceof Error ? error.message : "Falha ao abrir canal");
+          }
+        }),
+      );
+      actions.appendChild(openButton);
+    }
 
     const removeButton = document.createElement("button");
     removeButton.type = "button";
     removeButton.className = "danger";
     removeButton.textContent = "Excluir";
-    removeButton.addEventListener("click", async () => {
-      try {
-        const updatedConfig = await ipcRenderer.invoke("agent:remove-platform", { platform });
-        renderPlatforms(updatedConfig);
-        setPairState(updatedConfig);
-      } catch (error) {
-        setStatus(error instanceof Error ? error.message : "Falha ao remover canal");
-      }
-    });
+    removeButton.addEventListener("click", () =>
+      runWithButtonLock(removeButton, async () => {
+        try {
+          const updatedConfig = await ipcRenderer.invoke("agent:remove-platform", { platform });
+          renderPlatforms(updatedConfig);
+          setPairState(updatedConfig);
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : "Falha ao remover canal");
+        }
+      }),
+    );
 
-    actions.appendChild(openButton);
     actions.appendChild(removeButton);
     item.appendChild(info);
     item.appendChild(actions);
@@ -143,20 +164,22 @@ async function bootstrap() {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  try {
-    const config = await ipcRenderer.invoke("agent:pair", {
-      apiBaseUrl: apiBaseUrlInput.value.trim(),
-      token: tokenInput.value.trim(),
-    });
-    setPairState(config);
-    renderPlatforms(config);
-    setStatus(
-      `Dispositivo ativado com sucesso\nAgent: ${config.agentName}\nCompany: ${config.companyId}\nDispositivo: ${config.deviceName}\nAgora adicione os canais que este computador vai operar.`,
-    );
-    tokenInput.value = "";
-  } catch (error) {
-    setStatus(error instanceof Error ? error.message : "Falha ao ativar dispositivo");
-  }
+  await runWithButtonLock(form.querySelector('button[type="submit"]'), async () => {
+    try {
+      const config = await ipcRenderer.invoke("agent:pair", {
+        apiBaseUrl: apiBaseUrlInput.value.trim(),
+        token: tokenInput.value.trim(),
+      });
+      setPairState(config);
+      renderPlatforms(config);
+      setStatus(
+        `Dispositivo ativado com sucesso\nAgent: ${config.agentName}\nCompany: ${config.companyId}\nDispositivo: ${config.deviceName}\nAgora adicione os canais que este computador vai operar.`,
+      );
+      tokenInput.value = "";
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Falha ao ativar dispositivo");
+    }
+  });
 });
 
 testConnectionButton.addEventListener("click", async () => {
@@ -164,103 +187,88 @@ testConnectionButton.addEventListener("click", async () => {
     return;
   }
 
-  try {
-    await ipcRenderer.invoke("agent:test-connection", {
-      apiBaseUrl: apiBaseUrlInput.value.trim(),
-    });
-    setStatus(`Backend acessível em ${apiBaseUrlInput.value.trim()}.`);
-  } catch (error) {
-    setStatus(error instanceof Error ? error.message : "Falha ao validar backend");
-  }
-});
-
-openBothButton.addEventListener("click", async () => {
-  try {
-    await ipcRenderer.invoke("agent:open-logins");
-    setStatus("Canais abertos. Faça login manual nas abas necessárias.");
-  } catch (error) {
-    setStatus(error instanceof Error ? error.message : "Falha ao abrir navegadores");
-  }
-});
-
-openInstagramButton.addEventListener("click", async () => {
-  try {
-    await ipcRenderer.invoke("agent:open-platform", { platform: "instagram" });
-    setStatus("Instagram aberto. Faça login manual se necessário.");
-  } catch (error) {
-    setStatus(error instanceof Error ? error.message : "Falha ao abrir Instagram");
-  }
-});
-
-openWhatsappButton.addEventListener("click", async () => {
-  try {
-    await ipcRenderer.invoke("agent:open-platform", { platform: "whatsapp" });
-    setStatus("WhatsApp aberto. Escaneie o QR Code se necessário.");
-  } catch (error) {
-    setStatus(error instanceof Error ? error.message : "Falha ao abrir WhatsApp");
-  }
+  await runWithButtonLock(testConnectionButton, async () => {
+    try {
+      await ipcRenderer.invoke("agent:test-connection", {
+        apiBaseUrl: apiBaseUrlInput.value.trim(),
+      });
+      setStatus(`Backend acessível em ${apiBaseUrlInput.value.trim()}.`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Falha ao validar backend");
+    }
+  });
 });
 
 pollOnceButton.addEventListener("click", async () => {
-  try {
-    const result = await ipcRenderer.invoke("agent:poll-once");
-    setStatus(result.lastStatusMessage || "Polling executado.");
-  } catch (error) {
-    setStatus(error instanceof Error ? error.message : "Falha ao buscar job");
-  }
+  await runWithButtonLock(pollOnceButton, async () => {
+    try {
+      const result = await ipcRenderer.invoke("agent:poll-once");
+      setStatus(result.lastStatusMessage || "Polling executado.");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Falha ao buscar job");
+    }
+  });
 });
 
 addWhatsappButton.addEventListener("click", async () => {
-  try {
-    const updatedConfig = await ipcRenderer.invoke("agent:add-platform", { platform: "whatsapp" });
-    renderPlatforms(updatedConfig);
-    setPairState(updatedConfig);
-  } catch (error) {
-    setStatus(error instanceof Error ? error.message : "Falha ao adicionar WhatsApp");
-  }
+  await runWithButtonLock(addWhatsappButton, async () => {
+    try {
+      const updatedConfig = await ipcRenderer.invoke("agent:add-platform", { platform: "whatsapp" });
+      renderPlatforms(updatedConfig);
+      setPairState(updatedConfig);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Falha ao adicionar WhatsApp");
+    }
+  });
 });
 
 addInstagramButton.addEventListener("click", async () => {
-  try {
-    const updatedConfig = await ipcRenderer.invoke("agent:add-platform", { platform: "instagram" });
-    renderPlatforms(updatedConfig);
-    setPairState(updatedConfig);
-  } catch (error) {
-    setStatus(error instanceof Error ? error.message : "Falha ao adicionar Instagram");
-  }
+  await runWithButtonLock(addInstagramButton, async () => {
+    try {
+      const updatedConfig = await ipcRenderer.invoke("agent:add-platform", { platform: "instagram" });
+      renderPlatforms(updatedConfig);
+      setPairState(updatedConfig);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Falha ao adicionar Instagram");
+    }
+  });
 });
 
 exportBackupButton.addEventListener("click", async () => {
-  try {
-    const result = await ipcRenderer.invoke("agent:export-backup");
-    if (!result.canceled) {
-      setStatus(`Backup exportado com sucesso.\nArquivo: ${result.filePath}`);
+  await runWithButtonLock(exportBackupButton, async () => {
+    try {
+      const result = await ipcRenderer.invoke("agent:export-backup");
+      if (!result.canceled) {
+        setStatus(`Backup exportado com sucesso.\nArquivo: ${result.filePath}`);
+      }
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Falha ao exportar backup");
     }
-  } catch (error) {
-    setStatus(error instanceof Error ? error.message : "Falha ao exportar backup");
-  }
+  });
 });
 
 importBackupButton.addEventListener("click", async () => {
-  try {
-    const result = await ipcRenderer.invoke("agent:import-backup");
-    if (!result.canceled && result.needsReactivation) {
-      apiBaseUrlInput.value = result.apiBaseUrl || apiBaseUrlInput.value;
-      setStatus(
-        "Backup de outro computador carregado apenas como referência. Revogue o acesso anterior no painel web e use uma nova chave de ativação neste dispositivo.",
-      );
-      return;
-    }
+  await runWithButtonLock(importBackupButton, async () => {
+    try {
+      const result = await ipcRenderer.invoke("agent:import-backup");
+      if (!result.canceled && result.needsReactivation) {
+        apiBaseUrlInput.value = result.apiBaseUrl || apiBaseUrlInput.value;
+        setStatus(
+          "Backup de outro computador carregado apenas como referência. Revogue o acesso anterior no painel web e use uma nova chave de ativação neste dispositivo.",
+        );
+        return;
+      }
 
-    if (!result.canceled && result.config) {
-      setPairState(result.config);
-      renderPlatforms(result.config);
-      updatePlatformButtons(result.config);
-      setStatus(`Backup restaurado para ${result.config.agentName}.`);
+      if (!result.canceled && result.config) {
+        setPairState(result.config);
+        renderPlatforms(result.config);
+        updatePlatformButtons(result.config);
+        setStatus(`Backup restaurado para ${result.config.agentName}.`);
+      }
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Falha ao importar backup");
     }
-  } catch (error) {
-    setStatus(error instanceof Error ? error.message : "Falha ao importar backup");
-  }
+  });
 });
 
 ipcRenderer.on("agent:status", (_event, message) => {

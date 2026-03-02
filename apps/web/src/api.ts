@@ -1,12 +1,17 @@
 const API_URL = "http://localhost:4000";
-const SESSION_STORAGE_KEY = "socialup-admin-session";
+const PERSISTENT_SESSION_STORAGE_KEY = "socialup-admin-session";
+const TEMPORARY_SESSION_STORAGE_KEY = "socialup-admin-session-temporary";
 
 function getSessionToken(): string {
   if (typeof window === "undefined") {
     return "";
   }
 
-  return window.localStorage.getItem(SESSION_STORAGE_KEY) ?? "";
+  return (
+    window.localStorage.getItem(PERSISTENT_SESSION_STORAGE_KEY) ??
+    window.sessionStorage.getItem(TEMPORARY_SESSION_STORAGE_KEY) ??
+    ""
+  );
 }
 
 function buildHeaders(init?: RequestInit): Headers {
@@ -81,19 +86,26 @@ export const api = {
       body: formData,
     });
   },
-  setSessionToken(token: string): void {
+  setSessionToken(token: string, remember = true): void {
     if (typeof window === "undefined") {
       return;
     }
 
     if (token) {
-      window.localStorage.setItem(SESSION_STORAGE_KEY, token);
+      if (remember) {
+        window.localStorage.setItem(PERSISTENT_SESSION_STORAGE_KEY, token);
+        window.sessionStorage.removeItem(TEMPORARY_SESSION_STORAGE_KEY);
+      } else {
+        window.sessionStorage.setItem(TEMPORARY_SESSION_STORAGE_KEY, token);
+        window.localStorage.removeItem(PERSISTENT_SESSION_STORAGE_KEY);
+      }
       return;
     }
 
-    window.localStorage.removeItem(SESSION_STORAGE_KEY);
+    window.localStorage.removeItem(PERSISTENT_SESSION_STORAGE_KEY);
+    window.sessionStorage.removeItem(TEMPORARY_SESSION_STORAGE_KEY);
   },
   getSessionToken,
-  sessionStorageKey: SESSION_STORAGE_KEY,
+  sessionStorageKey: PERSISTENT_SESSION_STORAGE_KEY,
   baseUrl: API_URL,
 };

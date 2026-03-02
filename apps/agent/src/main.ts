@@ -43,6 +43,39 @@ function snapshotState() {
   };
 }
 
+function platformsRequiredByJob(job: JobDto): SocialPlatform[] {
+  const required = new Set<SocialPlatform>();
+  if (job.publicationType.startsWith("instagram_") || job.postStory || job.postReel) {
+    required.add("instagram");
+  }
+  if (job.publicationType.startsWith("whatsapp_") || job.postWhatsapp) {
+    required.add("whatsapp");
+  }
+  return Array.from(required);
+}
+
+async function updateLoginRequirement(platforms: SocialPlatform[], required: boolean): Promise<void> {
+  if (!currentConfig || platforms.length === 0) {
+    return;
+  }
+
+  const current = new Set(currentConfig.loginRequiredPlatforms ?? []);
+  for (const platform of platforms) {
+    if (required) {
+      current.add(platform);
+    } else {
+      current.delete(platform);
+    }
+  }
+
+  currentConfig = {
+    ...currentConfig,
+    loginRequiredPlatforms: Array.from(current),
+  };
+  await writeConfig(currentConfig);
+  publishState();
+}
+
 function publishState(): void {
   mainWindow?.webContents.send("agent:state", snapshotState());
 }
@@ -190,11 +223,16 @@ async function pollJobs(): Promise<void> {
       }
 
       await executeJob(job, currentConfig.apiBaseUrl);
+      await updateLoginRequirement(platformsRequiredByJob(job), false);
       await postJobState(currentConfig, job.id, "complete");
       sendStatus(`Job ${job.id} concluído.`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Falha desconhecida";
       if (message === "LOGIN_REQUIRED_INSTAGRAM" || message === "LOGIN_REQUIRED_WHATSAPP") {
+        await updateLoginRequirement(
+          [message === "LOGIN_REQUIRED_INSTAGRAM" ? "instagram" : "whatsapp"],
+          true,
+        );
         await postJobState(currentConfig, job.id, "waiting-login");
         sendStatus(`Job ${job.id} pausado aguardando login manual.`);
       } else if (message === "INSTAGRAM_NAO_HABILITADO_NESTE_AGENT" || message === "WHATSAPP_NAO_HABILITADO_NESTE_AGENT") {
@@ -339,6 +377,7 @@ ipcMain.handle("agent:pair", async (_event, payload: { apiBaseUrl: string; token
     deviceId: deviceIdentity.deviceId,
     deviceName: deviceIdentity.deviceName,
     enabledPlatforms: currentConfig?.enabledPlatforms ?? [],
+    loginRequiredPlatforms: currentConfig?.loginRequiredPlatforms ?? [],
   };
   await writeConfig(currentConfig);
   sendStatus(`Dispositivo ativado para ${pairing.agentName}. Agora habilite os canais desejados abaixo.`);

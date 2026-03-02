@@ -195,6 +195,12 @@
         padding: 10px 12px;
       }
 
+      .single-button-row {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 10px;
+      }
+
       h1,
       h2,
       h3,
@@ -261,16 +267,11 @@
         </div>
 
         <div class="card">
-          <h2>2. Navegadores</h2>
-          <div class="button-row">
-            <button id="open-both" type="button">Abrir canais habilitados</button>
+          <h2>2. Execução</h2>
+          <div class="single-button-row">
             <button id="poll-once" type="button" class="secondary">Buscar job agora</button>
           </div>
-          <div class="button-row">
-            <button id="open-instagram" type="button" class="secondary">Abrir Instagram</button>
-            <button id="open-whatsapp" type="button" class="secondary">Abrir WhatsApp</button>
-          </div>
-          <p class="muted">Esses botões existem para você fazer login manualmente e validar que as abas persistem.</p>
+          <p class="muted">O agent processa uma tarefa por vez. Quando um canal pedir relogin, a ação aparece no cartão do canal habilitado.</p>
         </div>
       </section>
 

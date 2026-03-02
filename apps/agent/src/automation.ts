@@ -39,7 +39,7 @@ async function ensureBrowserContext(): Promise<BrowserContext> {
   browserContextPromise = chromium.launchPersistentContext(getUserDataDir(), {
     headless: false,
     viewport: DESKTOP_VIEWPORT,
-    args: ["--start-minimized"],
+    args: ["--start-minimized", "--disable-gpu", "--disable-gpu-compositing"],
   });
 
   const context = await browserContextPromise;
