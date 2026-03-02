@@ -13,6 +13,7 @@ export interface AgentConfig {
   deviceId: string;
   deviceName: string;
   enabledPlatforms: SocialPlatform[];
+  loginRequiredPlatforms: SocialPlatform[];
 }
 
 export interface AgentBackupFile {
@@ -49,6 +50,7 @@ export async function readConfig(): Promise<AgentConfig | null> {
       deviceId: parsed.deviceId,
       deviceName: parsed.deviceName ?? os.hostname(),
       enabledPlatforms: Array.isArray(parsed.enabledPlatforms) ? parsed.enabledPlatforms : [],
+      loginRequiredPlatforms: Array.isArray(parsed.loginRequiredPlatforms) ? parsed.loginRequiredPlatforms : [],
     };
   } catch {
     return null;
@@ -105,6 +107,9 @@ export async function addPlatformToConfig(platform: SocialPlatform): Promise<Age
 
   if (!config.enabledPlatforms.includes(platform)) {
     config.enabledPlatforms.push(platform);
+    if (!config.loginRequiredPlatforms.includes(platform)) {
+      config.loginRequiredPlatforms.push(platform);
+    }
     await writeConfig(config);
   }
 
@@ -118,6 +123,7 @@ export async function removePlatformFromConfig(platform: SocialPlatform): Promis
   }
 
   config.enabledPlatforms = config.enabledPlatforms.filter((item) => item !== platform);
+  config.loginRequiredPlatforms = config.loginRequiredPlatforms.filter((item) => item !== platform);
   await writeConfig(config);
   return config;
 }

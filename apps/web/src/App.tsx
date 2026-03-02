@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type ChangeEvent, type FormEvent } from "react";
-import { FiAlertCircle, FiCheckCircle, FiClock, FiWifi } from "react-icons/fi";
+import { FiAlertCircle, FiCheckCircle, FiClock, FiEye, FiEyeOff, FiWifi } from "react-icons/fi";
 import { api } from "./api";
+import socialUpLogo from "./assets/social-up-logo.svg";
 
 type ViewKey =
   | "dashboard"
@@ -111,10 +112,10 @@ const navItems: Array<{ key: ViewKey; label: string; eyebrow?: string }> = [
   { key: "scheduler", label: "Agendar" },
   { key: "media", label: "Midias" },
   { key: "history", label: "Histórico" },
-  { key: "logs", label: "Logs" },
   { key: "agents", label: "Agentes" },
   { key: "organizations", label: "Empresa" },
   { key: "companies", label: "Unidades" },
+  { key: "logs", label: "Logs" },
 ];
 
 const whatsappTextEmojiGroups: Array<{ label: string; emojis: string[] }> = [
@@ -181,11 +182,28 @@ function isInstagramPublication(publicationType: Job["publicationType"]): boolea
   );
 }
 
+const REMEMBER_ME_STORAGE_KEY = "socialup-remember-me";
+const REMEMBERED_USERNAME_STORAGE_KEY = "socialup-remembered-username";
+
 function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
-  const [loginUsername, setLoginUsername] = useState("");
+  const [loginUsername, setLoginUsername] = useState(() => {
+    if (typeof window === "undefined") {
+      return "";
+    }
+
+    return window.localStorage.getItem(REMEMBERED_USERNAME_STORAGE_KEY) ?? "";
+  });
   const [loginPassword, setLoginPassword] = useState("");
+  const [rememberMe, setRememberMe] = useState(() => {
+    if (typeof window === "undefined") {
+      return true;
+    }
+
+    const stored = window.localStorage.getItem(REMEMBER_ME_STORAGE_KEY);
+    return stored === null ? true : stored === "true";
+  });
   const [setupKey, setSetupKey] = useState(() => new URLSearchParams(window.location.search).get("setupKey") ?? "");
   const [setupInviteValid, setSetupInviteValid] = useState(false);
   const [setupName, setSetupName] = useState("");
@@ -193,10 +211,13 @@ function App() {
   const [setupPassword, setSetupPassword] = useState("");
   const [authError, setAuthError] = useState("");
   const [authInfo, setAuthInfo] = useState("");
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [profileName, setProfileName] = useState("");
   const [profileUsername, setProfileUsername] = useState("");
   const [profilePassword, setProfilePassword] = useState("");
   const [activeView, setActiveView] = useState<ViewKey>("dashboard");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [organizations, setOrganizations] = useState<Organization[]>([]);
   const [companies, setCompanies] = useState<Company[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -413,6 +434,18 @@ function App() {
     };
   }, [activeView, selectedCompanyId, authUser]);
 
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    window.localStorage.setItem(REMEMBER_ME_STORAGE_KEY, String(rememberMe));
+
+    if (!rememberMe) {
+      window.localStorage.removeItem(REMEMBERED_USERNAME_STORAGE_KEY);
+    }
+  }, [rememberMe]);
+
   async function createOrganization(event: FormEvent) {
     event.preventDefault();
     await api.postJson("/organizations", { name: organizationName });
@@ -469,13 +502,15 @@ function App() {
       return;
     }
     setUploading(true);
+    setError("");
+    setSchedulerInfo("Enviando mídia...");
     try {
       const result = await api.postFile("/upload", file);
       setUploadedFilePath(result.filePath);
-      setError("");
       setSchedulerInfo("Midia enviada com sucesso.");
     } catch (uploadError) {
       setError(uploadError instanceof Error ? uploadError.message : "Falha no upload.");
+      setSchedulerInfo("");
     } finally {
       setUploading(false);
     }
@@ -546,6 +581,7 @@ function App() {
   async function login(event: FormEvent) {
     event.preventDefault();
     setAuthError("");
+    setAuthSubmitting(true);
 
     try {
       const result = await api.postJson<{ sessionToken: string; user: AuthUser }>("/auth/login", {
@@ -553,12 +589,19 @@ function App() {
         password: loginPassword,
       });
 
-      api.setSessionToken(result.sessionToken);
+      api.setSessionToken(result.sessionToken, rememberMe);
+      if (rememberMe) {
+        window.localStorage.setItem(REMEMBERED_USERNAME_STORAGE_KEY, loginUsername);
+      } else {
+        window.localStorage.removeItem(REMEMBERED_USERNAME_STORAGE_KEY);
+      }
       setAuthUser(result.user);
       setLoginPassword("");
       setAuthInfo("");
     } catch (loginError) {
       setAuthError(loginError instanceof Error ? loginError.message : "Falha ao fazer login.");
+    } finally {
+      setAuthSubmitting(false);
     }
   }
 
@@ -646,9 +689,7 @@ function App() {
     return (
       <div className="auth-shell">
         <div className="auth-logo">
-          <div className="brand-mark">S</div>
-          <span className="section-kicker auth-kicker">acesso seguro</span>
-          <strong className="auth-wordmark">SocialUp</strong>
+          <img src={socialUpLogo} alt="SocialUp" className="brand-logo auth-brand-logo" />
         </div>
 
         {showSetup ? (
@@ -705,26 +746,57 @@ function App() {
             {authInfo ? <div className="info-banner">{authInfo}</div> : null}
 
             <form onSubmit={login} className="form-stack">
-              <input
-                value={loginUsername}
-                onChange={(event) => setLoginUsername(event.target.value)}
-                placeholder="Usuário"
-                required
-                minLength={3}
-                maxLength={32}
-                title="Informe seu usuário."
-              />
-              <input
-                type="password"
-                value={loginPassword}
-                onChange={(event) => setLoginPassword(event.target.value)}
-                placeholder="Senha"
-                required
-                minLength={8}
-                maxLength={128}
-                title="Informe sua senha."
-              />
-              <button type="submit">Entrar</button>
+                <input
+                  value={loginUsername}
+                  onChange={(event) => setLoginUsername(event.target.value)}
+                  placeholder="Usuário"
+                  disabled={authSubmitting}
+                  required
+                  minLength={3}
+                  maxLength={32}
+                  title="Informe seu usuário."
+                />
+              <div className="password-field">
+                <input
+                  type={showLoginPassword ? "text" : "password"}
+                  value={loginPassword}
+                  onChange={(event) => setLoginPassword(event.target.value)}
+                  placeholder="Senha"
+                  disabled={authSubmitting}
+                  required
+                  minLength={8}
+                  maxLength={128}
+                  title="Informe sua senha."
+                />
+                <button
+                  type="button"
+                  className="password-toggle"
+                  onClick={() => setShowLoginPassword((current) => !current)}
+                  disabled={authSubmitting}
+                  aria-label={showLoginPassword ? "Ocultar senha" : "Mostrar senha"}
+                >
+                  {showLoginPassword ? <FiEyeOff /> : <FiEye />}
+                </button>
+              </div>
+              <label className="auth-checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={rememberMe}
+                  onChange={(event) => setRememberMe(event.target.checked)}
+                  disabled={authSubmitting}
+                />
+                <span>Manter conectado</span>
+              </label>
+              <button type="submit" disabled={authSubmitting}>
+                {authSubmitting ? (
+                  <>
+                    <span className="button-spinner" />
+                    Entrando...
+                  </>
+                ) : (
+                  "Entrar"
+                )}
+              </button>
             </form>
           </section>
         )}
@@ -753,7 +825,7 @@ function App() {
               <span className="metric-icon" aria-hidden="true">
                 <FiWifi />
               </span>
-              Agentes online
+              <span className="metric-label-text">Agentes online</span>
             </span>
             <strong>{dashboard.agentsOnline}</strong>
           </article>
@@ -762,7 +834,7 @@ function App() {
               <span className="metric-icon" aria-hidden="true">
                 <FiClock />
               </span>
-              Pendentes
+              <span className="metric-label-text">Pendentes</span>
             </span>
             <strong>{dashboard.pendingJobs}</strong>
           </article>
@@ -771,18 +843,18 @@ function App() {
               <span className="metric-icon" aria-hidden="true">
                 <FiCheckCircle />
               </span>
-              Concluidos
+              <span className="metric-label-text">Concluidos</span>
             </span>
             <strong>{dashboard.completedJobs}</strong>
           </article>
-          <article className="metric-card">
+          <article className="metric-card metric-card-failed">
             <span className="metric-label">
               <span className="metric-icon" aria-hidden="true">
                 <FiAlertCircle />
               </span>
-              Falhados
+              <span className="metric-label-text">Falhados</span>
             </span>
-            <strong>{dashboard.failedJobs}</strong>
+            <strong className="metric-value-failed">{dashboard.failedJobs}</strong>
           </article>
         </section>
 
@@ -794,7 +866,7 @@ function App() {
                 <h2>Próximos Agendamentos</h2>
               </div>
               <button type="button" className="ghost-button" onClick={() => setActiveView("scheduler")}>
-                Ir para agenda
+                Agendar
               </button>
             </div>
             <div className="table-list">
@@ -888,6 +960,7 @@ function App() {
     return (
       <div className="view-stack">
         <section className="panel-card view-stack">
+          <h2 className="profile-page-title">Perfil</h2>
           <form onSubmit={saveProfile} className="form-stack">
             <input
               value={profileName}
@@ -1164,13 +1237,16 @@ function App() {
           </select>
 
           <button type="submit" disabled={submittingJob || (requiresMediaUpload && !uploadedFilePath)}>
-            {submittingJob
-              ? editingJobId
-                ? "Salvando..."
-                : "Agendando..."
-              : editingJobId
-                ? "Salvar alteracoes"
-                : "Agendar Postagem"}
+            {submittingJob ? <span className="button-spinner" aria-hidden="true" /> : null}
+            <span>
+              {submittingJob
+                ? editingJobId
+                  ? "Salvando..."
+                  : "Agendando..."
+                : editingJobId
+                  ? "Salvar alteracoes"
+                  : "Agendar Postagem"}
+            </span>
           </button>
         </form>
       </section>
@@ -1205,7 +1281,6 @@ function App() {
                 <span className="publication-pill">{publicationTypeLabel(media.publicationType)}</span>
                 <span className="unit-pill">{`Unidade: ${companyNameMap[media.companyId] || "Unidade removida"}`}</span>
                 <span>Ultimo uso: {formatDate(media.lastUsedAt)}</span>
-                <span>Usada {media.usageCount}x</span>
                 <span className={`status-pill status-${media.lastStatus.toLowerCase()}`}>
                   {jobStatusLabel(media.lastStatus)}
                 </span>
@@ -1276,7 +1351,7 @@ function App() {
 
   function renderLogs() {
     return (
-      <section className="panel-card view-stack">
+      <section className="panel-card view-stack tinted-panel">
         <div className="section-head">
           <div>
             <span className="section-kicker">debug</span>
@@ -1289,7 +1364,7 @@ function App() {
         </div>
         <div className="table-list">
           {filteredLogs.map((log) => (
-            <div key={log.id} className="row-card">
+            <div key={log.id} className="row-card log-row">
               <div>
                 <strong>{log.level}</strong>
                 <span>{log.message}</span>
@@ -1337,13 +1412,24 @@ function App() {
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
+      <button
+        type="button"
+        className={`sidebar-overlay ${sidebarOpen ? "sidebar-overlay-visible" : ""}`}
+        aria-label="Fechar menu"
+        onClick={() => setSidebarOpen(false)}
+      />
+
+      <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
+        <button
+          type="button"
+          className="sidebar-close"
+          aria-label="Fechar menu"
+          onClick={() => setSidebarOpen(false)}
+        >
+          ×
+        </button>
         <div className="brand-block">
-          <div className="brand-mark">S</div>
-          <div>
-            <span className="section-kicker">local suite</span>
-            <strong>SocialUp</strong>
-          </div>
+          <img src={socialUpLogo} alt="SocialUp" className="brand-logo" />
         </div>
 
         <nav className="nav-list">
@@ -1352,7 +1438,10 @@ function App() {
               key={item.key}
               type="button"
               className={`nav-item ${activeView === item.key ? "nav-item-active" : ""}`}
-              onClick={() => setActiveView(item.key)}
+              onClick={() => {
+                setActiveView(item.key);
+                setSidebarOpen(false);
+              }}
             >
               {item.eyebrow ? <span className="nav-eyebrow">{item.eyebrow}</span> : null}
               <span>{item.label}</span>
@@ -1364,9 +1453,28 @@ function App() {
 
       <main className="main-shell">
         <header className="topbar">
-          <div>
-            <span className="section-kicker">dashboard</span>
-            <h2>{activeView === "profile" ? "Perfil" : navItems.find((item) => item.key === activeView)?.label}</h2>
+          <div className="topbar-heading">
+            <img src={socialUpLogo} alt="SocialUp" className="mobile-top-logo" />
+          </div>
+          <div className="topbar-mobile-actions">
+            <button
+              type="button"
+              className={`profile-trigger mobile-profile-trigger ${activeView === "profile" ? "profile-trigger-active" : ""}`}
+              onClick={() => setActiveView("profile")}
+            >
+              <span className="profile-icon" aria-hidden="true" />
+              <span className="profile-trigger-label">Perfil</span>
+            </button>
+            <button
+              type="button"
+              className="menu-toggle"
+              aria-label="Abrir menu"
+              onClick={() => setSidebarOpen((current) => !current)}
+            >
+              <span />
+              <span />
+              <span />
+            </button>
           </div>
           <div className="topbar-actions">
             <button
@@ -1385,7 +1493,7 @@ function App() {
               <span>Midias</span>
               <strong>{mediaLibrary.length}</strong>
             </div>
-            <button type="button" className="danger-button" onClick={() => void logout()}>
+            <button type="button" className="danger-button logout-button" onClick={() => void logout()}>
               Sair
             </button>
           </div>
@@ -1403,12 +1511,11 @@ function App() {
                 <h2>Atalho rápido para agendar</h2>
               </div>
               <button type="button" className="danger-button" onClick={() => setActiveView("scheduler")}>
-                Abrir agenda completa
+                Agendar
               </button>
             </div>
             <div className="quick-summary">
               <span>{uploadedFilePath ? "Midia pronta para reutilizacao" : "Selecione uma midia na biblioteca para reutilizar."}</span>
-              {recentJobs.length > 0 ? <span>{`Ultimo item: ${recentJobs[0].caption || recentJobs[0].id}`}</span> : null}
             </div>
           </section>
         ) : null}
