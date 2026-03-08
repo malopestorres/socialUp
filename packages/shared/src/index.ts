@@ -1,6 +1,7 @@
 export type JobStatus =
   | "PENDING"
   | "RUNNING"
+  | "SENT_UNCONFIRMED"
   | "COMPLETED"
   | "FAILED"
   | "WAITING_LOGIN";
@@ -27,21 +28,10 @@ export interface CompanyDto {
   createdAt: string;
 }
 
-export interface AgentDto {
-  id: string;
-  name: string;
-  companyId: string;
-  createdAt: string;
-  hasToken: boolean;
-  lastSeenAt: string | null;
-  activationCode: string | null;
-  activationStatus: "PENDING" | "ACTIVE" | "REVOKED";
-  deviceName: string | null;
-}
-
 export interface JobDto {
   id: string;
   companyId: string;
+  socialConnectionId: string | null;
   filePath: string;
   caption: string | null;
   locationName: string | null;
@@ -62,7 +52,6 @@ export interface JobDto {
 export interface AgentLogDto {
   id: string;
   companyId: string;
-  agentId: string | null;
   level: "INFO" | "WARN" | "ERROR";
   message: string;
   createdAt: string;
@@ -75,11 +64,4 @@ export interface DashboardDto {
   pendingJobs: number;
   failedJobs: number;
   completedJobs: number;
-}
-
-export interface PairingResponse {
-  agentId: string;
-  companyId: string;
-  agentToken: string;
-  agentName: string;
 }

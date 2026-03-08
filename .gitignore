@@ -1,10 +1,13 @@
 node_modules
 dist
 .DS_Store
+.socialup-debug
 .env
 *.log
 apps/backend/dev.db
 apps/backend/dev.db-journal
+apps/backend/prisma/dev.db
+apps/backend/prisma/dev.db-journal
+apps/backend/.socialup-server/
 apps/backend/uploads/*
 !apps/backend/uploads/.gitkeep
-
