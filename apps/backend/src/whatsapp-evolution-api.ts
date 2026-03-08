@@ -1,0 +1,875 @@
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import QRCode from "qrcode";
+import { prisma } from "./prisma.js";
+
+export type WhatsappQrStatus =
+  | "IDLE"
+  | "PREPARING"
+  | "WAITING_QR_SCAN"
+  | "QR_EXPIRED"
+  | "CONNECTED"
+  | "ERROR";
+
+type ConnectionIdentity = {
+  id: string;
+  companyId: string;
+  displayName: string;
+  platform?: string;
+  loginIdentifier: string | null;
+  secretCipher: string | null;
+};
+
+type JobIdentity = {
+  id: string;
+  publicationType: string;
+  caption?: string | null;
+  filePath?: string | null;
+};
+
+type EvolutionCredentials = {
+  instanceName: string;
+  apiKey: string;
+  baseUrl: string;
+};
+
+type QrOverlayState = {
+  qrStatus: WhatsappQrStatus;
+  qrImageDataUrl: string | null;
+  qrGeneratedAt: Date | null;
+  workerLastSeenAt: Date | null;
+  qrMessage: string | null;
+};
+
+type EvolutionConnectionStateResponse = {
+  instance?: {
+    state?: string | null;
+    status?: string | null;
+  } | null;
+  state?: string | null;
+  status?: string | null;
+};
+
+type EvolutionFetchInstanceRecord = {
+  id?: string | null;
+  name?: string | null;
+  instanceName?: string | null;
+  connectionStatus?: string | null;
+  integration?: string | null;
+};
+
+type EvolutionConnectResponse = {
+  code?: string | null;
+  base64?: string | null;
+  pairingCode?: string | null;
+  message?: string | null;
+};
+
+type EvolutionSendStatusResponse = {
+  key?: {
+    id?: string | null;
+    remoteJid?: string | null;
+  } | null;
+  id?: string | null;
+  messageId?: string | null;
+};
+
+type EvolutionRequestOptions = {
+  method?: "GET" | "POST" | "DELETE";
+  jsonBody?: unknown;
+};
+
+const EVOLUTION_API_BASE_URL = normalizeBaseUrl(process.env.EVOLUTION_API_BASE_URL || "http://localhost:8080");
+const EVOLUTION_API_KEY = (process.env.EVOLUTION_API_KEY || "").trim();
+const EVOLUTION_API_TIMEOUT_MS = parsePositiveInt(process.env.EVOLUTION_API_TIMEOUT_MS, 45_000);
+const EVOLUTION_QR_POLL_INTERVAL_MS = parsePositiveInt(process.env.EVOLUTION_QR_POLL_INTERVAL_MS, 4_000);
+const EVOLUTION_INSTANCE_INTEGRATION = (process.env.EVOLUTION_INSTANCE_INTEGRATION || "WHATSAPP-BAILEYS").trim();
+const EVOLUTION_STATUS_TEXT_BACKGROUND = process.env.EVOLUTION_STATUS_TEXT_BACKGROUND?.trim() || "#202C33";
+const EVOLUTION_STATUS_TEXT_FONT = parseStatusTextFont(process.env.EVOLUTION_STATUS_TEXT_FONT, 1);
+
+const HARD_CODED_INSTANCE_NAME = (process.env.EVOLUTION_HARD_CODED_INSTANCE_NAME || "").trim();
+const HARD_CODED_INSTANCE_API_KEY = (process.env.EVOLUTION_HARD_CODED_INSTANCE_API_KEY || "").trim();
+
+const qrOverlayByConnectionId = new Map<string, QrOverlayState>();
+const qrPollersByConnectionId = new Map<string, NodeJS.Timeout>();
+
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseStatusTextFont(value: string | undefined, fallback: number): number {
+  const parsed = parsePositiveInt(value, fallback);
+  if (parsed < 1) {
+    return 1;
+  }
+  if (parsed > 5) {
+    return 5;
+  }
+  return parsed;
+}
+
+function normalizeBaseUrl(url: string): string {
+  return url.trim().replace(/\/+$/, "");
+}
+
+function decodeSecret(secretCipher?: string | null): string | null {
+  if (!secretCipher) {
+    return null;
+  }
+
+  try {
+    const decoded = Buffer.from(secretCipher, "base64").toString("utf8").trim();
+    return decoded.length > 0 ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+export function isWhatsappEvolutionHardcodedEnabled(): boolean {
+  return Boolean(HARD_CODED_INSTANCE_NAME);
+}
+
+function getOrCreateQrOverlay(connectionId: string): QrOverlayState {
+  const existing = qrOverlayByConnectionId.get(connectionId);
+  if (existing) {
+    return existing;
+  }
+
+  const created: QrOverlayState = {
+    qrStatus: "IDLE",
+    qrImageDataUrl: null,
+    qrGeneratedAt: null,
+    workerLastSeenAt: null,
+    qrMessage: null,
+  };
+  qrOverlayByConnectionId.set(connectionId, created);
+  return created;
+}
+
+function setQrOverlay(connectionId: string, patch: Partial<QrOverlayState>): void {
+  const current = getOrCreateQrOverlay(connectionId);
+  qrOverlayByConnectionId.set(connectionId, {
+    ...current,
+    ...patch,
+    workerLastSeenAt: new Date(),
+  });
+}
+
+function clearQrPoller(connectionId: string): void {
+  const existing = qrPollersByConnectionId.get(connectionId);
+  if (existing) {
+    clearInterval(existing);
+    qrPollersByConnectionId.delete(connectionId);
+  }
+}
+
+async function getConnectionIdentity(connectionId: string): Promise<ConnectionIdentity | null> {
+  return prisma.socialConnection.findUnique({
+    where: { id: connectionId },
+    select: {
+      id: true,
+      companyId: true,
+      displayName: true,
+      platform: true,
+      loginIdentifier: true,
+      secretCipher: true,
+    },
+  });
+}
+
+function getConnectionCredentials(connection: ConnectionIdentity): EvolutionCredentials {
+  if (isWhatsappEvolutionHardcodedEnabled()) {
+    const apiKey = HARD_CODED_INSTANCE_API_KEY || EVOLUTION_API_KEY;
+    if (!apiKey) {
+      throw new Error("WHATSAPP_EVOLUTION_API_KEY_MISSING");
+    }
+
+    return {
+      instanceName: HARD_CODED_INSTANCE_NAME,
+      apiKey,
+      baseUrl: EVOLUTION_API_BASE_URL,
+    };
+  }
+
+  const instanceName = connection.loginIdentifier?.trim() ?? "";
+  const apiKey = decodeSecret(connection.secretCipher) ?? EVOLUTION_API_KEY;
+
+  if (!instanceName) {
+    throw new Error("WHATSAPP_EVOLUTION_INSTANCE_NAME_MISSING");
+  }
+
+  if (!apiKey) {
+    throw new Error("WHATSAPP_EVOLUTION_API_KEY_MISSING");
+  }
+
+  return {
+    instanceName,
+    apiKey,
+    baseUrl: EVOLUTION_API_BASE_URL,
+  };
+}
+
+async function parseResponsePayload(response: Response): Promise<unknown> {
+  const text = await response.text();
+  if (!text) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return text;
+  }
+}
+
+function errorDetailFromPayload(payload: unknown): string {
+  const normalizeMessage = (value: unknown): string => {
+    if (typeof value === "string") {
+      return value;
+    }
+    if (Array.isArray(value)) {
+      return value
+        .map((entry) => normalizeMessage(entry))
+        .filter((entry) => entry.length > 0)
+        .join("; ");
+    }
+    if (value && typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      return (
+        normalizeMessage(record.message) ||
+        normalizeMessage(record.error) ||
+        normalizeMessage(record.description) ||
+        ""
+      );
+    }
+    return "";
+  };
+
+  if (!payload) {
+    return "";
+  }
+
+  if (typeof payload === "string") {
+    return payload;
+  }
+
+  if (typeof payload === "object") {
+    const record = payload as Record<string, unknown>;
+    const directMessage =
+      normalizeMessage(record.message) ||
+      normalizeMessage(record.error) ||
+      normalizeMessage(record.description) ||
+      "";
+    if (directMessage) {
+      return directMessage;
+    }
+
+    const nested = record.response;
+    if (nested && typeof nested === "object") {
+      const nestedRecord = nested as Record<string, unknown>;
+      const nestedMessage =
+        normalizeMessage(nestedRecord.message) ||
+        normalizeMessage(nestedRecord.error) ||
+        "";
+      if (nestedMessage) {
+        return nestedMessage;
+      }
+    }
+  }
+
+  return "";
+}
+
+function errorHasHttpStatus(error: unknown, status: number): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return error.message.includes(`WHATSAPP_EVOLUTION_API_HTTP_${status}:`);
+}
+
+async function evolutionRequest<T>(
+  credentials: EvolutionCredentials,
+  route: string,
+  options: EvolutionRequestOptions = {},
+): Promise<T> {
+  const safeRoute = route.startsWith("/") ? route : `/${route}`;
+  const url = `${credentials.baseUrl}${safeRoute}`;
+
+  const headers = new Headers();
+  headers.set("apikey", credentials.apiKey);
+
+  let body: string | undefined;
+  if (options.jsonBody !== undefined) {
+    body = JSON.stringify(options.jsonBody);
+    headers.set("Content-Type", "application/json");
+  }
+
+  const abortController = new AbortController();
+  const timeoutHandle = setTimeout(() => abortController.abort(), EVOLUTION_API_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      method: options.method ?? "GET",
+      headers,
+      body,
+      signal: abortController.signal,
+    });
+    const payload = await parseResponsePayload(response);
+
+    if (!response.ok) {
+      const detail = errorDetailFromPayload(payload);
+      throw new Error(
+        `WHATSAPP_EVOLUTION_API_HTTP_${response.status}:${safeRoute}${detail ? `:${detail}` : ""}`,
+      );
+    }
+
+    return payload as T;
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
+async function markConnectionConnected(connectionId: string): Promise<void> {
+  await prisma.socialConnection.updateMany({
+    where: { id: connectionId, platform: "whatsapp" },
+    data: {
+      authStatus: "CONNECTED",
+      lastAuthAt: new Date(),
+      lastSeenAt: new Date(),
+    },
+  });
+}
+
+async function fetchInstanceRecord(credentials: EvolutionCredentials): Promise<EvolutionFetchInstanceRecord | null> {
+  const query = encodeURIComponent(credentials.instanceName);
+  const payload = await evolutionRequest<unknown>(credentials, `/instance/fetchInstances?instanceName=${query}`);
+
+  if (Array.isArray(payload)) {
+    const first = payload.find(
+      (entry) =>
+        entry &&
+        typeof entry === "object" &&
+        typeof (entry as Record<string, unknown>).name === "string" &&
+        ((entry as Record<string, unknown>).name as string) === credentials.instanceName,
+    );
+    if (first && typeof first === "object") {
+      return first as EvolutionFetchInstanceRecord;
+    }
+    return null;
+  }
+
+  if (payload && typeof payload === "object") {
+    const record = payload as Record<string, unknown>;
+    const instances = record.instances;
+    if (Array.isArray(instances)) {
+      const first = instances.find(
+        (entry) =>
+          entry &&
+          typeof entry === "object" &&
+          (typeof (entry as Record<string, unknown>).name === "string" ||
+            typeof (entry as Record<string, unknown>).instanceName === "string"),
+      );
+      if (first && typeof first === "object") {
+        return first as EvolutionFetchInstanceRecord;
+      }
+    }
+  }
+
+  return null;
+}
+
+async function ensureInstanceExists(credentials: EvolutionCredentials): Promise<void> {
+  try {
+    const existing = await fetchInstanceRecord(credentials);
+    if (existing) {
+      return;
+    }
+  } catch (error) {
+    if (!errorHasHttpStatus(error, 404)) {
+      throw error;
+    }
+  }
+
+  await evolutionRequest(credentials, "/instance/create", {
+    method: "POST",
+    jsonBody: {
+      instanceName: credentials.instanceName,
+      integration: EVOLUTION_INSTANCE_INTEGRATION || "WHATSAPP-BAILEYS",
+      qrcode: false,
+    },
+  });
+}
+
+async function getConnectionState(credentials: EvolutionCredentials): Promise<string | null> {
+  const payload = await evolutionRequest<EvolutionConnectionStateResponse>(
+    credentials,
+    `/instance/connectionState/${encodeURIComponent(credentials.instanceName)}`,
+  );
+
+  const state =
+    payload?.instance?.state ??
+    payload?.instance?.status ??
+    payload?.state ??
+    payload?.status ??
+    null;
+
+  return typeof state === "string" ? state : null;
+}
+
+function normalizeState(state: string | null): string | null {
+  return state?.trim().toLowerCase() ?? null;
+}
+
+async function getEffectiveConnectionState(credentials: EvolutionCredentials): Promise<string | null> {
+  try {
+    const state = await getConnectionState(credentials);
+    if (state) {
+      return state;
+    }
+  } catch (error) {
+    if (!errorHasHttpStatus(error, 404)) {
+      throw error;
+    }
+  }
+
+  const instance = await fetchInstanceRecord(credentials);
+  const fallbackState = instance?.connectionStatus ?? null;
+  return typeof fallbackState === "string" ? fallbackState : null;
+}
+
+async function connectInstance(credentials: EvolutionCredentials): Promise<EvolutionConnectResponse> {
+  try {
+    return await evolutionRequest<EvolutionConnectResponse>(
+      credentials,
+      `/instance/connect/${encodeURIComponent(credentials.instanceName)}`,
+    );
+  } catch (error) {
+    if (!errorHasHttpStatus(error, 404)) {
+      throw error;
+    }
+
+    await ensureInstanceExists(credentials);
+    return evolutionRequest<EvolutionConnectResponse>(
+      credentials,
+      `/instance/connect/${encodeURIComponent(credentials.instanceName)}`,
+    );
+  }
+}
+
+async function logoutInstance(credentials: EvolutionCredentials): Promise<void> {
+  await evolutionRequest(credentials, `/instance/logout/${encodeURIComponent(credentials.instanceName)}`, {
+    method: "DELETE",
+  });
+}
+
+function formatStateMessage(state: string | null): string {
+  const normalized = normalizeState(state);
+  switch (normalized) {
+    case "open":
+      return "Instancia conectada.";
+    case "connecting":
+      return "Instancia iniciando sessao. Aguarde alguns segundos.";
+    case "close":
+    case "closed":
+      return "Escaneie o QR Code no WhatsApp.";
+    default:
+      return "Sincronizando estado da instancia.";
+  }
+}
+
+function toQrImageDataUrl(base64: string): string {
+  if (base64.startsWith("data:image/")) {
+    return base64;
+  }
+
+  return `data:image/png;base64,${base64}`;
+}
+
+async function qrCodeToDataUrl(code: string): Promise<string> {
+  return QRCode.toDataURL(code, {
+    margin: 1,
+    errorCorrectionLevel: "M",
+  });
+}
+
+function mimeTypeForFile(fileName: string): string {
+  const extension = path.extname(fileName).toLowerCase();
+
+  switch (extension) {
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".png":
+      return "image/png";
+    case ".webp":
+      return "image/webp";
+    case ".gif":
+      return "image/gif";
+    case ".mp4":
+      return "video/mp4";
+    case ".mov":
+      return "video/quicktime";
+    case ".mkv":
+      return "video/x-matroska";
+    case ".webm":
+      return "video/webm";
+    case ".mp3":
+      return "audio/mpeg";
+    case ".ogg":
+      return "audio/ogg";
+    case ".wav":
+      return "audio/wav";
+    case ".m4a":
+      return "audio/mp4";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+function statusMediaTypeFromMimeType(mimeType: string): "image" | "video" | "audio" {
+  if (mimeType.startsWith("image/")) {
+    return "image";
+  }
+  if (mimeType.startsWith("video/")) {
+    return "video";
+  }
+  if (mimeType.startsWith("audio/")) {
+    return "audio";
+  }
+
+  throw new Error("WHATSAPP_STATUS_MEDIA_UNSUPPORTED");
+}
+
+async function appendWhatsappDiagnosticLog(input: {
+  companyId: string;
+  level: "INFO" | "WARN" | "ERROR";
+  message: string;
+  errorCode?: string;
+}): Promise<void> {
+  await prisma.agentLog.create({
+    data: {
+      companyId: input.companyId,
+      level: input.level,
+      errorCode: input.errorCode ?? null,
+      message: input.message,
+    },
+  });
+}
+
+async function syncQrState(connectionId: string, credentials: EvolutionCredentials): Promise<"CONTINUE" | "STOP"> {
+  const state = await getEffectiveConnectionState(credentials);
+  const normalizedState = normalizeState(state);
+
+  if (normalizedState === "open") {
+    setQrOverlay(connectionId, {
+      qrStatus: "CONNECTED",
+      qrImageDataUrl: null,
+      qrMessage: "Conta WhatsApp conectada com sucesso.",
+      qrGeneratedAt: null,
+    });
+    await markConnectionConnected(connectionId);
+    return "STOP";
+  }
+
+  const connect = await connectInstance(credentials);
+  const qrCodeContent = connect.code?.trim() || "";
+  const qrBase64 = connect.base64?.trim() || "";
+  const pairingCode = connect.pairingCode?.trim() || "";
+
+  if (qrBase64) {
+    setQrOverlay(connectionId, {
+      qrStatus: "WAITING_QR_SCAN",
+      qrImageDataUrl: toQrImageDataUrl(qrBase64),
+      qrMessage: "Escaneie o QR Code no WhatsApp do celular.",
+      qrGeneratedAt: new Date(),
+    });
+    return "CONTINUE";
+  }
+
+  if (qrCodeContent) {
+    const qrDataUrl = await qrCodeToDataUrl(qrCodeContent);
+    setQrOverlay(connectionId, {
+      qrStatus: "WAITING_QR_SCAN",
+      qrImageDataUrl: qrDataUrl,
+      qrMessage: "Escaneie o QR Code no WhatsApp do celular.",
+      qrGeneratedAt: new Date(),
+    });
+    return "CONTINUE";
+  }
+
+  if (pairingCode) {
+    setQrOverlay(connectionId, {
+      qrStatus: "WAITING_QR_SCAN",
+      qrImageDataUrl: null,
+      qrMessage: `Codigo de pareamento: ${pairingCode}`,
+      qrGeneratedAt: new Date(),
+    });
+    return "CONTINUE";
+  }
+
+  setQrOverlay(connectionId, {
+    qrStatus: normalizedState === "close" ? "QR_EXPIRED" : "PREPARING",
+    qrImageDataUrl: null,
+    qrMessage: formatStateMessage(state),
+    qrGeneratedAt: null,
+  });
+  return "CONTINUE";
+}
+
+function extractMessageId(payload: EvolutionSendStatusResponse): string | null {
+  return payload?.key?.id ?? payload?.messageId ?? payload?.id ?? null;
+}
+
+function extractRemoteJid(payload: EvolutionSendStatusResponse): string {
+  return payload?.key?.remoteJid ?? "status@broadcast";
+}
+
+function buildTextStatusPayload(content: string): Record<string, unknown> {
+  return {
+    type: "text",
+    content,
+    caption: "",
+    backgroundColor: EVOLUTION_STATUS_TEXT_BACKGROUND,
+    font: EVOLUTION_STATUS_TEXT_FONT,
+    allContacts: true,
+  };
+}
+
+function buildMediaStatusPayload(input: {
+  statusType: "image" | "video" | "audio";
+  dataUrl: string;
+  caption: string;
+}): Record<string, unknown> {
+  return {
+    type: input.statusType,
+    content: input.dataUrl,
+    caption: input.caption || "",
+    backgroundColor: EVOLUTION_STATUS_TEXT_BACKGROUND,
+    font: EVOLUTION_STATUS_TEXT_FONT,
+    allContacts: true,
+  };
+}
+
+function assertAuthorizedState(state: string | null): void {
+  const normalized = normalizeState(state);
+
+  if (normalized === "open") {
+    return;
+  }
+
+  if (normalized === "connecting") {
+    throw new Error("WHATSAPP_INSTANCE_STARTING");
+  }
+
+  if (!normalized || normalized === "close" || normalized === "closed") {
+    throw new Error("LOGIN_REQUIRED_WHATSAPP");
+  }
+
+  throw new Error(`WHATSAPP_INSTANCE_STATE_${state ?? "UNKNOWN"}`);
+}
+
+export function getWhatsappConnectionOverlay(connectionId: string): Partial<Record<string, unknown>> {
+  const state = qrOverlayByConnectionId.get(connectionId);
+  if (!state) {
+    return {};
+  }
+
+  return {
+    qrStatus: state.qrStatus,
+    qrImageDataUrl: state.qrImageDataUrl,
+    qrGeneratedAt: state.qrGeneratedAt,
+    workerLastSeenAt: state.workerLastSeenAt,
+    qrMessage: state.qrMessage,
+  };
+}
+
+export async function requestWhatsappQr(connectionId: string, forceRegenerate: boolean): Promise<void> {
+  clearQrPoller(connectionId);
+
+  const connection = await getConnectionIdentity(connectionId);
+  if (!connection || connection.platform !== "whatsapp") {
+    throw new Error("WHATSAPP_CONNECTION_NOT_FOUND");
+  }
+
+  let credentials: EvolutionCredentials;
+  try {
+    credentials = getConnectionCredentials(connection);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "WHATSAPP_EVOLUTION_CREDENTIALS_MISSING";
+    setQrOverlay(connectionId, {
+      qrStatus: "ERROR",
+      qrImageDataUrl: null,
+      qrGeneratedAt: null,
+      qrMessage: message,
+    });
+    throw error;
+  }
+
+  setQrOverlay(connectionId, {
+    qrStatus: "PREPARING",
+    qrImageDataUrl: null,
+    qrGeneratedAt: null,
+    qrMessage: "Preparando QR Code da Evolution API...",
+  });
+
+  await ensureInstanceExists(credentials);
+
+  if (forceRegenerate) {
+    try {
+      await logoutInstance(credentials);
+    } catch {
+      // Some providers return conflict errors when there is no active session.
+    }
+  }
+
+  let running = false;
+  const tick = async () => {
+    if (running) {
+      return;
+    }
+    running = true;
+
+    try {
+      const outcome = await syncQrState(connectionId, credentials);
+      if (outcome === "STOP") {
+        clearQrPoller(connectionId);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "WHATSAPP_EVOLUTION_QR_ERROR";
+      setQrOverlay(connectionId, {
+        qrStatus: "ERROR",
+        qrImageDataUrl: null,
+        qrGeneratedAt: null,
+        qrMessage: message,
+      });
+    } finally {
+      running = false;
+    }
+  };
+
+  await tick();
+
+  const state = qrOverlayByConnectionId.get(connectionId)?.qrStatus ?? "IDLE";
+  if (state === "PREPARING" || state === "WAITING_QR_SCAN") {
+    const interval = setInterval(() => {
+      void tick();
+    }, EVOLUTION_QR_POLL_INTERVAL_MS);
+    qrPollersByConnectionId.set(connectionId, interval);
+  }
+}
+
+export async function dismissWhatsappQr(connectionId: string): Promise<void> {
+  clearQrPoller(connectionId);
+  setQrOverlay(connectionId, {
+    qrStatus: "IDLE",
+    qrImageDataUrl: null,
+    qrGeneratedAt: null,
+    qrMessage: "Geracao de QR cancelada.",
+  });
+}
+
+export async function markWhatsappConnected(connectionId: string): Promise<void> {
+  clearQrPoller(connectionId);
+  setQrOverlay(connectionId, {
+    qrStatus: "CONNECTED",
+    qrImageDataUrl: null,
+    qrGeneratedAt: null,
+    qrMessage: "Conta WhatsApp conectada.",
+  });
+}
+
+export async function disconnectWhatsappConnection(connectionId: string): Promise<void> {
+  clearQrPoller(connectionId);
+
+  const connection = await getConnectionIdentity(connectionId);
+  if (connection) {
+    try {
+      const credentials = getConnectionCredentials(connection);
+      await logoutInstance(credentials);
+    } catch {
+      // Ignore logout failures while disconnecting.
+    }
+  }
+
+  setQrOverlay(connectionId, {
+    qrStatus: "IDLE",
+    qrImageDataUrl: null,
+    qrGeneratedAt: null,
+    qrMessage: "Conta desconectada.",
+  });
+}
+
+export async function executeWhatsappJobWithEvolutionApi(
+  connection: ConnectionIdentity,
+  job: JobIdentity,
+  uploadsDir: string,
+): Promise<{ remoteJid: string; messageId: string | null }> {
+  const credentials = getConnectionCredentials(connection);
+  await ensureInstanceExists(credentials);
+  const state = await getEffectiveConnectionState(credentials);
+  assertAuthorizedState(state);
+
+  await appendWhatsappDiagnosticLog({
+    companyId: connection.companyId,
+    level: "INFO",
+    errorCode: "WHATSAPP_STATUS_BROADCAST_ALL",
+    message: `Job ${job.id} enviando status com allContacts=true via Evolution API.`,
+  });
+
+  const route = `/message/sendStatus/${encodeURIComponent(credentials.instanceName)}`;
+
+  if (job.publicationType === "whatsapp_status_texto") {
+    const message = job.caption?.trim() ?? "";
+
+    if (!message) {
+      throw new Error("WHATSAPP_STATUS_TEXT_REQUIRED");
+    }
+
+    if (message.length > 700) {
+      throw new Error("WHATSAPP_STATUS_TEXT_TOO_LONG");
+    }
+
+    const response = await evolutionRequest<EvolutionSendStatusResponse>(credentials, route, {
+      method: "POST",
+      jsonBody: buildTextStatusPayload(message),
+    });
+
+    return {
+      remoteJid: extractRemoteJid(response),
+      messageId: extractMessageId(response),
+    };
+  }
+
+  const sourceFilePath = job.filePath?.trim() ?? "";
+  if (!sourceFilePath) {
+    throw new Error("WHATSAPP_STATUS_MEDIA_REQUIRED");
+  }
+
+  const absoluteFilePath = path.join(uploadsDir, path.basename(sourceFilePath));
+  const fileBuffer = await fs.readFile(absoluteFilePath);
+  const fileName = path.basename(absoluteFilePath);
+  const mimeType = mimeTypeForFile(fileName);
+  const statusType = statusMediaTypeFromMimeType(mimeType);
+  const dataUrl = `data:${mimeType};base64,${fileBuffer.toString("base64")}`;
+  const caption = job.caption?.trim() ?? "";
+
+  if (caption.length > 1024) {
+    throw new Error("WHATSAPP_STATUS_CAPTION_TOO_LONG");
+  }
+
+  const response = await evolutionRequest<EvolutionSendStatusResponse>(credentials, route, {
+    method: "POST",
+    jsonBody: buildMediaStatusPayload({
+      statusType,
+      dataUrl,
+      caption,
+    }),
+  });
+
+  return {
+    remoteJid: extractRemoteJid(response),
+    messageId: extractMessageId(response),
+  };
+}
