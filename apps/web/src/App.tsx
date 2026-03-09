@@ -16,7 +16,7 @@ type ViewKey =
   | "notices"
   | "noticeAdmin";
 
-type HistoryFilterKey = "all" | "upcoming" | "canceled" | "sent" | "failed";
+type HistoryFilterKey = "all" | "upcoming" | "canceled" | "sent" | "failed" | "waiting_login";
 
 type Organization = {
   id: string;
@@ -207,7 +207,13 @@ const VIEW_ROUTE_MAP: Record<ViewKey, string> = {
 };
 
 function parseHistoryFilterKey(value: string | null | undefined): HistoryFilterKey {
-  if (value === "upcoming" || value === "canceled" || value === "sent" || value === "failed") {
+  if (
+    value === "upcoming" ||
+    value === "canceled" ||
+    value === "sent" ||
+    value === "failed" ||
+    value === "waiting_login"
+  ) {
     return value;
   }
   return "all";
@@ -281,7 +287,7 @@ type AvisoTone = "auth" | "error" | "info" | "success" | "neutral";
 
 function avisoTone(kind: string): AvisoTone {
   const normalizedKind = kind.trim().toUpperCase();
-  if (normalizedKind === "JOB_WAITING_LOGIN") {
+  if (normalizedKind === "JOB_WAITING_LOGIN" || normalizedKind === "JOB_RATE_LIMIT") {
     return "auth";
   }
   if (normalizedKind === "JOB_FAILED") {
@@ -1166,7 +1172,7 @@ function App() {
   const failedJobsPreview = useMemo(
     () =>
       jobsOrderedByCreatedAtDesc
-        .filter((job) => job.status === "FAILED" || job.status === "WAITING_LOGIN")
+        .filter((job) => job.status === "FAILED")
         .slice(0, 5),
     [jobsOrderedByCreatedAtDesc],
   );
@@ -1203,7 +1209,9 @@ function App() {
             (job) => job.status === "SENT_UNCONFIRMED" || job.status === "COMPLETED",
           );
         case "failed":
-          return jobsOrderedByCreatedAtDesc.filter((job) => job.status === "FAILED" || job.status === "WAITING_LOGIN");
+          return jobsOrderedByCreatedAtDesc.filter((job) => job.status === "FAILED");
+        case "waiting_login":
+          return jobsOrderedByCreatedAtDesc.filter((job) => job.status === "WAITING_LOGIN");
         case "all":
         default:
           return jobsOrderedByCreatedAtDesc;
@@ -1230,7 +1238,9 @@ function App() {
         case "sent":
           return mediaLibrary.filter((media) => media.lastStatus === "SENT_UNCONFIRMED" || media.lastStatus === "COMPLETED");
         case "failed":
-          return mediaLibrary.filter((media) => media.lastStatus === "FAILED" || media.lastStatus === "WAITING_LOGIN");
+          return mediaLibrary.filter((media) => media.lastStatus === "FAILED");
+        case "waiting_login":
+          return mediaLibrary.filter((media) => media.lastStatus === "WAITING_LOGIN");
         case "all":
         default:
           return mediaLibrary;
@@ -2914,6 +2924,7 @@ function App() {
           <option value="canceled">Cancelados</option>
           <option value="sent">Enviados</option>
           <option value="failed">Falhados</option>
+          <option value="waiting_login">Aguardando login</option>
         </select>
       </div>
     );
@@ -2979,6 +2990,7 @@ function App() {
           <option value="canceled">Cancelados</option>
           <option value="sent">Enviados</option>
           <option value="failed">Falhados</option>
+          <option value="waiting_login">Aguardando login</option>
         </select>
       </div>
     );
@@ -3760,7 +3772,6 @@ function App() {
                 <span className="unit-pill">{`Unidade: ${companyNameMap[job.companyId] || "Unidade removida"}`}</span>
                 {job.locationName ? <span>Localização: {job.locationName}</span> : null}
                 <span>{formatDate(job.dataPostagem)}</span>
-                <span>{job.lastError ?? "Sem erro"}</span>
               </div>
               <div className="inline-actions">
                 <span className={`status-pill status-${job.status.toLowerCase()}`}>{jobStatusLabel(job.status)}</span>
@@ -4090,13 +4101,13 @@ function App() {
               </button>
             </div>
             <div className="quick-summary">
-              <span>
-                {uploadedMediaCount > 0
-                  ? uploadedMediaCount === 1
+              {uploadedMediaCount > 0 ? (
+                <span>
+                  {uploadedMediaCount === 1
                     ? "1 mídia pronta para reutilização"
-                    : `${uploadedMediaCount} mídias prontas para reutilização`
-                  : "Selecione uma mídia na biblioteca para reutilizar."}
-              </span>
+                    : `${uploadedMediaCount} mídias prontas para reutilização`}
+                </span>
+              ) : null}
             </div>
           </section>
         ) : null}
