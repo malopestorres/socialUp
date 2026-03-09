@@ -57,6 +57,9 @@ type Job = {
   companyId: string;
   socialConnectionId: string | null;
   filePath: string;
+  filePaths?: string[];
+  sequential?: boolean;
+  title?: string | null;
   caption: string | null;
   locationName: string | null;
   locationId?: string | null;
@@ -77,12 +80,13 @@ type Job = {
   lastError: string | null;
 };
 
-type InstagramLocationSuggestion = {
-  id: string;
-  name: string;
-};
-
 type SchedulerPublicationType = Job["publicationType"] | "";
+
+type SchedulerUploadedMedia = {
+  filePath: string;
+  fileName: string;
+  fileSizeBytes: number | null;
+};
 
 type Log = {
   id: string;
@@ -126,15 +130,6 @@ type Aviso = {
   createdAt: string;
 };
 
-type InstagramLocationCatalogEntry = {
-  id: string;
-  locationId: string;
-  name: string;
-  source: string;
-  createdAt: string;
-  updatedAt: string;
-};
-
 type AuthUser = {
   id: string;
   name: string;
@@ -173,12 +168,13 @@ const navItems: Array<{ key: ViewKey; label: string; eyebrow?: string }> = [
   { key: "logs", label: "Logs" },
 ];
 
-const HISTORY_VIEW_QUERY_PARAM = "view";
+const LEGACY_HISTORY_VIEW_QUERY_PARAM = "view";
 const HISTORY_FILTER_QUERY_PARAM = "historyFilter";
 const HISTORY_PAGE_SIZE = 10;
 const MEDIA_PAGE_SIZE = 12;
 const NOTICE_PAGE_SIZE = 10;
 const INSTAGRAM_IMAGE_MAX_SIZE_BYTES = 8 * 1024 * 1024;
+const INSTAGRAM_MULTI_MEDIA_MAX_FILES = 10;
 const INSTAGRAM_POST_ASPECT_RATIO_MIN = 4 / 5;
 const INSTAGRAM_POST_ASPECT_RATIO_MAX = 1.91;
 const HISTORY_MONTH_OPTIONS: Array<{ value: string; label: string }> = [
@@ -196,6 +192,20 @@ const HISTORY_MONTH_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "12", label: "Dezembro" },
 ];
 
+const VIEW_ROUTE_MAP: Record<ViewKey, string> = {
+  dashboard: "/dashboard",
+  profile: "/perfil",
+  organizations: "/empresa",
+  companies: "/unidades",
+  agents: "/conectar-contas",
+  scheduler: "/agendar",
+  media: "/midias",
+  history: "/historico",
+  logs: "/logs",
+  notices: "/avisos",
+  noticeAdmin: "/avisos/cadastrar",
+};
+
 function parseHistoryFilterKey(value: string | null | undefined): HistoryFilterKey {
   if (value === "upcoming" || value === "canceled" || value === "sent" || value === "failed") {
     return value;
@@ -210,8 +220,47 @@ function readSearchParam(name: string): string | null {
   return new URLSearchParams(window.location.search).get(name);
 }
 
-function initialViewFromQuery(): ViewKey {
-  return readSearchParam(HISTORY_VIEW_QUERY_PARAM) === "history" ? "history" : "dashboard";
+function normalizePath(pathname: string): string {
+  if (!pathname || pathname === "/") {
+    return "/";
+  }
+
+  const withLeadingSlash = pathname.startsWith("/") ? pathname : `/${pathname}`;
+  return withLeadingSlash.endsWith("/") ? withLeadingSlash.slice(0, -1) : withLeadingSlash;
+}
+
+function viewFromPathname(pathname: string): ViewKey | null {
+  const normalizedPath = normalizePath(pathname);
+  const entry = (Object.entries(VIEW_ROUTE_MAP) as Array<[ViewKey, string]>).find(([, route]) => route === normalizedPath);
+  return entry?.[0] ?? null;
+}
+
+function buildViewHref(view: ViewKey, options?: { historyFilter?: HistoryFilterKey }): string {
+  const route = VIEW_ROUTE_MAP[view] ?? VIEW_ROUTE_MAP.dashboard;
+  const params = new URLSearchParams();
+  if (view === "history" && options?.historyFilter && options.historyFilter !== "all") {
+    params.set(HISTORY_FILTER_QUERY_PARAM, options.historyFilter);
+  }
+  const search = params.toString();
+  return search ? `${route}?${search}` : route;
+}
+
+function initialViewFromLocation(): ViewKey {
+  if (typeof window === "undefined") {
+    return "dashboard";
+  }
+
+  const fromPath = viewFromPathname(window.location.pathname);
+  if (fromPath) {
+    return fromPath;
+  }
+
+  if (normalizePath(window.location.pathname) === "/") {
+    const legacyView = readSearchParam(LEGACY_HISTORY_VIEW_QUERY_PARAM);
+    return legacyView === "history" ? "history" : "dashboard";
+  }
+
+  return "dashboard";
 }
 
 const whatsappTextEmojiGroups: Array<{ label: string; emojis: string[] }> = [
@@ -228,10 +277,47 @@ function formatDate(value: string | null | undefined): string {
   return new Date(value).toLocaleString();
 }
 
+type AvisoTone = "auth" | "error" | "info" | "success" | "neutral";
+
+function avisoTone(kind: string): AvisoTone {
+  const normalizedKind = kind.trim().toUpperCase();
+  if (normalizedKind === "JOB_WAITING_LOGIN") {
+    return "auth";
+  }
+  if (normalizedKind === "JOB_FAILED") {
+    return "error";
+  }
+  if (normalizedKind === "SYSTEM_BROADCAST") {
+    return "success";
+  }
+  if (normalizedKind === "JOB_SENT" || normalizedKind === "JOB_SENT_UNCONFIRMED") {
+    return "info";
+  }
+  return "neutral";
+}
+
+function avisoToneClass(kind: string): string {
+  return `notice-tone-${avisoTone(kind)}`;
+}
+
 function toDateTimeLocal(value: string): string {
   const date = new Date(value);
   const timezoneOffset = date.getTimezoneOffset() * 60_000;
   return new Date(date.getTime() - timezoneOffset).toISOString().slice(0, 16);
+}
+
+function resolveJobDisplayTitle(job: Pick<Job, "id" | "title" | "caption">): string {
+  const normalizedTitle = job.title?.trim();
+  if (normalizedTitle) {
+    return normalizedTitle;
+  }
+
+  const normalizedCaption = job.caption?.trim();
+  if (normalizedCaption) {
+    return normalizedCaption;
+  }
+
+  return `Job ${job.id}`;
 }
 
 function toDateLocal(value: string): string {
@@ -568,7 +654,7 @@ function App() {
   const [profileName, setProfileName] = useState("");
   const [profileUsername, setProfileUsername] = useState("");
   const [profilePassword, setProfilePassword] = useState("");
-  const [activeView, setActiveView] = useState<ViewKey>(initialViewFromQuery);
+  const [activeView, setActiveView] = useState<ViewKey>(initialViewFromLocation);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [organizations, setOrganizations] = useState<Organization[]>([]);
   const [companies, setCompanies] = useState<Company[]>([]);
@@ -589,18 +675,13 @@ function App() {
   const [activeQrConnectionId, setActiveQrConnectionId] = useState<string | null>(null);
   const [qrRequestingConnectionId, setQrRequestingConnectionId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
-  const [uploadedFilePath, setUploadedFilePath] = useState("");
-  const [uploadedFileName, setUploadedFileName] = useState("");
-  const [uploadedFileSizeBytes, setUploadedFileSizeBytes] = useState<number | null>(null);
+  const [uploadedSchedulerMedia, setUploadedSchedulerMedia] = useState<SchedulerUploadedMedia[]>([]);
+  const [draggingSchedulerMediaIndex, setDraggingSchedulerMediaIndex] = useState<number | null>(null);
   const [uploadDragActive, setUploadDragActive] = useState(false);
   const [jobCompanyId, setJobCompanyId] = useState("");
   const [jobSocialConnectionId, setJobSocialConnectionId] = useState("");
+  const [postTitle, setPostTitle] = useState("");
   const [caption, setCaption] = useState("");
-  const [locationName, setLocationName] = useState("");
-  const [locationId, setLocationId] = useState("");
-  const [instagramLocationSuggestions, setInstagramLocationSuggestions] = useState<InstagramLocationSuggestion[]>([]);
-  const [instagramLocationSuggestionsLoading, setInstagramLocationSuggestionsLoading] = useState(false);
-  const [instagramLocationSuggestionsInfo, setInstagramLocationSuggestionsInfo] = useState("");
   const [publicationType, setPublicationType] = useState<SchedulerPublicationType>("");
   const [scheduledDate, setScheduledDate] = useState("");
   const [scheduledTime, setScheduledTime] = useState(getCurrentTimeValue);
@@ -633,17 +714,6 @@ function App() {
   const [broadcastAvisoTitle, setBroadcastAvisoTitle] = useState("");
   const [broadcastAvisoMessage, setBroadcastAvisoMessage] = useState("");
   const [broadcastAvisoSubmitting, setBroadcastAvisoSubmitting] = useState(false);
-  const [instagramCatalogEntries, setInstagramCatalogEntries] = useState<InstagramLocationCatalogEntry[]>([]);
-  const [instagramCatalogQuery, setInstagramCatalogQuery] = useState("");
-  const [instagramCatalogPage, setInstagramCatalogPage] = useState(1);
-  const [instagramCatalogTotalPages, setInstagramCatalogTotalPages] = useState(1);
-  const [instagramCatalogTotal, setInstagramCatalogTotal] = useState(0);
-  const [instagramCatalogLoading, setInstagramCatalogLoading] = useState(false);
-  const [instagramCatalogLocationId, setInstagramCatalogLocationId] = useState("");
-  const [instagramCatalogName, setInstagramCatalogName] = useState("");
-  const [instagramCatalogSubmitting, setInstagramCatalogSubmitting] = useState(false);
-  const [instagramCatalogDeletingId, setInstagramCatalogDeletingId] = useState<string | null>(null);
-  const [instagramCatalogInfo, setInstagramCatalogInfo] = useState("");
   const [loadedMediaPreviewByPath, setLoadedMediaPreviewByPath] = useState<Record<string, boolean>>({});
   const [mediaPreviewPlaceholderByPath, setMediaPreviewPlaceholderByPath] = useState<Record<string, string>>({});
   const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
@@ -685,13 +755,17 @@ function App() {
   const isPositiveNoticeAdminInfo = noticeAdminInfo === "Aviso enviado com sucesso.";
   const isTransientAvisosInfo = isPositiveAvisosInfo;
   const isTransientNoticeAdminInfo = isPositiveNoticeAdminInfo;
-  const isPositiveInstagramCatalogInfo =
-    instagramCatalogInfo === "Localização salva no catálogo." ||
-    instagramCatalogInfo === "Localização removida do catálogo." ||
-    instagramCatalogInfo === "Catálogo atualizado.";
-  const isTransientInstagramCatalogInfo = isPositiveInstagramCatalogInfo;
   const requiresMediaUpload = publicationType !== "" && publicationType !== "whatsapp_status_texto";
+  const supportsMultiMediaUpload = publicationType === "instagram_post" || publicationType === "instagram_story";
+  const uploadedFilePath = uploadedSchedulerMedia[0]?.filePath ?? "";
+  const uploadedFileName = uploadedSchedulerMedia[0]?.fileName ?? "";
+  const uploadedFileSizeBytes = uploadedSchedulerMedia[0]?.fileSizeBytes ?? null;
+  const uploadedMediaCount = uploadedSchedulerMedia.length;
+  const effectiveSequentialPublishing =
+    (publicationType === "instagram_post" || publicationType === "instagram_story") &&
+    uploadedMediaCount > 1;
   const requiresInstagramMetadata = isInstagramPublication(publicationType);
+  const supportsCaption = publicationType !== "" && publicationType !== "instagram_story";
   const captionLabel = publicationType === "whatsapp_status_texto" ? "Texto do status (aceita emojis)" : "Legenda da postagem";
   const captionPlaceholder =
     publicationType === "whatsapp_status_texto"
@@ -701,6 +775,45 @@ function App() {
     publicationType === "whatsapp_status_texto"
       ? "Digite o texto do status do WhatsApp. Este campo aceita emojis e e obrigatório nesse tipo de publicação."
       : "Preencha a legenda da postagem. Para Instagram e WhatsApp Status em texto, este campo é obrigatório.";
+
+  function navigateToView(view: ViewKey, options?: { historyFilter?: HistoryFilterKey }) {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const nextHistoryFilter =
+      view === "history" ? options?.historyFilter ?? historyFilter : undefined;
+    const nextHref = buildViewHref(view, { historyFilter: nextHistoryFilter });
+    const currentUrl = new URL(window.location.href);
+    const nextUrl = new URL(nextHref, window.location.origin);
+    const currentComparable = `${normalizePath(currentUrl.pathname)}${currentUrl.search}`;
+    const nextComparable = `${normalizePath(nextUrl.pathname)}${nextUrl.search}`;
+
+    if (currentComparable !== nextComparable) {
+      window.history.pushState({}, "", `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`);
+    }
+
+    if (view === "history") {
+      if (nextHistoryFilter) {
+        setHistoryFilter(nextHistoryFilter);
+      }
+      setHistoryMonthFilter("all");
+      setHistoryYearFilter("all");
+      setHistoryPage(1);
+    }
+
+    if (view === "notices") {
+      setAvisosPage(1);
+    }
+
+    setNoticesPopoverOpen(false);
+    setSidebarOpen(false);
+    setActiveView(view);
+
+    window.requestAnimationFrame(() => {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+  }
 
   const companyNameMap = useMemo(
     () => Object.fromEntries(companies.map((company) => [company.id, company.name])),
@@ -816,20 +929,6 @@ function App() {
   }, [isTransientNoticeAdminInfo]);
 
   useEffect(() => {
-    if (!isTransientInstagramCatalogInfo) {
-      return;
-    }
-
-    const timer = window.setTimeout(() => {
-      setInstagramCatalogInfo("");
-    }, 3200);
-
-    return () => {
-      window.clearTimeout(timer);
-    };
-  }, [isTransientInstagramCatalogInfo]);
-
-  useEffect(() => {
     if (activeView !== "media" && mediaInfo) {
       setMediaInfo("");
     }
@@ -846,12 +945,6 @@ function App() {
       setNoticeAdminInfo("");
     }
   }, [activeView, noticeAdminInfo]);
-
-  useEffect(() => {
-    if (activeView !== "noticeAdmin" && instagramCatalogInfo) {
-      setInstagramCatalogInfo("");
-    }
-  }, [activeView, instagramCatalogInfo]);
 
   useEffect(() => {
     if (!mediaInfo || typeof window === "undefined" || !mediaSectionRef.current) {
@@ -955,94 +1048,6 @@ function App() {
     }
   }, [activeQrConnection, qrRequestingConnectionId]);
 
-  useEffect(() => {
-    const shouldSearch =
-      requiresInstagramMetadata &&
-      !isInstagramForcedLocationEnabled &&
-      jobSocialConnectionId.trim().length > 0 &&
-      locationName.trim().length >= 2 &&
-      locationId.trim().length === 0;
-
-    if (!shouldSearch) {
-      setInstagramLocationSuggestions([]);
-      setInstagramLocationSuggestionsLoading(false);
-      setInstagramLocationSuggestionsInfo("");
-      return;
-    }
-
-    let cancelled = false;
-    setInstagramLocationSuggestionsLoading(true);
-    setInstagramLocationSuggestionsInfo("");
-
-    const timer = window.setTimeout(() => {
-      void (async () => {
-        try {
-          const response = await api.get<{ items: InstagramLocationSuggestion[]; warning?: string }>(
-            `/jobs/instagram-location-suggestions?connectionId=${encodeURIComponent(jobSocialConnectionId)}&query=${encodeURIComponent(locationName.trim())}&limit=8`,
-          );
-          if (cancelled) {
-            return;
-          }
-          setInstagramLocationSuggestions(response.items);
-          if (response.warning?.trim()) {
-            setInstagramLocationSuggestionsInfo(response.warning.trim());
-          } else {
-            setInstagramLocationSuggestionsInfo(response.items.length === 0 ? "Nenhum local encontrado para este termo." : "");
-          }
-        } catch (searchError) {
-          if (cancelled) {
-            return;
-          }
-          setInstagramLocationSuggestions([]);
-          const message =
-            searchError instanceof Error && searchError.message
-              ? searchError.message
-              : "Não foi possível buscar locais agora. Verifique a conexão do Instagram e tente novamente.";
-          setInstagramLocationSuggestionsInfo(message);
-        } finally {
-          if (!cancelled) {
-            setInstagramLocationSuggestionsLoading(false);
-          }
-        }
-      })();
-    }, 300);
-
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [requiresInstagramMetadata, isInstagramForcedLocationEnabled, jobSocialConnectionId, locationName, locationId]);
-
-  useEffect(() => {
-    if (!requiresInstagramMetadata || !isInstagramForcedLocationEnabled) {
-      return;
-    }
-
-    setLocationId(instagramForcedLocationId);
-    setLocationName(instagramForcedLocationName);
-    setInstagramLocationSuggestions([]);
-    setInstagramLocationSuggestionsLoading(false);
-    setInstagramLocationSuggestionsInfo(
-      `Localização fixa ativa (#${instagramForcedLocationId}).`,
-    );
-  }, [
-    requiresInstagramMetadata,
-    isInstagramForcedLocationEnabled,
-    instagramForcedLocationId,
-    instagramForcedLocationName,
-  ]);
-
-  useEffect(() => {
-    if (requiresInstagramMetadata) {
-      return;
-    }
-
-    setLocationId("");
-    setInstagramLocationSuggestions([]);
-    setInstagramLocationSuggestionsLoading(false);
-    setInstagramLocationSuggestionsInfo("");
-  }, [requiresInstagramMetadata]);
-
   const filteredJobs = useMemo(
     () => jobs.filter((job) => (selectedCompanyId ? job.companyId === selectedCompanyId : true)),
     [jobs, selectedCompanyId],
@@ -1076,31 +1081,37 @@ function App() {
     const map = new Map<string, MediaEntry>();
 
     for (const job of filteredJobs) {
-      if (!job.filePath || job.publicationType === "whatsapp_status_texto" || !isSupportedMediaPath(job.filePath)) {
+      if (job.publicationType === "whatsapp_status_texto") {
         continue;
       }
 
-      const existing = map.get(job.filePath);
-      if (!existing) {
-        map.set(job.filePath, {
-          filePath: job.filePath,
-          companyId: job.companyId,
-          previewUrl: `${api.baseUrl}${job.filePath}`,
-          caption: job.caption,
-          publicationType: job.publicationType,
-          lastUsedAt: job.dataPostagem,
-          usageCount: 1,
-          lastStatus: job.status,
-        });
-        continue;
-      }
+      const mediaPaths = (job.filePaths && job.filePaths.length > 0 ? job.filePaths : [job.filePath])
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0 && isSupportedMediaPath(entry));
 
-      existing.usageCount += 1;
-      if (new Date(job.dataPostagem).getTime() >= new Date(existing.lastUsedAt).getTime()) {
-        existing.caption = job.caption;
-        existing.publicationType = job.publicationType;
-        existing.lastUsedAt = job.dataPostagem;
-        existing.lastStatus = job.status;
+      for (const mediaPath of mediaPaths) {
+        const existing = map.get(mediaPath);
+        if (!existing) {
+          map.set(mediaPath, {
+            filePath: mediaPath,
+            companyId: job.companyId,
+            previewUrl: `${api.baseUrl}${mediaPath}`,
+            caption: job.caption,
+            publicationType: job.publicationType,
+            lastUsedAt: job.dataPostagem,
+            usageCount: 1,
+            lastStatus: job.status,
+          });
+          continue;
+        }
+
+        existing.usageCount += 1;
+        if (new Date(job.dataPostagem).getTime() >= new Date(existing.lastUsedAt).getTime()) {
+          existing.caption = job.caption;
+          existing.publicationType = job.publicationType;
+          existing.lastUsedAt = job.dataPostagem;
+          existing.lastStatus = job.status;
+        }
       }
     }
 
@@ -1314,28 +1325,30 @@ function App() {
     }
   }
 
-  async function loadInstagramCatalog(page = instagramCatalogPage): Promise<void> {
-    setInstagramCatalogLoading(true);
+  async function refreshLiveData(): Promise<void> {
     try {
-      const result = await api.get<{
-        items: InstagramLocationCatalogEntry[];
-        page: number;
-        pageSize: number;
-        total: number;
-        totalPages: number;
-      }>(
-        `/instagram-location-catalog?page=${page}&pageSize=10&query=${encodeURIComponent(instagramCatalogQuery.trim())}`,
-      );
+      const companyFilter = selectedCompanyId ? `?companyId=${selectedCompanyId}` : "";
+      const logsPromise =
+        isRootUser && activeView === "logs"
+          ? api.get<Log[]>(`/logs${companyFilter}`)
+          : Promise.resolve<Log[] | null>(null);
 
-      setInstagramCatalogEntries(result.items);
-      setInstagramCatalogPage(result.page);
-      setInstagramCatalogTotal(result.total);
-      setInstagramCatalogTotalPages(result.totalPages);
-      setError("");
-    } catch (catalogError) {
-      setError(catalogError instanceof Error ? catalogError.message : "Falha ao carregar catálogo de localizações.");
-    } finally {
-      setInstagramCatalogLoading(false);
+      const [connectionsData, jobsData, dashboardData, logsData] = await Promise.all([
+        api.get<SocialConnection[]>(`/connections${companyFilter}`),
+        api.get<Job[]>(`/jobs${companyFilter}`),
+        api.get<Dashboard>(`/dashboard${companyFilter}`),
+        logsPromise,
+      ]);
+
+      setConnections(connectionsData);
+      setJobs(jobsData);
+      setDashboard(dashboardData);
+
+      if (logsData) {
+        setLogs(logsData);
+      }
+    } catch {
+      // polling silencioso: não suja a UI com erros transitórios de rede/API
     }
   }
 
@@ -1384,6 +1397,45 @@ function App() {
   }, [selectedCompanyId, authUser]);
 
   useEffect(() => {
+    if (!authUser || activeView === "agents" || activeView === "notices") {
+      return;
+    }
+
+    let cancelled = false;
+
+    const tick = async () => {
+      if (cancelled || document.visibilityState !== "visible") {
+        return;
+      }
+      await refreshLiveData();
+    };
+
+    void tick();
+
+    const intervalId = window.setInterval(() => {
+      void tick();
+    }, 5000);
+
+    const handleVisibilityChange = () => {
+      void tick();
+    };
+
+    const handleFocus = () => {
+      void tick();
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("focus", handleFocus);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("focus", handleFocus);
+    };
+  }, [authUser, activeView, selectedCompanyId, isRootUser]);
+
+  useEffect(() => {
     if (!authUser) {
       return;
     }
@@ -1391,19 +1443,13 @@ function App() {
     let cancelled = false;
 
     const refreshUnreadCount = async () => {
-      if (document.visibilityState !== "visible") {
-        return;
-      }
-
       try {
         const result = await api.get<{ count: number }>("/avisos/unread-count");
         if (!cancelled) {
           setUnreadAvisosCount(result.count);
         }
       } catch {
-        if (!cancelled) {
-          setUnreadAvisosCount(0);
-        }
+        // Mantém o contador atual quando há erro transitório de rede/API.
       }
     };
 
@@ -1469,16 +1515,37 @@ function App() {
       return;
     }
 
-    void loadAvisosPage(avisosPage);
+    let cancelled = false;
+
+    const refreshAvisosPage = () => {
+      if (cancelled) {
+        return;
+      }
+      void loadAvisosPage(avisosPage);
+    };
+
+    refreshAvisosPage();
+
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        refreshAvisosPage();
+      }
+    }, 5000);
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        refreshAvisosPage();
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
   }, [activeView, avisosPage, authUser]);
-
-  useEffect(() => {
-    if (!authUser || !isRootUser || activeView !== "noticeAdmin") {
-      return;
-    }
-
-    void loadInstagramCatalog(instagramCatalogPage);
-  }, [activeView, authUser, isRootUser, instagramCatalogPage]);
 
   useEffect(() => {
     if (schedulerConnections.length === 0) {
@@ -1494,6 +1561,13 @@ function App() {
       return schedulerConnections[0]?.id ?? "";
     });
   }, [schedulerConnections]);
+
+  useEffect(() => {
+    if (publicationType !== "instagram_post" && publicationType !== "instagram_story" && uploadedSchedulerMedia.length > 1) {
+      setUploadedSchedulerMedia((current) => current.slice(0, 1));
+      setDraggingSchedulerMediaIndex(null);
+    }
+  }, [publicationType, uploadedSchedulerMedia.length]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1512,22 +1586,57 @@ function App() {
       return;
     }
 
-    const url = new URL(window.location.href);
-    if (activeView === "history") {
-      url.searchParams.set(HISTORY_VIEW_QUERY_PARAM, "history");
-      if (historyFilter === "all") {
-        url.searchParams.delete(HISTORY_FILTER_QUERY_PARAM);
-      } else {
-        url.searchParams.set(HISTORY_FILTER_QUERY_PARAM, historyFilter);
+    const handlePopState = () => {
+      const nextView = initialViewFromLocation();
+      const nextHistoryFilter = parseHistoryFilterKey(readSearchParam(HISTORY_FILTER_QUERY_PARAM));
+
+      setActiveView(nextView);
+      setHistoryFilter(nextHistoryFilter);
+
+      if (nextView === "history") {
+        setHistoryMonthFilter("all");
+        setHistoryYearFilter("all");
+        setHistoryPage(1);
       }
-    } else {
-      url.searchParams.delete(HISTORY_VIEW_QUERY_PARAM);
+
+      if (nextView === "notices") {
+        setAvisosPage(1);
+      }
+
+      setNoticesPopoverOpen(false);
+      setSidebarOpen(false);
+      window.scrollTo({ top: 0, behavior: "auto" });
+    };
+
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    if (!authUser) {
+      return;
+    }
+
+    const url = new URL(window.location.href);
+    url.pathname = VIEW_ROUTE_MAP[activeView] ?? VIEW_ROUTE_MAP.dashboard;
+    url.searchParams.delete(LEGACY_HISTORY_VIEW_QUERY_PARAM);
+
+    if (activeView !== "history" || historyFilter === "all") {
       url.searchParams.delete(HISTORY_FILTER_QUERY_PARAM);
+    } else {
+      url.searchParams.set(HISTORY_FILTER_QUERY_PARAM, historyFilter);
     }
 
     const nextUrl = `${url.pathname}${url.search}${url.hash}`;
-    window.history.replaceState({}, "", nextUrl);
-  }, [activeView, historyFilter]);
+    const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (nextUrl !== currentUrl) {
+      window.history.replaceState({}, "", nextUrl);
+    }
+  }, [activeView, historyFilter, authUser]);
 
   useEffect(() => {
     setHistoryPage(1);
@@ -1548,10 +1657,6 @@ function App() {
   useEffect(() => {
     setAvisosPage((current) => Math.min(Math.max(current, 1), avisosTotalPages));
   }, [avisosTotalPages]);
-
-  useEffect(() => {
-    setInstagramCatalogPage((current) => Math.min(Math.max(current, 1), instagramCatalogTotalPages));
-  }, [instagramCatalogTotalPages]);
 
   useEffect(() => {
     const pendingPreviewGeneration = paginatedMediaItems.filter(
@@ -1634,17 +1739,15 @@ function App() {
   async function openConnectionVisualAuth(connectionId: string) {
     const connection = connections.find((entry) => entry.id === connectionId);
     const isWhatsappConnection = connection?.platform === "whatsapp";
-    const popupFeatures =
-      "width=780,height=920,menubar=no,toolbar=no,location=yes,status=no,resizable=yes,scrollbars=yes";
-    let oauthPopup: Window | null = null;
+    let oauthTab: Window | null = null;
 
     if (!isWhatsappConnection) {
-      oauthPopup = window.open("about:blank", "socialup-instagram-oauth", popupFeatures);
-      if (!oauthPopup) {
-        setError("Não foi possível abrir o popup de autorização. Libere popups no navegador e tente novamente.");
+      oauthTab = window.open("about:blank", "_blank");
+      if (!oauthTab) {
+        setError("Não foi possível abrir a aba de autorização. Libere popups no navegador e tente novamente.");
         return;
       }
-      oauthPopup.focus();
+      oauthTab.focus();
     }
 
     if (isWhatsappConnection) {
@@ -1664,25 +1767,25 @@ function App() {
       }
 
       if (!result.launchUrl) {
-        if (oauthPopup && !oauthPopup.closed) {
-          oauthPopup.close();
+        if (oauthTab && !oauthTab.closed) {
+          oauthTab.close();
         }
         setError("A URL de autorização do Instagram não foi retornada pelo backend.");
         return;
       }
 
-      if (oauthPopup && !oauthPopup.closed) {
-        oauthPopup.location.href = result.launchUrl;
-        oauthPopup.focus();
+      if (oauthTab && !oauthTab.closed) {
+        oauthTab.location.href = result.launchUrl;
+        oauthTab.focus();
       } else {
-        oauthPopup = window.open(result.launchUrl, "socialup-instagram-oauth", popupFeatures);
-        if (!oauthPopup) {
-          setError("Não foi possível abrir o popup de autorização. Libere popups no navegador e tente novamente.");
+        oauthTab = window.open(result.launchUrl, "_blank");
+        if (!oauthTab) {
+          setError("Não foi possível abrir a aba de autorização. Libere popups no navegador e tente novamente.");
           return;
         }
-        oauthPopup.focus();
+        oauthTab.focus();
       }
-      setAuthInfo("Finalize a autorização no popup da Meta. O painel será atualizado quando ele for fechado.");
+      setAuthInfo("Finalize a autorização na aba da Meta. O painel será atualizado quando ela for fechada.");
 
       if (instagramOauthPopupPollRef.current !== null) {
         window.clearInterval(instagramOauthPopupPollRef.current);
@@ -1690,7 +1793,7 @@ function App() {
       }
 
       instagramOauthPopupPollRef.current = window.setInterval(() => {
-        if (!oauthPopup || !oauthPopup.closed) {
+        if (!oauthTab || !oauthTab.closed) {
           return;
         }
         if (instagramOauthPopupPollRef.current !== null) {
@@ -1700,8 +1803,8 @@ function App() {
         void loadAll();
       }, 900);
     } catch (error) {
-      if (!isWhatsappConnection && oauthPopup && !oauthPopup.closed) {
-        oauthPopup.close();
+      if (!isWhatsappConnection && oauthTab && !oauthTab.closed) {
+        oauthTab.close();
       }
       setError(error instanceof Error ? error.message : "Falha ao iniciar a autorização.");
     } finally {
@@ -1746,64 +1849,136 @@ function App() {
     await loadAll();
   }
 
-  async function uploadSelectedMedia(file?: File | null) {
-    if (!file) {
+  async function uploadSelectedMedia(files: File[]) {
+    if (files.length === 0) {
       return;
     }
 
-    const rejectSelectedMedia = (message: string) => {
-      setUploadedFilePath("");
-      setUploadedFileName("");
-      setUploadedFileSizeBytes(null);
-      setError("");
-      setSchedulerInfo(message);
-      setUploadDragActive(false);
-      if (schedulerMediaInputRef.current) {
-        schedulerMediaInputRef.current.value = "";
-        schedulerMediaInputRef.current.focus();
+    const selectedFiles = supportsMultiMediaUpload ? files : [files[0]!];
+    if (supportsMultiMediaUpload) {
+      const totalAfterUpload = uploadedSchedulerMedia.length + selectedFiles.length;
+      if (totalAfterUpload > INSTAGRAM_MULTI_MEDIA_MAX_FILES) {
+        setError("");
+        setSchedulerInfo(`Você pode enviar até ${INSTAGRAM_MULTI_MEDIA_MAX_FILES} mídias por publicação.`);
+        schedulerMediaInputRef.current?.focus();
+        return;
       }
-    };
-
-    const validationMessage = schedulerMediaValidationMessage(publicationType, file.name, file.size);
-    if (validationMessage) {
-      rejectSelectedMedia(validationMessage);
-      return;
     }
 
-    const advancedValidationMessage = await schedulerMediaAdvancedValidationMessage(publicationType, file);
-    if (advancedValidationMessage) {
-      rejectSelectedMedia(advancedValidationMessage);
-      return;
-    }
+    const uploadedBatch: SchedulerUploadedMedia[] = [];
 
     setUploading(true);
     setError("");
     setSchedulerInfo("Enviando mídia...");
     try {
-      const result = await api.postFile("/upload", file);
-      setUploadedFilePath(result.filePath);
-      setUploadedFileName(file.name);
-      setUploadedFileSizeBytes(file.size);
-      setSchedulerInfo("Midia enviada com sucesso.");
+      for (const file of selectedFiles) {
+        const validationMessage = schedulerMediaValidationMessage(publicationType, file.name, file.size);
+        if (validationMessage) {
+          throw new Error(validationMessage);
+        }
+
+        const advancedValidationMessage = await schedulerMediaAdvancedValidationMessage(publicationType, file);
+        if (advancedValidationMessage) {
+          throw new Error(advancedValidationMessage);
+        }
+
+        const result = await api.postFile("/upload", file);
+        uploadedBatch.push({
+          filePath: result.filePath,
+          fileName: file.name,
+          fileSizeBytes: file.size,
+        });
+      }
+
+      setUploadedSchedulerMedia((current) => {
+        const base = supportsMultiMediaUpload ? current : [];
+        const merged = [...base, ...uploadedBatch];
+        const seen = new Set<string>();
+        return merged.filter((item) => {
+          if (seen.has(item.filePath)) {
+            return false;
+          }
+          seen.add(item.filePath);
+          return true;
+        });
+      });
+
+      setSchedulerInfo(
+        uploadedBatch.length > 1
+          ? `${uploadedBatch.length} mídias enviadas com sucesso.`
+          : "Midia enviada com sucesso.",
+      );
     } catch (uploadError) {
-      setError(uploadError instanceof Error ? uploadError.message : "Falha no upload.");
-      setSchedulerInfo("");
+      setError("");
+      setSchedulerInfo(uploadError instanceof Error ? uploadError.message : "Falha no upload.");
+      if (schedulerMediaInputRef.current) {
+        schedulerMediaInputRef.current.focus();
+      }
+      return;
     } finally {
+      if (schedulerMediaInputRef.current) {
+        schedulerMediaInputRef.current.value = "";
+      }
       setUploading(false);
       setUploadDragActive(false);
     }
   }
 
+  function removeSchedulerUploadedMedia(filePath: string) {
+    setUploadedSchedulerMedia((current) => current.filter((item) => item.filePath !== filePath));
+  }
+
+  function reorderSchedulerUploadedMedia(fromIndex: number, toIndex: number) {
+    if (fromIndex === toIndex) {
+      return;
+    }
+
+    setUploadedSchedulerMedia((current) => {
+      if (fromIndex < 0 || toIndex < 0 || fromIndex >= current.length || toIndex >= current.length) {
+        return current;
+      }
+
+      const next = [...current];
+      const [moved] = next.splice(fromIndex, 1);
+      if (!moved) {
+        return current;
+      }
+      next.splice(toIndex, 0, moved);
+      return next;
+    });
+  }
+
+  function handleSchedulerMediaThumbDragStart(index: number) {
+    setDraggingSchedulerMediaIndex(index);
+  }
+
+  function handleSchedulerMediaThumbDragEnd() {
+    setDraggingSchedulerMediaIndex(null);
+  }
+
+  function handleSchedulerMediaThumbDragOver(event: DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+  }
+
+  function handleSchedulerMediaThumbDrop(index: number, event: DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    if (draggingSchedulerMediaIndex === null) {
+      return;
+    }
+    reorderSchedulerUploadedMedia(draggingSchedulerMediaIndex, index);
+    setDraggingSchedulerMediaIndex(null);
+  }
+
   async function uploadMedia(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    await uploadSelectedMedia(file);
+    const files = Array.from(event.target.files ?? []);
+    await uploadSelectedMedia(files);
   }
 
   async function handleSchedulerMediaDrop(event: DragEvent<HTMLLabelElement>) {
     event.preventDefault();
     setUploadDragActive(false);
-    const file = event.dataTransfer.files?.[0];
-    await uploadSelectedMedia(file);
+    const files = Array.from(event.dataTransfer.files ?? []);
+    await uploadSelectedMedia(files);
   }
 
   function handleSchedulerMediaDragOver(event: DragEvent<HTMLLabelElement>) {
@@ -1829,11 +2004,28 @@ function App() {
     if (!publicationType) {
       return;
     }
-    if (requiresMediaUpload && !uploadedFilePath) {
+
+    const normalizedTitle = postTitle.trim();
+    if (!normalizedTitle) {
+      setError("");
+      setSchedulerInfo("Preencha o título da postagem.");
+      return;
+    }
+
+    if (requiresMediaUpload && uploadedSchedulerMedia.length === 0) {
       setError("");
       setSchedulerInfo("Envie uma mídia antes de agendar este tipo de postagem.");
       schedulerMediaInputRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
       schedulerMediaInputRef.current?.focus();
+      return;
+    }
+
+    if (
+      (publicationType === "instagram_post" || publicationType === "instagram_story") &&
+      uploadedSchedulerMedia.length > INSTAGRAM_MULTI_MEDIA_MAX_FILES
+    ) {
+      setError("");
+      setSchedulerInfo(`Você pode enviar até ${INSTAGRAM_MULTI_MEDIA_MAX_FILES} mídias por publicação.`);
       return;
     }
 
@@ -1861,16 +2053,18 @@ function App() {
         : null;
     const effectiveLocationName =
       requiresInstagramMetadata
-        ? isInstagramForcedLocationEnabled
-          ? instagramForcedLocationName
-          : ""
-        : "";
+        ? (isInstagramForcedLocationEnabled ? instagramForcedLocationName : null)
+        : null;
+    const effectiveCaption = publicationType === "instagram_story" ? null : caption;
 
     const payload = {
       companyId: jobCompanyId,
       socialConnectionId: jobSocialConnectionId,
       filePath: uploadedFilePath,
-      caption,
+      filePaths: uploadedSchedulerMedia.map((item) => item.filePath),
+      sequential: effectiveSequentialPublishing,
+      title: normalizedTitle,
+      caption: effectiveCaption,
       locationName: effectiveLocationName,
       locationId: effectiveLocationId,
       publicationType,
@@ -1897,15 +2091,10 @@ function App() {
   }
 
   function resetSchedulerForm() {
+    setPostTitle("");
     setCaption("");
-    setLocationName("");
-    setLocationId("");
-    setInstagramLocationSuggestions([]);
-    setInstagramLocationSuggestionsLoading(false);
-    setInstagramLocationSuggestionsInfo("");
-    setUploadedFilePath("");
-    setUploadedFileName("");
-    setUploadedFileSizeBytes(null);
+    setUploadedSchedulerMedia([]);
+    setDraggingSchedulerMediaIndex(null);
     setUploadDragActive(false);
     setJobCompanyId("");
     setJobSocialConnectionId("");
@@ -1924,15 +2113,19 @@ function App() {
     setEditingJobId(job.id);
     setJobCompanyId(job.companyId);
     setJobSocialConnectionId(job.socialConnectionId ?? "");
-    setUploadedFilePath(job.filePath);
-    setUploadedFileName(job.filePath.split("/").pop() ?? "");
-    setUploadedFileSizeBytes(null);
+    const selectedFiles = (job.filePaths && job.filePaths.length > 0 ? job.filePaths : [job.filePath])
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+    setUploadedSchedulerMedia(
+      selectedFiles.map((filePath) => ({
+        filePath,
+        fileName: filePath.split("/").pop() ?? "",
+        fileSizeBytes: null,
+      })),
+    );
+    setDraggingSchedulerMediaIndex(null);
+    setPostTitle(job.title?.trim() || job.caption?.trim() || "");
     setCaption(job.caption ?? "");
-    setLocationName("");
-    setLocationId("");
-    setInstagramLocationSuggestions([]);
-    setInstagramLocationSuggestionsLoading(false);
-    setInstagramLocationSuggestionsInfo("");
     setPublicationType(job.publicationType);
     setScheduledDate(toDateLocal(job.dataPostagem));
     setScheduledTime(toTimeLocal(job.dataPostagem));
@@ -1961,11 +2154,7 @@ function App() {
       setMediaInfo("");
       await api.delete(`/upload?filePath=${encodeURIComponent(media.filePath)}`);
 
-      if (uploadedFilePath === media.filePath) {
-        setUploadedFilePath("");
-        setUploadedFileName("");
-        setUploadedFileSizeBytes(null);
-      }
+      setUploadedSchedulerMedia((current) => current.filter((item) => item.filePath !== media.filePath));
 
       setLoadedMediaPreviewByPath((current) => {
         if (!current[media.filePath]) {
@@ -2040,16 +2229,7 @@ function App() {
   }
 
   function openHistoryWithFilter(filter: HistoryFilterKey): void {
-    setHistoryFilter(filter);
-    setHistoryMonthFilter("all");
-    setHistoryYearFilter("all");
-    setHistoryPage(1);
-    setActiveView("history");
-    if (typeof window !== "undefined") {
-      window.requestAnimationFrame(() => {
-        window.scrollTo({ top: 0, behavior: "smooth" });
-      });
-    }
+    navigateToView("history", { historyFilter: filter });
   }
 
   async function toggleNoticesPopover() {
@@ -2095,13 +2275,7 @@ function App() {
 
   function openAvisosView() {
     setNoticesPopoverOpen(false);
-    setAvisosPage(1);
-    setActiveView("notices");
-    if (typeof window !== "undefined") {
-      window.requestAnimationFrame(() => {
-        window.scrollTo({ top: 0, behavior: "smooth" });
-      });
-    }
+    navigateToView("notices");
   }
 
   async function createBroadcastAviso(event: FormEvent) {
@@ -2121,86 +2295,27 @@ function App() {
       setNoticeAdminInfo(
         result.created > 0
           ? "Aviso enviado com sucesso."
-          : "Nenhum cliente encontrado para receber o aviso.",
+          : "Nenhum usuário encontrado para receber o aviso.",
       );
       await loadAll();
+      if (activeView === "notices") {
+        await loadAvisosPage(avisosPage);
+      }
+      try {
+        const unread = await api.get<{ count: number }>("/avisos/unread-count");
+        setUnreadAvisosCount(unread.count);
+        if (noticesPopoverOpen) {
+          const recent = await api.get<{ items: Aviso[]; unreadCount: number }>("/avisos/recent?limit=5");
+          setRecentAvisos(recent.items);
+          setUnreadAvisosCount(recent.unreadCount);
+        }
+      } catch {
+        // Mantém o feedback de sucesso mesmo se a atualização do sino falhar.
+      }
     } catch (createAvisoError) {
       setError(createAvisoError instanceof Error ? createAvisoError.message : "Falha ao enviar aviso.");
     } finally {
       setBroadcastAvisoSubmitting(false);
-    }
-  }
-
-  async function submitInstagramCatalogSearch(event: FormEvent) {
-    event.preventDefault();
-    setInstagramCatalogInfo("");
-    setError("");
-    if (instagramCatalogPage !== 1) {
-      setInstagramCatalogPage(1);
-      return;
-    }
-    await loadInstagramCatalog(1);
-  }
-
-  async function createInstagramCatalogEntry(event: FormEvent) {
-    event.preventDefault();
-    const normalizedLocationId = instagramCatalogLocationId.trim();
-    const normalizedName = instagramCatalogName.trim();
-
-    if (!/^\d+$/.test(normalizedLocationId)) {
-      setError("Informe um ID de localização numérico.");
-      return;
-    }
-
-    if (normalizedName.length < 2) {
-      setError("Informe um nome válido para a localização.");
-      return;
-    }
-
-    setInstagramCatalogSubmitting(true);
-    setError("");
-    setInstagramCatalogInfo("");
-
-    try {
-      await api.postJson("/instagram-location-catalog", {
-        locationId: normalizedLocationId,
-        name: normalizedName,
-      });
-      setInstagramCatalogLocationId("");
-      setInstagramCatalogName("");
-      setInstagramCatalogInfo("Localização salva no catálogo.");
-      if (instagramCatalogPage !== 1) {
-        setInstagramCatalogPage(1);
-      } else {
-        await loadInstagramCatalog(1);
-      }
-    } catch (catalogError) {
-      setError(catalogError instanceof Error ? catalogError.message : "Falha ao salvar localização.");
-    } finally {
-      setInstagramCatalogSubmitting(false);
-    }
-  }
-
-  async function deleteInstagramCatalogEntry(entry: InstagramLocationCatalogEntry) {
-    if (typeof window !== "undefined") {
-      const confirmed = window.confirm(`Excluir "${entry.name}" (#${entry.locationId}) do catálogo?`);
-      if (!confirmed) {
-        return;
-      }
-    }
-
-    setInstagramCatalogDeletingId(entry.id);
-    setError("");
-    setInstagramCatalogInfo("");
-
-    try {
-      await api.delete(`/instagram-location-catalog/${entry.id}`);
-      setInstagramCatalogInfo("Localização removida do catálogo.");
-      await loadInstagramCatalog(instagramCatalogPage);
-    } catch (catalogError) {
-      setError(catalogError instanceof Error ? catalogError.message : "Falha ao excluir localização.");
-    } finally {
-      setInstagramCatalogDeletingId(null);
     }
   }
 
@@ -2241,6 +2356,7 @@ function App() {
       setAuthUser(result.user);
       setLoginPassword("");
       setAuthInfo("");
+      navigateToView("dashboard");
     } catch (loginError) {
       setAuthError(loginError instanceof Error ? loginError.message : "Falha ao fazer login.");
     } finally {
@@ -2261,6 +2377,10 @@ function App() {
       setAuthInfo("");
       setAuthError("");
       setNoticesPopoverOpen(false);
+      setActiveView("dashboard");
+      if (typeof window !== "undefined") {
+        window.history.replaceState({}, "", "/");
+      }
     }
   }
 
@@ -2316,18 +2436,19 @@ function App() {
     setSchedulerInfo("");
     setError("");
     setEditingJobId(null);
-    setUploadedFilePath(media.filePath);
-    setUploadedFileName(media.filePath.split("/").pop() ?? "");
-    setUploadedFileSizeBytes(null);
+    setUploadedSchedulerMedia([
+      {
+        filePath: media.filePath,
+        fileName: media.filePath.split("/").pop() ?? "",
+        fileSizeBytes: null,
+      },
+    ]);
+    setDraggingSchedulerMediaIndex(null);
     setPublicationType(media.publicationType);
     setJobCompanyId("");
     setJobSocialConnectionId("");
+    setPostTitle("");
     setCaption("");
-    setLocationName("");
-    setLocationId("");
-    setInstagramLocationSuggestions([]);
-    setInstagramLocationSuggestionsLoading(false);
-    setInstagramLocationSuggestionsInfo("");
     setScheduledDate("");
     setScheduledTime(getCurrentTimeValue());
     setScheduledTimeTouched(false);
@@ -2344,14 +2465,6 @@ function App() {
 
   function appendEmojiToCaption(emoji: string) {
     setCaption((current) => `${current}${emoji}`);
-  }
-
-  function selectInstagramLocationSuggestion(suggestion: InstagramLocationSuggestion) {
-    setLocationName(suggestion.name);
-    setLocationId(suggestion.id);
-    setInstagramLocationSuggestions([]);
-    setInstagramLocationSuggestionsLoading(false);
-    setInstagramLocationSuggestionsInfo("");
   }
 
   function renderNoticesBell(shellRef: { current: HTMLDivElement | null }, extraClassName = "") {
@@ -2373,7 +2486,17 @@ function App() {
           <section className="notices-popover">
             <div className="notices-popover-header">
               <strong>Avisos</strong>
-              <span>{`${unreadAvisosCount} não lido(s)`}</span>
+              <div className="notices-popover-meta">
+                <span>{`${unreadAvisosCount} não lido(s)`}</span>
+                <button
+                  type="button"
+                  className="notices-mark-read-inline"
+                  onClick={() => void markAllAvisosAsRead()}
+                  disabled={markingAllAvisosRead || noticesPopoverLoading || unreadAvisosCount === 0}
+                >
+                  {markingAllAvisosRead ? "Marcando..." : "Marcar como lido"}
+                </button>
+              </div>
             </div>
 
             <div className="notices-popover-list">
@@ -2383,7 +2506,7 @@ function App() {
                 <div className="empty-state">Nenhum aviso recente.</div>
               ) : (
                 recentAvisos.map((aviso) => (
-                  <article key={aviso.id} className="notice-popover-item">
+                  <article key={aviso.id} className={`notice-popover-item ${avisoToneClass(aviso.kind)}`}>
                     <strong>{aviso.title}</strong>
                     <span>{aviso.message}</span>
                     <small>{formatDate(aviso.createdAt)}</small>
@@ -2393,14 +2516,6 @@ function App() {
             </div>
 
             <div className="notices-popover-actions">
-              <button
-                type="button"
-                className="ghost-button notices-view-all"
-                onClick={() => void markAllAvisosAsRead()}
-                disabled={markingAllAvisosRead || noticesPopoverLoading || unreadAvisosCount === 0}
-              >
-                {markingAllAvisosRead ? "Marcando..." : "Marcar todos como lido"}
-              </button>
               <button type="button" className="ghost-button notices-view-all" onClick={openAvisosView}>
                 Ver todos
               </button>
@@ -2609,7 +2724,7 @@ function App() {
                 upcomingJobs.map((job) => (
                   <div key={job.id} className="row-card">
                     <div>
-                      <strong>{job.caption || "Midia sem titulo"}</strong>
+                      <strong>{resolveJobDisplayTitle(job)}</strong>
                       <span className="publication-pill">{publicationTypeLabel(job.publicationType)}</span>
                       <span className="unit-pill">
                         {`Unidade: ${companyNameMap[job.companyId] || "Unidade removida"}`}
@@ -2659,7 +2774,7 @@ function App() {
                 sentJobsPreview.map((job) => (
                   <div key={job.id} className="row-card">
                     <div>
-                      <strong>{job.caption || "Midia sem titulo"}</strong>
+                      <strong>{resolveJobDisplayTitle(job)}</strong>
                       <span className="publication-pill">{publicationTypeLabel(job.publicationType)}</span>
                       <span className="unit-pill">
                         {`Unidade: ${companyNameMap[job.companyId] || "Unidade removida"}`}
@@ -2695,7 +2810,7 @@ function App() {
                 canceledJobsPreview.map((job) => (
                   <div key={job.id} className="row-card">
                     <div>
-                      <strong>{job.caption || "Midia sem titulo"}</strong>
+                      <strong>{resolveJobDisplayTitle(job)}</strong>
                       <span className="publication-pill">{publicationTypeLabel(job.publicationType)}</span>
                       <span className="unit-pill">
                         {`Unidade: ${companyNameMap[job.companyId] || "Unidade removida"}`}
@@ -2739,7 +2854,7 @@ function App() {
                 failedJobsPreview.map((job) => (
                   <div key={job.id} className="row-card">
                     <div>
-                      <strong>{job.caption || "Midia sem titulo"}</strong>
+                      <strong>{resolveJobDisplayTitle(job)}</strong>
                       <span className="publication-pill">{publicationTypeLabel(job.publicationType)}</span>
                       <span className="unit-pill">
                         {`Unidade: ${companyNameMap[job.companyId] || "Unidade removida"}`}
@@ -3201,13 +3316,15 @@ function App() {
                     {qrRequestingConnectionId === connection.id ? "Gerando..." : "Gerar novo QR"}
                   </button>
                 ) : null}
-                <button
-                  type="button"
-                  className="ghost-button"
-                  onClick={() => void disconnectConnection(connection.id)}
-                >
-                  Desconectar
-                </button>
+                {connection.platform !== "instagram" || connection.authStatus === "CONNECTED" ? (
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={() => void disconnectConnection(connection.id)}
+                  >
+                    Desconectar
+                  </button>
+                ) : null}
                 <button
                   type="button"
                   className="danger-button"
@@ -3273,6 +3390,20 @@ function App() {
             </select>
           </div>
 
+          <label className="field-shell">
+            <span>Título da postagem</span>
+            <input
+              type="text"
+              value={postTitle}
+              onChange={(event) => setPostTitle(event.target.value)}
+              disabled={submittingJob}
+              placeholder="Ex: Oferta da semana - unidade Centro"
+              maxLength={120}
+              required
+              title="Título interno e curto para identificar a postagem nas listas e notificações."
+            />
+          </label>
+
           <div className="form-grid form-grid-two scheduler-top-grid">
             <input
               type="date"
@@ -3297,11 +3428,7 @@ function App() {
           <div className="form-grid form-grid-two">
             <select
               value={jobSocialConnectionId}
-              onChange={(event) => {
-                setJobSocialConnectionId(event.target.value);
-                setLocationId("");
-                setInstagramLocationSuggestions([]);
-              }}
+              onChange={(event) => setJobSocialConnectionId(event.target.value)}
               required
             >
               <option value="">Selecione a conta vinculada</option>
@@ -3330,6 +3457,7 @@ function App() {
                 ref={schedulerMediaInputRef}
                 type="file"
                 onChange={uploadMedia}
+                multiple={supportsMultiMediaUpload}
                 accept={
                   publicationType === "instagram_post"
                     ? ".jpg,.jpeg,.png"
@@ -3338,7 +3466,7 @@ function App() {
                     : "image/*,video/*"
                 }
                 disabled={submittingJob || uploading}
-                required={!uploadedFilePath}
+                required={uploadedMediaCount === 0}
                 title={
                   publicationType === "instagram_post"
                     ? "Selecione uma imagem JPG ou PNG (máximo de 8 MB)."
@@ -3366,7 +3494,11 @@ function App() {
                   <strong>
                     {uploading
                       ? "Enviando mídia..."
-                      : uploadedFileName ||
+                      : uploadedMediaCount > 0
+                        ? uploadedMediaCount === 1
+                          ? uploadedFileName
+                          : `${uploadedMediaCount} mídias prontas para publicação`
+                        :
                         (publicationType === "instagram_post"
                           ? "Arraste uma imagem JPG ou PNG aqui (máx. 8 MB)"
                           : publicationType === "instagram_reel"
@@ -3379,11 +3511,11 @@ function App() {
                     {uploading
                       ? "Aguarde enquanto o arquivo é enviado."
                       : publicationType === "instagram_post"
-                        ? "Ou clique aqui para selecionar uma imagem JPG ou PNG de até 8 MB."
+                        ? "Ou clique aqui para selecionar imagens JPG/PNG de até 8 MB (máximo de 10)."
                         : publicationType === "instagram_reel"
                           ? "Ou clique aqui para selecionar um vídeo MP4."
                           : publicationType === "instagram_story"
-                            ? "Ou clique aqui para selecionar imagem (até 8 MB) ou vídeo."
+                            ? "Ou clique aqui para selecionar imagens/vídeos (máximo de 10)."
                           : "Ou clique aqui para selecionar do computador."}
                   </small>
                 </div>
@@ -3391,21 +3523,67 @@ function App() {
             </label>
           ) : null}
 
-          <label className="field-shell">
-            <span>{captionLabel}</span>
-            <textarea
-              value={caption}
-              onChange={(event) => setCaption(event.target.value)}
-              disabled={submittingJob}
-              placeholder={captionPlaceholder}
-              rows={publicationType === "whatsapp_status_texto" ? 5 : 4}
-              maxLength={2000}
-              required={requiresInstagramMetadata || publicationType === "whatsapp_status_texto"}
-              title={captionTitle}
-            />
-          </label>
+          {supportsMultiMediaUpload && uploadedMediaCount > 1 ? (
+            <label className="field-shell scheduler-sequence-shell">
+              <span>Publicação em sequência</span>
+              <div className="scheduler-sequence-row">
+                <small>
+                  Arraste as miniaturas para direita para ordenar a sequencia.
+                </small>
+              </div>
+            </label>
+          ) : null}
 
-          {caption.trim().length > 0 || publicationType === "whatsapp_status_midia" || publicationType === "whatsapp_status_texto" || requiresInstagramMetadata ? (
+          {supportsMultiMediaUpload && uploadedMediaCount > 0 ? (
+            <div className="scheduler-media-preview-list">
+              {uploadedSchedulerMedia.map((media, index) => (
+                <div
+                  key={media.filePath}
+                  className={`scheduler-media-preview-item${draggingSchedulerMediaIndex === index ? " scheduler-media-preview-item-dragging" : ""}`}
+                  draggable
+                  onDragStart={() => handleSchedulerMediaThumbDragStart(index)}
+                  onDragEnd={handleSchedulerMediaThumbDragEnd}
+                  onDragOver={handleSchedulerMediaThumbDragOver}
+                  onDrop={(event) => handleSchedulerMediaThumbDrop(index, event)}
+                  title={`Ordem ${index + 1}`}
+                >
+                  <button
+                    type="button"
+                    className="scheduler-media-preview-remove"
+                    onClick={() => removeSchedulerUploadedMedia(media.filePath)}
+                    disabled={submittingJob || uploading}
+                    aria-label={`Remover mídia ${index + 1}`}
+                  >
+                    <FiX />
+                  </button>
+                  <img src={`${api.baseUrl}${media.filePath}`} alt={`Prévia ${index + 1}`} loading="lazy" />
+                  <small>{`#${index + 1}`}</small>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {supportsCaption ? (
+            <label className="field-shell">
+              <span>{captionLabel}</span>
+              <textarea
+                value={caption}
+                onChange={(event) => setCaption(event.target.value)}
+                disabled={submittingJob}
+                placeholder={captionPlaceholder}
+                rows={publicationType === "whatsapp_status_texto" ? 5 : 4}
+                maxLength={2000}
+                required={requiresInstagramMetadata || publicationType === "whatsapp_status_texto"}
+                title={captionTitle}
+              />
+            </label>
+          ) : null}
+
+          {supportsCaption &&
+          (caption.trim().length > 0 ||
+            publicationType === "whatsapp_status_midia" ||
+            publicationType === "whatsapp_status_texto" ||
+            requiresInstagramMetadata) ? (
             <div className="emoji-picker-shell">
               <span>Emojis rápidos</span>
               <div className="emoji-group-list">
@@ -3437,7 +3615,7 @@ function App() {
                 ? `Localização fixa ativa: ${instagramForcedLocationName} (#${instagramForcedLocationId}).`
                 : publicationType === "instagram_story"
                   ? "Story será publicado sem localização pela API oficial."
-                  : "Post/Reel usam localização automática da conta conectada quando disponível."}
+                  : "Post/Reel usam automaticamente a localização da Page vinculada à conta Instagram Business. Se não houver localização válida, publica sem localização."}
             </div>
           ) : null}
 
@@ -3577,7 +3755,7 @@ function App() {
           {paginatedHistoryJobs.map((job) => (
             <div key={job.id} className="row-card">
               <div>
-                <strong>{job.caption || "Midia sem titulo"}</strong>
+                <strong>{resolveJobDisplayTitle(job)}</strong>
                 <span className="publication-pill">{publicationTypeLabel(job.publicationType)}</span>
                 <span className="unit-pill">{`Unidade: ${companyNameMap[job.companyId] || "Unidade removida"}`}</span>
                 {job.locationName ? <span>Localização: {job.locationName}</span> : null}
@@ -3702,7 +3880,7 @@ function App() {
 
         <div className="table-list">
           {avisos.map((aviso) => (
-            <div key={aviso.id} className="row-card">
+            <div key={aviso.id} className={`row-card notice-row ${avisoToneClass(aviso.kind)}`}>
               <div>
                 <strong>{aviso.title}</strong>
                 <span>{aviso.message}</span>
@@ -3767,94 +3945,6 @@ function App() {
             {broadcastAvisoSubmitting ? "Enviando..." : "Enviar aviso global"}
           </button>
         </form>
-
-        <div className="section-head">
-          <div>
-            <span className="section-kicker">instagram</span>
-            <h2>Catálogo de localizações</h2>
-          </div>
-          <span className="count-pill">{instagramCatalogTotal} registros</span>
-        </div>
-
-        {instagramCatalogInfo ? (
-          <div className={`info-banner${isPositiveInstagramCatalogInfo ? " info-banner-success" : ""}`}>
-            {instagramCatalogInfo}
-          </div>
-        ) : null}
-
-        <form onSubmit={submitInstagramCatalogSearch} className="form-grid form-grid-three">
-          <input
-            value={instagramCatalogQuery}
-            onChange={(event) => setInstagramCatalogQuery(event.target.value)}
-            placeholder="Buscar por nome ou ID"
-            maxLength={120}
-          />
-          <button type="submit" className="ghost-button" disabled={instagramCatalogLoading}>
-            {instagramCatalogLoading ? "Buscando..." : "Buscar no catálogo"}
-          </button>
-        </form>
-
-        <form onSubmit={createInstagramCatalogEntry} className="form-grid form-grid-three">
-          <input
-            value={instagramCatalogLocationId}
-            onChange={(event) => setInstagramCatalogLocationId(event.target.value)}
-            placeholder="ID da localização (somente números)"
-            inputMode="numeric"
-            pattern="^[0-9]+$"
-            required
-          />
-          <input
-            value={instagramCatalogName}
-            onChange={(event) => setInstagramCatalogName(event.target.value)}
-            placeholder="Nome da localização"
-            minLength={2}
-            maxLength={120}
-            required
-          />
-          <button type="submit" disabled={instagramCatalogSubmitting}>
-            {instagramCatalogSubmitting ? "Salvando..." : "Salvar localização"}
-          </button>
-        </form>
-
-        {renderNumericPagination("instagram-catalog-top", instagramCatalogPage, instagramCatalogTotalPages, setInstagramCatalogPage)}
-
-        <div className="table-list">
-          {instagramCatalogLoading ? (
-            <div className="empty-state">Carregando catálogo...</div>
-          ) : instagramCatalogEntries.length === 0 ? (
-            <div className="empty-state">Nenhuma localização cadastrada para este filtro.</div>
-          ) : (
-            instagramCatalogEntries.map((entry) => (
-              <div key={entry.id} className="row-card">
-                <div>
-                  <strong>{entry.name}</strong>
-                  <span>ID: {entry.locationId}</span>
-                  <span>
-                    Origem:{" "}
-                    {entry.source === "MANUAL"
-                      ? "Manual"
-                      : entry.source === "JOB_SELECTION"
-                        ? "Agendamento"
-                          : "Meta"}
-                  </span>
-                  <span>Atualizado em {formatDate(entry.updatedAt)}</span>
-                </div>
-                <div className="inline-actions">
-                  <button
-                    type="button"
-                    className="danger-button"
-                    onClick={() => void deleteInstagramCatalogEntry(entry)}
-                    disabled={instagramCatalogDeletingId === entry.id}
-                  >
-                    {instagramCatalogDeletingId === entry.id ? "Excluindo..." : "Excluir"}
-                  </button>
-                </div>
-              </div>
-            ))
-          )}
-        </div>
-
-        {renderNumericPagination("instagram-catalog-bottom", instagramCatalogPage, instagramCatalogTotalPages, setInstagramCatalogPage)}
       </section>
     );
   }
@@ -3914,26 +4004,19 @@ function App() {
           ×
         </button>
         <nav className="nav-list">
-          {visibleNavItems.map((item, index) => (
-            <button
+          {visibleNavItems.map((item) => (
+            <a
               key={item.key}
-              type="button"
+              href={buildViewHref(item.key)}
               className={`nav-item ${activeView === item.key ? "nav-item-active" : ""}`}
-              onClick={() => {
-                setActiveView(item.key);
-                if (item.key === "notices") {
-                  setAvisosPage(1);
-                }
-                if (item.key === "noticeAdmin") {
-                  setInstagramCatalogPage(1);
-                }
-                setNoticesPopoverOpen(false);
-                setSidebarOpen(false);
+              onClick={(event) => {
+                event.preventDefault();
+                navigateToView(item.key);
               }}
             >
               {item.eyebrow ? <span className="nav-eyebrow">{item.eyebrow}</span> : null}
               <span>{item.label}</span>
-            </button>
+            </a>
           ))}
         </nav>
 
@@ -3951,7 +4034,7 @@ function App() {
               className={`profile-trigger mobile-profile-trigger ${activeView === "profile" ? "profile-trigger-active" : ""}`}
               onClick={() => {
                 setNoticesPopoverOpen(false);
-                setActiveView("profile");
+                navigateToView("profile");
               }}
             >
               <span className="profile-icon" aria-hidden="true" />
@@ -3977,7 +4060,7 @@ function App() {
               className={`profile-trigger ${activeView === "profile" ? "profile-trigger-active" : ""}`}
               onClick={() => {
                 setNoticesPopoverOpen(false);
-                setActiveView("profile");
+                navigateToView("profile");
               }}
             >
               <span className="profile-icon" aria-hidden="true" />
@@ -4002,12 +4085,18 @@ function App() {
                 <span className="section-kicker">Ação rápida</span>
                 <h2>Atalho rápido para agendar</h2>
               </div>
-              <button type="button" className="activate-button" onClick={() => setActiveView("scheduler")}>
+              <button type="button" className="activate-button" onClick={() => navigateToView("scheduler")}>
                 Agendar
               </button>
             </div>
             <div className="quick-summary">
-              <span>{uploadedFilePath ? "Midia pronta para reutilizacao" : "Selecione uma midia na biblioteca para reutilizar."}</span>
+              <span>
+                {uploadedMediaCount > 0
+                  ? uploadedMediaCount === 1
+                    ? "1 mídia pronta para reutilização"
+                    : `${uploadedMediaCount} mídias prontas para reutilização`
+                  : "Selecione uma mídia na biblioteca para reutilizar."}
+              </span>
             </div>
           </section>
         ) : null}

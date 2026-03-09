@@ -9,6 +9,7 @@
   "scripts": {
     "dev:web": "npm run dev -w apps/web",
     "dev:backend": "npm run dev -w apps/backend",
+    "dev:tunnel": "cloudflared tunnel run socialup-backend",
     "dev:whatsapp": "bash ./scripts/dev-whatsapp.sh",
     "stop:whatsapp": "bash ./scripts/stop-whatsapp.sh",
     "build": "npm run build -ws",
