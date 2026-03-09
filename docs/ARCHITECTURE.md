@@ -107,6 +107,7 @@ Backend runs two internal polling workers:
   - `facebook_login`: `graph.facebook.com`
 - Flow:
   1. Validate connected account + access token.
+  1.0. If job is `PENDING` but the related Instagram connection is no longer `CONNECTED` (ex.: `AUTH_REQUIRED`), backend moves job to `WAITING_LOGIN` automatically to avoid pending jobs stuck sem execução.
   1.1. Before execution, worker runs proactive token refresh (cooldown-based, per connection) to reduce `WAITING_LOGIN` during normal operation.
   1.2. Dedicated keep-alive worker periodically refreshes tokens for Instagram connections in `CONNECTED`.
   1.3. If keep-alive receives `LOGIN_REQUIRED_INSTAGRAM`, connection is forcefully moved to `AUTH_REQUIRED` and secret is cleared (forced disconnect), so UI shows reconnection flow (`Abrir login`) again.

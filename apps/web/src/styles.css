@@ -883,7 +883,7 @@ code,
 .auth-panel-clean input:focus {
   outline: none;
   border-color: var(--pink);
-  box-shadow: 0 0 0 1px rgba(213, 63, 140, 0.2);
+  box-shadow: none;
 }
 
 .auth-panel-clean button {
@@ -1096,7 +1096,7 @@ select:focus,
 textarea:focus {
   outline: none;
   border-color: var(--pink);
-  box-shadow: 0 0 0 1px rgba(213, 63, 140, 0.2);
+  box-shadow: none;
 }
 
 button {
@@ -1391,35 +1391,39 @@ code {
   color: var(--pink-deep);
 }
 
-.status-pending,
-.status-waiting_login {
+.status-pill.status-pending {
   background: #fff1f2;
   color: #be123c;
 }
 
-.status-running {
+.status-pill.status-waiting_login {
+  background: #fffdf0;
+  color: #8b6f1f;
+}
+
+.status-pill.status-running {
   background: #fce7f3;
   color: #9d174d;
 }
 
-.status-sent_unconfirmed {
+.status-pill.status-sent_unconfirmed {
   background: #fff7ed;
   color: #c2410c;
 }
 
-.status-completed {
+.status-pill.status-completed {
   background: #ecfeff;
   color: #155e75;
 }
 
-.status-failed {
+.status-pill.status-failed {
   background: #f3f4f6;
   color: #374151;
 }
 
-.status-canceled {
-  background: #fef3c7;
-  color: #92400e;
+.status-pill.status-canceled {
+  background: #d1d5db;
+  color: #111111;
 }
 
 .media-grid {

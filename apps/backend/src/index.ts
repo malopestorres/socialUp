@@ -1239,6 +1239,15 @@ function summarizeFailureMessageForAviso(publicationType: PublicationType, rawMe
   return "Falha ao executar o agendamento. Tente novamente.";
 }
 
+function isInstagramTooManyActionsMessage(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return normalized.includes("user is performing too many actions") || normalized.includes("too many actions");
+}
+
 function isInstagramTransientExecutionError(message: string): boolean {
   const normalized = message.trim().toLowerCase();
   if (!normalized) {
@@ -1609,11 +1618,35 @@ function startServerInstagramJobWorker(): void {
             id: job.socialConnectionId,
             companyId: job.companyId,
             platform: platformForPublication(normalizePublicationType(job)),
-            authStatus: "CONNECTED",
           },
         });
 
-        if (!connection || busyConnections.has(connection.id)) {
+        if (!connection) {
+          continue;
+        }
+
+        if (connection.authStatus !== "CONNECTED" || !connection.secretCipher) {
+          if (job.status === "PENDING") {
+            await prisma.job.update({
+              where: { id: job.id },
+              data: {
+                status: "WAITING_LOGIN",
+                startedAt: null,
+                completedAt: null,
+                lastError: "Aguardando autenticacao do Instagram.",
+              },
+            });
+
+            await appendJobAvisoSafely(job, {
+              title: "Aguardando autenticacao",
+              kind: "JOB_WAITING_LOGIN",
+              message: "A conta do Instagram precisa ser autenticada para continuar.",
+            });
+          }
+          continue;
+        }
+
+        if (busyConnections.has(connection.id)) {
           continue;
         }
 
@@ -1899,6 +1932,7 @@ function startServerInstagramJobWorker(): void {
 
             const errorCode = normalizeAutomationErrorCode(message);
             const attemptNumber = job.tentativas + 1;
+            const instagramRateLimited = isInstagramTooManyActionsMessage(message);
             const shouldAutoRetry =
               !sequentialStoryJob &&
               !waitingLogin &&
@@ -1927,6 +1961,15 @@ function startServerInstagramJobWorker(): void {
                   `(${attemptNumber}/${INSTAGRAM_WORKER_AUTO_RETRY_MAX_ATTEMPTS}) em ${retryAt.toISOString()}. ` +
                   `Erro original: ${message}`,
               });
+
+              if (instagramRateLimited && attemptNumber === 1) {
+                await appendJobAvisoSafely(job, {
+                  title: "Bloqueio temporario do Instagram",
+                  kind: "JOB_RATE_LIMIT",
+                  message:
+                    "Muitas requisicoes em curto espaco de tempo. Aguarde ate 24 horas para liberacao de postagens e leia nosso FAQ para mais informacoes.",
+                });
+              }
               return;
             }
 
