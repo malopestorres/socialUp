@@ -1,0 +1,7 @@
+tunnel: 8ebb40a5-eb9a-414c-b52a-ddf9f1997454
+credentials-file: /Users/marcustorres/.cloudflared/8ebb40a5-eb9a-414c-b52a-ddf9f1997454.json
+
+ingress:
+  - hostname: oauth.socialup.space
+    service: http://localhost:4000
+  - service: http_status:404

@@ -33,6 +33,9 @@ export interface JobDto {
   companyId: string;
   socialConnectionId: string | null;
   filePath: string;
+  filePaths?: string[];
+  sequential?: boolean;
+  title?: string | null;
   caption: string | null;
   locationName: string | null;
   publicationType: PublicationType;

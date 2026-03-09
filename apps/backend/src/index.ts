@@ -2,6 +2,7 @@ import cors from "cors";
 import express from "express";
 import type { NextFunction, Request, Response } from "express";
 import multer from "multer";
+import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import path from "node:path";
@@ -13,8 +14,11 @@ import {
   consumeInstagramOAuthState,
   createInstagramOAuthLaunchUrl,
   exchangeInstagramOAuthCodeForConnection,
+  executeInstagramCarouselJobWithGraphApi,
   executeInstagramJobWithGraphApi,
+  isInstagramLoginRequiredErrorMessage,
   listInstagramLocationCandidatesForConnection,
+  refreshInstagramAccessTokenForConnection,
   type InstagramLocationSuggestion,
   searchInstagramLocationsForConnection,
 } from "./instagram-graph-api.js";
@@ -37,6 +41,8 @@ const INSTAGRAM_IMAGE_MAX_SIZE_BYTES = 8 * 1024 * 1024;
 const INSTAGRAM_POST_ASPECT_RATIO_MIN = 4 / 5;
 const INSTAGRAM_POST_ASPECT_RATIO_MAX = 1.91;
 const INSTAGRAM_LOCATION_STORAGE_PREFIX = "__IGLOC__";
+const JOB_MEDIA_BUNDLE_STORAGE_PREFIX = "__JOB_MEDIA_BUNDLE__";
+const INSTAGRAM_MULTI_MEDIA_MAX_FILES = 10;
 const INSTAGRAM_FORCED_LOCATION_ID_RAW = (process.env.INSTAGRAM_FORCED_LOCATION_ID || "").trim();
 const INSTAGRAM_FORCED_LOCATION_ID = /^\d+$/.test(INSTAGRAM_FORCED_LOCATION_ID_RAW)
   ? INSTAGRAM_FORCED_LOCATION_ID_RAW
@@ -49,6 +55,22 @@ const INSTAGRAM_WORKER_AUTO_RETRY_MAX_ATTEMPTS = parseEnvPositiveInt(
 const INSTAGRAM_WORKER_AUTO_RETRY_DELAY_MS = parseEnvPositiveInt(
   process.env.INSTAGRAM_WORKER_AUTO_RETRY_DELAY_MS,
   20_000,
+);
+const INSTAGRAM_STORY_SEQUENCE_STEP_DELAY_MS = parseEnvPositiveInt(
+  process.env.INSTAGRAM_STORY_SEQUENCE_STEP_DELAY_MS,
+  1_500,
+);
+const INSTAGRAM_PROACTIVE_TOKEN_REFRESH_COOLDOWN_MS = parseEnvPositiveInt(
+  process.env.INSTAGRAM_PROACTIVE_TOKEN_REFRESH_COOLDOWN_MS,
+  30 * 60 * 1000,
+);
+const INSTAGRAM_TOKEN_KEEPALIVE_INTERVAL_MS = parseEnvPositiveInt(
+  process.env.INSTAGRAM_TOKEN_KEEPALIVE_INTERVAL_MS,
+  5 * 60 * 1000,
+);
+const INSTAGRAM_TOKEN_KEEPALIVE_BATCH_SIZE = parseEnvPositiveInt(
+  process.env.INSTAGRAM_TOKEN_KEEPALIVE_BATCH_SIZE,
+  25,
 );
 
 function parseEnvPositiveInt(value: string | undefined, fallback: number): number {
@@ -67,6 +89,11 @@ function formatAspectRatio(value: number): string {
 type ImageDimensions = {
   width: number;
   height: number;
+};
+
+type JobMediaBundle = {
+  files: string[];
+  sequential: boolean;
 };
 
 function readPngDimensions(buffer: Buffer): ImageDimensions | null {
@@ -171,6 +198,77 @@ function createFilePathValidationError(message: string): z.ZodError {
       message,
     },
   ]);
+}
+
+function decodeJobMediaBundleStorage(filePath: string | null | undefined): JobMediaBundle {
+  const raw = filePath?.trim() || "";
+  if (!raw) {
+    return {
+      files: [],
+      sequential: false,
+    };
+  }
+
+  if (!raw.startsWith(JOB_MEDIA_BUNDLE_STORAGE_PREFIX)) {
+    return {
+      files: [raw],
+      sequential: false,
+    };
+  }
+
+  const encodedPayload = raw.slice(JOB_MEDIA_BUNDLE_STORAGE_PREFIX.length).trim();
+  if (!encodedPayload) {
+    return {
+      files: [],
+      sequential: false,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(Buffer.from(encodedPayload, "base64").toString("utf8")) as {
+      files?: unknown;
+      sequential?: unknown;
+    };
+
+    const files = Array.isArray(parsed.files)
+      ? parsed.files
+          .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+          .filter((entry) => entry.length > 0)
+      : [];
+
+    return {
+      files,
+      sequential: parsed.sequential === true,
+    };
+  } catch {
+    return {
+      files: [raw],
+      sequential: false,
+    };
+  }
+}
+
+function encodeJobMediaBundleStorage(input: JobMediaBundle): string {
+  const files = input.files.map((entry) => entry.trim()).filter((entry) => entry.length > 0);
+  const sequential = input.sequential === true;
+
+  if (files.length === 0) {
+    return "";
+  }
+
+  if (files.length === 1 && !sequential) {
+    return files[0]!;
+  }
+
+  const payload = Buffer.from(
+    JSON.stringify({
+      files,
+      sequential,
+    }),
+    "utf8",
+  ).toString("base64");
+
+  return `${JOB_MEDIA_BUNDLE_STORAGE_PREFIX}${payload}`;
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutCode: string): Promise<T> {
@@ -339,73 +437,6 @@ function dedupeInstagramLocationSuggestions(
   return output;
 }
 
-async function searchInstagramLocationCatalog(
-  query: string,
-  limit: number,
-): Promise<InstagramLocationSuggestion[]> {
-  const normalizedQuery = normalizeSearchText(query);
-  if (normalizedQuery.length < 2) {
-    return [];
-  }
-
-  const rows = await prisma.instagramLocationCatalog.findMany({
-    where: {
-      OR: [
-        { normalizedName: { contains: normalizedQuery } },
-        { locationId: { contains: normalizedQuery } },
-      ],
-    },
-    orderBy: [{ updatedAt: "desc" }, { name: "asc" }],
-    take: Math.max(1, Math.min(50, limit * 3)),
-    select: {
-      locationId: true,
-      name: true,
-    },
-  });
-
-  return dedupeInstagramLocationSuggestions(
-    rows.map((row) => ({
-      id: row.locationId,
-      name: row.name,
-    })),
-    limit,
-  );
-}
-
-async function upsertInstagramLocationCatalogEntries(input: {
-  entries: InstagramLocationSuggestion[];
-  source: string;
-  createdByUserId?: string | null;
-}): Promise<void> {
-  const deduped = dedupeInstagramLocationSuggestions(input.entries, 1000);
-  if (deduped.length === 0) {
-    return;
-  }
-
-  await Promise.all(
-    deduped.map((entry) =>
-      prisma.instagramLocationCatalog.upsert({
-        where: {
-          locationId: entry.id,
-        },
-        update: {
-          name: entry.name,
-          normalizedName: normalizeSearchText(entry.name),
-          source: input.source,
-          createdByUserId: input.createdByUserId ?? undefined,
-        },
-        create: {
-          locationId: entry.id,
-          name: entry.name,
-          normalizedName: normalizeSearchText(entry.name),
-          source: input.source,
-          createdByUserId: input.createdByUserId ?? null,
-        },
-      }),
-    ),
-  );
-}
-
 function applyConnectionWorkerOverlay(connection: {
   id: string;
   companyId: string;
@@ -485,6 +516,9 @@ const createJobSchema = z.object({
   companyId: z.string().min(1),
   socialConnectionId: z.string().min(1),
   filePath: z.string().optional().nullable(),
+  filePaths: z.array(z.string()).optional().nullable(),
+  sequential: z.boolean().optional(),
+  title: z.string().trim().max(120).optional().nullable(),
   caption: z.string().optional().nullable(),
   locationName: z.string().optional().nullable(),
   locationId: z.string().optional().nullable(),
@@ -502,6 +536,9 @@ const updateJobSchema = z.object({
   companyId: z.string().min(1),
   socialConnectionId: z.string().min(1),
   filePath: z.string().optional().nullable(),
+  filePaths: z.array(z.string()).optional().nullable(),
+  sequential: z.boolean().optional(),
+  title: z.string().trim().max(120).optional().nullable(),
   caption: z.string().optional().nullable(),
   locationName: z.string().optional().nullable(),
   locationId: z.string().optional().nullable(),
@@ -537,17 +574,6 @@ const instagramLocationSuggestionsQuerySchema = z.object({
   connectionId: z.string().trim().min(1),
   query: z.string().trim().min(2).max(120),
   limit: z.coerce.number().int().min(1).max(20).default(8),
-});
-
-const instagramLocationCatalogListQuerySchema = z.object({
-  query: z.string().trim().max(120).optional().default(""),
-  page: z.coerce.number().int().min(1).default(1),
-  pageSize: z.coerce.number().int().min(1).max(100).default(25),
-});
-
-const createInstagramLocationCatalogSchema = z.object({
-  locationId: z.string().trim().regex(/^\d+$/, "ID de localização inválido."),
-  name: z.string().trim().min(2).max(120),
 });
 
 function deriveLegacyJobFields(publicationType: PublicationType): {
@@ -606,15 +632,7 @@ function normalizePublicationType(job: {
   return "instagram_post";
 }
 
-function ensureFilePathForPublication(publicationType: PublicationType, filePath?: string | null): string {
-  if (publicationType === "whatsapp_status_texto") {
-    return filePath ?? "";
-  }
-
-  if (!filePath || filePath.trim().length === 0) {
-    throw createFilePathValidationError("Este tipo de publicacao exige uma midia.");
-  }
-
+function validateSingleFilePathForPublication(publicationType: PublicationType, filePath: string): string {
   const trimmedPath = filePath.trim();
   const normalizedPath = trimmedPath.toLowerCase();
 
@@ -670,7 +688,55 @@ function ensureFilePathForPublication(publicationType: PublicationType, filePath
     }
   }
 
-  return filePath;
+  return trimmedPath;
+}
+
+function ensureFilePathForPublication(
+  publicationType: PublicationType,
+  filePath?: string | null,
+  filePaths?: string[] | null,
+  sequential?: boolean,
+): string {
+  if (publicationType === "whatsapp_status_texto") {
+    return filePath ?? "";
+  }
+
+  const mergedFiles = [
+    ...(Array.isArray(filePaths) ? filePaths : []),
+    filePath ?? "",
+  ]
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+
+  const uniqueFiles = Array.from(new Set(mergedFiles));
+
+  if (uniqueFiles.length === 0) {
+    throw createFilePathValidationError("Este tipo de publicacao exige uma midia.");
+  }
+
+  if (publicationType === "instagram_reel" && uniqueFiles.length > 1) {
+    throw createFilePathValidationError("Instagram Reel aceita apenas uma mídia por agendamento.");
+  }
+
+  if ((publicationType === "instagram_post" || publicationType === "instagram_story") && uniqueFiles.length > INSTAGRAM_MULTI_MEDIA_MAX_FILES) {
+    throw createFilePathValidationError(`Você pode enviar até ${INSTAGRAM_MULTI_MEDIA_MAX_FILES} mídias por agendamento.`);
+  }
+
+  const normalizedSequential = sequential === true;
+  if ((publicationType === "instagram_post" || publicationType === "instagram_story") && uniqueFiles.length > 1 && !normalizedSequential) {
+    throw createFilePathValidationError(
+      publicationType === "instagram_post"
+        ? "Marque a opção de publicação em sequência para criar carrossel com múltiplas mídias."
+        : "Marque a opção de publicação em sequência para publicar stories em ordem.",
+    );
+  }
+
+  const validatedFiles = uniqueFiles.map((entry) => validateSingleFilePathForPublication(publicationType, entry));
+
+  return encodeJobMediaBundleStorage({
+    files: validatedFiles,
+    sequential: normalizedSequential && validatedFiles.length > 1,
+  });
 }
 
 function isInstagramPublication(publicationType: PublicationType): boolean {
@@ -732,6 +798,11 @@ function compactAvisoText(value: string | null | undefined, maxLength: number): 
   return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
 }
 
+function normalizeJobTitle(value: string | null | undefined): string | null {
+  const normalized = value?.trim();
+  return normalized ? normalized : null;
+}
+
 function ensureInstagramMetadata(
   publicationType: PublicationType,
   caption?: string | null,
@@ -750,7 +821,7 @@ function ensureInstagramMetadata(
       : normalizedLocation;
 
   if (isInstagramPublication(publicationType)) {
-    if (!normalizedCaption) {
+    if (publicationType !== "instagram_story" && !normalizedCaption) {
       throw new z.ZodError([
         {
           code: "custom",
@@ -772,7 +843,7 @@ function ensureInstagramMetadata(
   }
 
   return {
-    caption: normalizedCaption,
+    caption: publicationType === "instagram_story" ? null : normalizedCaption,
     locationName: encodeInstagramLocationStorage(effectiveLocationName, effectiveLocationId),
   };
 }
@@ -864,59 +935,10 @@ async function resolveAutomaticInstagramLocation(input: {
     };
   }
 
-  const connection = await prisma.socialConnection.findUnique({
-    where: { id: input.socialConnectionId },
-    select: {
-      platform: true,
-      secretCipher: true,
-    },
-  });
-
-  if (!connection || connection.platform !== "instagram") {
-    return {
-      locationName: normalizedLocationName,
-      locationId: normalizedLocationId,
-    };
-  }
-
-  try {
-    const items = await withTimeout(
-      listInstagramLocationCandidatesForConnection({
-        secretCipher: connection.secretCipher,
-        limit: 100,
-      }),
-      8_000,
-      "INSTAGRAM_GRAPH_AUTO_LOCATION_TIMEOUT",
-    );
-    const candidate = items.find((item) => (item.city?.trim().length ?? 0) > 0) ?? null;
-    if (!candidate) {
-      return {
-        locationName: normalizedLocationName,
-        locationId: normalizedLocationId,
-      };
-    }
-
-    const candidateCity = candidate.city?.trim() || "";
-    const normalizedCandidateCity = normalizeSearchText(candidateCity);
-    const normalizedPageName = normalizeSearchText(candidate.pageName);
-
-    if (!normalizedCandidateCity || !normalizedPageName.includes(normalizedCandidateCity)) {
-      return {
-        locationName: normalizedLocationName,
-        locationId: normalizedLocationId,
-      };
-    }
-
-    return {
-      locationName: normalizedLocationName || candidateCity,
-      locationId: candidate.pageId,
-    };
-  } catch {
-    return {
-      locationName: normalizedLocationName,
-      locationId: normalizedLocationId,
-    };
-  }
+  return {
+    locationName: normalizedLocationName,
+    locationId: null,
+  };
 }
 
 function isRootUser(request: Request & { adminUser?: AdminUserAuth }): boolean {
@@ -1126,6 +1148,7 @@ async function appendJobAvisoSafely(
   job: {
     id: string;
     createdByUserId: string | null;
+    title?: string | null;
     caption: string | null;
     publicationType?: string | null;
     postStory?: boolean;
@@ -1144,8 +1167,9 @@ async function appendJobAvisoSafely(
   }
 
   const publicationLabel = publicationTypeDisplayLabel(normalizePublicationType(job));
+  const titleSnippet = compactAvisoText(job.title, 90);
   const captionSnippet = compactAvisoText(job.caption, 90);
-  const subject = captionSnippet ? `"${captionSnippet}"` : `Job ${job.id}`;
+  const subject = titleSnippet || captionSnippet ? `"${titleSnippet || captionSnippet}"` : `Job ${job.id}`;
   const composedMessage = `${publicationLabel} - ${subject}. ${input.message}`;
 
   try {
@@ -1193,6 +1217,18 @@ function summarizeFailureMessageForAviso(publicationType: PublicationType, rawMe
       return "Não foi possível validar a mídia no Instagram. Verifique o arquivo e tente novamente.";
     }
 
+    if (normalized.includes("user is performing too many actions") || normalized.includes("too many actions")) {
+      return "O Instagram limitou ações temporariamente. Aguarde alguns minutos e tente novamente.";
+    }
+
+    if (normalized.includes("story_sequence_duplicate_publish_id")) {
+      return "A API retornou duplicação em sequência de stories. Tente novamente.";
+    }
+
+    if (normalized.includes("story_sequence_duplicate_creation_id")) {
+      return "A API retornou criação duplicada em sequência de stories. Tente novamente.";
+    }
+
     return "Falha ao publicar no Instagram. Revise a mídia e tente novamente.";
   }
 
@@ -1222,6 +1258,14 @@ function isInstagramTransientExecutionError(message: string): boolean {
   }
 
   if (
+    normalized.includes("too many actions") ||
+    normalized.includes("rate limit") ||
+    normalized.includes("application request limit reached")
+  ) {
+    return true;
+  }
+
+  if (
     normalized.includes("econnreset") ||
     normalized.includes("econnrefused") ||
     normalized.includes("etimedout") ||
@@ -1240,6 +1284,47 @@ function isInstagramTransientExecutionError(message: string): boolean {
 
 const runningServerJobs = new Set<string>();
 const busyConnections = new Set<string>();
+const instagramLastProactiveTokenRefreshByConnection = new Map<string, number>();
+
+function shouldAttemptProactiveInstagramTokenRefresh(connectionId: string, nowMs: number): boolean {
+  const lastRefreshedAtMs = instagramLastProactiveTokenRefreshByConnection.get(connectionId) ?? 0;
+  return nowMs - lastRefreshedAtMs >= INSTAGRAM_PROACTIVE_TOKEN_REFRESH_COOLDOWN_MS;
+}
+
+function markProactiveInstagramTokenRefreshAttempt(connectionId: string, nowMs: number): void {
+  instagramLastProactiveTokenRefreshByConnection.set(connectionId, nowMs);
+}
+
+async function appendInstagramAuthRequiredAvisosForConnection(connectionId: string): Promise<void> {
+  const recipients = await prisma.job.findMany({
+    where: {
+      socialConnectionId: connectionId,
+      createdByUserId: {
+        not: null,
+      },
+    },
+    select: {
+      createdByUserId: true,
+    },
+    distinct: ["createdByUserId"],
+    take: 200,
+  });
+
+  await Promise.all(
+    recipients
+      .map((entry) => entry.createdByUserId)
+      .filter((userId): userId is string => Boolean(userId))
+      .map((userId) =>
+        appendAviso({
+          userId,
+          title: "Aguardando autenticacao",
+          kind: "JOB_WAITING_LOGIN",
+          message: "A conta do Instagram precisa ser autenticada para continuar.",
+        }),
+      ),
+  );
+}
+
 function resolveUploadFilePath(filePath: string): string {
   return path.join(uploadsDir, path.basename(filePath));
 }
@@ -1265,6 +1350,230 @@ function resolvePublicUploadUrl(filePath: string): string {
   baseUrl.search = "";
   baseUrl.hash = "";
   return baseUrl.toString();
+}
+
+function appendStorySequenceCacheBuster(mediaUrl: string, jobId: string, index: number, fileName: string): string {
+  const targetUrl = new URL(mediaUrl);
+  targetUrl.searchParams.set("_su_story_job", jobId);
+  targetUrl.searchParams.set("_su_story_idx", String(index + 1));
+  targetUrl.searchParams.set("_su_story_file", fileName);
+  targetUrl.searchParams.set("_su_story_ts", String(Date.now()));
+  return targetUrl.toString();
+}
+
+function storySequenceFileAudit(filePath: string): { fileName: string; fingerprint: string } {
+  const normalizedPath = filePath.trim();
+  const fileName = path.basename(normalizedPath) || normalizedPath;
+
+  if (/^https?:\/\//i.test(normalizedPath)) {
+    return {
+      fileName,
+      fingerprint: `url:${normalizedPath}`,
+    };
+  }
+
+  try {
+    const absolutePath = resolveUploadFilePath(normalizedPath);
+    const fileBuffer = readFileSync(absolutePath);
+    const fingerprint = createHash("sha256").update(fileBuffer).digest("hex");
+    return {
+      fileName,
+      fingerprint,
+    };
+  } catch {
+    return {
+      fileName,
+      fingerprint: `path:${normalizedPath}`,
+    };
+  }
+}
+
+async function executeInstagramJobWithResolvedMediaBundle(
+  connection: {
+    id: string;
+    loginIdentifier: string | null;
+    secretCipher: string | null;
+  },
+  job: {
+    id: string;
+    companyId?: string;
+    filePath: string;
+    caption: string | null;
+    locationName: string | null;
+    publicationType?: string | null;
+    postStory?: boolean;
+    postReel?: boolean;
+    postWhatsapp?: boolean;
+  },
+): Promise<void> {
+  const normalizedPublicationType = normalizePublicationType(job);
+  if (!isInstagramPublication(normalizedPublicationType)) {
+    throw new Error(`UNSUPPORTED_SERVER_PUBLICATION_TYPE:${normalizedPublicationType}`);
+  }
+
+  const mediaBundle = decodeJobMediaBundleStorage(job.filePath);
+  const mediaFiles = mediaBundle.files.length > 0
+    ? mediaBundle.files
+    : (job.filePath?.trim() ? [job.filePath.trim()] : []);
+
+  if (mediaFiles.length === 0) {
+    throw new Error("INSTAGRAM_GRAPH_MEDIA_URL_INVALID");
+  }
+
+  const locationMetadata = decodeInstagramLocationStorage(job.locationName);
+  if (normalizedPublicationType === "instagram_post" && mediaFiles.length > 1) {
+    if (!mediaBundle.sequential) {
+      throw new Error("INSTAGRAM_CAROUSEL_REQUIRES_SEQUENTIAL_FLAG");
+    }
+
+    const mediaUrls = mediaFiles.map((filePath) => resolvePublicUploadUrl(filePath));
+    await executeInstagramCarouselJobWithGraphApi(
+      {
+        id: connection.id,
+        loginIdentifier: connection.loginIdentifier,
+        secretCipher: connection.secretCipher,
+      },
+      {
+        id: job.id,
+        caption: job.caption,
+        locationName: locationMetadata.locationName,
+        locationId: locationMetadata.locationId,
+      },
+      mediaUrls,
+    );
+    return;
+  }
+
+  if (normalizedPublicationType === "instagram_story" && mediaFiles.length > 1) {
+    if (!mediaBundle.sequential) {
+      throw new Error("INSTAGRAM_STORY_SEQUENCE_REQUIRES_SEQUENTIAL_FLAG");
+    }
+
+    const createdStoryIds = new Set<string>();
+    const publishedStoryIds = new Set<string>();
+    for (const [index, filePath] of mediaFiles.entries()) {
+      const audit = storySequenceFileAudit(filePath);
+      const mediaUrl = appendStorySequenceCacheBuster(
+        resolvePublicUploadUrl(filePath),
+        job.id,
+        index,
+        audit.fileName,
+      );
+      let published: {
+        creationId: string;
+        publishedMediaId: string;
+      };
+      try {
+        published = await executeInstagramJobWithGraphApi(
+          {
+            id: connection.id,
+            loginIdentifier: connection.loginIdentifier,
+            secretCipher: connection.secretCipher,
+          },
+          {
+            id: job.id,
+            publicationType: normalizedPublicationType,
+            caption: job.caption,
+            locationName: locationMetadata.locationName,
+            locationId: locationMetadata.locationId,
+          },
+          mediaUrl,
+        );
+      } catch (sequenceStepError) {
+        const stepMessage = sequenceStepError instanceof Error
+          ? sequenceStepError.message
+          : "INSTAGRAM_STORY_SEQUENCE_STEP_FAILED";
+        if (isInstagramLoginRequiredErrorMessage(stepMessage)) {
+          throw new Error(
+            `LOGIN_REQUIRED_INSTAGRAM:STORY_SEQUENCE_PUBLISHED_COUNT=${publishedStoryIds.size};` +
+              `STEP=${index + 1};TOTAL=${mediaFiles.length};DETAIL=${stepMessage}`,
+          );
+        }
+        throw new Error(
+          `INSTAGRAM_STORY_SEQUENCE_STEP_FAILED:STORY_SEQUENCE_PUBLISHED_COUNT=${publishedStoryIds.size};` +
+            `STEP=${index + 1};TOTAL=${mediaFiles.length};DETAIL=${stepMessage}`,
+        );
+      }
+
+      const creationId = published.creationId?.trim() || "";
+      if (creationId) {
+        if (createdStoryIds.has(creationId)) {
+          throw new Error("INSTAGRAM_STORY_SEQUENCE_DUPLICATE_CREATION_ID");
+        }
+        createdStoryIds.add(creationId);
+      }
+
+      const publishedMediaId = published.publishedMediaId?.trim() || "";
+      if (publishedMediaId) {
+        if (publishedStoryIds.has(publishedMediaId)) {
+          throw new Error("INSTAGRAM_STORY_SEQUENCE_DUPLICATE_PUBLISH_ID");
+        }
+        publishedStoryIds.add(publishedMediaId);
+      }
+
+      if (job.companyId) {
+        await appendLog({
+          companyId: job.companyId,
+          level: "INFO",
+          message:
+            `Job ${job.id} story ${index + 1}/${mediaFiles.length} publicado em sequência. ` +
+            `arquivo=${audit.fileName} mediaId=${publishedMediaId || "indisponivel"} ` +
+            `hash=${audit.fingerprint.slice(0, 12)}.`,
+        });
+      }
+
+      if (index < mediaFiles.length - 1 && INSTAGRAM_STORY_SEQUENCE_STEP_DELAY_MS > 0) {
+        await new Promise((resolve) => setTimeout(resolve, INSTAGRAM_STORY_SEQUENCE_STEP_DELAY_MS));
+      }
+    }
+    return;
+  }
+
+  const mediaUrl = resolvePublicUploadUrl(mediaFiles[0]!);
+  await executeInstagramJobWithGraphApi(
+    {
+      id: connection.id,
+      loginIdentifier: connection.loginIdentifier,
+      secretCipher: connection.secretCipher,
+    },
+    {
+      id: job.id,
+      publicationType: normalizedPublicationType,
+      caption: job.caption,
+      locationName: locationMetadata.locationName,
+      locationId: locationMetadata.locationId,
+    },
+    mediaUrl,
+  );
+}
+
+function isSequentialStoryJob(input: {
+  filePath: string;
+  publicationType?: string | null;
+  postStory?: boolean;
+  postReel?: boolean;
+  postWhatsapp?: boolean;
+}): boolean {
+  if (normalizePublicationType(input) !== "instagram_story") {
+    return false;
+  }
+
+  const mediaBundle = decodeJobMediaBundleStorage(input.filePath);
+  const mediaFiles = mediaBundle.files.length > 0
+    ? mediaBundle.files
+    : (input.filePath?.trim() ? [input.filePath.trim()] : []);
+
+  return mediaBundle.sequential && mediaFiles.length > 1;
+}
+
+function parseSequentialStoryPublishedCountFromError(message: string): number | null {
+  const match = message.match(/STORY_SEQUENCE_PUBLISHED_COUNT=(\d+)/);
+  if (!match || !match[1]) {
+    return null;
+  }
+
+  const parsed = Number.parseInt(match[1], 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
 
 function startServerInstagramJobWorker(): void {
@@ -1331,6 +1640,12 @@ function startServerInstagramJobWorker(): void {
         busyConnections.add(connection.id);
 
         void (async () => {
+          const effectiveConnection = {
+            id: connection.id,
+            loginIdentifier: connection.loginIdentifier,
+            secretCipher: connection.secretCipher,
+          };
+
           try {
             await appendLog({
               companyId: job.companyId,
@@ -1338,29 +1653,88 @@ function startServerInstagramJobWorker(): void {
               message: `Job ${job.id} iniciado pelo worker interno da unidade.`,
             });
 
-            const normalizedPublicationType = normalizePublicationType(job);
-            const mediaUrl = resolvePublicUploadUrl(job.filePath);
+            const refreshStartedAtMs = Date.now();
+            if (shouldAttemptProactiveInstagramTokenRefresh(connection.id, refreshStartedAtMs)) {
+              markProactiveInstagramTokenRefreshAttempt(connection.id, refreshStartedAtMs);
 
-            if (!isInstagramPublication(normalizedPublicationType)) {
-              throw new Error(`UNSUPPORTED_SERVER_PUBLICATION_TYPE:${normalizedPublicationType}`);
+              try {
+                const refreshed = await refreshInstagramAccessTokenForConnection({
+                  secretCipher: effectiveConnection.secretCipher,
+                });
+                const refreshedSecretCipher = encodeSecret(refreshed.accessToken);
+                if (refreshedSecretCipher) {
+                  effectiveConnection.secretCipher = refreshedSecretCipher;
+                  const refreshedAt = new Date();
+
+                  await prisma.socialConnection.update({
+                    where: { id: connection.id },
+                    data: {
+                      secretCipher: refreshedSecretCipher,
+                      authStatus: "CONNECTED",
+                      lastSeenAt: refreshedAt,
+                    },
+                  });
+
+                  await appendLog({
+                    companyId: job.companyId,
+                    level: "INFO",
+                    message:
+                      `Token da conta ${connection.displayName} foi renovado automaticamente antes da execução do job ${job.id}.`,
+                  });
+                }
+              } catch (proactiveRefreshError) {
+                const proactiveRefreshMessage = proactiveRefreshError instanceof Error
+                  ? proactiveRefreshError.message
+                  : "INSTAGRAM_GRAPH_TOKEN_REFRESH_FAILED";
+                const proactiveRefreshRequiresLogin = isInstagramLoginRequiredErrorMessage(proactiveRefreshMessage);
+
+                if (proactiveRefreshRequiresLogin) {
+                  await prisma.job.update({
+                    where: { id: job.id },
+                    data: {
+                      status: "WAITING_LOGIN",
+                      lastError: "Aguardando autenticacao do Instagram.",
+                    },
+                  });
+
+                  await prisma.socialConnection.update({
+                    where: { id: connection.id },
+                    data: {
+                      authStatus: "AUTH_REQUIRED",
+                      secretCipher: null,
+                      lastAuthAt: null,
+                      authLaunchUrl: null,
+                      lastSeenAt: null,
+                    },
+                  });
+
+                  await appendLog({
+                    companyId: job.companyId,
+                    level: "WARN",
+                    errorCode: "LOGIN_REQUIRED_INSTAGRAM",
+                    message:
+                      `Job ${job.id} aguardando novo login antes da execução: ${proactiveRefreshMessage}`,
+                  });
+
+                  await appendJobAvisoSafely(job, {
+                    title: "Aguardando autenticacao",
+                    kind: "JOB_WAITING_LOGIN",
+                    message: "A conta do Instagram precisa ser autenticada para continuar.",
+                  });
+                  return;
+                }
+
+                await appendLog({
+                  companyId: job.companyId,
+                  level: "WARN",
+                  errorCode: "INSTAGRAM_TOKEN_REFRESH_PRECHECK_FAILED",
+                  message:
+                    `Falha ao renovar token antes do job ${job.id}. Continuando com o token atual. Erro: ${proactiveRefreshMessage}`,
+                });
+              }
             }
 
-            const locationMetadata = decodeInstagramLocationStorage(job.locationName);
-            await executeInstagramJobWithGraphApi(
-              {
-                id: connection.id,
-                loginIdentifier: connection.loginIdentifier,
-                secretCipher: connection.secretCipher,
-              },
-              {
-                id: job.id,
-                publicationType: normalizedPublicationType,
-                caption: job.caption,
-                locationName: locationMetadata.locationName,
-                locationId: locationMetadata.locationId,
-              },
-              mediaUrl,
-            );
+            await executeInstagramJobWithResolvedMediaBundle(effectiveConnection, job);
 
             await prisma.job.update({
               where: { id: job.id },
@@ -1383,11 +1757,150 @@ function startServerInstagramJobWorker(): void {
               message: "Publicacao concluida com sucesso.",
             });
           } catch (error) {
-            const message = error instanceof Error ? error.message : "Erro desconhecido no worker interno.";
-            const waitingLogin = message === "LOGIN_REQUIRED_INSTAGRAM";
+            let message = error instanceof Error ? error.message : "Erro desconhecido no worker interno.";
+            let waitingLogin = isInstagramLoginRequiredErrorMessage(message);
+            const sequentialStoryJob = isSequentialStoryJob(job);
+            const publishedCountBeforeFailure = sequentialStoryJob
+              ? parseSequentialStoryPublishedCountFromError(message)
+              : null;
+            const canRetrySequentialStoryFromStart = sequentialStoryJob && publishedCountBeforeFailure === 0;
+
+            if (waitingLogin && !sequentialStoryJob) {
+              try {
+                const refreshed = await refreshInstagramAccessTokenForConnection({
+                  secretCipher: effectiveConnection.secretCipher,
+                });
+                const refreshedSecretCipher = encodeSecret(refreshed.accessToken);
+                const refreshedAt = new Date();
+                effectiveConnection.secretCipher = refreshedSecretCipher;
+                await prisma.socialConnection.update({
+                  where: { id: connection.id },
+                  data: {
+                    secretCipher: refreshedSecretCipher,
+                    authStatus: "CONNECTED",
+                    lastSeenAt: refreshedAt,
+                  },
+                });
+
+                await appendLog({
+                  companyId: job.companyId,
+                  level: "INFO",
+                  message:
+                    `Token da conta ${connection.displayName} foi renovado automaticamente. ` +
+                    "Retentando publicação sem exigir novo login.",
+                });
+
+                await executeInstagramJobWithResolvedMediaBundle(effectiveConnection, job);
+
+                await prisma.job.update({
+                  where: { id: job.id },
+                  data: {
+                    status: "COMPLETED",
+                    completedAt: new Date(),
+                    lastError: null,
+                  },
+                });
+
+                await appendLog({
+                  companyId: job.companyId,
+                  level: "INFO",
+                  message: `Job ${job.id} concluido após renovacao automatica do token.`,
+                });
+
+                await appendJobAvisoSafely(job, {
+                  title: "Postagem enviada",
+                  kind: "JOB_SENT",
+                  message: "Publicacao concluida com sucesso.",
+                  });
+                return;
+              } catch (refreshError) {
+                message = refreshError instanceof Error ? refreshError.message : message;
+                waitingLogin = isInstagramLoginRequiredErrorMessage(message);
+              }
+            } else if (waitingLogin && sequentialStoryJob) {
+              try {
+                const refreshed = await refreshInstagramAccessTokenForConnection({
+                  secretCipher: effectiveConnection.secretCipher,
+                });
+                const refreshedSecretCipher = encodeSecret(refreshed.accessToken);
+                const refreshedAt = new Date();
+                effectiveConnection.secretCipher = refreshedSecretCipher;
+                await prisma.socialConnection.update({
+                  where: { id: connection.id },
+                  data: {
+                    secretCipher: refreshedSecretCipher,
+                    authStatus: "CONNECTED",
+                    lastSeenAt: refreshedAt,
+                  },
+                });
+
+                if (canRetrySequentialStoryFromStart) {
+                  await appendLog({
+                    companyId: job.companyId,
+                    level: "INFO",
+                    message:
+                      `Token da conta ${connection.displayName} foi renovado automaticamente. ` +
+                      "Retentando stories em sequência sem exigir novo login.",
+                  });
+
+                  await executeInstagramJobWithResolvedMediaBundle(effectiveConnection, job);
+
+                  await prisma.job.update({
+                    where: { id: job.id },
+                    data: {
+                      status: "COMPLETED",
+                      completedAt: new Date(),
+                      lastError: null,
+                    },
+                  });
+
+                  await appendLog({
+                    companyId: job.companyId,
+                    level: "INFO",
+                    message: `Job ${job.id} concluido após renovacao automatica do token.`,
+                  });
+
+                  await appendJobAvisoSafely(job, {
+                    title: "Postagem enviada",
+                    kind: "JOB_SENT",
+                    message: "Publicacao concluida com sucesso.",
+                  });
+                  return;
+                }
+
+                waitingLogin = false;
+                message = "INSTAGRAM_STORY_SEQUENCE_INTERRUPTED_TOKEN_REFRESHED";
+
+                await appendLog({
+                  companyId: job.companyId,
+                  level: "WARN",
+                  errorCode: "INSTAGRAM_STORY_SEQUENCE_INTERRUPTED",
+                  message:
+                    `Job ${job.id} (stories em sequência) foi interrompido para evitar duplicação. ` +
+                    "Token renovado automaticamente; reenfileire manualmente se quiser continuar.",
+                });
+              } catch (refreshError) {
+                message = refreshError instanceof Error ? refreshError.message : message;
+                waitingLogin = isInstagramLoginRequiredErrorMessage(message);
+
+                await appendLog({
+                  companyId: job.companyId,
+                  level: "WARN",
+                  errorCode: "INSTAGRAM_STORY_SEQUENCE_WAITING_LOGIN",
+                  message:
+                    canRetrySequentialStoryFromStart
+                      ? `Job ${job.id} (stories em sequência) falhou antes do primeiro item, mas não foi possível renovar/reexecutar automaticamente. ` +
+                        "Será necessário autenticar e reenfileirar manualmente."
+                      : `Job ${job.id} (stories em sequência) não foi retentado automaticamente para evitar duplicação. ` +
+                        "Será necessário autenticar e reenfileirar manualmente.",
+                });
+              }
+            }
+
             const errorCode = normalizeAutomationErrorCode(message);
             const attemptNumber = job.tentativas + 1;
             const shouldAutoRetry =
+              !sequentialStoryJob &&
               !waitingLogin &&
               isInstagramTransientExecutionError(message) &&
               attemptNumber < INSTAGRAM_WORKER_AUTO_RETRY_MAX_ATTEMPTS;
@@ -1423,7 +1936,9 @@ function startServerInstagramJobWorker(): void {
                 status: waitingLogin ? "WAITING_LOGIN" : "FAILED",
                 lastError: waitingLogin
                   ? "Aguardando autenticacao do Instagram."
-                  : message,
+                  : sequentialStoryJob
+                    ? `${message} (Sequência de stories interrompida; sem retentativa automática para evitar duplicação.)`
+                    : message,
               },
             });
 
@@ -1432,6 +1947,10 @@ function startServerInstagramJobWorker(): void {
                 where: { id: connection.id },
                 data: {
                   authStatus: "AUTH_REQUIRED",
+                  secretCipher: null,
+                  lastAuthAt: null,
+                  authLaunchUrl: null,
+                  lastSeenAt: null,
                 },
               });
             }
@@ -1469,6 +1988,96 @@ function startServerInstagramJobWorker(): void {
   setInterval(() => {
     void tick();
   }, 10_000);
+}
+
+function startInstagramTokenKeepAliveWorker(): void {
+  const tick = async () => {
+    try {
+      const nowMs = Date.now();
+      const candidates = await prisma.socialConnection.findMany({
+        where: {
+          platform: "instagram",
+          authStatus: "CONNECTED",
+          secretCipher: {
+            not: null,
+          },
+        },
+        orderBy: {
+          updatedAt: "asc",
+        },
+        take: INSTAGRAM_TOKEN_KEEPALIVE_BATCH_SIZE,
+      });
+
+      for (const connection of candidates) {
+        if (busyConnections.has(connection.id) || !shouldAttemptProactiveInstagramTokenRefresh(connection.id, nowMs)) {
+          continue;
+        }
+
+        markProactiveInstagramTokenRefreshAttempt(connection.id, nowMs);
+
+        try {
+          const refreshed = await refreshInstagramAccessTokenForConnection({
+            secretCipher: connection.secretCipher,
+          });
+          const refreshedSecretCipher = encodeSecret(refreshed.accessToken);
+          if (!refreshedSecretCipher) {
+            continue;
+          }
+
+          await prisma.socialConnection.update({
+            where: { id: connection.id },
+            data: {
+              secretCipher: refreshedSecretCipher,
+              authStatus: "CONNECTED",
+              lastSeenAt: new Date(),
+            },
+          });
+        } catch (refreshError) {
+          const message = refreshError instanceof Error ? refreshError.message : "INSTAGRAM_GRAPH_TOKEN_REFRESH_FAILED";
+          if (!isInstagramLoginRequiredErrorMessage(message)) {
+            await appendLog({
+              companyId: connection.companyId,
+              level: "WARN",
+              errorCode: "INSTAGRAM_TOKEN_KEEPALIVE_REFRESH_FAILED",
+              message:
+                `Keep-alive do token Instagram falhou para ${connection.displayName}. ` +
+                `Tentará novamente no próximo ciclo. Erro: ${message}`,
+            });
+            continue;
+          }
+
+          await prisma.socialConnection.update({
+            where: { id: connection.id },
+            data: {
+              authStatus: "AUTH_REQUIRED",
+              secretCipher: null,
+              lastAuthAt: null,
+              authLaunchUrl: null,
+              lastSeenAt: null,
+            },
+          });
+
+          await appendLog({
+            companyId: connection.companyId,
+            level: "WARN",
+            errorCode: "LOGIN_REQUIRED_INSTAGRAM",
+            message:
+              `Sessão Instagram da conta ${connection.displayName} foi invalidada pela Meta e a conexão foi desconectada automaticamente. ` +
+              "Será necessário abrir login novamente.",
+          });
+
+          await appendInstagramAuthRequiredAvisosForConnection(connection.id);
+        }
+      }
+    } catch (error) {
+      console.error("Instagram token keep-alive worker error", error);
+    }
+  };
+
+  void tick();
+  setInterval(() => {
+    void tick();
+  }, INSTAGRAM_TOKEN_KEEPALIVE_INTERVAL_MS);
 }
 
 function startServerWhatsappJobWorker(): void {
@@ -1951,7 +2560,7 @@ app.get("/oauth/instagram/callback", async (request, response) => {
 });
 
 app.use(
-  ["/organizations", "/companies", "/connections", "/upload", "/jobs", "/dashboard", "/logs", "/avisos", "/instagram-location-catalog"],
+  ["/organizations", "/companies", "/connections", "/upload", "/jobs", "/dashboard", "/logs", "/avisos"],
   adminAuthMiddleware,
 );
 
@@ -1998,7 +2607,7 @@ app.get("/connections/:id/instagram-location-candidates", async (request, respon
     });
   } catch (error) {
     const message = error instanceof Error && error.message ? error.message : "Falha ao listar localizações da conta.";
-    if (message === "LOGIN_REQUIRED_INSTAGRAM") {
+    if (isInstagramLoginRequiredErrorMessage(message)) {
       response.status(400).json({ error: "Conta do Instagram exige nova autenticação para listar location_id." });
       return;
     }
@@ -2388,16 +2997,22 @@ app.delete("/upload", async (request, response) => {
     return;
   }
 
-  const referencedJobs = await prisma.job.findMany({
-    where: {
-      filePath: normalizedFilePath,
-    },
+  const candidateJobs = await prisma.job.findMany({
     select: {
       id: true,
       companyId: true,
       createdByUserId: true,
       status: true,
+      filePath: true,
     },
+  });
+
+  const referencedJobs = candidateJobs.filter((job) => {
+    const mediaBundle = decodeJobMediaBundleStorage(job.filePath);
+    const mediaFiles = mediaBundle.files.length > 0
+      ? mediaBundle.files
+      : (job.filePath?.trim() ? [job.filePath.trim()] : []);
+    return mediaFiles.includes(normalizedFilePath);
   });
 
   if (referencedJobs.length === 0) {
@@ -2433,26 +3048,28 @@ app.delete("/upload", async (request, response) => {
     }
   }
 
-  if (isRootUser(authRequest)) {
-    await prisma.job.updateMany({
-      where: {
-        filePath: normalizedFilePath,
-      },
-      data: {
-        filePath: "",
-      },
-    });
-  } else {
-    await prisma.job.updateMany({
-      where: {
-        filePath: normalizedFilePath,
-        createdByUserId: authRequest.adminUser?.id,
-      },
-      data: {
-        filePath: "",
-      },
-    });
-  }
+  await Promise.all(
+    referencedJobs.map(async (job) => {
+      const mediaBundle = decodeJobMediaBundleStorage(job.filePath);
+      const currentFiles = mediaBundle.files.length > 0
+        ? mediaBundle.files
+        : (job.filePath?.trim() ? [job.filePath.trim()] : []);
+      const nextFiles = currentFiles.filter((entry) => entry !== normalizedFilePath);
+      const nextFilePath = nextFiles.length > 0
+        ? encodeJobMediaBundleStorage({
+            files: nextFiles,
+            sequential: mediaBundle.sequential && nextFiles.length > 1,
+          })
+        : "";
+
+      await prisma.job.update({
+        where: { id: job.id },
+        data: {
+          filePath: nextFilePath,
+        },
+      });
+    }),
+  );
 
   const companyIds = Array.from(new Set(referencedJobs.map((job) => job.companyId)));
   await Promise.all(
@@ -2464,119 +3081,6 @@ app.delete("/upload", async (request, response) => {
       }),
     ),
   );
-
-  response.status(204).send();
-});
-
-app.get("/instagram-location-catalog", async (request, response) => {
-  const query = instagramLocationCatalogListQuerySchema.parse(request.query);
-  const normalizedQuery = normalizeSearchText(query.query);
-  const skip = (query.page - 1) * query.pageSize;
-
-  const where = normalizedQuery
-    ? {
-        OR: [
-          { normalizedName: { contains: normalizedQuery } },
-          { locationId: { contains: normalizedQuery } },
-        ],
-      }
-    : undefined;
-
-  const [items, total] = await Promise.all([
-    prisma.instagramLocationCatalog.findMany({
-      where,
-      orderBy: [{ updatedAt: "desc" }, { name: "asc" }],
-      skip,
-      take: query.pageSize,
-      select: {
-        id: true,
-        locationId: true,
-        name: true,
-        source: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-    }),
-    prisma.instagramLocationCatalog.count({ where }),
-  ]);
-
-  const totalPages = Math.max(1, Math.ceil(total / query.pageSize));
-
-  response.json({
-    items: items.map((item) => ({
-      id: item.id,
-      locationId: item.locationId,
-      name: item.name,
-      source: item.source,
-      createdAt: item.createdAt,
-      updatedAt: item.updatedAt,
-    })),
-    page: query.page,
-    pageSize: query.pageSize,
-    total,
-    totalPages,
-  });
-});
-
-app.post("/instagram-location-catalog", async (request, response) => {
-  const authRequest = request as Request & { adminUser?: AdminUserAuth };
-  if (!isRootUser(authRequest)) {
-    response.status(403).json({ error: "Apenas o usuário root pode cadastrar localizações no catálogo." });
-    return;
-  }
-
-  const payload = createInstagramLocationCatalogSchema.parse(request.body);
-
-  const item = await prisma.instagramLocationCatalog.upsert({
-    where: {
-      locationId: payload.locationId,
-    },
-    update: {
-      name: payload.name,
-      normalizedName: normalizeSearchText(payload.name),
-      source: "MANUAL",
-      createdByUserId: authRequest.adminUser!.id,
-    },
-    create: {
-      locationId: payload.locationId,
-      name: payload.name,
-      normalizedName: normalizeSearchText(payload.name),
-      source: "MANUAL",
-      createdByUserId: authRequest.adminUser!.id,
-    },
-    select: {
-      id: true,
-      locationId: true,
-      name: true,
-      source: true,
-      createdAt: true,
-      updatedAt: true,
-    },
-  });
-
-  response.status(201).json(item);
-});
-
-app.delete("/instagram-location-catalog/:id", async (request, response) => {
-  const authRequest = request as Request & { adminUser?: AdminUserAuth };
-  if (!isRootUser(authRequest)) {
-    response.status(403).json({ error: "Apenas o usuário root pode excluir localizações do catálogo." });
-    return;
-  }
-
-  const existing = await prisma.instagramLocationCatalog.findUnique({
-    where: { id: request.params.id },
-    select: { id: true },
-  });
-
-  if (!existing) {
-    response.status(404).json({ error: "Localização não encontrada no catálogo." });
-    return;
-  }
-
-  await prisma.instagramLocationCatalog.delete({
-    where: { id: request.params.id },
-  });
 
   response.status(204).send();
 });
@@ -2607,11 +3111,6 @@ app.get("/jobs/instagram-location-suggestions", async (request, response) => {
   }
 
   const queryVariants = buildInstagramLocationQueryVariants(payload.query);
-  const localItemsByVariant = await Promise.all(
-    queryVariants.map((variant) => searchInstagramLocationCatalog(variant, payload.limit)),
-  );
-  const localItems = dedupeInstagramLocationSuggestions(localItemsByVariant.flat(), payload.limit);
-
   const pushUniqueError = (bucket: string[], error: unknown, fallbackCode: string) => {
     const message = error instanceof Error && error.message ? error.message : fallbackCode;
     if (!bucket.includes(message)) {
@@ -2642,34 +3141,10 @@ app.get("/jobs/instagram-location-suggestions", async (request, response) => {
     }
   }
 
-  if (metaItems.length > 0) {
-    await upsertInstagramLocationCatalogEntries({
-      entries: metaItems,
-      source: "META_SYNC",
-    });
-
-    if (connection.secretCipher && connection.authStatus !== "CONNECTED") {
-      await prisma.socialConnection.update({
-        where: { id: connection.id },
-        data: {
-          authStatus: "CONNECTED",
-          lastSeenAt: new Date(),
-        },
-      });
-    }
-  }
-
-  const mergedItems = dedupeInstagramLocationSuggestions(
-    [...localItems, ...metaItems],
-    payload.limit,
-  );
+  const mergedItems = dedupeInstagramLocationSuggestions(metaItems, payload.limit);
 
   let warning: string | undefined;
-  if (mergedItems.length > 0) {
-    if (metaItems.length === 0 && localItems.length > 0 && metaErrors.length > 0) {
-      warning = "Mostrando localizações salvas no catálogo local.";
-    }
-  } else if (metaErrors.length > 0) {
+  if (mergedItems.length === 0 && metaErrors.length > 0) {
     warning = "Não foi possível carregar sugestões agora. Você pode publicar sem localização.";
   }
 
@@ -2692,11 +3167,15 @@ app.get("/jobs", async (request, response) => {
   response.json(
     jobs.map((job) => {
       const locationMetadata = decodeInstagramLocationStorage(job.locationName);
+      const mediaBundle = decodeJobMediaBundleStorage(job.filePath);
       return {
         id: job.id,
         companyId: job.companyId,
         socialConnectionId: job.socialConnectionId,
-        filePath: job.filePath,
+        filePath: mediaBundle.files[0] ?? job.filePath,
+        filePaths: mediaBundle.files,
+        sequential: mediaBundle.sequential,
+        title: job.title,
         caption: job.caption,
         locationName: locationMetadata.locationName,
         locationId: locationMetadata.locationId,
@@ -2722,7 +3201,12 @@ app.post("/jobs", async (request, response) => {
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
   await ensureMatchingConnection(payload);
   const legacyFields = deriveLegacyJobFields(payload.publicationType);
-  const filePath = ensureFilePathForPublication(payload.publicationType, payload.filePath);
+  const filePath = ensureFilePathForPublication(
+    payload.publicationType,
+    payload.filePath,
+    payload.filePaths,
+    payload.sequential,
+  );
   const resolvedLocation = await resolveAutomaticInstagramLocation({
     publicationType: payload.publicationType,
     socialConnectionId: payload.socialConnectionId,
@@ -2735,12 +3219,14 @@ app.post("/jobs", async (request, response) => {
     resolvedLocation.locationName,
     resolvedLocation.locationId,
   );
+  const normalizedTitle = normalizeJobTitle(payload.title);
   const job = await prisma.job.create({
     data: {
       companyId: payload.companyId,
       createdByUserId: authRequest.adminUser!.id,
       socialConnectionId: payload.socialConnectionId,
       filePath,
+      title: normalizedTitle,
       caption: metadata.caption,
       locationName: metadata.locationName,
       publicationType: payload.publicationType,
@@ -2751,19 +3237,6 @@ app.post("/jobs", async (request, response) => {
       dataPostagem: new Date(payload.dataPostagem),
     },
   });
-
-  if (isInstagramPublication(payload.publicationType)) {
-    const selectedLocation = decodeInstagramLocationStorage(metadata.locationName);
-    const locationId = selectedLocation.locationId?.trim() || "";
-    const locationName = selectedLocation.locationName?.trim() || "";
-    if (/^\d+$/.test(locationId) && locationName) {
-      await upsertInstagramLocationCatalogEntries({
-        entries: [{ id: locationId, name: locationName }],
-        source: "JOB_SELECTION",
-        createdByUserId: authRequest.adminUser?.id ?? null,
-      });
-    }
-  }
 
   await appendLog({
     companyId: payload.companyId,
@@ -2778,7 +3251,12 @@ app.put("/jobs/:id", async (request, response) => {
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
   await ensureMatchingConnection(payload);
   const legacyFields = deriveLegacyJobFields(payload.publicationType);
-  const filePath = ensureFilePathForPublication(payload.publicationType, payload.filePath);
+  const filePath = ensureFilePathForPublication(
+    payload.publicationType,
+    payload.filePath,
+    payload.filePaths,
+    payload.sequential,
+  );
   const resolvedLocation = await resolveAutomaticInstagramLocation({
     publicationType: payload.publicationType,
     socialConnectionId: payload.socialConnectionId,
@@ -2791,6 +3269,7 @@ app.put("/jobs/:id", async (request, response) => {
     resolvedLocation.locationName,
     resolvedLocation.locationId,
   );
+  const normalizedTitle = normalizeJobTitle(payload.title);
   const existingJob = await prisma.job.findUnique({ where: { id: request.params.id } });
 
   if (!existingJob) {
@@ -2809,6 +3288,7 @@ app.put("/jobs/:id", async (request, response) => {
       companyId: payload.companyId,
       socialConnectionId: payload.socialConnectionId,
       filePath,
+      title: normalizedTitle,
       caption: metadata.caption,
       locationName: metadata.locationName,
       publicationType: payload.publicationType,
@@ -2818,24 +3298,12 @@ app.put("/jobs/:id", async (request, response) => {
       modoWhatsapp: legacyFields.modoWhatsapp,
       dataPostagem: new Date(payload.dataPostagem),
       status: "PENDING",
+      tentativas: 0,
       startedAt: null,
       completedAt: null,
       lastError: null,
     },
   });
-
-  if (isInstagramPublication(payload.publicationType)) {
-    const selectedLocation = decodeInstagramLocationStorage(metadata.locationName);
-    const locationId = selectedLocation.locationId?.trim() || "";
-    const locationName = selectedLocation.locationName?.trim() || "";
-    if (/^\d+$/.test(locationId) && locationName) {
-      await upsertInstagramLocationCatalogEntries({
-        entries: [{ id: locationId, name: locationName }],
-        source: "JOB_SELECTION",
-        createdByUserId: authRequest.adminUser?.id ?? null,
-      });
-    }
-  }
 
   await appendLog({
     companyId: payload.companyId,
@@ -2864,6 +3332,7 @@ app.post("/jobs/:id/retry", async (request, response) => {
     where: { id: request.params.id },
     data: {
       status: "PENDING",
+      tentativas: 0,
       startedAt: null,
       completedAt: null,
       lastError: null,
@@ -3174,11 +3643,6 @@ app.post("/avisos/broadcast", async (request, response) => {
   const payload = createBroadcastAvisoSchema.parse(request.body);
 
   const recipients = await prisma.user.findMany({
-    where: {
-      username: {
-        not: "root",
-      },
-    },
     select: {
       id: true,
     },
@@ -3215,6 +3679,7 @@ app.use((error: unknown, _request: Request, response: Response, _next: NextFunct
 const port = Number(process.env.PORT ?? 4000);
 
 startServerInstagramJobWorker();
+startInstagramTokenKeepAliveWorker();
 startServerWhatsappJobWorker();
 
 app.listen(port, () => {

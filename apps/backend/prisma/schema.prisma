@@ -26,7 +26,6 @@ model User {
   jobs           Job[]
   receivedAvisos Aviso[]  @relation("AvisoRecipient")
   createdAvisos  Aviso[]  @relation("AvisoCreator")
-  createdInstagramLocations InstagramLocationCatalog[] @relation("InstagramLocationCatalogCreator")
 }
 
 model SetupInvite {
@@ -54,6 +53,7 @@ model Job {
   createdByUserId String?
   socialConnectionId String?
   filePath     String
+  title        String?
   caption      String?
   locationName String?
   publicationType String @default("instagram_reel")
@@ -143,20 +143,4 @@ model Aviso {
   @@index([userId, readAt])
   @@index([userId, createdAt])
   @@map("avisos")
-}
-
-model InstagramLocationCatalog {
-  id              String    @id @default(cuid())
-  locationId      String    @unique
-  name            String
-  normalizedName  String
-  source          String    @default("MANUAL")
-  createdByUserId String?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-  createdBy       User?     @relation("InstagramLocationCatalogCreator", fields: [createdByUserId], references: [id], onDelete: SetNull)
-
-  @@index([normalizedName])
-  @@index([updatedAt])
-  @@map("instagram_location_catalog")
 }
