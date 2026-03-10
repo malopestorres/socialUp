@@ -178,6 +178,18 @@ async function getConnectionIdentity(connectionId: string): Promise<ConnectionId
   });
 }
 
+async function isQrRequestStillActive(connectionId: string): Promise<boolean> {
+  const connection = await prisma.socialConnection.findUnique({
+    where: { id: connectionId },
+    select: {
+      platform: true,
+      authStatus: true,
+    },
+  });
+
+  return Boolean(connection && connection.platform === "whatsapp" && connection.authStatus === "AUTH_IN_PROGRESS");
+}
+
 function getConnectionCredentials(connection: ConnectionIdentity): EvolutionCredentials {
   if (isWhatsappEvolutionHardcodedEnabled()) {
     const apiKey = HARD_CODED_INSTANCE_API_KEY || EVOLUTION_API_KEY;
@@ -732,6 +744,11 @@ export async function requestWhatsappQr(connectionId: string, forceRegenerate: b
     running = true;
 
     try {
+      const stillActive = await isQrRequestStillActive(connectionId);
+      if (!stillActive) {
+        clearQrPoller(connectionId);
+        return;
+      }
       const outcome = await syncQrState(connectionId, credentials);
       if (outcome === "STOP") {
         clearQrPoller(connectionId);

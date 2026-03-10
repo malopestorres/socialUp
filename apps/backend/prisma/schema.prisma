@@ -7,13 +7,6 @@ datasource db {
   url      = "file:./dev.db"
 }
 
-model Organization {
-  id        String    @id @default(cuid())
-  name      String
-  createdAt DateTime  @default(now())
-  companies Company[]
-}
-
 model User {
   id             String   @id @default(cuid())
   name           String
@@ -36,11 +29,9 @@ model SetupInvite {
 }
 
 model Company {
-  id             String          @id @default(cuid())
+  id             String           @id @default(cuid())
   name           String
-  organizationId String
-  createdAt      DateTime        @default(now())
-  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdAt      DateTime         @default(now())
   connections    SocialConnection[]
   jobs           Job[]
   logs           AgentLog[]

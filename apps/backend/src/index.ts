@@ -465,19 +465,14 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
-const createOrganizationSchema = z.object({
-  name: z.string().min(2),
-});
-
 const createCompanySchema = z.object({
   name: z.string().min(2),
-  organizationId: z.string().min(1),
 });
 
 const socialPlatformSchema = z.enum(["instagram", "whatsapp"]);
 
 const createConnectionSchema = z.object({
-  companyId: z.string().min(1),
+  companyId: z.string().trim().min(1, "Perfil é obrigatório."),
   platform: socialPlatformSchema,
   displayName: z.string().min(2).max(80),
   loginIdentifier: z.string().trim().max(160).optional().nullable(),
@@ -488,6 +483,10 @@ const updateConnectionSchema = z.object({
   displayName: z.string().min(2).max(80),
   loginIdentifier: z.string().trim().max(160).optional().nullable(),
   secret: z.string().trim().max(255).optional().nullable(),
+});
+
+const openVisualAuthSchema = z.object({
+  returnToUrl: z.string().trim().url().max(2000).optional().nullable(),
 });
 
 const loginSchema = z.object({
@@ -887,7 +886,7 @@ async function ensureMatchingConnection(input: {
       {
         code: "custom",
         path: ["socialConnectionId"],
-        message: "A conta social precisa pertencer a mesma unidade da postagem.",
+        message: "A conta social precisa pertencer ao mesmo perfil da postagem.",
       },
     ]);
   }
@@ -994,11 +993,74 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
+function buildInstagramOAuthReturnUrl(input: {
+  returnToUrl?: string | null;
+  success: boolean;
+  message: string;
+  connectionId?: string | null;
+}): string | null {
+  const normalizedBaseUrl = (input.returnToUrl || "").trim();
+  if (!normalizedBaseUrl) {
+    return null;
+  }
+
+  try {
+    const url = new URL(normalizedBaseUrl);
+    url.searchParams.set("instagram_oauth", "1");
+    url.searchParams.set("instagram_oauth_success", input.success ? "1" : "0");
+    url.searchParams.set("instagram_oauth_message", input.message);
+    if (input.connectionId) {
+      url.searchParams.set("instagram_oauth_connection_id", input.connectionId);
+    }
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function respondInstagramOAuthResult(
+  response: Response,
+  input: {
+    statusCode: number;
+    success: boolean;
+    message: string;
+    connectionId?: string | null;
+    postMessage?: boolean;
+    returnToUrl?: string | null;
+  },
+): void {
+  const redirectUrl = buildInstagramOAuthReturnUrl({
+    returnToUrl: input.returnToUrl,
+    success: input.success,
+    message: input.message,
+    connectionId: input.connectionId ?? null,
+  });
+
+  if (redirectUrl) {
+    response.redirect(302, redirectUrl);
+    return;
+  }
+
+  response
+    .status(input.statusCode)
+    .setHeader("Content-Type", "text/html; charset=utf-8")
+    .send(
+      renderInstagramOAuthCallbackHtml({
+        success: input.success,
+        message: input.message,
+        connectionId: input.connectionId,
+        postMessage: input.postMessage,
+        returnToUrl: input.returnToUrl,
+      }),
+    );
+}
+
 function renderInstagramOAuthCallbackHtml(input: {
   success: boolean;
   message: string;
   connectionId?: string | null;
   postMessage?: boolean;
+  returnToUrl?: string | null;
 }): string {
   const title = input.success ? "Instagram conectado" : "Falha na autorizacao do Instagram";
   const payload = JSON.stringify({
@@ -1007,11 +1069,18 @@ function renderInstagramOAuthCallbackHtml(input: {
     message: input.message,
     connectionId: input.connectionId ?? null,
   });
+  const panelReturnUrl = buildInstagramOAuthReturnUrl({
+    returnToUrl: input.returnToUrl,
+    success: input.success,
+    message: input.message,
+    connectionId: input.connectionId ?? null,
+  });
   const shouldPostMessage = input.postMessage !== false;
+  const shouldAutoRedirectToPanel = Boolean(panelReturnUrl);
   const toneColor = input.success ? "#166534" : "#9f1239";
   const toneBackground = input.success ? "#ecfdf3" : "#fff1f2";
   const toneBorder = input.success ? "#86efac" : "#fecdd3";
-  const actionLabel = input.success ? "Voltar ao painel" : "Fechar janela";
+  const actionLabel = shouldAutoRedirectToPanel ? "Voltar ao painel" : "Fechar janela";
 
   return `<!doctype html>
 <html lang="pt-BR">
@@ -1095,6 +1164,21 @@ function renderInstagramOAuthCallbackHtml(input: {
     <script>
       (function () {
         var shouldPostMessage = ${shouldPostMessage ? "true" : "false"};
+        var panelReturnUrl = ${JSON.stringify(panelReturnUrl)};
+        var shouldAutoRedirectToPanel = ${shouldAutoRedirectToPanel ? "true" : "false"};
+
+        function goBackToPanel() {
+          if (!panelReturnUrl) {
+            return false;
+          }
+          try {
+            window.location.replace(panelReturnUrl);
+            return true;
+          } catch (_) {
+            return false;
+          }
+        }
+
         if (shouldPostMessage) {
           try {
             if (window.opener && !window.opener.closed) {
@@ -1103,27 +1187,34 @@ function renderInstagramOAuthCallbackHtml(input: {
           } catch (_) {}
         }
         var actionButton = document.getElementById("oauth-action-btn");
-        if (!actionButton) {
-          return;
+        if (actionButton) {
+          actionButton.addEventListener("click", function () {
+            if (goBackToPanel()) {
+              return;
+            }
+            try {
+              if (window.opener && !window.opener.closed) {
+                window.opener.focus();
+              }
+            } catch (_) {}
+
+            try {
+              window.close();
+            } catch (_) {}
+
+            if (!window.closed) {
+              try {
+                window.location.replace("about:blank");
+              } catch (_) {}
+            }
+          });
         }
 
-        actionButton.addEventListener("click", function () {
-          try {
-            if (window.opener && !window.opener.closed) {
-              window.opener.focus();
-            }
-          } catch (_) {}
-
-          try {
-            window.close();
-          } catch (_) {}
-
-          if (!window.closed) {
-            try {
-              window.location.replace("about:blank");
-            } catch (_) {}
-          }
-        });
+        if (shouldAutoRedirectToPanel) {
+          window.setTimeout(function () {
+            goBackToPanel();
+          }, 350);
+        }
       })();
     </script>
   </body>
@@ -1399,7 +1490,7 @@ async function appendInstagramAuthRequiredAvisosForConnection(connectionId: stri
       .map((userId) =>
         appendAviso({
           userId,
-          title: "Aguardando autenticacao",
+          title: "Aguardando autenticação",
           kind: "JOB_WAITING_LOGIN",
           message: "A conta do Instagram precisa ser autenticada para continuar.",
         }),
@@ -1707,12 +1798,12 @@ function startServerInstagramJobWorker(): void {
                 status: "WAITING_LOGIN",
                 startedAt: null,
                 completedAt: null,
-                lastError: "Aguardando autenticacao do Instagram.",
+                lastError: "Aguardando autenticação do Instagram.",
               },
             });
 
             await appendJobAvisoSafely(job, {
-              title: "Aguardando autenticacao",
+              title: "Aguardando autenticação",
               kind: "JOB_WAITING_LOGIN",
               message: "A conta do Instagram precisa ser autenticada para continuar.",
             });
@@ -1757,7 +1848,7 @@ function startServerInstagramJobWorker(): void {
             await appendLog({
               companyId: job.companyId,
               level: "INFO",
-              message: `Job ${job.id} iniciado pelo worker interno da unidade.`,
+              message: `Job ${job.id} iniciado pelo worker interno do perfil.`,
             });
 
             const refreshStartedAtMs = Date.now();
@@ -1800,7 +1891,7 @@ function startServerInstagramJobWorker(): void {
                     where: { id: job.id },
                     data: {
                       status: "WAITING_LOGIN",
-                      lastError: "Aguardando autenticacao do Instagram.",
+                      lastError: "Aguardando autenticação do Instagram.",
                     },
                   });
 
@@ -1824,7 +1915,7 @@ function startServerInstagramJobWorker(): void {
                   });
 
                   await appendJobAvisoSafely(job, {
-                    title: "Aguardando autenticacao",
+                    title: "Aguardando autenticação",
                     kind: "JOB_WAITING_LOGIN",
                     message: "A conta do Instagram precisa ser autenticada para continuar.",
                   });
@@ -2052,7 +2143,7 @@ function startServerInstagramJobWorker(): void {
               data: {
                 status: waitingLogin ? "WAITING_LOGIN" : "FAILED",
                 lastError: waitingLogin
-                  ? "Aguardando autenticacao do Instagram."
+                  ? "Aguardando autenticação do Instagram."
                   : sequentialStoryJob
                     ? `${message} (Sequência de stories interrompida; sem retentativa automática para evitar duplicação.)`
                     : message,
@@ -2081,7 +2172,7 @@ function startServerInstagramJobWorker(): void {
 
             await appendJobAvisoSafely(job, waitingLogin
               ? {
-                  title: "Aguardando autenticacao",
+                  title: "Aguardando autenticação",
                   kind: "JOB_WAITING_LOGIN",
                   message: "A conta do Instagram precisa ser autenticada para continuar.",
                 }
@@ -2298,7 +2389,7 @@ function startServerWhatsappJobWorker(): void {
               data: {
                 status: waitingLogin ? "WAITING_LOGIN" : "FAILED",
                 lastError: waitingLogin
-                  ? "Aguardando autenticacao do WhatsApp."
+                  ? "Aguardando autenticação do WhatsApp."
                   : message,
               },
             });
@@ -2321,7 +2412,7 @@ function startServerWhatsappJobWorker(): void {
 
             await appendJobAvisoSafely(job, waitingLogin
               ? {
-                  title: "Aguardando autenticacao",
+                  title: "Aguardando autenticação",
                   kind: "JOB_WAITING_LOGIN",
                   message: "A conta do WhatsApp precisa ser autenticada para continuar.",
                 }
@@ -2519,18 +2610,14 @@ app.get("/oauth/instagram/callback", async (request, response) => {
 
   if (!state || !consumedState) {
     const looksLikeProcessedRefresh = Boolean(code || oauthError || oauthErrorDescription);
-    response
-      .status(looksLikeProcessedRefresh ? 200 : 400)
-      .setHeader("Content-Type", "text/html; charset=utf-8")
-      .send(
-        renderInstagramOAuthCallbackHtml({
-          success: looksLikeProcessedRefresh,
-          postMessage: false,
-          message: looksLikeProcessedRefresh
-            ? "Autorização já processada nesta janela."
-            : "A autorização expirou ou não é válida. Gere um novo login no painel.",
-        }),
-      );
+    respondInstagramOAuthResult(response, {
+      statusCode: looksLikeProcessedRefresh ? 200 : 400,
+      success: looksLikeProcessedRefresh,
+      postMessage: false,
+      message: looksLikeProcessedRefresh
+        ? "Autorização já processada nesta janela."
+        : "A autorização expirou ou não é válida. Gere um novo login no painel.",
+    });
     return;
   }
 
@@ -2539,16 +2626,13 @@ app.get("/oauth/instagram/callback", async (request, response) => {
   });
 
   if (!connection || connection.platform !== "instagram") {
-    response
-      .status(404)
-      .setHeader("Content-Type", "text/html; charset=utf-8")
-      .send(
-        renderInstagramOAuthCallbackHtml({
-          success: false,
-          connectionId: consumedState.connectionId,
-          message: "Conta de Instagram não encontrada para concluir a autorização.",
-        }),
-      );
+    respondInstagramOAuthResult(response, {
+      statusCode: 404,
+      success: false,
+      connectionId: consumedState.connectionId,
+      returnToUrl: consumedState.returnToUrl,
+      message: "Conta de Instagram não encontrada para concluir a autorização.",
+    });
     return;
   }
 
@@ -2570,16 +2654,13 @@ app.get("/oauth/instagram/callback", async (request, response) => {
       message: `Autorização Instagram cancelada para ${connection.displayName}: ${errorMessage}`,
     });
 
-    response
-      .status(400)
-      .setHeader("Content-Type", "text/html; charset=utf-8")
-      .send(
-        renderInstagramOAuthCallbackHtml({
-          success: false,
-          connectionId: connection.id,
-          message: `Autorização cancelada: ${errorMessage}`,
-        }),
-      );
+    respondInstagramOAuthResult(response, {
+      statusCode: 400,
+      success: false,
+      connectionId: connection.id,
+      returnToUrl: consumedState.returnToUrl,
+      message: `Autorização cancelada: ${errorMessage}`,
+    });
     return;
   }
 
@@ -2600,16 +2681,13 @@ app.get("/oauth/instagram/callback", async (request, response) => {
       message: `Falha ao concluir OAuth da conta ${connection.displayName}: código não retornado pela Meta.`,
     });
 
-    response
-      .status(400)
-      .setHeader("Content-Type", "text/html; charset=utf-8")
-      .send(
-        renderInstagramOAuthCallbackHtml({
-          success: false,
-          connectionId: connection.id,
-          message: "Não foi possível concluir a autorização: código OAuth ausente.",
-        }),
-      );
+    respondInstagramOAuthResult(response, {
+      statusCode: 400,
+      success: false,
+      connectionId: connection.id,
+      returnToUrl: consumedState.returnToUrl,
+      message: "Não foi possível concluir a autorização: código OAuth ausente.",
+    });
     return;
   }
 
@@ -2638,16 +2716,13 @@ app.get("/oauth/instagram/callback", async (request, response) => {
       message: `Conta ${connection.displayName} conectada via OAuth (Instagram @${oauthResult.instagramUsername || "sem-username"}).`,
     });
 
-    response
-      .status(200)
-      .setHeader("Content-Type", "text/html; charset=utf-8")
-      .send(
-        renderInstagramOAuthCallbackHtml({
-          success: true,
-          connectionId: connection.id,
-          message: `Conta conectada com sucesso${oauthResult.instagramUsername ? ` (@${oauthResult.instagramUsername})` : ""}.`,
-        }),
-      );
+    respondInstagramOAuthResult(response, {
+      statusCode: 200,
+      success: true,
+      connectionId: connection.id,
+      returnToUrl: consumedState.returnToUrl,
+      message: `Conta conectada com sucesso${oauthResult.instagramUsername ? ` (@${oauthResult.instagramUsername})` : ""}.`,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : "INSTAGRAM_OAUTH_CALLBACK_UNKNOWN_ERROR";
 
@@ -2668,21 +2743,18 @@ app.get("/oauth/instagram/callback", async (request, response) => {
       message: `Falha ao conectar conta ${connection.displayName} via OAuth da Meta: ${message}`,
     });
 
-    response
-      .status(400)
-      .setHeader("Content-Type", "text/html; charset=utf-8")
-      .send(
-        renderInstagramOAuthCallbackHtml({
-          success: false,
-          connectionId: connection.id,
-          message: `Falha ao concluir autorização: ${message}`,
-        }),
-      );
+    respondInstagramOAuthResult(response, {
+      statusCode: 400,
+      success: false,
+      connectionId: connection.id,
+      returnToUrl: consumedState.returnToUrl,
+      message: `Falha ao concluir autorização: ${message}`,
+    });
   }
 });
 
 app.use(
-  ["/organizations", "/companies", "/connections", "/upload", "/jobs", "/dashboard", "/logs", "/avisos"],
+  ["/companies", "/connections", "/upload", "/jobs", "/dashboard", "/logs", "/avisos"],
   adminAuthMiddleware,
 );
 
@@ -2745,6 +2817,15 @@ app.post("/connections", async (request, response) => {
   const payload = createConnectionSchema.parse(request.body);
   const loginIdentifier = payload.loginIdentifier?.trim() || null;
   const secretCipher = encodeSecret(payload.secret);
+  const company = await prisma.company.findUnique({
+    where: { id: payload.companyId },
+    select: { id: true },
+  });
+
+  if (!company) {
+    response.status(400).json({ error: "Perfil inválido. Selecione um perfil existente." });
+    return;
+  }
 
   if (
     payload.platform === "whatsapp" &&
@@ -2775,7 +2856,7 @@ app.post("/connections", async (request, response) => {
   await appendLog({
     companyId: payload.companyId,
     level: "INFO",
-    message: `Conta ${payload.displayName} (${payload.platform}) criada e pronta para autenticacao.`,
+    message: `Conta ${payload.displayName} (${payload.platform}) criada e pronta para autenticação.`,
   });
 
   response.status(201).json(mapConnection(connection));
@@ -2822,6 +2903,7 @@ app.put("/connections/:id", async (request, response) => {
 });
 
 app.post("/connections/:id/open-visual-auth", async (request, response) => {
+  const payload = openVisualAuthSchema.parse(request.body ?? {});
   const connection = await prisma.socialConnection.findUnique({
     where: { id: request.params.id },
   });
@@ -2866,7 +2948,9 @@ app.post("/connections/:id/open-visual-auth", async (request, response) => {
 
   let launchUrl: string;
   try {
-    launchUrl = createInstagramOAuthLaunchUrl(connection.id);
+    launchUrl = createInstagramOAuthLaunchUrl(connection.id, {
+      returnToUrl: payload.returnToUrl ?? null,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : "INSTAGRAM_GRAPH_CONFIG_MISSING";
     response.status(400).json({
@@ -3048,30 +3132,8 @@ app.delete("/connections/:id", async (request, response) => {
   response.status(204).send();
 });
 
-app.get("/organizations", async (_request, response) => {
-  const organizations = await prisma.organization.findMany({
-    orderBy: { createdAt: "desc" },
-  });
-  response.json(organizations);
-});
-
-app.post("/organizations", async (request, response) => {
-  const payload = createOrganizationSchema.parse(request.body);
-  const existingOrganization = await prisma.organization.count();
-
-  if (existingOrganization > 0) {
-    response.status(409).json({ error: "Apenas uma empresa principal pode ser cadastrada." });
-    return;
-  }
-
-  const organization = await prisma.organization.create({ data: payload });
-  response.status(201).json(organization);
-});
-
 app.get("/companies", async (request, response) => {
-  const organizationId = typeof request.query.organizationId === "string" ? request.query.organizationId : undefined;
   const companies = await prisma.company.findMany({
-    where: organizationId ? { organizationId } : undefined,
     orderBy: { createdAt: "desc" },
   });
   response.json(companies);
@@ -3081,18 +3143,6 @@ app.post("/companies", async (request, response) => {
   const payload = createCompanySchema.parse(request.body);
   const company = await prisma.company.create({ data: payload });
   response.status(201).json(company);
-});
-
-app.delete("/organizations/:id", async (request, response) => {
-  const existingOrganization = await prisma.organization.findUnique({ where: { id: request.params.id } });
-
-  if (!existingOrganization) {
-    response.status(404).json({ error: "Empresa nao encontrada." });
-    return;
-  }
-
-  await prisma.organization.delete({ where: { id: request.params.id } });
-  response.status(204).send();
 });
 
 app.post("/upload", upload.single("file"), async (request, response) => {

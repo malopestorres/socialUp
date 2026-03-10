@@ -18,16 +18,9 @@ export type PublicationType =
 
 export type PublicationState = "PUBLISHED" | "DRAFT";
 
-export interface OrganizationDto {
-  id: string;
-  name: string;
-  createdAt: string;
-}
-
 export interface CompanyDto {
   id: string;
   name: string;
-  organizationId: string;
   createdAt: string;
 }
 
