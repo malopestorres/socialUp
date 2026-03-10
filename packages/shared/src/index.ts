@@ -4,7 +4,8 @@ export type JobStatus =
   | "SENT_UNCONFIRMED"
   | "COMPLETED"
   | "FAILED"
-  | "WAITING_LOGIN";
+  | "WAITING_LOGIN"
+  | "CANCELED";
 
 export type WhatsappMode = "link" | "midia" | "texto";
 
@@ -14,6 +15,8 @@ export type PublicationType =
   | "instagram_post"
   | "whatsapp_status_midia"
   | "whatsapp_status_texto";
+
+export type PublicationState = "PUBLISHED" | "DRAFT";
 
 export interface OrganizationDto {
   id: string;
@@ -39,6 +42,7 @@ export interface JobDto {
   caption: string | null;
   locationName: string | null;
   publicationType: PublicationType;
+  publicationState: PublicationState;
   postStory: boolean;
   postReel: boolean;
   postWhatsapp: boolean;

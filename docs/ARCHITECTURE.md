@@ -42,6 +42,9 @@ Main frontend files:
 - `SocialConnection`: Instagram/WhatsApp account for a company
 - `Job`: scheduled publication
   - New naming field: `title` (short internal title used in UI lists and notifications; legacy jobs still fallback to `caption` when `title` is empty)
+  - Publication state field: `publicationState` (`PUBLISHED` | `DRAFT`)
+    - `PUBLISHED`: entra no worker na data/hora agendada
+    - `DRAFT`: permanece salvo no histórico e não entra em execução automática
 - `AgentLog`: operation logs and errors
 - `Aviso`: user notifications (bell + notices page)
 
@@ -101,6 +104,7 @@ Backend runs two internal polling workers:
   - `instagram_post`
   - `instagram_reel`
   - `instagram_story`
+- Worker executa apenas jobs com `publicationState=PUBLISHED`.
 - Uses `executeInstagramJobWithGraphApi(...)`.
 - Publish host:
   - `instagram_login`: `graph.instagram.com`
@@ -129,6 +133,7 @@ Backend runs two internal polling workers:
 - Polls due jobs for:
   - `whatsapp_status_midia`
   - `whatsapp_status_texto`
+- Worker executa apenas jobs com `publicationState=PUBLISHED`.
 - Sends status via Evolution API.
 - Marks `SENT_UNCONFIRMED`, `FAILED`, or `WAITING_LOGIN`.
 - Emits `Aviso` and `AgentLog`.
@@ -138,6 +143,7 @@ Backend runs two internal polling workers:
 - Upload endpoint: `POST /upload` (Multer), files under `apps/backend/uploads`.
 - Jobs store `filePath` (`/uploads/...`).
 - No formulário de agendamento, `instagram_post` e `instagram_story` entram automaticamente em modo sequencial quando há mais de 1 mídia enviada (não há toggle manual).
+- No formulário de agendamento existe seleção explícita de estado da publicação (`Publicado` ou `Rascunho`).
 - Instagram Graph publish requires public HTTP(S) media URL reachable by Meta.
 - Backend composes this URL from `INSTAGRAM_GRAPH_PUBLIC_BASE_URL + filePath`.
 - Frontend valida arquivo antes do upload para Instagram imagem (`instagram_post` e imagem de `instagram_story`) com limite de `8 MB`.
@@ -174,6 +180,7 @@ Jobs:
 - `POST /jobs/:id/retry`
 - `POST /jobs/:id/cancel`
 - `POST /jobs/:id/activate`
+- `POST /jobs/:id/publish` (publica um rascunho sem editar o restante do job)
 
 `GET /jobs/instagram-location-suggestions`:
 
