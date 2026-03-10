@@ -63,6 +63,7 @@ type FacebookPageSearchResponse = {
 type OAuthStateEntry = {
   connectionId: string;
   createdAtMs: number;
+  returnToUrl: string | null;
 };
 
 type InstagramAccountCandidate = {
@@ -153,6 +154,23 @@ let cachedAppAccessToken: { token: string; expiresAtMs: number | null } | null =
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value ?? "", 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function normalizeOAuthReturnToUrl(value: string | null | undefined): string | null {
+  const normalized = (value || "").trim();
+  if (!normalized) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(normalized);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
 }
 
 function decodeSecret(secretCipher?: string | null): string | null {
@@ -919,7 +937,12 @@ async function publishMediaContainerWithRetry(input: {
   throw new Error("INSTAGRAM_GRAPH_MEDIA_PUBLISH_RETRY_EXHAUSTED");
 }
 
-export function createInstagramOAuthLaunchUrl(connectionId: string): string {
+export function createInstagramOAuthLaunchUrl(
+  connectionId: string,
+  options?: {
+    returnToUrl?: string | null;
+  },
+): string {
   ensureInstagramOAuthConfigured();
   const nowMs = Date.now();
   cleanupExpiredOAuthStateEntries(nowMs);
@@ -928,6 +951,7 @@ export function createInstagramOAuthLaunchUrl(connectionId: string): string {
   oauthStateByToken.set(stateToken, {
     connectionId,
     createdAtMs: nowMs,
+    returnToUrl: normalizeOAuthReturnToUrl(options?.returnToUrl),
   });
 
   const launchUrl = new URL(INSTAGRAM_OAUTH_AUTHORIZE_URL);
@@ -943,7 +967,7 @@ export function createInstagramOAuthLaunchUrl(connectionId: string): string {
   return launchUrl.toString();
 }
 
-export function consumeInstagramOAuthState(stateToken: string): { connectionId: string } | null {
+export function consumeInstagramOAuthState(stateToken: string): { connectionId: string; returnToUrl: string | null } | null {
   if (!stateToken || stateToken.trim().length === 0) {
     return null;
   }
@@ -958,6 +982,7 @@ export function consumeInstagramOAuthState(stateToken: string): { connectionId: 
 
   return {
     connectionId: entry.connectionId,
+    returnToUrl: entry.returnToUrl,
   };
 }
 

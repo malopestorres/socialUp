@@ -9,9 +9,8 @@ import {
   FiFileText,
   FiHome,
   FiImage,
-  FiLayers,
   FiLink2,
-  FiMapPin,
+  FiUsers,
   FiWifi,
   FiX,
   FiEye,
@@ -19,6 +18,7 @@ import {
   FiMoon,
   FiSun,
 } from "react-icons/fi";
+import { FaInstagram, FaWhatsapp } from "react-icons/fa6";
 import { api } from "./api";
 import appLogo from "./assets/logo.svg";
 import appLogoAlternative from "./assets/logo-alternativo.svg";
@@ -26,7 +26,7 @@ import appLogoAlternative from "./assets/logo-alternativo.svg";
 type ViewKey =
   | "dashboard"
   | "profile"
-  | "organizations"
+  | "plan"
   | "companies"
   | "agents"
   | "scheduler"
@@ -42,16 +42,9 @@ type HistoryFilterKey = "all" | "upcoming" | "canceled" | "sent" | "failed" | "w
 type PublicationState = "PUBLISHED" | "DRAFT";
 type SchedulerPublicationState = PublicationState | "";
 
-type Organization = {
-  id: string;
-  name: string;
-  createdAt: string;
-};
-
 type Company = {
   id: string;
   name: string;
-  organizationId: string;
   createdAt: string;
 };
 
@@ -169,6 +162,15 @@ type InstagramOauthWindowMessage = {
   connectionId?: string | null;
 };
 
+type ConnectionPlatformOption = {
+  platform: SocialConnection["platform"];
+  label: string;
+  icon: IconType;
+  description: string;
+};
+
+type ConnectionPlatformFilter = "all" | SocialConnection["platform"];
+
 const initialDashboard: Dashboard = {
   companyId: null,
   totals: {},
@@ -183,21 +185,52 @@ const initialDashboard: Dashboard = {
 
 const navItems: Array<{ key: ViewKey; label: string; eyebrow?: string; icon: IconType }> = [
   { key: "dashboard", label: "Dashboard", icon: FiHome },
+  { key: "companies", label: "Perfis", icon: FiUsers },
   { key: "agents", label: "Conectar contas", icon: FiLink2 },
   { key: "scheduler", label: "Agendar", icon: FiCalendar },
   { key: "media", label: "Midias", icon: FiImage },
   { key: "history", label: "Histórico", icon: FiClock },
   { key: "noticeAdmin", label: "Cadastrar avisos", icon: FiBell },
-  { key: "organizations", label: "Empresa", icon: FiLayers },
-  { key: "companies", label: "Unidades", icon: FiMapPin },
   { key: "logs", label: "Logs", icon: FiFileText },
+];
+
+const viewHeadingIconByView: Partial<Record<ViewKey, IconType>> = {
+  dashboard: FiHome,
+  agents: FiLink2,
+  scheduler: FiCalendar,
+  media: FiImage,
+  history: FiClock,
+  companies: FiUsers,
+  logs: FiFileText,
+  notices: FiBell,
+  noticeAdmin: FiBell,
+};
+
+const connectionPlatformOptions: ConnectionPlatformOption[] = [
+  {
+    platform: "instagram",
+    label: "Instagram",
+    icon: FaInstagram,
+    description: "Conectar via OAuth oficial",
+  },
+  {
+    platform: "whatsapp",
+    label: "WhatsApp",
+    icon: FaWhatsapp,
+    description: "Conectar via Evolution API",
+  },
 ];
 
 const LEGACY_HISTORY_VIEW_QUERY_PARAM = "view";
 const HISTORY_FILTER_QUERY_PARAM = "historyFilter";
+const INSTAGRAM_OAUTH_RESULT_MARKER_QUERY_PARAM = "instagram_oauth";
+const INSTAGRAM_OAUTH_SUCCESS_QUERY_PARAM = "instagram_oauth_success";
+const INSTAGRAM_OAUTH_MESSAGE_QUERY_PARAM = "instagram_oauth_message";
+const INSTAGRAM_OAUTH_CONNECTION_ID_QUERY_PARAM = "instagram_oauth_connection_id";
 const HISTORY_PAGE_SIZE = 10;
 const MEDIA_PAGE_SIZE = 12;
 const NOTICE_PAGE_SIZE = 10;
+const CONTENT_SKELETON_MIN_MS = 1500;
 const INSTAGRAM_IMAGE_MAX_SIZE_BYTES = 8 * 1024 * 1024;
 const INSTAGRAM_MULTI_MEDIA_MAX_FILES = 10;
 const INSTAGRAM_POST_ASPECT_RATIO_MIN = 4 / 5;
@@ -220,8 +253,8 @@ const HISTORY_MONTH_OPTIONS: Array<{ value: string; label: string }> = [
 const VIEW_ROUTE_MAP: Record<ViewKey, string> = {
   dashboard: "/dashboard",
   profile: "/perfil",
-  organizations: "/empresa",
-  companies: "/unidades",
+  plan: "/meu-plano",
+  companies: "/perfis",
   agents: "/conectar-contas",
   scheduler: "/agendar",
   media: "/midias",
@@ -264,6 +297,12 @@ function normalizePath(pathname: string): string {
 
 function viewFromPathname(pathname: string): ViewKey | null {
   const normalizedPath = normalizePath(pathname);
+  if (normalizedPath === "/unidades" || normalizedPath === "/empresa") {
+    return "companies";
+  }
+  if (normalizedPath === "/plano") {
+    return "plan";
+  }
   const entry = (Object.entries(VIEW_ROUTE_MAP) as Array<[ViewKey, string]>).find(([, route]) => route === normalizedPath);
   return entry?.[0] ?? null;
 }
@@ -396,50 +435,6 @@ function isSupportedMediaPath(filePath: string): boolean {
   return isVideoPath(filePath) || isImagePath(filePath);
 }
 
-function buildLowQualityPreviewDataUrl(imageUrl: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    if (typeof window === "undefined") {
-      reject(new Error("Window indisponível para gerar preview."));
-      return;
-    }
-
-    const image = new Image();
-    image.crossOrigin = "anonymous";
-    image.decoding = "async";
-
-    image.onload = () => {
-      try {
-        const naturalWidth = image.naturalWidth || 1;
-        const naturalHeight = image.naturalHeight || 1;
-        const targetWidth = 28;
-        const targetHeight = Math.max(1, Math.round((naturalHeight / naturalWidth) * targetWidth));
-        const canvas = document.createElement("canvas");
-        canvas.width = targetWidth;
-        canvas.height = targetHeight;
-        const context = canvas.getContext("2d");
-
-        if (!context) {
-          reject(new Error("Canvas indisponível para gerar preview."));
-          return;
-        }
-
-        context.imageSmoothingEnabled = true;
-        context.imageSmoothingQuality = "high";
-        context.drawImage(image, 0, 0, targetWidth, targetHeight);
-        resolve(canvas.toDataURL("image/jpeg", 0.4));
-      } catch (error) {
-        reject(error);
-      }
-    };
-
-    image.onerror = () => {
-      reject(new Error("Falha ao gerar preview da mídia."));
-    };
-
-    image.src = imageUrl;
-  });
-}
-
 function isInstagramPostImagePath(filePath: string): boolean {
   return /\.(jpe?g|png)$/i.test(filePath);
 }
@@ -544,16 +539,40 @@ async function schedulerMediaAdvancedValidationMessage(
 function publicationTypeLabel(publicationType: Job["publicationType"]): string {
   switch (publicationType) {
     case "instagram_story":
-      return "Instagram Story";
+      return "Stories";
     case "instagram_reel":
-      return "Instagram Reel";
+      return "Reels";
     case "instagram_post":
-      return "Instagram Post";
+      return "Posts";
     case "whatsapp_status_midia":
-      return "WhatsApp Status (midia)";
+      return "Status";
     case "whatsapp_status_texto":
-      return "WhatsApp Status (texto)";
+      return "Status";
   }
+}
+
+function publicationTypeNetwork(publicationType: Job["publicationType"]): "instagram" | "whatsapp" {
+  if (
+    publicationType === "instagram_post" ||
+    publicationType === "instagram_reel" ||
+    publicationType === "instagram_story"
+  ) {
+    return "instagram";
+  }
+
+  return "whatsapp";
+}
+
+function renderPublicationTypePill(publicationType: Job["publicationType"]) {
+  const network = publicationTypeNetwork(publicationType);
+  const Icon = network === "instagram" ? FaInstagram : FaWhatsapp;
+
+  return (
+    <span className={`publication-pill publication-pill-with-icon publication-pill-${network}`}>
+      <Icon className={`publication-pill-icon publication-pill-icon-${network}`} aria-hidden="true" />
+      <span>{publicationTypeLabel(publicationType)}</span>
+    </span>
+  );
 }
 
 function jobStatusLabel(status: string): string {
@@ -694,6 +713,12 @@ function initialThemeMode(): ThemeMode {
   return "light";
 }
 
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, milliseconds);
+  });
+}
+
 function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
@@ -728,7 +753,6 @@ function App() {
   const [profilePassword, setProfilePassword] = useState("");
   const [activeView, setActiveView] = useState<ViewKey>(initialViewFromLocation);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [organizations, setOrganizations] = useState<Organization[]>([]);
   const [companies, setCompanies] = useState<Company[]>([]);
   const [connections, setConnections] = useState<SocialConnection[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -736,16 +760,18 @@ function App() {
   const [avisos, setAvisos] = useState<Aviso[]>([]);
   const [dashboard, setDashboard] = useState<Dashboard>(initialDashboard);
   const [selectedCompanyId, setSelectedCompanyId] = useState<string>("");
-  const [organizationName, setOrganizationName] = useState("");
   const [companyName, setCompanyName] = useState("");
-  const [companyOrganizationId, setCompanyOrganizationId] = useState("");
   const [connectionDisplayName, setConnectionDisplayName] = useState("");
   const [connectionCompanyId, setConnectionCompanyId] = useState("");
   const [connectionPlatform, setConnectionPlatform] = useState<SocialConnection["platform"]>("instagram");
+  const [connectionPlatformFilter, setConnectionPlatformFilter] = useState<ConnectionPlatformFilter>("all");
   const [connectionLoginIdentifier, setConnectionLoginIdentifier] = useState("");
   const [connectionSecret, setConnectionSecret] = useState("");
+  const [connectionCreateAttempted, setConnectionCreateAttempted] = useState(false);
+  const [isCreateConnectionModalOpen, setIsCreateConnectionModalOpen] = useState(false);
   const [activeQrConnectionId, setActiveQrConnectionId] = useState<string | null>(null);
   const [qrRequestingConnectionId, setQrRequestingConnectionId] = useState<string | null>(null);
+  const [qrCancellingConnectionId, setQrCancellingConnectionId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadedSchedulerMedia, setUploadedSchedulerMedia] = useState<SchedulerUploadedMedia[]>([]);
   const [draggingSchedulerMediaIndex, setDraggingSchedulerMediaIndex] = useState<number | null>(null);
@@ -782,24 +808,26 @@ function App() {
   const [recentAvisos, setRecentAvisos] = useState<Aviso[]>([]);
   const [unreadAvisosCount, setUnreadAvisosCount] = useState(0);
   const [noticesPopoverOpen, setNoticesPopoverOpen] = useState(false);
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [noticesPopoverLoading, setNoticesPopoverLoading] = useState(false);
   const [markingAllAvisosRead, setMarkingAllAvisosRead] = useState(false);
   const [broadcastAvisoTitle, setBroadcastAvisoTitle] = useState("");
   const [broadcastAvisoMessage, setBroadcastAvisoMessage] = useState("");
   const [broadcastAvisoSubmitting, setBroadcastAvisoSubmitting] = useState(false);
-  const [loadedMediaPreviewByPath, setLoadedMediaPreviewByPath] = useState<Record<string, boolean>>({});
-  const [mediaPreviewPlaceholderByPath, setMediaPreviewPlaceholderByPath] = useState<Record<string, string>>({});
+  const [contentLoading, setContentLoading] = useState(false);
   const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
   const [togglingScheduleJobId, setTogglingScheduleJobId] = useState<string | null>(null);
   const [publishingDraftJobId, setPublishingDraftJobId] = useState<string | null>(null);
   const [submittingJob, setSubmittingJob] = useState(false);
+  const contentLoadingCounterRef = useRef(0);
   const schedulerMediaInputRef = useRef<HTMLInputElement | null>(null);
   const mediaSectionRef = useRef<HTMLElement | null>(null);
   const historySectionRef = useRef<HTMLElement | null>(null);
   const avisosSectionRef = useRef<HTMLElement | null>(null);
   const noticesBellDesktopRef = useRef<HTMLDivElement | null>(null);
   const noticesBellMobileRef = useRef<HTMLDivElement | null>(null);
-  const instagramOauthPopupPollRef = useRef<number | null>(null);
+  const profileMenuDesktopRef = useRef<HTMLDivElement | null>(null);
+  const profileMenuMobileRef = useRef<HTMLDivElement | null>(null);
   const isRootUser = authUser?.username === "root";
   const instagramForcedLocationId = (dashboard.instagramForcedLocationId || "").trim();
   const instagramForcedLocationName =
@@ -853,6 +881,18 @@ function App() {
       ? "Digite o texto do status do WhatsApp. Este campo aceita emojis e e obrigatório nesse tipo de publicação."
       : "Preencha a legenda da postagem. Para Instagram e WhatsApp Status em texto, este campo é obrigatório.";
 
+  function startContentLoading() {
+    contentLoadingCounterRef.current += 1;
+    setContentLoading(true);
+  }
+
+  function finishContentLoading() {
+    contentLoadingCounterRef.current = Math.max(0, contentLoadingCounterRef.current - 1);
+    if (contentLoadingCounterRef.current === 0) {
+      setContentLoading(false);
+    }
+  }
+
   function navigateToView(view: ViewKey, options?: { historyFilter?: HistoryFilterKey }) {
     if (typeof window === "undefined") {
       return;
@@ -893,6 +933,7 @@ function App() {
     }
 
     setNoticesPopoverOpen(false);
+    setProfileMenuOpen(false);
     setSidebarOpen(false);
     setActiveView(view);
 
@@ -923,19 +964,6 @@ function App() {
           : activeQrState === "ERROR"
             ? "Falha ao gerar QR"
             : "Gerando QR do WhatsApp...";
-
-  const activeQrDescription =
-    activeQrConnection?.qrMessage
-      ? activeQrConnection.qrMessage
-      : activeQrState === "CONNECTED"
-      ? "A conta foi autenticada com sucesso."
-      : activeQrState === "QR_EXPIRED"
-        ? "O QR expirou. Gere um novo código para continuar."
-        : activeQrState === "WAITING_QR_SCAN"
-          ? "Escaneie este QR Code no seu celular."
-          : activeQrState === "ERROR"
-            ? "Nao foi possivel gerar o QR. Tente novamente."
-            : "Preparando um novo QR do WhatsApp...";
 
   useEffect(() => {
     if (!isTransientSchedulerInfo) {
@@ -1076,24 +1104,43 @@ function App() {
   }, [noticesPopoverOpen]);
 
   useEffect(() => {
-    return () => {
-      if (instagramOauthPopupPollRef.current !== null) {
-        window.clearInterval(instagramOauthPopupPollRef.current);
-        instagramOauthPopupPollRef.current = null;
+    if (!profileMenuOpen) {
+      return;
+    }
+
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) {
+        return;
+      }
+
+      const clickedDesktopMenu = profileMenuDesktopRef.current?.contains(target) ?? false;
+      const clickedMobileMenu = profileMenuMobileRef.current?.contains(target) ?? false;
+
+      if (!clickedDesktopMenu && !clickedMobileMenu) {
+        setProfileMenuOpen(false);
       }
     };
-  }, []);
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setProfileMenuOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [profileMenuOpen]);
 
   useEffect(() => {
     const handleInstagramOauthMessage = (event: MessageEvent) => {
       const payload = parseInstagramOauthWindowMessage(event.data);
       if (!payload) {
         return;
-      }
-
-      if (instagramOauthPopupPollRef.current !== null) {
-        window.clearInterval(instagramOauthPopupPollRef.current);
-        instagramOauthPopupPollRef.current = null;
       }
 
       if (payload.success) {
@@ -1117,6 +1164,33 @@ function App() {
     return () => {
       window.removeEventListener("message", handleInstagramOauthMessage);
     };
+  }, [selectedCompanyId, isRootUser]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get(INSTAGRAM_OAUTH_RESULT_MARKER_QUERY_PARAM) !== "1") {
+      return;
+    }
+
+    const success = params.get(INSTAGRAM_OAUTH_SUCCESS_QUERY_PARAM) === "1";
+    const message = (params.get(INSTAGRAM_OAUTH_MESSAGE_QUERY_PARAM) || "").trim();
+    if (success) {
+      setError("");
+      setAuthInfo(message || "Conta conectada com sucesso.");
+    } else {
+      setAuthInfo("");
+      setError(message || "Falha ao concluir autorização do Instagram.");
+    }
+
+    params.delete(INSTAGRAM_OAUTH_RESULT_MARKER_QUERY_PARAM);
+    params.delete(INSTAGRAM_OAUTH_SUCCESS_QUERY_PARAM);
+    params.delete(INSTAGRAM_OAUTH_MESSAGE_QUERY_PARAM);
+    params.delete(INSTAGRAM_OAUTH_CONNECTION_ID_QUERY_PARAM);
+    const nextSearch = params.toString();
+    const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ""}${window.location.hash}`;
+    window.history.replaceState({}, "", nextUrl);
+
+    void loadAll();
   }, [selectedCompanyId, isRootUser]);
 
   useEffect(() => {
@@ -1151,8 +1225,14 @@ function App() {
   );
 
   const filteredConnections = useMemo(
-    () => connections.filter((connection) => (selectedCompanyId ? connection.companyId === selectedCompanyId : true)),
-    [connections, selectedCompanyId],
+    () =>
+      connections.filter((connection) => {
+        const matchesCompany = selectedCompanyId ? connection.companyId === selectedCompanyId : true;
+        const matchesPlatform =
+          connectionPlatformFilter === "all" ? true : connection.platform === connectionPlatformFilter;
+        return matchesCompany && matchesPlatform;
+      }),
+    [connections, selectedCompanyId, connectionPlatformFilter],
   );
 
   const schedulerConnections = useMemo(() => {
@@ -1245,30 +1325,6 @@ function App() {
     const scheduledJobs = eligibleUpcomingJobs.filter((job) => job.status !== "RUNNING");
     return [...runningJobs, ...scheduledJobs].slice(0, 5);
   }, [jobsOrderedByCreatedAtDesc]);
-
-  const canceledJobsPreview = useMemo(
-    () =>
-      jobsOrderedByCreatedAtDesc
-        .filter((job) => job.status === "CANCELED" && job.publicationState === "PUBLISHED")
-        .slice(0, 5),
-    [jobsOrderedByCreatedAtDesc],
-  );
-
-  const sentJobsPreview = useMemo(
-    () =>
-      jobsOrderedByCreatedAtDesc
-        .filter((job) => job.status === "SENT_UNCONFIRMED" || job.status === "COMPLETED")
-        .slice(0, 5),
-    [jobsOrderedByCreatedAtDesc],
-  );
-
-  const failedJobsPreview = useMemo(
-    () =>
-      jobsOrderedByCreatedAtDesc
-        .filter((job) => job.status === "FAILED")
-        .slice(0, 5),
-    [jobsOrderedByCreatedAtDesc],
-  );
 
   const historyAvailableYears = useMemo(
     () =>
@@ -1373,13 +1429,18 @@ function App() {
     [mediaFilteredItems, mediaPage],
   );
 
-  async function loadAll(): Promise<void> {
+  async function loadAll(options?: { withSkeleton?: boolean }): Promise<void> {
+    const withSkeleton = options?.withSkeleton ?? true;
+    const loadingStartedAt = withSkeleton ? Date.now() : 0;
+    if (withSkeleton) {
+      startContentLoading();
+    }
+
     try {
       const companyFilter = selectedCompanyId ? `?companyId=${selectedCompanyId}` : "";
       const logsPromise = isRootUser ? api.get<Log[]>(`/logs${companyFilter}`) : Promise.resolve<Log[]>([]);
-      const [organizationsData, companiesData, connectionsData, jobsData, logsData, dashboardData] =
+      const [companiesData, connectionsData, jobsData, logsData, dashboardData] =
         await Promise.all([
-          api.get<Organization[]>("/organizations"),
           api.get<Company[]>("/companies"),
           api.get<SocialConnection[]>(`/connections${companyFilter}`),
           api.get<Job[]>(`/jobs${companyFilter}`),
@@ -1387,18 +1448,11 @@ function App() {
           api.get<Dashboard>(`/dashboard${companyFilter}`),
         ]);
 
-      setOrganizations(organizationsData);
       setCompanies(companiesData);
       setConnections(connectionsData);
       setJobs(jobsData);
       setLogs(logsData);
       setDashboard(dashboardData);
-
-      const firstCompany = companiesData[0];
-      if (firstCompany) {
-        setCompanyOrganizationId((current) => current || firstCompany.organizationId);
-        setConnectionCompanyId((current) => current || firstCompany.id);
-      }
 
       setError("");
     } catch (loadError) {
@@ -1410,10 +1464,24 @@ function App() {
       }
 
       setError(loadError instanceof Error ? loadError.message : "Falha ao carregar dados.");
+    } finally {
+      if (withSkeleton) {
+        const elapsed = Date.now() - loadingStartedAt;
+        if (elapsed < CONTENT_SKELETON_MIN_MS) {
+          await delay(CONTENT_SKELETON_MIN_MS - elapsed);
+        }
+        finishContentLoading();
+      }
     }
   }
 
-  async function loadAvisosPage(page: number): Promise<void> {
+  async function loadAvisosPage(page: number, options?: { withSkeleton?: boolean }): Promise<void> {
+    const withSkeleton = options?.withSkeleton ?? true;
+    const loadingStartedAt = withSkeleton ? Date.now() : 0;
+    if (withSkeleton) {
+      startContentLoading();
+    }
+
     try {
       const result = await api.get<{
         items: Aviso[];
@@ -1430,6 +1498,14 @@ function App() {
       setError("");
     } catch (loadAvisosError) {
       setError(loadAvisosError instanceof Error ? loadAvisosError.message : "Falha ao carregar avisos.");
+    } finally {
+      if (withSkeleton) {
+        const elapsed = Date.now() - loadingStartedAt;
+        if (elapsed < CONTENT_SKELETON_MIN_MS) {
+          await delay(CONTENT_SKELETON_MIN_MS - elapsed);
+        }
+        finishContentLoading();
+      }
     }
   }
 
@@ -1501,8 +1577,12 @@ function App() {
       return;
     }
 
-    void loadAll();
-  }, [selectedCompanyId, authUser]);
+    if (activeView === "notices" || activeView === "profile" || activeView === "plan") {
+      return;
+    }
+
+    void loadAll({ withSkeleton: true });
+  }, [selectedCompanyId, authUser, activeView]);
 
   useEffect(() => {
     if (!authUser || activeView === "agents" || activeView === "notices") {
@@ -1599,7 +1679,7 @@ function App() {
 
     const tick = () => {
       if (document.visibilityState === "visible" && !cancelled) {
-        void loadAll();
+        void loadAll({ withSkeleton: false });
       }
     };
 
@@ -1624,12 +1704,14 @@ function App() {
     }
 
     let cancelled = false;
+    let firstLoad = true;
 
     const refreshAvisosPage = () => {
       if (cancelled) {
         return;
       }
-      void loadAvisosPage(avisosPage);
+      void loadAvisosPage(avisosPage, { withSkeleton: firstLoad });
+      firstLoad = false;
     };
 
     refreshAvisosPage();
@@ -1721,6 +1803,7 @@ function App() {
       }
 
       setNoticesPopoverOpen(false);
+      setProfileMenuOpen(false);
       setSidebarOpen(false);
       window.scrollTo({ top: 0, behavior: "auto" });
     };
@@ -1775,97 +1858,59 @@ function App() {
     setAvisosPage((current) => Math.min(Math.max(current, 1), avisosTotalPages));
   }, [avisosTotalPages]);
 
-  useEffect(() => {
-    const pendingPreviewGeneration = paginatedMediaItems.filter(
-      (media) => !isVideoPath(media.filePath) && !mediaPreviewPlaceholderByPath[media.filePath],
-    );
-
-    if (pendingPreviewGeneration.length === 0) {
-      return;
-    }
-
-    let cancelled = false;
-
-    const generatePreviews = async () => {
-      for (const media of pendingPreviewGeneration) {
-        try {
-          const lowQualityPreview = await buildLowQualityPreviewDataUrl(media.previewUrl);
-          if (cancelled) {
-            return;
-          }
-
-          setMediaPreviewPlaceholderByPath((current) => {
-            if (current[media.filePath]) {
-              return current;
-            }
-
-            return {
-              ...current,
-              [media.filePath]: lowQualityPreview,
-            };
-          });
-        } catch {
-          if (cancelled) {
-            return;
-          }
-        }
-      }
-    };
-
-    void generatePreviews();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [paginatedMediaItems, mediaPreviewPlaceholderByPath]);
-
-  async function createOrganization(event: FormEvent) {
-    event.preventDefault();
-    await api.postJson("/organizations", { name: organizationName });
-    setOrganizationName("");
-    await loadAll();
-  }
-
   async function createCompany(event: FormEvent) {
     event.preventDefault();
-    await api.postJson("/companies", { name: companyName, organizationId: companyOrganizationId });
+    await api.postJson("/companies", { name: companyName });
     setCompanyName("");
     await loadAll();
   }
 
-  async function deleteOrganization(organizationId: string) {
-    await api.delete(`/organizations/${organizationId}`);
-    await loadAll();
-  }
-
-  async function createConnection(event: FormEvent) {
+  async function createConnection(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    setConnectionCreateAttempted(true);
+    const formElement = event.currentTarget;
+    if (!formElement.reportValidity()) {
+      return;
+    }
+
+    const normalizedCompanyId = connectionCompanyId.trim();
+    if (!normalizedCompanyId) {
+      setAuthInfo("");
+      setError("Selecione o perfil para adicionar a conta.");
+      return;
+    }
+    const loginIdentifierPayload = connectionPlatform === "whatsapp" ? connectionLoginIdentifier || null : null;
     await api.postJson("/connections", {
-      companyId: connectionCompanyId,
+      companyId: normalizedCompanyId,
       platform: connectionPlatform,
       displayName: connectionDisplayName,
-      loginIdentifier: connectionLoginIdentifier || null,
+      loginIdentifier: loginIdentifierPayload,
       secret: connectionSecret || null,
     });
     setConnectionDisplayName("");
     setConnectionLoginIdentifier("");
     setConnectionSecret("");
+    setConnectionCreateAttempted(false);
+    setIsCreateConnectionModalOpen(false);
     await loadAll();
+  }
+
+  function openCreateConnectionModal(platform: SocialConnection["platform"]) {
+    setConnectionPlatform(platform);
+    setConnectionDisplayName("");
+    setConnectionCompanyId("");
+    setConnectionLoginIdentifier("");
+    setConnectionSecret("");
+    setConnectionCreateAttempted(false);
+    setIsCreateConnectionModalOpen(true);
+    setError("");
+    setAuthInfo("");
   }
 
   async function openConnectionVisualAuth(connectionId: string) {
     const connection = connections.find((entry) => entry.id === connectionId);
     const isWhatsappConnection = connection?.platform === "whatsapp";
-    let oauthTab: Window | null = null;
-
-    if (!isWhatsappConnection) {
-      oauthTab = window.open("about:blank", "_blank");
-      if (!oauthTab) {
-        setError("Não foi possível abrir a aba de autorização. Libere popups no navegador e tente novamente.");
-        return;
-      }
-      oauthTab.focus();
-    }
+    const returnToUrl = new URL(buildViewHref("agents"), window.location.origin).toString();
 
     if (isWhatsappConnection) {
       setActiveQrConnectionId(connectionId);
@@ -1875,7 +1920,7 @@ function App() {
     try {
       const result = await api.postJson<{ launchUrl?: string }>(
         "/connections/" + connectionId + "/open-visual-auth",
-        {},
+        isWhatsappConnection ? {} : { returnToUrl },
       );
       await loadAll();
       setError("");
@@ -1884,45 +1929,12 @@ function App() {
       }
 
       if (!result.launchUrl) {
-        if (oauthTab && !oauthTab.closed) {
-          oauthTab.close();
-        }
         setError("A URL de autorização do Instagram não foi retornada pelo backend.");
         return;
       }
 
-      if (oauthTab && !oauthTab.closed) {
-        oauthTab.location.href = result.launchUrl;
-        oauthTab.focus();
-      } else {
-        oauthTab = window.open(result.launchUrl, "_blank");
-        if (!oauthTab) {
-          setError("Não foi possível abrir a aba de autorização. Libere popups no navegador e tente novamente.");
-          return;
-        }
-        oauthTab.focus();
-      }
-      setAuthInfo("Finalize a autorização na aba da Meta. O painel será atualizado quando ela for fechada.");
-
-      if (instagramOauthPopupPollRef.current !== null) {
-        window.clearInterval(instagramOauthPopupPollRef.current);
-        instagramOauthPopupPollRef.current = null;
-      }
-
-      instagramOauthPopupPollRef.current = window.setInterval(() => {
-        if (!oauthTab || !oauthTab.closed) {
-          return;
-        }
-        if (instagramOauthPopupPollRef.current !== null) {
-          window.clearInterval(instagramOauthPopupPollRef.current);
-          instagramOauthPopupPollRef.current = null;
-        }
-        void loadAll();
-      }, 900);
+      window.location.assign(result.launchUrl);
     } catch (error) {
-      if (!isWhatsappConnection && oauthTab && !oauthTab.closed) {
-        oauthTab.close();
-      }
       setError(error instanceof Error ? error.message : "Falha ao iniciar a autorização.");
     } finally {
       if (isWhatsappConnection) {
@@ -1932,6 +1944,9 @@ function App() {
   }
 
   async function regenerateConnectionQr(connectionId: string) {
+    if (qrCancellingConnectionId === connectionId) {
+      return;
+    }
     setActiveQrConnectionId(connectionId);
     setQrRequestingConnectionId(connectionId);
     try {
@@ -1943,17 +1958,17 @@ function App() {
     }
   }
 
-  async function dismissConnectionQr(connectionId: string) {
-    setActiveQrConnectionId((current) => (current === connectionId ? null : current));
-    setQrRequestingConnectionId((current) => (current === connectionId ? null : current));
-  }
-
   async function cancelConnectionQr(connectionId: string) {
+    setQrCancellingConnectionId(connectionId);
     setActiveQrConnectionId((current) => (current === connectionId ? null : current));
     setQrRequestingConnectionId((current) => (current === connectionId ? null : current));
-    await api.postJson(`/connections/${connectionId}/dismiss-qr`, {});
-    await loadAll();
-    setError("");
+    try {
+      await api.postJson(`/connections/${connectionId}/dismiss-qr`, {});
+      await loadAll();
+      setError("");
+    } finally {
+      setQrCancellingConnectionId((current) => (current === connectionId ? null : current));
+    }
   }
 
   async function disconnectConnection(connectionId: string) {
@@ -2282,43 +2297,12 @@ function App() {
 
       setUploadedSchedulerMedia((current) => current.filter((item) => item.filePath !== media.filePath));
 
-      setLoadedMediaPreviewByPath((current) => {
-        if (!current[media.filePath]) {
-          return current;
-        }
-
-        const next = { ...current };
-        delete next[media.filePath];
-        return next;
-      });
-      setMediaPreviewPlaceholderByPath((current) => {
-        if (!current[media.filePath]) {
-          return current;
-        }
-
-        const next = { ...current };
-        delete next[media.filePath];
-        return next;
-      });
-
       await loadAll();
       setMediaInfo("Mídia excluída com sucesso.");
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : "Falha ao excluir mídia.");
       setMediaInfo("");
     }
-  }
-
-  function markMediaPreviewLoaded(filePath: string) {
-    setLoadedMediaPreviewByPath((current) => {
-      if (current[filePath]) {
-        return current;
-      }
-      return {
-        ...current,
-        [filePath]: true,
-      };
-    });
   }
 
   async function toggleJobSchedule(job: Job) {
@@ -2390,6 +2374,8 @@ function App() {
   }
 
   async function toggleNoticesPopover() {
+    setProfileMenuOpen(false);
+
     if (noticesPopoverOpen) {
       setNoticesPopoverOpen(false);
       return;
@@ -2421,7 +2407,7 @@ function App() {
       setUnreadAvisosCount(recent.unreadCount);
 
       if (activeView === "notices") {
-        await loadAvisosPage(avisosPage);
+        await loadAvisosPage(avisosPage, { withSkeleton: false });
       }
     } catch (noticesError) {
       setError(noticesError instanceof Error ? noticesError.message : "Falha ao marcar avisos como lidos.");
@@ -2456,7 +2442,7 @@ function App() {
       );
       await loadAll();
       if (activeView === "notices") {
-        await loadAvisosPage(avisosPage);
+        await loadAvisosPage(avisosPage, { withSkeleton: false });
       }
       try {
         const unread = await api.get<{ count: number }>("/avisos/unread-count");
@@ -2534,7 +2520,10 @@ function App() {
       setAuthInfo("");
       setAuthError("");
       setNoticesPopoverOpen(false);
+      setProfileMenuOpen(false);
       setActiveView("dashboard");
+      contentLoadingCounterRef.current = 0;
+      setContentLoading(false);
       if (typeof window !== "undefined") {
         window.history.replaceState({}, "", "/");
       }
@@ -2623,6 +2612,45 @@ function App() {
 
   function appendEmojiToCaption(emoji: string) {
     setCaption((current) => `${current}${emoji}`);
+  }
+
+  function renderProfileMenu(shellRef: { current: HTMLDivElement | null }, extraClassName = "") {
+    return (
+      <div ref={shellRef} className={`profile-menu-shell${extraClassName ? ` ${extraClassName}` : ""}`}>
+        <button
+          type="button"
+          className={`profile-trigger ${(activeView === "profile" || activeView === "plan") ? "profile-trigger-active" : ""}`}
+          onClick={() => {
+            setNoticesPopoverOpen(false);
+            setProfileMenuOpen((current) => !current);
+          }}
+          aria-haspopup="menu"
+          aria-expanded={profileMenuOpen}
+        >
+          <span className="profile-icon" aria-hidden="true" />
+          <span className="profile-trigger-label">Minha Conta</span>
+        </button>
+
+        {profileMenuOpen ? (
+          <div className="profile-menu-dropdown" role="menu">
+            <button
+              type="button"
+              className={`profile-menu-item ${activeView === "profile" ? "profile-menu-item-active" : ""}`}
+              onClick={() => navigateToView("profile")}
+            >
+              Meu perfil
+            </button>
+            <button
+              type="button"
+              className={`profile-menu-item ${activeView === "plan" ? "profile-menu-item-active" : ""}`}
+              onClick={() => navigateToView("plan")}
+            >
+              Meu plano
+            </button>
+          </div>
+        ) : null}
+      </div>
+    );
   }
 
   function renderNoticesBell(shellRef: { current: HTMLDivElement | null }, extraClassName = "") {
@@ -2814,7 +2842,7 @@ function App() {
               Seja Bem vindo, <span className="hero-user-name">{authUser?.username ?? ""}</span>
             </span>
             <p>
-              Controle o seu calendario de postagens das redes sociais da sua empresa e unidades separadamente em uma
+              Controle o seu calendario de postagens das redes sociais da sua empresa e perfis separadamente em uma
               interface clara e intuitiva.
             </p>
           </div>
@@ -2886,10 +2914,12 @@ function App() {
                   >
                     <div>
                       <strong>{resolveJobDisplayTitle(job)}</strong>
-                      <span className="publication-pill">{publicationTypeLabel(job.publicationType)}</span>
-                      <span className="unit-pill">
-                        {`Unidade: ${companyNameMap[job.companyId] || "Unidade removida"}`}
-                      </span>
+                      <div className="meta-pill-row">
+                        {renderPublicationTypePill(job.publicationType)}
+                        <span className="unit-pill">
+                          {`Perfil: ${companyNameMap[job.companyId] || "Perfil removido"}`}
+                        </span>
+                      </div>
                     </div>
                     <div className="inline-actions">
                       <span>{formatDate(job.dataPostagem)}</span>
@@ -2922,129 +2952,6 @@ function App() {
             </div>
           </article>
 
-          <article className="panel-card full-width-panel">
-            <div className="section-head">
-              <div>
-                <h2>Agendamentos Publicados</h2>
-              </div>
-              <button
-                type="button"
-                className="ghost-button view-all-button"
-                onClick={() => openHistoryWithFilter("sent")}
-              >
-                Ver todos
-              </button>
-            </div>
-            <div className="table-list">
-              {sentJobsPreview.length === 0 ? (
-                <div className="empty-state">Nao ha agendamentos enviados nesse filtro.</div>
-              ) : (
-                sentJobsPreview.map((job) => (
-                  <div key={job.id} className="row-card">
-                    <div>
-                      <strong>{resolveJobDisplayTitle(job)}</strong>
-                      <span className="publication-pill">{publicationTypeLabel(job.publicationType)}</span>
-                      <span className="unit-pill">
-                        {`Unidade: ${companyNameMap[job.companyId] || "Unidade removida"}`}
-                      </span>
-                    </div>
-                    <div className="inline-actions">
-                      <span>{formatDate(job.dataPostagem)}</span>
-                      <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-          </article>
-
-          <article className="panel-card full-width-panel">
-            <div className="section-head">
-              <div>
-                <h2>Agendamentos Cancelados</h2>
-              </div>
-              <button
-                type="button"
-                className="ghost-button view-all-button"
-                onClick={() => openHistoryWithFilter("canceled")}
-              >
-                Ver todos
-              </button>
-            </div>
-            <div className="table-list">
-              {canceledJobsPreview.length === 0 ? (
-                <div className="empty-state">Nao ha agendamentos cancelados nesse filtro.</div>
-              ) : (
-                canceledJobsPreview.map((job) => (
-                  <div key={job.id} className="row-card">
-                    <div>
-                      <strong>{resolveJobDisplayTitle(job)}</strong>
-                      <span className="publication-pill">{publicationTypeLabel(job.publicationType)}</span>
-                      <span className="unit-pill">
-                        {`Unidade: ${companyNameMap[job.companyId] || "Unidade removida"}`}
-                      </span>
-                    </div>
-                    <div className="inline-actions">
-                      <span>{formatDate(job.dataPostagem)}</span>
-                      <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
-                      <button
-                        type="button"
-                        className="activate-button"
-                        onClick={() => void toggleJobSchedule(job)}
-                        disabled={togglingScheduleJobId === job.id}
-                      >
-                        {togglingScheduleJobId === job.id ? "Salvando..." : "Ativar agendamento"}
-                      </button>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-          </article>
-
-          <article className="panel-card full-width-panel">
-            <div className="section-head">
-              <div>
-                <h2>Agendamentos Falhados</h2>
-              </div>
-              <button
-                type="button"
-                className="ghost-button view-all-button"
-                onClick={() => openHistoryWithFilter("failed")}
-              >
-                Ver todos
-              </button>
-            </div>
-            <div className="table-list">
-              {failedJobsPreview.length === 0 ? (
-                <div className="empty-state">Nao ha agendamentos falhados nesse filtro.</div>
-              ) : (
-                failedJobsPreview.map((job) => (
-                  <div key={job.id} className="row-card">
-                    <div>
-                      <strong>{resolveJobDisplayTitle(job)}</strong>
-                      <span className="publication-pill">{publicationTypeLabel(job.publicationType)}</span>
-                      <span className="unit-pill">
-                        {`Unidade: ${companyNameMap[job.companyId] || "Unidade removida"}`}
-                      </span>
-                    </div>
-                    <div className="inline-actions">
-                      <span>{formatDate(job.dataPostagem)}</span>
-                      <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
-                      <button
-                        type="button"
-                        className="ghost-button"
-                        onClick={() => retryJob(job.id)}
-                        disabled={retryingJobId === job.id}
-                      >
-                        {retryingJobId === job.id ? "Tentando..." : "Tentar de novo"}
-                      </button>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-          </article>
         </section>
       </div>
     );
@@ -3061,6 +2968,22 @@ function App() {
               {company.name}
             </option>
           ))}
+        </select>
+      </div>
+    );
+  }
+
+  function renderConnectionPlatformFilter() {
+    return (
+      <div className="inline-filter">
+        <span>Filtrar rede</span>
+        <select
+          value={connectionPlatformFilter}
+          onChange={(event) => setConnectionPlatformFilter(event.target.value as ConnectionPlatformFilter)}
+        >
+          <option value="all">Todas</option>
+          <option value="instagram">Instagram</option>
+          <option value="whatsapp">WhatsApp</option>
         </select>
       </div>
     );
@@ -3236,47 +3159,20 @@ function App() {
     );
   }
 
-  function renderOrganizations() {
+  function renderSectionTitleWithIcon(view: ViewKey, title: string, kicker?: string) {
+    const Icon = viewHeadingIconByView[view];
     return (
-      <section className="panel-card view-stack">
-        <div className="section-head">
-          <div>
-            <span className="section-kicker">setup</span>
-            <h2>Empresa</h2>
-          </div>
+      <div>
+        {kicker ? <span className="section-kicker">{kicker}</span> : null}
+        <div className="view-title-with-icon">
+          {Icon ? (
+            <span className="view-title-icon" aria-hidden="true">
+              <Icon />
+            </span>
+          ) : null}
+          <h2>{title}</h2>
         </div>
-        {organizations.length === 0 ? (
-          <form onSubmit={createOrganization} className="form-grid">
-            <input
-              value={organizationName}
-              onChange={(event) => setOrganizationName(event.target.value)}
-              placeholder="Nome da empresa principal"
-              required
-              minLength={2}
-              maxLength={80}
-              title="Informe o nome da empresa principal com 2 a 80 caracteres."
-            />
-            <button type="submit">Criar empresa</button>
-          </form>
-        ) : (
-          <div className="empty-state">A empresa principal já foi cadastrada. Use a tela de Unidades para adicionar novas unidades.</div>
-        )}
-        <div className="table-list">
-          {organizations.map((organization) => (
-            <div key={organization.id} className="row-card">
-              <div>
-                <strong>{organization.name}</strong>
-                <span>Criada em {formatDate(organization.createdAt)}</span>
-              </div>
-              <div className="inline-actions">
-                <button type="button" className="danger-button" onClick={() => deleteOrganization(organization.id)}>
-                  Excluir empresa
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      </section>
+      </div>
     );
   }
 
@@ -3284,7 +3180,7 @@ function App() {
     return (
       <div className="view-stack">
         <section className="panel-card view-stack">
-          <h2 className="profile-page-title">Perfil</h2>
+          <h2 className="profile-page-title">Minha Conta</h2>
           <form onSubmit={saveProfile} className="form-stack">
             <input
               value={profileName}
@@ -3322,41 +3218,33 @@ function App() {
     );
   }
 
+  function renderPlan() {
+    return <section className="plan-empty-view" aria-label="Meu plano" />;
+  }
+
   function renderCompanies() {
     return (
       <section className="panel-card view-stack">
         <div className="section-head">
-          <div>
-            <span className="section-kicker">setup</span>
-            <h2>Unidades</h2>
-          </div>
+          {renderSectionTitleWithIcon("companies", "Perfis", "setup")}
         </div>
-        <form onSubmit={createCompany} className="form-grid form-grid-two">
+        <form onSubmit={createCompany} className="form-grid">
           <input
             value={companyName}
             onChange={(event) => setCompanyName(event.target.value)}
-            placeholder="Nome da unidade"
+            placeholder="Nome do perfil"
             required
             minLength={2}
             maxLength={80}
-            title="Informe o nome da unidade com 2 a 80 caracteres."
+            title="Informe o nome do perfil com 2 a 80 caracteres."
           />
-          <select value={companyOrganizationId} onChange={(event) => setCompanyOrganizationId(event.target.value)} required>
-            <option value="">Selecione a empresa</option>
-            {organizations.map((organization) => (
-              <option key={organization.id} value={organization.id}>
-                {organization.name}
-              </option>
-            ))}
-          </select>
-          <button type="submit">Criar unidade</button>
+          <button type="submit">Criar perfil</button>
         </form>
         <div className="table-list">
           {companies.map((company) => (
             <div key={company.id} className="row-card">
               <div>
                 <strong>{company.name}</strong>
-                <span>Empresa: {organizations.find((item) => item.id === company.organizationId)?.name || "-"}</span>
               </div>
               <span>{formatDate(company.createdAt)}</span>
             </div>
@@ -3370,103 +3258,50 @@ function App() {
     return (
       <section className="panel-card view-stack">
         <div className="section-head">
-          <div>
-            <span className="section-kicker">operação</span>
-            <h2>Conectar contas</h2>
+          {renderSectionTitleWithIcon("agents", "Conectar contas", "operação")}
+          <div className="inline-actions">
+            {renderCompanyFilter("Filtrar perfil")}
+            {renderConnectionPlatformFilter()}
           </div>
-          <div className="inline-actions">{renderCompanyFilter("Filtrar unidade")}</div>
         </div>
 
-        <form onSubmit={createConnection} className="form-grid form-grid-three">
-          <input
-            value={connectionDisplayName}
-            onChange={(event) => setConnectionDisplayName(event.target.value)}
-            placeholder="Nome da conta"
-            required
-            minLength={2}
-            maxLength={80}
-            title="Informe um nome interno para identificar essa conta conectada."
-          />
-          <select value={connectionCompanyId} onChange={(event) => setConnectionCompanyId(event.target.value)} required>
-            <option value="">Selecione a unidade</option>
-            {companies.map((company) => (
-              <option key={company.id} value={company.id}>
-                {company.name}
-              </option>
-            ))}
-          </select>
-          <select
-            value={connectionPlatform}
-            onChange={(event) => setConnectionPlatform(event.target.value as SocialConnection["platform"])}
-            required
-          >
-            <option value="instagram">Instagram</option>
-            <option value="whatsapp">WhatsApp</option>
-          </select>
-          <input
-            value={connectionLoginIdentifier}
-            onChange={(event) => setConnectionLoginIdentifier(event.target.value)}
-            placeholder={
-              connectionPlatform === "instagram"
-                ? "ID/usuario Instagram (opcional)"
-                : "Nome da Instancia Evolution (ex: unidade-centro-01)"
-            }
-            title={
-              connectionPlatform === "instagram"
-                ? "Opcional: use este campo se o mesmo Facebook tiver mais de uma conta Instagram Business, para o backend escolher a conta certa no OAuth."
-                : "Informe o Nome da Instancia da Evolution API para conectar o WhatsApp. Em modo hardcoded no backend, pode ficar vazio."
-            }
-          />
-          {connectionPlatform === "whatsapp" ? (
-            <input
-              type="password"
-              value={connectionSecret}
-              onChange={(event) => setConnectionSecret(event.target.value)}
-              placeholder="API Key da instância (opcional)"
-              title="Opcional: API Key da instância da Evolution API. Se vazio, o backend usa EVOLUTION_API_KEY."
-            />
-          ) : null}
-          <button type="submit">Adicionar conta</button>
-        </form>
+        <section className="connection-platform-grid" aria-label="Selecionar plataforma para conectar conta">
+          {connectionPlatformOptions.map((option) => {
+            const Icon = option.icon;
+            return (
+              <button
+                key={option.platform}
+                type="button"
+                className="connection-platform-card"
+                data-platform={option.platform}
+                onClick={() => openCreateConnectionModal(option.platform)}
+                title={`Adicionar conta ${option.label}`}
+                aria-label={`Adicionar conta ${option.label}`}
+              >
+                <span className="connection-platform-card-icon" aria-hidden="true">
+                  <Icon />
+                </span>
+              </button>
+            );
+          })}
+        </section>
 
         <div className="table-list">
           {filteredConnections.map((connection) => (
             <div key={connection.id} className="row-card connection-row">
               <div className="agent-meta">
-                <strong>{connection.displayName}</strong>
-                <span className="publication-pill">{connectionPlatformLabel(connection.platform)}</span>
-                <span className="unit-pill">
-                  {`Unidade: ${companyNameMap[connection.companyId] || "Unidade removida"}`}
-                </span>
-                {connection.platform === "whatsapp" && connection.authStatus === "CONNECTED" ? (
-                  <div className="connection-state-shell">
-                    <strong>WhatsApp conectado</strong>
-                    <span>A conta esta conectada e pronta para postar.</span>
-                    {connection.lastAuthAt ? <span>Conectado em {formatDate(connection.lastAuthAt)}</span> : null}
-                  </div>
-                ) : null}
-                {connection.platform === "whatsapp" && connection.authStatus === "AUTH_IN_PROGRESS" ? (
-                  <div className="connection-state-shell connection-state-shell-pending">
-                    <strong>
-                      {connection.qrStatus === "QR_EXPIRED"
-                        ? "QR expirado"
-                        : connection.qrStatus === "WAITING_QR_SCAN"
-                          ? "Escaneie agora"
-                          : connection.qrStatus === "ERROR"
-                            ? "Falha ao gerar QR"
-                            : "Gerando QR..."}
-                    </strong>
-                    <span>
-                      {connection.qrStatus === "QR_EXPIRED"
-                        ? "Clique em Gerar novo QR para emitir outro código."
-                        : connection.qrStatus === "WAITING_QR_SCAN"
-                          ? "Abra o modal e escaneie o QR pelo painel."
-                          : connection.qrStatus === "ERROR"
-                            ? "Nao foi possivel gerar o QR. Tente novamente."
-                            : "O worker local está preparando o QR do WhatsApp."}
-                    </span>
-                  </div>
-                ) : null}
+                <strong className="agent-title-with-platform-icon">
+                  {connection.platform === "instagram" ? <FaInstagram aria-hidden="true" /> : <FaWhatsapp aria-hidden="true" />}
+                  {connection.displayName}
+                </strong>
+                <div className="meta-pill-row">
+                  <span className="unit-pill">
+                    {`Perfil: ${companyNameMap[connection.companyId] || "Perfil removido"}`}
+                  </span>
+                  {connection.platform === "whatsapp" && connection.authStatus === "CONNECTED" ? (
+                    <span className="connection-connected-text">Conectado</span>
+                  ) : null}
+                </div>
               </div>
               <div className="inline-actions connection-actions">
                 {connection.platform === "instagram" && connection.authStatus !== "CONNECTED" ? (
@@ -3482,10 +3317,14 @@ function App() {
                   <button
                     type="button"
                     className="secondary-button"
-                    disabled={qrRequestingConnectionId === connection.id}
+                    disabled={qrRequestingConnectionId === connection.id || qrCancellingConnectionId === connection.id}
                     onClick={() => void regenerateConnectionQr(connection.id)}
                   >
-                    {qrRequestingConnectionId === connection.id ? "Gerando..." : "Gerar novo QR"}
+                    {qrCancellingConnectionId === connection.id
+                      ? "Cancelando..."
+                      : qrRequestingConnectionId === connection.id
+                        ? "Gerando..."
+                        : "Gerar novo QR"}
                   </button>
                 ) : null}
                 {connection.platform !== "instagram" || connection.authStatus === "CONNECTED" ? (
@@ -3519,10 +3358,7 @@ function App() {
     return (
       <section className="panel-card view-stack">
         <div className="section-head">
-          <div>
-            <span className="section-kicker">agenda</span>
-            <h2>{editingJobId ? "Editar job" : "Agendar Postagem"}</h2>
-          </div>
+          {renderSectionTitleWithIcon("scheduler", editingJobId ? "Editar job" : "Agendar Postagem", "agenda")}
           <div className="inline-actions">
             {editingJobId ? (
               <button type="button" className="ghost-button" onClick={resetSchedulerForm}>
@@ -3547,10 +3383,10 @@ function App() {
               required
             >
               <option value="">Selecione o tipo de postagem</option>
-              <option value="instagram_reel">Instagram Reel</option>
-              <option value="instagram_post">Instagram Post</option>
-              <option value="instagram_story">Instagram Story</option>
-              <option value="whatsapp_status_midia">WhatsApp Status (midia)</option>
+              <option value="instagram_reel">Instagram - Reels</option>
+              <option value="instagram_post">Instagram - Posts</option>
+              <option value="instagram_story">Instagram - Stories</option>
+              <option value="whatsapp_status_midia">WhatsApp - Status (midia)</option>
             </select>
             <select
               value={publicationState}
@@ -3563,7 +3399,7 @@ function App() {
               <option value="DRAFT">Rascunho</option>
             </select>
             <select value={jobCompanyId} onChange={(event) => setJobCompanyId(event.target.value)} required>
-              <option value="">Selecione a unidade</option>
+              <option value="">Selecione o perfil</option>
               {companies.map((company) => (
                 <option key={company.id} value={company.id}>
                   {company.name}
@@ -3579,7 +3415,7 @@ function App() {
               value={postTitle}
               onChange={(event) => setPostTitle(event.target.value)}
               disabled={submittingJob}
-              placeholder="Ex: Oferta da semana - unidade Centro"
+              placeholder="Ex: Oferta da semana - perfil Centro"
               maxLength={120}
               required
               title="Título interno e curto para identificar a postagem nas listas e notificações."
@@ -3627,7 +3463,7 @@ function App() {
             <div className="text-chip">
               {schedulerConnections.length > 0
                 ? `${schedulerConnections.length} conta(s) disponivel(is) para este tipo`
-                : "Nenhuma conta conectada para esta unidade e rede"}
+                : "Nenhuma conta conectada para este perfil e rede"}
             </div>
           </div>
 
@@ -3742,7 +3578,7 @@ function App() {
                   >
                     <FiX />
                   </button>
-                  <img src={`${api.baseUrl}${media.filePath}`} alt={`Prévia ${index + 1}`} loading="lazy" />
+                  <img src={`${api.baseUrl}${media.filePath}`} alt={`Prévia ${index + 1}`} />
                   <small>{`#${index + 1}`}</small>
                 </div>
               ))}
@@ -3826,13 +3662,10 @@ function App() {
     return (
       <section ref={mediaSectionRef} className="panel-card view-stack">
         <div className="section-head">
-              <div>
-                <span className="section-kicker">Biblioteca</span>
-                <h2>Mídias por unidade</h2>
-          </div>
+          {renderSectionTitleWithIcon("media", "Mídias por perfil", "Biblioteca")}
         </div>
         <div className="history-filters-grid">
-          {renderCompanyFilter("Filtrar unidade")}
+          {renderCompanyFilter("Filtrar perfil")}
           {renderMediaFilter()}
           {renderMediaMonthFilter()}
           {renderMediaYearFilter()}
@@ -3850,9 +3683,6 @@ function App() {
         {renderNumericPagination("media-top", mediaPage, mediaTotalPages, setMediaPage, mediaSectionRef)}
         <div className="media-grid">
           {paginatedMediaItems.map((media) => {
-            const imageLoaded = loadedMediaPreviewByPath[media.filePath];
-            const placeholderPreview = mediaPreviewPlaceholderByPath[media.filePath];
-
             return (
               <article key={media.filePath} className="media-card">
                 <div className="media-preview">
@@ -3868,29 +3698,12 @@ function App() {
                   {isVideoPath(media.filePath) ? (
                     <video src={media.previewUrl} muted playsInline />
                   ) : (
-                    <>
-                      {!imageLoaded ? (
-                        placeholderPreview ? (
-                          <img
-                            src={placeholderPreview}
-                            alt=""
-                            aria-hidden="true"
-                            className="media-preview-placeholder"
-                          />
-                        ) : (
-                          <div className="media-preview-fallback-placeholder" aria-hidden="true" />
-                        )
-                      ) : null}
-                      <img
-                        src={media.previewUrl}
-                        alt={media.caption || "Midia"}
-                        loading="lazy"
-                        decoding="async"
-                        className={`media-preview-image${imageLoaded ? " media-preview-image-loaded" : ""}`}
-                        onLoad={() => markMediaPreviewLoaded(media.filePath)}
-                        onError={() => markMediaPreviewLoaded(media.filePath)}
-                      />
-                    </>
+                    <img
+                      src={media.previewUrl}
+                      alt={media.caption || "Midia"}
+                      decoding="async"
+                      className="media-preview-image"
+                    />
                   )}
                 </div>
                 <div className="inline-actions">
@@ -3915,13 +3728,10 @@ function App() {
     return (
       <section ref={historySectionRef} className="panel-card view-stack">
         <div className="section-head">
-          <div>
-            <span className="section-kicker">timeline</span>
-            <h2>Histórico</h2>
-          </div>
+          {renderSectionTitleWithIcon("history", "Histórico", "timeline")}
         </div>
         <div className="history-filters-grid">
-          {renderCompanyFilter("Filtrar unidade")}
+          {renderCompanyFilter("Filtrar perfil")}
           {renderHistoryFilter()}
           {renderHistoryMonthFilter()}
           {renderHistoryYearFilter()}
@@ -3942,8 +3752,10 @@ function App() {
             <div key={job.id} className="row-card">
               <div>
                 <strong>{resolveJobDisplayTitle(job)}</strong>
-                <span className="publication-pill">{publicationTypeLabel(job.publicationType)}</span>
-                <span className="unit-pill">{`Unidade: ${companyNameMap[job.companyId] || "Unidade removida"}`}</span>
+                <div className="meta-pill-row">
+                  {renderPublicationTypePill(job.publicationType)}
+                  <span className="unit-pill">{`Perfil: ${companyNameMap[job.companyId] || "Perfil removido"}`}</span>
+                </div>
                 {job.locationName ? <span>Localização: {job.locationName}</span> : null}
                 <span>{formatDate(job.dataPostagem)}</span>
               </div>
@@ -4019,12 +3831,9 @@ function App() {
     return (
       <section className="panel-card view-stack tinted-panel">
         <div className="section-head">
-          <div>
-            <span className="section-kicker">debug</span>
-            <h2>Alertas e logs de erro</h2>
-          </div>
+          {renderSectionTitleWithIcon("logs", "Alertas e logs de erro", "debug")}
           <div className="inline-actions">
-            {renderCompanyFilter("Filtrar unidade")}
+            {renderCompanyFilter("Filtrar perfil")}
             <span className="count-pill">{filteredLogs.length} alertas</span>
           </div>
         </div>
@@ -4049,7 +3858,7 @@ function App() {
               <span>{formatDate(log.createdAt)}</span>
             </div>
           ))}
-          {filteredLogs.length === 0 ? <div className="empty-state">Nenhum alerta de erro para esta unidade.</div> : null}
+          {filteredLogs.length === 0 ? <div className="empty-state">Nenhum alerta de erro para este perfil.</div> : null}
         </div>
       </section>
     );
@@ -4059,10 +3868,7 @@ function App() {
     return (
       <section ref={avisosSectionRef} className="panel-card view-stack">
         <div className="section-head">
-          <div>
-            <span className="section-kicker">painel</span>
-            <h2>Avisos</h2>
-          </div>
+          {renderSectionTitleWithIcon("notices", "Avisos", "painel")}
           <span className="count-pill">{avisosTotal} registros</span>
         </div>
 
@@ -4109,10 +3915,7 @@ function App() {
     return (
       <section className="panel-card view-stack">
         <div className="section-head">
-          <div>
-            <span className="section-kicker">root</span>
-            <h2>Cadastrar avisos</h2>
-          </div>
+          {renderSectionTitleWithIcon("noticeAdmin", "Cadastrar avisos", "root")}
         </div>
 
         {noticeAdminInfo ? (
@@ -4145,12 +3948,264 @@ function App() {
     );
   }
 
+  function renderSkeletonSectionHead(filterCount = 0) {
+    return (
+      <div className="section-head skeleton-section-head" aria-hidden="true">
+        <div className="skeleton-title-stack">
+          <span className="skeleton-line skeleton-line-kicker" />
+          <span className="skeleton-line skeleton-line-heading" />
+        </div>
+        {filterCount > 0 ? (
+          <div className="skeleton-filter-group">
+            {Array.from({ length: filterCount }, (_, index) => (
+              <span key={`skeleton-filter-${index}`} className="skeleton-line skeleton-line-filter" />
+            ))}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  function renderSkeletonRows(count: number) {
+    return (
+      <div className="table-list" aria-hidden="true">
+        {Array.from({ length: count }, (_, index) => (
+          <div key={`skeleton-row-${index}`} className="row-card skeleton-row-card">
+            <div className="skeleton-row-main">
+              <span className="skeleton-line skeleton-line-title" />
+              <div className="meta-pill-row">
+                <span className="skeleton-line skeleton-line-pill" />
+                <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
+              </div>
+              <span className="skeleton-line skeleton-line-text" />
+            </div>
+            <div className="inline-actions skeleton-inline-actions">
+              <span className="skeleton-line skeleton-line-chip" />
+              <span className="skeleton-line skeleton-line-button" />
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  function renderDashboardSkeleton() {
+    return (
+      <div className="view-stack skeleton-shell" aria-busy="true">
+        <section className="hero-card">
+          <div className="skeleton-stack" aria-hidden="true">
+            <span className="skeleton-line skeleton-line-kicker" />
+            <span className="skeleton-line skeleton-line-heading skeleton-line-heading-wide" />
+            <span className="skeleton-line skeleton-line-text skeleton-line-text-wide" />
+            <span className="skeleton-line skeleton-line-text skeleton-line-text-medium" />
+          </div>
+        </section>
+
+        <section className="stats-grid" aria-hidden="true">
+          {Array.from({ length: 4 }, (_, index) => (
+            <article key={`dashboard-metric-skeleton-${index}`} className="metric-card skeleton-metric-card">
+              <span className="skeleton-line skeleton-line-chip" />
+              <span className="skeleton-line skeleton-line-metric-value" />
+            </article>
+          ))}
+        </section>
+
+        <section className="content-grid">
+          <article className="panel-card full-width-panel">
+            {renderSkeletonSectionHead(1)}
+            {renderSkeletonRows(3)}
+          </article>
+        </section>
+      </div>
+    );
+  }
+
+  function renderCompaniesSkeleton() {
+    return (
+      <section className="panel-card view-stack skeleton-shell" aria-busy="true">
+        {renderSkeletonSectionHead()}
+        <div className="form-grid" aria-hidden="true">
+          <span className="skeleton-line skeleton-line-input" />
+          <span className="skeleton-line skeleton-line-button" />
+        </div>
+        {renderSkeletonRows(4)}
+      </section>
+    );
+  }
+
+  function renderAgentsSkeleton() {
+    return (
+      <section className="panel-card view-stack skeleton-shell" aria-busy="true">
+        {renderSkeletonSectionHead(2)}
+        <section className="connection-platform-grid" aria-hidden="true">
+          {Array.from({ length: 2 }, (_, index) => (
+            <div key={`connection-platform-skeleton-${index}`} className="connection-platform-card skeleton-platform-card" />
+          ))}
+        </section>
+        {renderSkeletonRows(3)}
+      </section>
+    );
+  }
+
+  function renderSchedulerSkeleton() {
+    return (
+      <section className="panel-card view-stack skeleton-shell" aria-busy="true">
+        {renderSkeletonSectionHead(1)}
+        <div className="form-stack" aria-hidden="true">
+          <div className="form-grid form-grid-three">
+            <span className="skeleton-line skeleton-line-input" />
+            <span className="skeleton-line skeleton-line-input" />
+            <span className="skeleton-line skeleton-line-input" />
+          </div>
+          <span className="skeleton-line skeleton-line-input" />
+          <div className="form-grid form-grid-two scheduler-top-grid">
+            <span className="skeleton-line skeleton-line-input" />
+            <span className="skeleton-line skeleton-line-input" />
+          </div>
+          <span className="skeleton-line skeleton-line-text" />
+          <div className="form-grid form-grid-two">
+            <span className="skeleton-line skeleton-line-input" />
+            <span className="skeleton-line skeleton-line-input" />
+          </div>
+          <div className="upload-shell">
+            <span className="skeleton-line skeleton-line-input" />
+            <span className="skeleton-line skeleton-line-text skeleton-line-text-wide" />
+          </div>
+          <span className="skeleton-line skeleton-line-input" />
+          <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" />
+        </div>
+      </section>
+    );
+  }
+
+  function renderMediaSkeleton() {
+    return (
+      <section className="panel-card view-stack skeleton-shell" aria-busy="true">
+        {renderSkeletonSectionHead()}
+        <div className="history-filters-grid" aria-hidden="true">
+          {Array.from({ length: 4 }, (_, index) => (
+            <span key={`media-filter-skeleton-${index}`} className="skeleton-line skeleton-line-filter" />
+          ))}
+        </div>
+        <div className="media-grid" aria-hidden="true">
+          {Array.from({ length: 8 }, (_, index) => (
+            <article key={`media-skeleton-${index}`} className="media-card skeleton-media-card">
+              <div className="media-preview skeleton-media-preview" />
+              <div className="inline-actions">
+                <span className="skeleton-line skeleton-line-button" />
+                <span className="skeleton-line skeleton-line-button" />
+              </div>
+            </article>
+          ))}
+        </div>
+      </section>
+    );
+  }
+
+  function renderHistorySkeleton() {
+    return (
+      <section className="panel-card view-stack skeleton-shell" aria-busy="true">
+        {renderSkeletonSectionHead()}
+        <div className="history-filters-grid" aria-hidden="true">
+          {Array.from({ length: 4 }, (_, index) => (
+            <span key={`history-filter-skeleton-${index}`} className="skeleton-line skeleton-line-filter" />
+          ))}
+        </div>
+        {renderSkeletonRows(4)}
+      </section>
+    );
+  }
+
+  function renderLogsSkeleton() {
+    return (
+      <section className="panel-card view-stack skeleton-shell" aria-busy="true">
+        {renderSkeletonSectionHead(1)}
+        {renderSkeletonRows(4)}
+      </section>
+    );
+  }
+
+  function renderNoticesSkeleton() {
+    return (
+      <section className="panel-card view-stack skeleton-shell" aria-busy="true">
+        {renderSkeletonSectionHead(1)}
+        {renderSkeletonRows(4)}
+      </section>
+    );
+  }
+
+  function renderNoticeAdminSkeleton() {
+    return (
+      <section className="panel-card view-stack skeleton-shell" aria-busy="true">
+        {renderSkeletonSectionHead()}
+        <div className="form-stack" aria-hidden="true">
+          <span className="skeleton-line skeleton-line-input" />
+          <span className="skeleton-line skeleton-line-textarea" />
+          <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" />
+        </div>
+      </section>
+    );
+  }
+
+  function renderProfileSkeleton() {
+    return (
+      <div className="view-stack skeleton-shell" aria-busy="true">
+        <section className="panel-card view-stack">
+          <span className="skeleton-line skeleton-line-heading" />
+          <div className="form-stack" aria-hidden="true">
+            <span className="skeleton-line skeleton-line-input" />
+            <span className="skeleton-line skeleton-line-input" />
+            <span className="skeleton-line skeleton-line-input" />
+            <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" />
+          </div>
+        </section>
+      </div>
+    );
+  }
+
+  function renderPlanSkeleton() {
+    return <section className="plan-empty-view" aria-label="Carregando plano" />;
+  }
+
+  function renderContentSkeleton() {
+    switch (activeView) {
+      case "dashboard":
+        return renderDashboardSkeleton();
+      case "companies":
+        return renderCompaniesSkeleton();
+      case "agents":
+        return renderAgentsSkeleton();
+      case "scheduler":
+        return renderSchedulerSkeleton();
+      case "media":
+        return renderMediaSkeleton();
+      case "history":
+        return renderHistorySkeleton();
+      case "logs":
+        return renderLogsSkeleton();
+      case "notices":
+        return renderNoticesSkeleton();
+      case "noticeAdmin":
+        return renderNoticeAdminSkeleton();
+      case "profile":
+        return renderProfileSkeleton();
+      case "plan":
+        return renderPlanSkeleton();
+      default:
+        return renderDashboardSkeleton();
+    }
+  }
+
   function renderContent() {
+    if (contentLoading) {
+      return renderContentSkeleton();
+    }
+
     switch (activeView) {
       case "profile":
         return renderProfile();
-      case "organizations":
-        return renderOrganizations();
+      case "plan":
+        return renderPlan();
       case "companies":
         return renderCompanies();
       case "agents":
@@ -4197,7 +4252,7 @@ function App() {
           aria-label="Fechar menu"
           onClick={() => setSidebarOpen(false)}
         >
-          ×
+          <span className="sidebar-close-icon" aria-hidden="true">×</span>
         </button>
         <nav className="nav-list">
           {visibleNavItems.map((item) => (
@@ -4240,23 +4295,14 @@ function App() {
             >
               {themeMode === "dark" ? <FiSun aria-hidden="true" /> : <FiMoon aria-hidden="true" />}
             </button>
-            <button
-              type="button"
-              className={`profile-trigger mobile-profile-trigger ${activeView === "profile" ? "profile-trigger-active" : ""}`}
-              onClick={() => {
-                setNoticesPopoverOpen(false);
-                navigateToView("profile");
-              }}
-            >
-              <span className="profile-icon" aria-hidden="true" />
-              <span className="profile-trigger-label">Perfil</span>
-            </button>
+            {renderProfileMenu(profileMenuMobileRef, "mobile-profile-trigger")}
             <button
               type="button"
               className="menu-toggle"
               aria-label="Abrir menu"
               onClick={() => {
                 setNoticesPopoverOpen(false);
+                setProfileMenuOpen(false);
                 setSidebarOpen((current) => !current);
               }}
             >
@@ -4266,17 +4312,7 @@ function App() {
             </button>
           </div>
           <div className="topbar-actions">
-            <button
-              type="button"
-              className={`profile-trigger ${activeView === "profile" ? "profile-trigger-active" : ""}`}
-              onClick={() => {
-                setNoticesPopoverOpen(false);
-                navigateToView("profile");
-              }}
-            >
-              <span className="profile-icon" aria-hidden="true" />
-              <span className="profile-trigger-label">Perfil</span>
-            </button>
+            {renderProfileMenu(profileMenuDesktopRef)}
             {renderNoticesBell(noticesBellDesktopRef)}
             <button
               type="button"
@@ -4298,27 +4334,77 @@ function App() {
 
         {renderContent()}
 
-        {activeView !== "scheduler" ? (
-          <section className="panel-card quick-scheduler">
-            <div className="section-head">
-              <div>
-                <span className="section-kicker">Ação rápida</span>
-                <h2>Atalho rápido para agendar</h2>
+        {isCreateConnectionModalOpen ? (
+          <button
+            type="button"
+            className="connection-create-modal-backdrop"
+            aria-label="Fechar cadastro de conta"
+            onClick={() => {
+              setConnectionCreateAttempted(false);
+              setIsCreateConnectionModalOpen(false);
+            }}
+          >
+            <section
+              className="connection-create-modal"
+              aria-label="Cadastrar nova conta"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="connection-create-modal-header">
+                <div>
+                  <strong>{`Adicionar ${connectionPlatformLabel(connectionPlatform)}`}</strong>
+                </div>
+                <button
+                  type="button"
+                  className="qr-modal-close"
+                  aria-label="Fechar"
+                  title="Fechar"
+                  onClick={() => {
+                    setConnectionCreateAttempted(false);
+                    setIsCreateConnectionModalOpen(false);
+                  }}
+                >
+                  <span className="modal-close-icon" aria-hidden="true">
+                    ×
+                  </span>
+                </button>
               </div>
-              <button type="button" className="activate-button" onClick={() => navigateToView("scheduler")}>
-                Agendar
-              </button>
-            </div>
-            <div className="quick-summary">
-              {uploadedMediaCount > 0 ? (
-                <span>
-                  {uploadedMediaCount === 1
-                    ? "1 mídia pronta para reutilização"
-                    : `${uploadedMediaCount} mídias prontas para reutilização`}
-                </span>
-              ) : null}
-            </div>
-          </section>
+              <form
+                onSubmit={createConnection}
+                className={`connection-create-form${connectionCreateAttempted ? " connection-create-form-attempted" : ""}`}
+              >
+                <label className="field-label">
+                  Nome
+                  <input
+                    value={connectionDisplayName}
+                    onChange={(event) => setConnectionDisplayName(event.target.value)}
+                    placeholder="Ex: Matriz Instagram"
+                    required
+                    minLength={2}
+                    maxLength={80}
+                    title="Informe um nome interno para identificar essa conta conectada."
+                  />
+                </label>
+                <label className="field-label">
+                  Perfil
+                  <select
+                    value={connectionCompanyId}
+                    onChange={(event) => setConnectionCompanyId(event.target.value)}
+                    required
+                  >
+                    <option value="">Selecione o perfil</option>
+                    {companies.map((company) => (
+                      <option key={company.id} value={company.id}>
+                        {company.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <div className="connection-create-modal-actions">
+                  <button type="submit">Adicionar conta</button>
+                </div>
+              </form>
+            </section>
+          </button>
         ) : null}
 
         {activeQrConnectionId ? (
@@ -4326,20 +4412,23 @@ function App() {
             type="button"
             className="qr-modal-backdrop"
             aria-label="Fechar QR do WhatsApp"
-            onClick={() => void dismissConnectionQr(activeQrConnectionId)}
+            onClick={() => void cancelConnectionQr(activeQrConnectionId)}
           >
             <section className="qr-modal" aria-label="QR do WhatsApp" onClick={(event) => event.stopPropagation()}>
               <div className="qr-modal-header">
                 <div>
                   <strong>QR do WhatsApp</strong>
-                  <span>{activeQrDescription}</span>
                 </div>
                 <button
                   type="button"
                   className="qr-modal-close"
-                  onClick={() => void dismissConnectionQr(activeQrConnectionId)}
+                  aria-label="Fechar"
+                  title="Fechar"
+                  onClick={() => void cancelConnectionQr(activeQrConnectionId)}
                 >
-                  Fechar
+                  <span className="modal-close-icon" aria-hidden="true">
+                    ×
+                  </span>
                 </button>
               </div>
 
@@ -4348,7 +4437,7 @@ function App() {
                   <img className="qr-image" src={activeQrConnection.qrImageDataUrl} alt="QR Code do WhatsApp" />
                 ) : (
                   <div className="qr-placeholder">
-                    <span className="spinner" aria-hidden="true" />
+                    {activeQrState === "PREPARING" ? <span className="spinner" aria-hidden="true" /> : null}
                     <span>{activeQrHeading}</span>
                   </div>
                 )}
@@ -4364,9 +4453,10 @@ function App() {
                   <button
                     type="button"
                     className="ghost-button"
+                    disabled={qrCancellingConnectionId === activeQrConnectionId}
                     onClick={() => void cancelConnectionQr(activeQrConnectionId)}
                   >
-                    Cancelar geração
+                    {qrCancellingConnectionId === activeQrConnectionId ? "Cancelando..." : "Cancelar geração"}
                   </button>
                 ) : null}
               </div>
