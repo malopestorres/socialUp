@@ -62,6 +62,7 @@ model Job {
   postWhatsapp Boolean  @default(false)
   modoWhatsapp String
   dataPostagem DateTime
+  publicationState String @default("PUBLISHED")
   status       String   @default("PENDING")
   tentativas   Int      @default(0)
   criadoEm     DateTime @default(now())

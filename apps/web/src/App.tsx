@@ -1,7 +1,27 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent } from "react";
-import { FiAlertCircle, FiBell, FiCheckCircle, FiClock, FiEye, FiEyeOff, FiWifi, FiX } from "react-icons/fi";
+import type { IconType } from "react-icons";
+import {
+  FiAlertCircle,
+  FiBell,
+  FiCalendar,
+  FiCheckCircle,
+  FiClock,
+  FiFileText,
+  FiHome,
+  FiImage,
+  FiLayers,
+  FiLink2,
+  FiMapPin,
+  FiWifi,
+  FiX,
+  FiEye,
+  FiEyeOff,
+  FiMoon,
+  FiSun,
+} from "react-icons/fi";
 import { api } from "./api";
 import appLogo from "./assets/logo.svg";
+import appLogoAlternative from "./assets/logo-alternativo.svg";
 
 type ViewKey =
   | "dashboard"
@@ -16,7 +36,11 @@ type ViewKey =
   | "notices"
   | "noticeAdmin";
 
-type HistoryFilterKey = "all" | "upcoming" | "canceled" | "sent" | "failed" | "waiting_login";
+type ThemeMode = "light" | "dark";
+
+type HistoryFilterKey = "all" | "upcoming" | "canceled" | "sent" | "failed" | "waiting_login" | "draft" | "published";
+type PublicationState = "PUBLISHED" | "DRAFT";
+type SchedulerPublicationState = PublicationState | "";
 
 type Organization = {
   id: string;
@@ -69,6 +93,7 @@ type Job = {
     | "instagram_post"
     | "whatsapp_status_midia"
     | "whatsapp_status_texto";
+  publicationState: PublicationState;
   postStory: boolean;
   postReel: boolean;
   postWhatsapp: boolean;
@@ -156,16 +181,16 @@ const initialDashboard: Dashboard = {
   instagramForcedLocationName: null,
 };
 
-const navItems: Array<{ key: ViewKey; label: string; eyebrow?: string }> = [
-  { key: "dashboard", label: "Dashboard" },
-  { key: "agents", label: "Conectar contas" },
-  { key: "scheduler", label: "Agendar" },
-  { key: "media", label: "Midias" },
-  { key: "history", label: "Histórico" },
-  { key: "noticeAdmin", label: "Cadastrar avisos" },
-  { key: "organizations", label: "Empresa" },
-  { key: "companies", label: "Unidades" },
-  { key: "logs", label: "Logs" },
+const navItems: Array<{ key: ViewKey; label: string; eyebrow?: string; icon: IconType }> = [
+  { key: "dashboard", label: "Dashboard", icon: FiHome },
+  { key: "agents", label: "Conectar contas", icon: FiLink2 },
+  { key: "scheduler", label: "Agendar", icon: FiCalendar },
+  { key: "media", label: "Midias", icon: FiImage },
+  { key: "history", label: "Histórico", icon: FiClock },
+  { key: "noticeAdmin", label: "Cadastrar avisos", icon: FiBell },
+  { key: "organizations", label: "Empresa", icon: FiLayers },
+  { key: "companies", label: "Unidades", icon: FiMapPin },
+  { key: "logs", label: "Logs", icon: FiFileText },
 ];
 
 const LEGACY_HISTORY_VIEW_QUERY_PARAM = "view";
@@ -212,7 +237,9 @@ function parseHistoryFilterKey(value: string | null | undefined): HistoryFilterK
     value === "canceled" ||
     value === "sent" ||
     value === "failed" ||
-    value === "waiting_login"
+    value === "waiting_login" ||
+    value === "draft" ||
+    value === "published"
   ) {
     return value;
   }
@@ -532,13 +559,13 @@ function publicationTypeLabel(publicationType: Job["publicationType"]): string {
 function jobStatusLabel(status: string): string {
   switch (status) {
     case "PENDING":
-      return "Pendente";
+      return "Aguardando publicação";
     case "RUNNING":
       return "Executando";
     case "SENT_UNCONFIRMED":
       return "Enviado sem confirmação";
     case "COMPLETED":
-      return "Concluído";
+      return "Publicado";
     case "FAILED":
       return "Falhou";
     case "WAITING_LOGIN":
@@ -582,6 +609,10 @@ function toTimeZoneComparableTimestamp(date: Date, timeZone: string): number {
 }
 
 function canToggleJobSchedule(job: Job): boolean {
+  if (job.publicationState === "DRAFT") {
+    return false;
+  }
+
   if (job.status === "CANCELED") {
     return true;
   }
@@ -591,6 +622,22 @@ function canToggleJobSchedule(job: Job): boolean {
   }
 
   return job.status === "PENDING" || job.status === "WAITING_LOGIN" || job.status === "FAILED";
+}
+
+function jobStatusTone(job: Job): string {
+  if (job.publicationState === "DRAFT") {
+    return "draft";
+  }
+
+  return job.status.toLowerCase();
+}
+
+function jobStatusDisplayLabel(job: Job): string {
+  if (job.publicationState === "DRAFT") {
+    return "Rascunho";
+  }
+
+  return jobStatusLabel(job.status);
 }
 
 function isPastScheduledAt(dateIso: string): boolean {
@@ -628,6 +675,24 @@ function isInstagramPublication(publicationType: SchedulerPublicationType): bool
 
 const REMEMBER_ME_STORAGE_KEY = "socialup-remember-me";
 const REMEMBERED_USERNAME_STORAGE_KEY = "socialup-remembered-username";
+const THEME_STORAGE_KEY = "socialup-theme";
+
+function initialThemeMode(): ThemeMode {
+  if (typeof window === "undefined") {
+    return "light";
+  }
+
+  const storedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
+  if (storedTheme === "dark" || storedTheme === "light") {
+    return storedTheme;
+  }
+
+  if (window.matchMedia?.("(prefers-color-scheme: dark)").matches) {
+    return "dark";
+  }
+
+  return "light";
+}
 
 function App() {
   const [authChecked, setAuthChecked] = useState(false);
@@ -640,6 +705,7 @@ function App() {
     return window.localStorage.getItem(REMEMBERED_USERNAME_STORAGE_KEY) ?? "";
   });
   const [loginPassword, setLoginPassword] = useState("");
+  const [themeMode, setThemeMode] = useState<ThemeMode>(initialThemeMode);
   const [rememberMe, setRememberMe] = useState(() => {
     if (typeof window === "undefined") {
       return true;
@@ -689,6 +755,7 @@ function App() {
   const [postTitle, setPostTitle] = useState("");
   const [caption, setCaption] = useState("");
   const [publicationType, setPublicationType] = useState<SchedulerPublicationType>("");
+  const [publicationState, setPublicationState] = useState<SchedulerPublicationState>("");
   const [scheduledDate, setScheduledDate] = useState("");
   const [scheduledTime, setScheduledTime] = useState(getCurrentTimeValue);
   const [scheduledTimeTouched, setScheduledTimeTouched] = useState(false);
@@ -724,6 +791,7 @@ function App() {
   const [mediaPreviewPlaceholderByPath, setMediaPreviewPlaceholderByPath] = useState<Record<string, string>>({});
   const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
   const [togglingScheduleJobId, setTogglingScheduleJobId] = useState<string | null>(null);
+  const [publishingDraftJobId, setPublishingDraftJobId] = useState<string | null>(null);
   const [submittingJob, setSubmittingJob] = useState(false);
   const schedulerMediaInputRef = useRef<HTMLInputElement | null>(null);
   const mediaSectionRef = useRef<HTMLElement | null>(null);
@@ -750,9 +818,11 @@ function App() {
   const isPositiveHistoryInfo =
     historyInfo === "Postagem reenfileirada para tentativa imediata." ||
     historyInfo === "Agendamento cancelado com sucesso." ||
-    historyInfo === "Agendamento ativado com sucesso.";
+    historyInfo === "Agendamento ativado com sucesso." ||
+    historyInfo === "Rascunho publicado com sucesso.";
   const isTransientHistoryInfo =
     historyInfo === "Atualizando agendamento..." ||
+    historyInfo === "Publicando rascunho..." ||
     historyInfo === "Reenfileirando postagem..." ||
     isPositiveHistoryInfo;
   const isPositiveMediaInfo = mediaInfo === "Mídia excluída com sucesso.";
@@ -763,6 +833,7 @@ function App() {
   const isTransientNoticeAdminInfo = isPositiveNoticeAdminInfo;
   const requiresMediaUpload = publicationType !== "" && publicationType !== "whatsapp_status_texto";
   const supportsMultiMediaUpload = publicationType === "instagram_post" || publicationType === "instagram_story";
+  const activeAppLogo = themeMode === "dark" ? appLogoAlternative : appLogo;
   const uploadedFilePath = uploadedSchedulerMedia[0]?.filePath ?? "";
   const uploadedFileName = uploadedSchedulerMedia[0]?.fileName ?? "";
   const uploadedFileSizeBytes = uploadedSchedulerMedia[0]?.fileSizeBytes ?? null;
@@ -810,6 +881,15 @@ function App() {
 
     if (view === "notices") {
       setAvisosPage(1);
+    }
+
+    if (view !== activeView) {
+      setAuthInfo("");
+      setSchedulerInfo("");
+      setHistoryInfo("");
+      setMediaInfo("");
+      setAvisosInfo("");
+      setNoticeAdminInfo("");
     }
 
     setNoticesPopoverOpen(false);
@@ -1024,6 +1104,12 @@ function App() {
         setError(payload.message || "Falha ao concluir autorização do Instagram.");
       }
 
+      try {
+        window.focus();
+      } catch {
+        // Alguns navegadores podem bloquear foco programático.
+      }
+
       void loadAll();
     };
 
@@ -1147,17 +1233,24 @@ function App() {
   );
 
   const upcomingJobs = useMemo(() => {
-    return jobsOrderedByCreatedAtDesc
-      .filter(
-        (job) =>
-          !isPastScheduledAt(job.dataPostagem) &&
-          (job.status === "PENDING" || job.status === "WAITING_LOGIN"),
-      )
-      .slice(0, 5);
+    const eligibleUpcomingJobs = jobsOrderedByCreatedAtDesc.filter(
+      (job) =>
+        job.publicationState === "PUBLISHED" &&
+        (job.status === "RUNNING" ||
+          (!isPastScheduledAt(job.dataPostagem) &&
+            (job.status === "PENDING" || job.status === "WAITING_LOGIN"))),
+    );
+
+    const runningJobs = eligibleUpcomingJobs.filter((job) => job.status === "RUNNING");
+    const scheduledJobs = eligibleUpcomingJobs.filter((job) => job.status !== "RUNNING");
+    return [...runningJobs, ...scheduledJobs].slice(0, 5);
   }, [jobsOrderedByCreatedAtDesc]);
 
   const canceledJobsPreview = useMemo(
-    () => jobsOrderedByCreatedAtDesc.filter((job) => job.status === "CANCELED").slice(0, 5),
+    () =>
+      jobsOrderedByCreatedAtDesc
+        .filter((job) => job.status === "CANCELED" && job.publicationState === "PUBLISHED")
+        .slice(0, 5),
     [jobsOrderedByCreatedAtDesc],
   );
 
@@ -1199,6 +1292,7 @@ function App() {
         case "upcoming":
           return jobsOrderedByCreatedAtDesc.filter(
             (job) =>
+              job.publicationState === "PUBLISHED" &&
               !isPastScheduledAt(job.dataPostagem) &&
               (job.status === "PENDING" || job.status === "WAITING_LOGIN"),
           );
@@ -1212,6 +1306,10 @@ function App() {
           return jobsOrderedByCreatedAtDesc.filter((job) => job.status === "FAILED");
         case "waiting_login":
           return jobsOrderedByCreatedAtDesc.filter((job) => job.status === "WAITING_LOGIN");
+        case "draft":
+          return jobsOrderedByCreatedAtDesc.filter((job) => job.publicationState === "DRAFT");
+        case "published":
+          return jobsOrderedByCreatedAtDesc.filter((job) => job.publicationState === "PUBLISHED");
         case "all":
         default:
           return jobsOrderedByCreatedAtDesc;
@@ -1590,6 +1688,15 @@ function App() {
       window.localStorage.removeItem(REMEMBERED_USERNAME_STORAGE_KEY);
     }
   }, [rememberMe]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    window.localStorage.setItem(THEME_STORAGE_KEY, themeMode);
+    window.document.body.classList.toggle("theme-dark", themeMode === "dark");
+  }, [themeMode]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -2015,6 +2122,12 @@ function App() {
       return;
     }
 
+    if (!publicationState) {
+      setError("");
+      setSchedulerInfo("Selecione um status da publicação.");
+      return;
+    }
+
     const normalizedTitle = postTitle.trim();
     if (!normalizedTitle) {
       setError("");
@@ -2078,6 +2191,7 @@ function App() {
       locationName: effectiveLocationName,
       locationId: effectiveLocationId,
       publicationType,
+      publicationState,
       dataPostagem: new Date(effectiveDateTime).toISOString(),
     };
 
@@ -2112,6 +2226,7 @@ function App() {
     setScheduledTime(getCurrentTimeValue());
     setScheduledTimeTouched(false);
     setPublicationType("");
+    setPublicationState("");
     setEditingJobId(null);
     if (schedulerMediaInputRef.current) {
       schedulerMediaInputRef.current.value = "";
@@ -2137,6 +2252,7 @@ function App() {
     setPostTitle(job.title?.trim() || job.caption?.trim() || "");
     setCaption(job.caption ?? "");
     setPublicationType(job.publicationType);
+    setPublicationState(job.publicationState === "DRAFT" ? "DRAFT" : "PUBLISHED");
     setScheduledDate(toDateLocal(job.dataPostagem));
     setScheduledTime(toTimeLocal(job.dataPostagem));
     setScheduledTimeTouched(true);
@@ -2235,6 +2351,37 @@ function App() {
       setError(toggleError instanceof Error ? toggleError.message : "Falha ao atualizar o agendamento.");
     } finally {
       setTogglingScheduleJobId(null);
+    }
+  }
+
+  async function publishDraft(job: Job) {
+    if (job.publicationState !== "DRAFT") {
+      return;
+    }
+
+    const willRunImmediately = isPastScheduledAt(job.dataPostagem);
+    if (
+      willRunImmediately &&
+      !window.confirm(
+        "Este rascunho está com data/hora no passado. Ao publicar agora, ele pode executar imediatamente. Deseja continuar?",
+      )
+    ) {
+      return;
+    }
+
+    setError("");
+    setPublishingDraftJobId(job.id);
+    setHistoryInfo("Publicando rascunho...");
+
+    try {
+      await api.postJson(`/jobs/${job.id}/publish`, {});
+      setHistoryInfo("Rascunho publicado com sucesso.");
+      await loadAll();
+    } catch (publishError) {
+      setHistoryInfo("");
+      setError(publishError instanceof Error ? publishError.message : "Falha ao publicar o rascunho.");
+    } finally {
+      setPublishingDraftJobId(null);
     }
   }
 
@@ -2455,6 +2602,7 @@ function App() {
     ]);
     setDraggingSchedulerMediaIndex(null);
     setPublicationType(media.publicationType);
+    setPublicationState("");
     setJobCompanyId("");
     setJobSocialConnectionId("");
     setPostTitle("");
@@ -2542,7 +2690,7 @@ function App() {
     return (
       <div className="auth-shell">
         <div className="auth-logo">
-          <img src={appLogo} alt="SocialUp" className="brand-logo auth-brand-logo" />
+          <img src={activeAppLogo} alt="SocialUp" className="brand-logo auth-brand-logo" />
         </div>
 
         {showSetup ? (
@@ -2732,7 +2880,10 @@ function App() {
                 <div className="empty-state">Nao ha proximos agendamentos nesse filtro.</div>
               ) : (
                 upcomingJobs.map((job) => (
-                  <div key={job.id} className="row-card">
+                  <div
+                    key={job.id}
+                    className={`row-card${job.status === "RUNNING" ? " row-card-running-live" : ""}`}
+                  >
                     <div>
                       <strong>{resolveJobDisplayTitle(job)}</strong>
                       <span className="publication-pill">{publicationTypeLabel(job.publicationType)}</span>
@@ -2742,7 +2893,14 @@ function App() {
                     </div>
                     <div className="inline-actions">
                       <span>{formatDate(job.dataPostagem)}</span>
-                      <span className={`status-pill status-${job.status.toLowerCase()}`}>{jobStatusLabel(job.status)}</span>
+                      {job.status === "RUNNING" ? (
+                        <span className="status-pill status-running-live">
+                          <span className="status-pill-spinner" aria-hidden="true" />
+                          Executando
+                        </span>
+                      ) : (
+                        <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
+                      )}
                       {canToggleJobSchedule(job) ? (
                         <button
                           type="button"
@@ -2767,7 +2925,7 @@ function App() {
           <article className="panel-card full-width-panel">
             <div className="section-head">
               <div>
-                <h2>Agendamentos Enviados</h2>
+                <h2>Agendamentos Publicados</h2>
               </div>
               <button
                 type="button"
@@ -2792,7 +2950,7 @@ function App() {
                     </div>
                     <div className="inline-actions">
                       <span>{formatDate(job.dataPostagem)}</span>
-                      <span className={`status-pill status-${job.status.toLowerCase()}`}>{jobStatusLabel(job.status)}</span>
+                      <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
                     </div>
                   </div>
                 ))
@@ -2828,7 +2986,7 @@ function App() {
                     </div>
                     <div className="inline-actions">
                       <span>{formatDate(job.dataPostagem)}</span>
-                      <span className={`status-pill status-${job.status.toLowerCase()}`}>{jobStatusLabel(job.status)}</span>
+                      <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
                       <button
                         type="button"
                         className="activate-button"
@@ -2872,7 +3030,7 @@ function App() {
                     </div>
                     <div className="inline-actions">
                       <span>{formatDate(job.dataPostagem)}</span>
-                      <span className={`status-pill status-${job.status.toLowerCase()}`}>{jobStatusLabel(job.status)}</span>
+                      <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
                       <button
                         type="button"
                         className="ghost-button"
@@ -2922,9 +3080,11 @@ function App() {
           <option value="all">Todos</option>
           <option value="upcoming">Próximos</option>
           <option value="canceled">Cancelados</option>
-          <option value="sent">Enviados</option>
+          <option value="sent">Publicados</option>
           <option value="failed">Falhados</option>
           <option value="waiting_login">Aguardando login</option>
+          <option value="draft">Rascunhos</option>
+          <option value="published">Publicados</option>
         </select>
       </div>
     );
@@ -2988,7 +3148,7 @@ function App() {
           <option value="all">Todos</option>
           <option value="upcoming">Próximos</option>
           <option value="canceled">Cancelados</option>
-          <option value="sent">Enviados</option>
+          <option value="sent">Publicados</option>
           <option value="failed">Falhados</option>
           <option value="waiting_login">Aguardando login</option>
         </select>
@@ -3379,7 +3539,7 @@ function App() {
           </div>
         ) : null}
         <form onSubmit={createJob} className="form-stack">
-          <div className="form-grid form-grid-two scheduler-top-grid">
+          <div className="form-grid form-grid-three">
             <select
               value={publicationType}
               onChange={(event) => setPublicationType(event.target.value as SchedulerPublicationType)}
@@ -3391,6 +3551,16 @@ function App() {
               <option value="instagram_post">Instagram Post</option>
               <option value="instagram_story">Instagram Story</option>
               <option value="whatsapp_status_midia">WhatsApp Status (midia)</option>
+            </select>
+            <select
+              value={publicationState}
+              onChange={(event) => setPublicationState(event.target.value as SchedulerPublicationState)}
+              disabled={submittingJob}
+              required
+            >
+              <option value="">Selecione um status</option>
+              <option value="PUBLISHED">Publicado</option>
+              <option value="DRAFT">Rascunho</option>
             </select>
             <select value={jobCompanyId} onChange={(event) => setJobCompanyId(event.target.value)} required>
               <option value="">Selecione a unidade</option>
@@ -3435,7 +3605,11 @@ function App() {
             />
           </div>
 
-          <div className="text-chip">Se o horário ficar em branco, a postagem usa o horário atual ao salvar.</div>
+          <div className="text-chip">
+            {publicationState === "DRAFT"
+              ? "Rascunho não entra em execução automática, independente de data e horário."
+              : "Se o horário ficar em branco, a postagem usa o horário atual ao salvar."}
+          </div>
 
           <div className="form-grid form-grid-two">
             <select
@@ -3774,7 +3948,17 @@ function App() {
                 <span>{formatDate(job.dataPostagem)}</span>
               </div>
               <div className="inline-actions">
-                <span className={`status-pill status-${job.status.toLowerCase()}`}>{jobStatusLabel(job.status)}</span>
+                <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
+                {job.publicationState === "DRAFT" ? (
+                  <button
+                    type="button"
+                    className="activate-button"
+                    onClick={() => void publishDraft(job)}
+                    disabled={publishingDraftJobId === job.id}
+                  >
+                    {publishingDraftJobId === job.id ? "Publicando..." : "Publicar"}
+                  </button>
+                ) : null}
                 {canToggleJobSchedule(job) ? (
                   <button
                     type="button"
@@ -3796,7 +3980,8 @@ function App() {
                 ) : (
                   <span className="text-chip">Sem midia</span>
                 )}
-                {job.status === "FAILED" || job.status === "WAITING_LOGIN" || job.status === "SENT_UNCONFIRMED" ? (
+                {job.publicationState !== "DRAFT" &&
+                (job.status === "FAILED" || job.status === "WAITING_LOGIN" || job.status === "SENT_UNCONFIRMED") ? (
                   <button
                     type="button"
                     className="ghost-button"
@@ -4020,13 +4205,19 @@ function App() {
               key={item.key}
               href={buildViewHref(item.key)}
               className={`nav-item ${activeView === item.key ? "nav-item-active" : ""}`}
+              data-tooltip={item.label}
               onClick={(event) => {
                 event.preventDefault();
                 navigateToView(item.key);
               }}
             >
-              {item.eyebrow ? <span className="nav-eyebrow">{item.eyebrow}</span> : null}
-              <span>{item.label}</span>
+              <span className="nav-item-icon" aria-hidden="true">
+                <item.icon />
+              </span>
+              <span className="nav-item-content">
+                {item.eyebrow ? <span className="nav-eyebrow">{item.eyebrow}</span> : null}
+                <span className="nav-item-label">{item.label}</span>
+              </span>
             </a>
           ))}
         </nav>
@@ -4036,10 +4227,19 @@ function App() {
       <main className="main-shell">
         <header className="topbar">
           <div className="topbar-heading">
-            <img src={appLogo} alt="SocialUp" className="topbar-logo" />
+            <img src={activeAppLogo} alt="SocialUp" className="topbar-logo" />
           </div>
           <div className="topbar-mobile-actions">
             {renderNoticesBell(noticesBellMobileRef, "notices-shell-mobile")}
+            <button
+              type="button"
+              className="theme-toggle"
+              aria-label={themeMode === "dark" ? "Ativar modo claro" : "Ativar modo escuro"}
+              title={themeMode === "dark" ? "Ativar modo claro" : "Ativar modo escuro"}
+              onClick={() => setThemeMode((current) => (current === "dark" ? "light" : "dark"))}
+            >
+              {themeMode === "dark" ? <FiSun aria-hidden="true" /> : <FiMoon aria-hidden="true" />}
+            </button>
             <button
               type="button"
               className={`profile-trigger mobile-profile-trigger ${activeView === "profile" ? "profile-trigger-active" : ""}`}
@@ -4078,6 +4278,15 @@ function App() {
               <span className="profile-trigger-label">Perfil</span>
             </button>
             {renderNoticesBell(noticesBellDesktopRef)}
+            <button
+              type="button"
+              className="theme-toggle"
+              aria-label={themeMode === "dark" ? "Ativar modo claro" : "Ativar modo escuro"}
+              title={themeMode === "dark" ? "Ativar modo claro" : "Ativar modo escuro"}
+              onClick={() => setThemeMode((current) => (current === "dark" ? "light" : "dark"))}
+            >
+              {themeMode === "dark" ? <FiSun aria-hidden="true" /> : <FiMoon aria-hidden="true" />}
+            </button>
             <button type="button" className="danger-button logout-button" onClick={() => void logout()}>
               Sair
             </button>

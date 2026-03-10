@@ -7,7 +7,7 @@ import { readFileSync, statSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { PublicationType, WhatsappMode } from "@socialup/shared";
+import type { PublicationState, PublicationType, WhatsappMode } from "@socialup/shared";
 import { z } from "zod";
 import { adminAuthMiddleware, type AdminUserAuth } from "./admin-auth.js";
 import {
@@ -512,6 +512,8 @@ const updateProfileSchema = z.object({
   password: z.string().min(8).max(128).optional().or(z.literal("")),
 });
 
+const publicationStateSchema = z.enum(["PUBLISHED", "DRAFT"]);
+
 const createJobSchema = z.object({
   companyId: z.string().min(1),
   socialConnectionId: z.string().min(1),
@@ -529,6 +531,7 @@ const createJobSchema = z.object({
     "whatsapp_status_midia",
     "whatsapp_status_texto",
   ]),
+  publicationState: publicationStateSchema.optional().default("PUBLISHED"),
   dataPostagem: z.string().datetime(),
 });
 
@@ -549,6 +552,7 @@ const updateJobSchema = z.object({
     "whatsapp_status_midia",
     "whatsapp_status_texto",
   ]),
+  publicationState: publicationStateSchema.optional(),
   dataPostagem: z.string().datetime(),
 });
 
@@ -630,6 +634,10 @@ function normalizePublicationType(job: {
   }
 
   return "instagram_post";
+}
+
+function normalizePublicationState(value?: string | null): PublicationState {
+  return value === "DRAFT" ? "DRAFT" : "PUBLISHED";
 }
 
 function validateSingleFilePathForPublication(publicationType: PublicationType, filePath: string): string {
@@ -990,6 +998,7 @@ function renderInstagramOAuthCallbackHtml(input: {
   success: boolean;
   message: string;
   connectionId?: string | null;
+  postMessage?: boolean;
 }): string {
   const title = input.success ? "Instagram conectado" : "Falha na autorizacao do Instagram";
   const payload = JSON.stringify({
@@ -998,10 +1007,11 @@ function renderInstagramOAuthCallbackHtml(input: {
     message: input.message,
     connectionId: input.connectionId ?? null,
   });
-  const toneColor = input.success ? "#0f5132" : "#842029";
-  const toneBackground = input.success ? "#d1e7dd" : "#f8d7da";
-  const actionButtonBackground = input.success ? "#198754" : "#6b7280";
-  const actionButtonHover = input.success ? "#157347" : "#4b5563";
+  const shouldPostMessage = input.postMessage !== false;
+  const toneColor = input.success ? "#166534" : "#9f1239";
+  const toneBackground = input.success ? "#ecfdf3" : "#fff1f2";
+  const toneBorder = input.success ? "#86efac" : "#fecdd3";
+  const actionLabel = input.success ? "Voltar ao painel" : "Fechar janela";
 
   return `<!doctype html>
 <html lang="pt-BR">
@@ -1010,47 +1020,110 @@ function renderInstagramOAuthCallbackHtml(input: {
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>${escapeHtml(title)}</title>
     <style>
-      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; padding: 24px; background: #f8f9fc; color: #1f2937; }
-      .card { max-width: 560px; margin: 0 auto; background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 20px; box-shadow: 0 6px 24px rgba(15, 23, 42, 0.08); }
-      .status { margin-top: 12px; border-radius: 10px; padding: 12px; font-weight: 600; color: ${toneColor}; background: ${toneBackground}; }
-      p { line-height: 1.45; margin: 0; }
-      .hint { margin-top: 12px; color: #6b7280; font-size: 0.92rem; }
-      .action-row { margin-top: 16px; display: flex; justify-content: flex-end; }
-      .close-btn {
-        border: 0;
-        border-radius: 10px;
-        padding: 10px 16px;
-        background: ${actionButtonBackground};
-        color: #fff;
-        font-weight: 700;
-        cursor: pointer;
-        transition: background 120ms ease;
+      :root { color-scheme: light; }
+      body {
+        font-family: "K2D", "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+        margin: 0;
+        padding: 24px;
+        background: #ffffff;
+        color: #111827;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        box-sizing: border-box;
       }
-      .close-btn:hover { background: ${actionButtonHover}; }
+      .card {
+        max-width: 620px;
+        margin: 0 auto;
+        background: #ffffff;
+        border: 1px solid #dce3ee;
+        border-radius: 20px;
+        padding: 24px;
+        box-shadow: 0 14px 32px rgba(15, 23, 42, 0.08);
+      }
+      h1 {
+        margin: 0;
+        font-size: 26px;
+        line-height: 1.15;
+        font-weight: 500;
+        color: #111827;
+      }
+      .status {
+        margin-top: 14px;
+        border-radius: 14px;
+        padding: 13px 14px;
+        font-size: 15px;
+        line-height: 1.45;
+        font-weight: 400;
+        color: ${toneColor};
+        background: ${toneBackground};
+        border: 1px solid ${toneBorder};
+      }
+      .actions {
+        margin-top: 18px;
+        display: flex;
+        justify-content: flex-end;
+      }
+      .action-btn {
+        font-family: "K2D", "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+        appearance: none;
+        border: 1px solid #dce3ee;
+        background: #f8fafc;
+        color: #334155;
+        border-radius: 12px;
+        padding: 10px 14px;
+        font-size: 14px;
+        font-weight: 400;
+        cursor: pointer;
+        transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+      }
+      .action-btn:hover {
+        background: #f1f5f9;
+        border-color: #cfd8e6;
+        color: #1e293b;
+      }
     </style>
   </head>
   <body>
     <main class="card">
       <h1>${escapeHtml(title)}</h1>
       <div class="status">${escapeHtml(input.message)}</div>
-      <p class="hint">Esta janela pode ser fechada agora.</p>
-      <div class="action-row">
-        <button type="button" class="close-btn" id="oauth-close-btn">Fechar janela</button>
+      <div class="actions">
+        <button type="button" class="action-btn" id="oauth-action-btn">${escapeHtml(actionLabel)}</button>
       </div>
     </main>
     <script>
       (function () {
-        try {
-          if (window.opener && !window.opener.closed) {
-            window.opener.postMessage(${payload}, "*");
-          }
-        } catch (_) {}
-        var closeButton = document.getElementById("oauth-close-btn");
-        if (closeButton) {
-          closeButton.addEventListener("click", function () {
-            window.close();
-          });
+        var shouldPostMessage = ${shouldPostMessage ? "true" : "false"};
+        if (shouldPostMessage) {
+          try {
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage(${payload}, "*");
+            }
+          } catch (_) {}
         }
+        var actionButton = document.getElementById("oauth-action-btn");
+        if (!actionButton) {
+          return;
+        }
+
+        actionButton.addEventListener("click", function () {
+          try {
+            if (window.opener && !window.opener.closed) {
+              window.opener.focus();
+            }
+          } catch (_) {}
+
+          try {
+            window.close();
+          } catch (_) {}
+
+          if (!window.closed) {
+            try {
+              window.location.replace("about:blank");
+            } catch (_) {}
+          }
+        });
       })();
     </script>
   </body>
@@ -1593,6 +1666,7 @@ function startServerInstagramJobWorker(): void {
           publicationType: {
             in: ["instagram_post", "instagram_reel", "instagram_story"],
           },
+          publicationState: "PUBLISHED",
           status: {
             in: ["PENDING", "WAITING_LOGIN"],
           },
@@ -2131,6 +2205,7 @@ function startServerWhatsappJobWorker(): void {
           publicationType: {
             in: ["whatsapp_status_midia", "whatsapp_status_texto"],
           },
+          publicationState: "PUBLISHED",
           status: {
             in: ["PENDING", "WAITING_LOGIN"],
           },
@@ -2443,13 +2518,17 @@ app.get("/oauth/instagram/callback", async (request, response) => {
   const consumedState = consumeInstagramOAuthState(state);
 
   if (!state || !consumedState) {
+    const looksLikeProcessedRefresh = Boolean(code || oauthError || oauthErrorDescription);
     response
-      .status(400)
+      .status(looksLikeProcessedRefresh ? 200 : 400)
       .setHeader("Content-Type", "text/html; charset=utf-8")
       .send(
         renderInstagramOAuthCallbackHtml({
-          success: false,
-          message: "A autorização expirou ou não é válida. Gere um novo login no painel.",
+          success: looksLikeProcessedRefresh,
+          postMessage: false,
+          message: looksLikeProcessedRefresh
+            ? "Autorização já processada nesta janela."
+            : "A autorização expirou ou não é válida. Gere um novo login no painel.",
         }),
       );
     return;
@@ -3223,6 +3302,7 @@ app.get("/jobs", async (request, response) => {
         locationName: locationMetadata.locationName,
         locationId: locationMetadata.locationId,
         publicationType: normalizePublicationType(job),
+        publicationState: normalizePublicationState(job.publicationState),
         postStory: job.postStory,
         postReel: job.postReel,
         postWhatsapp: job.postWhatsapp,
@@ -3273,6 +3353,7 @@ app.post("/jobs", async (request, response) => {
       caption: metadata.caption,
       locationName: metadata.locationName,
       publicationType: payload.publicationType,
+      publicationState: normalizePublicationState(payload.publicationState),
       postStory: legacyFields.postStory,
       postReel: legacyFields.postReel,
       postWhatsapp: legacyFields.postWhatsapp,
@@ -3335,6 +3416,7 @@ app.put("/jobs/:id", async (request, response) => {
       caption: metadata.caption,
       locationName: metadata.locationName,
       publicationType: payload.publicationType,
+      publicationState: normalizePublicationState(payload.publicationState ?? existingJob.publicationState),
       postStory: legacyFields.postStory,
       postReel: legacyFields.postReel,
       postWhatsapp: legacyFields.postWhatsapp,
@@ -3368,6 +3450,11 @@ app.post("/jobs/:id/retry", async (request, response) => {
 
   if (!isRootUser(authRequest) && existingJob.createdByUserId !== authRequest.adminUser?.id) {
     response.status(403).json({ error: "Voce nao pode reenfileirar esta postagem." });
+    return;
+  }
+
+  if (normalizePublicationState(existingJob.publicationState) === "DRAFT") {
+    response.status(409).json({ error: "Rascunhos não podem ser reenfileirados. Use 'Publicar'." });
     return;
   }
 
@@ -3406,6 +3493,11 @@ app.post("/jobs/:id/cancel", async (request, response) => {
     return;
   }
 
+  if (normalizePublicationState(existingJob.publicationState) === "DRAFT") {
+    response.status(409).json({ error: "Rascunhos não possuem cancelamento de agendamento." });
+    return;
+  }
+
   if (existingJob.status === "CANCELED") {
     response.json(existingJob);
     return;
@@ -3438,6 +3530,51 @@ app.post("/jobs/:id/cancel", async (request, response) => {
   });
 
   response.json(job);
+});
+
+app.post("/jobs/:id/publish", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  const existingJob = await prisma.job.findUnique({ where: { id: request.params.id } });
+
+  if (!existingJob) {
+    response.status(404).json({ error: "Job nao encontrado." });
+    return;
+  }
+
+  if (!isRootUser(authRequest) && existingJob.createdByUserId !== authRequest.adminUser?.id) {
+    response.status(403).json({ error: "Voce nao pode publicar este rascunho." });
+    return;
+  }
+
+  if (normalizePublicationState(existingJob.publicationState) !== "DRAFT") {
+    response.status(409).json({ error: "Apenas rascunhos podem ser publicados por esta ação." });
+    return;
+  }
+
+  const willRunImmediately = existingJob.dataPostagem.getTime() <= Date.now();
+  const job = await prisma.job.update({
+    where: { id: request.params.id },
+    data: {
+      publicationState: "PUBLISHED",
+      status: "PENDING",
+      startedAt: null,
+      completedAt: null,
+      lastError: null,
+    },
+  });
+
+  await appendLog({
+    companyId: existingJob.companyId,
+    level: "INFO",
+    message: willRunImmediately
+      ? `Rascunho ${job.id} foi publicado e está com data no passado; será executado imediatamente.`
+      : `Rascunho ${job.id} foi publicado para execução em ${job.dataPostagem.toISOString()}.`,
+  });
+
+  response.json({
+    ...job,
+    willRunImmediately,
+  });
 });
 
 app.post("/jobs/:id/activate", async (request, response) => {
@@ -3513,7 +3650,7 @@ app.get("/dashboard", async (request, response) => {
   const where = jobVisibilityWhere(authRequest, companyId);
 
   const [jobs, connectedAccounts] = await Promise.all([
-    prisma.job.findMany({ where, select: { status: true } }),
+    prisma.job.findMany({ where, select: { status: true, publicationState: true } }),
     prisma.socialConnection.count({
       where: {
         companyId: companyId ?? undefined,
@@ -3535,6 +3672,9 @@ app.get("/dashboard", async (request, response) => {
   };
 
   for (const job of jobs) {
+    if (normalizePublicationState(job.publicationState) !== "PUBLISHED") {
+      continue;
+    }
     if (job.status in totals) {
       totals[job.status as keyof typeof totals] += 1;
     }
