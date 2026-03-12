@@ -500,6 +500,36 @@ async function instagramMeRequest(accessToken: string): Promise<InstagramAccount
   };
 }
 
+export async function resolveInstagramConnectionRuntimeMetadata(input: {
+  loginIdentifier: string | null;
+  secretCipher: string | null;
+}): Promise<{ instagramUserId: string | null; instagramUsername: string | null }> {
+  const fallbackUserIdRaw = input.loginIdentifier?.trim() || "";
+  const fallbackUserId = /^\d+$/.test(fallbackUserIdRaw) ? fallbackUserIdRaw : null;
+  const fallback = {
+    instagramUserId: fallbackUserId,
+    instagramUsername: null,
+  };
+
+  const accessToken = decodeSecret(input.secretCipher)?.trim() || "";
+  if (!accessToken) {
+    return fallback;
+  }
+
+  try {
+    const me = await instagramMeRequest(accessToken);
+    if (!me) {
+      return fallback;
+    }
+    return {
+      instagramUserId: me.instagramUserId,
+      instagramUsername: me.instagramUsername,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
 function selectInstagramAccount(
   accounts: InstagramAccountCandidate[],
   preferredIdentifier: string | null | undefined,

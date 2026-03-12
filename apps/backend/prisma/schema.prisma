@@ -3,8 +3,8 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
-  url      = "file:./dev.db"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 model User {
@@ -12,11 +12,15 @@ model User {
   name           String
   username       String   @unique
   passwordHash   String
+  timeZone       String   @default("America/Sao_Paulo")
   role           String   @default("ADMIN")
   sessionToken   String?  @unique
   sessionIssuedAt DateTime?
   createdAt      DateTime @default(now())
   jobs           Job[]
+  companies      Company[]
+  socialConnections SocialConnection[]
+  subscription   UserPlanSubscription?
   receivedAvisos Aviso[]  @relation("AvisoRecipient")
   createdAvisos  Aviso[]  @relation("AvisoCreator")
 }
@@ -31,7 +35,9 @@ model SetupInvite {
 model Company {
   id             String           @id @default(cuid())
   name           String
+  createdByUserId String?
   createdAt      DateTime         @default(now())
+  createdBy      User?            @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
   connections    SocialConnection[]
   jobs           Job[]
   logs           AgentLog[]
@@ -99,6 +105,7 @@ model Agent {
 model SocialConnection {
   id                String   @id @default(cuid())
   companyId          String
+  createdByUserId    String?
   platform          String
   displayName       String
   loginIdentifier   String?
@@ -110,8 +117,53 @@ model SocialConnection {
   lastSeenAt        DateTime?
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
+  createdBy         User?    @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
   company           Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
   jobs              Job[]
+}
+
+model Plan {
+  id                         String   @id @default(cuid())
+  code                       String   @unique
+  name                       String
+  description                String?
+  isActive                   Boolean  @default(true)
+  isTrial                    Boolean  @default(false)
+  maxProfiles                Int
+  maxConnections             Int
+  maxMonthlyPublications     Int
+  monthlyPriceCents          Int?
+  yearlyPriceCents           Int?
+  stripeProductId            String?
+  stripeMonthlyPriceId       String?
+  stripeYearlyPriceId        String?
+  stripePixMonthlyPriceId    String?
+  stripePixYearlyPriceId     String?
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+  subscriptions              UserPlanSubscription[]
+}
+
+model UserPlanSubscription {
+  id                   String   @id @default(cuid())
+  userId               String   @unique
+  planId               String?
+  status               String   @default("PAYMENT_REQUIRED")
+  billingModel         String   @default("NONE")
+  cycle                String?
+  startsAt             DateTime @default(now())
+  endsAt               DateTime?
+  trialEndsAt          DateTime?
+  blockedReason        String?
+  stripeCustomerId     String?
+  stripeSubscriptionId String?
+  stripePriceId        String?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan                 Plan?    @relation(fields: [planId], references: [id], onDelete: SetNull)
+
+  @@index([status, endsAt])
 }
 
 model AppSetting {

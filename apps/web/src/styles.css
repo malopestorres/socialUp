@@ -440,12 +440,19 @@ a {
   align-items: center;
   padding: 6px 10px;
   border-radius: 999px;
-  background: #dcfce7;
-  border: 1px solid #86efac;
-  color: #14532d !important;
+  border: 1px solid transparent;
+  color: #ffffff !important;
   font-size: 14px;
   line-height: 1;
   font-weight: 500;
+}
+
+.connection-connected-text-instagram {
+  background: linear-gradient(135deg, #8b5cf6 0%, #ec4899 56%, #f59e0b 100%);
+}
+
+.connection-connected-text-whatsapp {
+  background: linear-gradient(135deg, #34d399 0%, #22c55e 50%, #16a34a 100%);
 }
 
 .connection-state-shell {
@@ -986,12 +993,6 @@ code,
   font-size: 14px;
 }
 
-.profile-page-title {
-  display: none;
-  margin: 0;
-  color: #111111;
-}
-
 .error-banner {
   margin-bottom: 20px;
   padding: 14px 16px;
@@ -1015,6 +1016,30 @@ code,
   border-color: #86efac;
   color: #166534;
   margin-top: 20px;
+}
+
+.info-banner-warning {
+  background: #fef9c3;
+  border-color: #fde68a;
+  color: #8b6f1f;
+  margin-top: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.billing-warning-link {
+  color: #8b6f1f;
+  font-weight: 500;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.billing-warning-link:hover,
+.billing-warning-link:focus-visible {
+  color: #6c5314;
 }
 
 .info-banner-transient {
@@ -1645,6 +1670,25 @@ button {
   border: 1px solid #86efac;
 }
 
+.stripe-pay-button {
+  width: auto;
+  background: #9f1239;
+  border: 1px solid #9f1239;
+  color: #ffffff;
+}
+
+.billing-cancel-button {
+  width: auto;
+  background: #be185d;
+  border: 1px solid #be185d;
+  color: #ffffff;
+  border-radius: 999px;
+  padding: 8px 10px;
+  min-height: 34px;
+  font-weight: 200;
+  white-space: nowrap;
+}
+
 .logout-button {
   background: #fff0f7;
   color: #be123c;
@@ -1664,6 +1708,116 @@ button {
   border-radius: 20px;
   background: var(--surface);
   border: 1px solid var(--line);
+}
+
+.billing-row-card {
+  padding-top: 14px;
+  padding-bottom: 14px;
+}
+
+.billing-row-card > .view-stack {
+  gap: 6px;
+  width: 100%;
+}
+
+.billing-row-card .billing-usage-inline {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.billing-row-card .billing-usage-inline > strong {
+  margin: 0;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.billing-row-card .billing-usage-inline .meta-pill-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0;
+}
+
+.billing-plan-catalog-row {
+  align-items: flex-start;
+}
+
+.view-stack.billing-summary-stack {
+  gap: 6px;
+  margin-top: 0 !important;
+}
+
+.billing-summary-inline {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.billing-summary-inline > strong {
+  line-height: 1;
+}
+
+.billing-summary-inline .status-pill,
+.billing-summary-inline .unit-pill,
+.billing-summary-inline .billing-cancel-button {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.billing-summary-inline .billing-cancel-button {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.billing-summary-inline .status-pill,
+.billing-summary-inline .unit-pill {
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+.billing-model-pill {
+  background: #dbeafe;
+  color: #1e3a8a;
+  border-color: #bfdbfe;
+}
+
+.billing-plan-catalog-row > .billing-plan-row-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.billing-plan-row-inline > strong {
+  line-height: 1;
+}
+
+.billing-plan-action-row {
+  width: 100%;
+  justify-content: flex-end;
+}
+
+.billing-plan-note {
+  color: var(--text-soft);
+}
+
+.checkout-price-preview {
+  display: block;
+  font-size: 1.06rem;
+  font-weight: 500;
+  color: #111827;
+  margin-top: 4px;
+}
+
+.billing-plan-row-inline > .ghost-button,
+.billing-plan-row-inline > .danger-button {
+  margin-top: 0;
 }
 
 .connection-row {
@@ -1862,6 +2016,13 @@ code {
   margin-top: 0;
 }
 
+.connection-detail-pill {
+  max-width: min(100%, 320px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .agent-title-with-platform-icon {
   display: inline-flex;
   align-items: flex-end;
@@ -1939,6 +2100,24 @@ code {
 
 .status-pill.status-draft {
   background: #f3f4f6;
+  color: #374151;
+  border-color: #d1d5db;
+}
+
+.status-pill.status-billing-active {
+  background: #dbeafe;
+  color: #1e3a8a;
+  border-color: #bfdbfe;
+}
+
+.status-pill.status-billing-paused {
+  background: #fffdf0;
+  color: #8b6f1f;
+  border-color: #f3e9bf;
+}
+
+.status-pill.status-billing-canceled {
+  background: #e5e7eb;
   color: #374151;
   border-color: #d1d5db;
 }
@@ -2220,14 +2399,14 @@ code {
   gap: 8px;
   padding: 14px;
   border-radius: 20px;
-  background: #fff7fb;
-  border: 1px solid #f4bfd8;
+  background: transparent;
+  border: 1px solid var(--line);
 }
 
 .emoji-picker-shell span {
   font-size: 13px;
   font-weight: 500;
-  color: var(--pink-deep);
+  color: var(--text-soft);
 }
 
 .emoji-group-list {
@@ -2240,14 +2419,14 @@ code {
   gap: 8px;
   padding: 12px;
   border-radius: 16px;
-  background: #ffffff;
-  border: 1px solid #f6d1e1;
+  background: var(--surface);
+  border: 1px solid var(--line);
 }
 
 .emoji-group-card strong {
   font-size: 14px;
   font-weight: 500;
-  color: var(--pink-deep);
+  color: var(--text);
 }
 
 .emoji-picker-grid {
@@ -2261,9 +2440,9 @@ code {
   min-width: 46px;
   padding: 10px 12px;
   border-radius: 14px;
-  border: 1px solid #f4bfd8;
-  background: #fff1f7;
-  color: #1f1720;
+  border: 1px solid var(--line);
+  background: var(--surface-soft);
+  color: var(--text);
   font-size: 20px;
   line-height: 1;
 }
@@ -2332,6 +2511,24 @@ code {
   font-size: 14px;
   line-height: 1;
   font-weight: 300;
+}
+
+.unit-pill-plan {
+  background: #f0fdf4;
+  color: #14532d;
+  border-color: #bbf7d0;
+}
+
+.row-card .unit-pill-plan {
+  color: #14532d;
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+}
+
+.row-card .unit-pill-plan.unit-pill-plan-trial {
+  color: #8b6f1f;
+  border-color: #f3e9bf;
+  background: #fffdf0;
 }
 
 .pagination-shell {
@@ -2608,10 +2805,6 @@ code {
 
   .hero-greeting {
     font-size: 1.1rem;
-  }
-
-  .profile-page-title {
-    display: block;
   }
 
   .empty-state {
@@ -2997,6 +3190,15 @@ button {
   color: #111827 !important;
 }
 
+.topbar .notices-trigger,
+.topbar .theme-toggle {
+  -webkit-appearance: none;
+  appearance: none;
+  -webkit-tap-highlight-color: transparent;
+  outline: none !important;
+  border-color: transparent !important;
+}
+
 .topbar .logout-button {
   border: none !important;
   background: transparent !important;
@@ -3215,6 +3417,129 @@ button {
   background: #121826;
 }
 
+button,
+.link-chip,
+.nav-item,
+.notices-mark-read-inline,
+.profile-menu-item {
+  transition:
+    background-color 220ms ease,
+    color 220ms ease,
+    border-color 220ms ease,
+    filter 220ms ease,
+    box-shadow 220ms ease,
+    transform 220ms ease;
+}
+
+button:not(:disabled):hover,
+button:not(:disabled):focus-visible,
+.link-chip:hover,
+.link-chip:focus-visible {
+  filter: brightness(1.06);
+}
+
+button[type="submit"]:not(:disabled):hover,
+button[type="submit"]:not(:disabled):focus-visible {
+  filter: none;
+  background: #1f2a44;
+  border-color: #1f2a44;
+  color: #ffffff;
+}
+
+button.stripe-pay-button[type="submit"]:not(:disabled):hover,
+button.stripe-pay-button[type="submit"]:not(:disabled):focus-visible {
+  background: #831843;
+  border-color: #831843;
+  color: #ffffff;
+}
+
+.ghost-button:not(:disabled):hover,
+.ghost-button:not(:disabled):focus-visible,
+.secondary-button:not(:disabled):hover,
+.secondary-button:not(:disabled):focus-visible,
+.danger-button:not(:disabled):hover,
+.danger-button:not(:disabled):focus-visible,
+.activate-button:not(:disabled):hover,
+.activate-button:not(:disabled):focus-visible,
+.billing-cancel-button:not(:disabled):hover,
+.billing-cancel-button:not(:disabled):focus-visible,
+.logout-button:not(:disabled):hover,
+.logout-button:not(:disabled):focus-visible,
+.pagination-button:not(:disabled):hover,
+.pagination-button:not(:disabled):focus-visible,
+.link-chip:hover,
+.link-chip:focus-visible {
+  filter: brightness(0.95);
+}
+
+.billing-cancel-button:not(:disabled):hover,
+.billing-cancel-button:not(:disabled):focus-visible {
+  background: #9d174d;
+  border-color: #9d174d;
+  color: #ffffff;
+  filter: none;
+}
+
+.nav-item:not(.nav-item-active):hover,
+.nav-item:not(.nav-item-active):focus-visible {
+  background: #f8faff;
+  border-color: #dce3ee;
+}
+
+.notices-mark-read-inline:hover:not(:disabled),
+.notices-mark-read-inline:focus-visible:not(:disabled) {
+  color: #1f4e8c;
+}
+
+.topbar .profile-trigger:not(:disabled):hover,
+.topbar .profile-trigger:not(:disabled):focus-visible,
+.topbar .menu-toggle:not(:disabled):hover,
+.topbar .menu-toggle:not(:disabled):focus-visible {
+  filter: none;
+  background: #edf4ff !important;
+  color: #1f4e8c !important;
+  border-radius: 8px;
+}
+
+.topbar .notices-trigger:not(:disabled):hover,
+.topbar .notices-trigger:not(:disabled):focus-visible,
+.topbar .theme-toggle:not(:disabled):hover,
+.topbar .theme-toggle:not(:disabled):focus-visible {
+  filter: none !important;
+  background: transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+  outline: none !important;
+  color: #111827 !important;
+  border-radius: 0;
+}
+
+.topbar .notices-trigger:focus,
+.topbar .notices-trigger:focus-visible,
+.topbar .notices-trigger:active,
+.topbar .theme-toggle:focus,
+.topbar .theme-toggle:focus-visible,
+.topbar .theme-toggle:active {
+  background: transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+.topbar .profile-menu-shell .profile-trigger:not(:disabled):hover,
+.topbar .profile-menu-shell .profile-trigger:not(:disabled):focus-visible {
+  background: transparent !important;
+  border-radius: 0;
+}
+
+.topbar .logout-button:not(:disabled):hover,
+.topbar .logout-button:not(:disabled):focus-visible {
+  filter: none;
+  background: #fff1f2 !important;
+  color: #be123c !important;
+  border-radius: 8px;
+}
+
 body.theme-dark {
   --bg: #0b1220;
   --surface: #0f172a;
@@ -3275,6 +3600,15 @@ body.theme-dark .topbar .theme-toggle {
   color: #e5e7eb !important;
 }
 
+body.theme-dark .topbar .notices-trigger,
+body.theme-dark .topbar .theme-toggle {
+  -webkit-appearance: none;
+  appearance: none;
+  -webkit-tap-highlight-color: transparent;
+  outline: none !important;
+  border-color: transparent !important;
+}
+
 body.theme-dark .topbar .profile-trigger-label {
   color: #e5e7eb;
 }
@@ -3323,6 +3657,27 @@ body.theme-dark .skeleton-line {
   background-size: 240% 100%;
 }
 
+body.theme-dark button:not(:disabled):hover,
+body.theme-dark button:not(:disabled):focus-visible,
+body.theme-dark .link-chip:hover,
+body.theme-dark .link-chip:focus-visible,
+body.theme-dark .pagination-button:not(:disabled):hover,
+body.theme-dark .pagination-button:not(:disabled):focus-visible,
+body.theme-dark .ghost-button:not(:disabled):hover,
+body.theme-dark .ghost-button:not(:disabled):focus-visible,
+body.theme-dark .secondary-button:not(:disabled):hover,
+body.theme-dark .secondary-button:not(:disabled):focus-visible {
+  filter: brightness(1.08);
+}
+
+body.theme-dark button[type="submit"]:not(:disabled):hover,
+body.theme-dark button[type="submit"]:not(:disabled):focus-visible {
+  filter: none;
+  background: #2a3f63;
+  border-color: #2a3f63;
+  color: #f8fafc;
+}
+
 body.theme-dark .ghost-button,
 body.theme-dark .secondary-button,
 body.theme-dark .profile-trigger,
@@ -3347,6 +3702,52 @@ body.theme-dark .topbar .menu-toggle {
   border-color: #93c5fd !important;
   background: transparent !important;
   color: #bfdbfe !important;
+}
+
+body.theme-dark .topbar .profile-trigger:not(:disabled):hover,
+body.theme-dark .topbar .profile-trigger:not(:disabled):focus-visible,
+body.theme-dark .topbar .menu-toggle:not(:disabled):hover,
+body.theme-dark .topbar .menu-toggle:not(:disabled):focus-visible {
+  filter: none;
+  background: #16253f !important;
+  color: #dbeafe !important;
+}
+
+body.theme-dark .topbar .notices-trigger:not(:disabled):hover,
+body.theme-dark .topbar .notices-trigger:not(:disabled):focus-visible,
+body.theme-dark .topbar .theme-toggle:not(:disabled):hover,
+body.theme-dark .topbar .theme-toggle:not(:disabled):focus-visible {
+  filter: none !important;
+  background: transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+  outline: none !important;
+  color: #e5e7eb !important;
+  border-radius: 0;
+}
+
+body.theme-dark .topbar .notices-trigger:focus,
+body.theme-dark .topbar .notices-trigger:focus-visible,
+body.theme-dark .topbar .notices-trigger:active,
+body.theme-dark .topbar .theme-toggle:focus,
+body.theme-dark .topbar .theme-toggle:focus-visible,
+body.theme-dark .topbar .theme-toggle:active {
+  background: transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+body.theme-dark .topbar .profile-menu-shell .profile-trigger:not(:disabled):hover,
+body.theme-dark .topbar .profile-menu-shell .profile-trigger:not(:disabled):focus-visible {
+  background: transparent !important;
+}
+
+body.theme-dark .topbar .logout-button:not(:disabled):hover,
+body.theme-dark .topbar .logout-button:not(:disabled):focus-visible {
+  filter: none;
+  background: #3a1722 !important;
+  color: #fecdd3 !important;
 }
 
 body.theme-dark .sidebar-close {

@@ -55,6 +55,8 @@ type EvolutionFetchInstanceRecord = {
   name?: string | null;
   instanceName?: string | null;
   connectionStatus?: string | null;
+  ownerJid?: string | null;
+  profileName?: string | null;
   integration?: string | null;
 };
 
@@ -74,6 +76,30 @@ type EvolutionSendStatusResponse = {
   messageId?: string | null;
 };
 
+type EvolutionFindMessagesResponse = {
+  messages?: {
+    total?: number;
+    records?: unknown[];
+  } | null;
+};
+
+type EvolutionContactRecord = {
+  remoteJid?: string | null;
+  pushName?: string | null;
+  isGroup?: boolean | null;
+  type?: string | null;
+};
+
+type StatusRecipientsResolution = {
+  recipients: string[];
+  ownerJid: string | null;
+  ownerIncluded: boolean;
+  contactsTotal: number;
+  contactsRejectedGroups: number;
+  contactsRejectedInvalid: number;
+  contactsRejectedLid: number;
+};
+
 type EvolutionRequestOptions = {
   method?: "GET" | "POST" | "DELETE";
   jsonBody?: unknown;
@@ -86,6 +112,14 @@ const EVOLUTION_QR_POLL_INTERVAL_MS = parsePositiveInt(process.env.EVOLUTION_QR_
 const EVOLUTION_INSTANCE_INTEGRATION = (process.env.EVOLUTION_INSTANCE_INTEGRATION || "WHATSAPP-BAILEYS").trim();
 const EVOLUTION_STATUS_TEXT_BACKGROUND = process.env.EVOLUTION_STATUS_TEXT_BACKGROUND?.trim() || "#202C33";
 const EVOLUTION_STATUS_TEXT_FONT = parseStatusTextFont(process.env.EVOLUTION_STATUS_TEXT_FONT, 1);
+const EVOLUTION_STATUS_CONFIRMATION_MAX_ATTEMPTS = Math.max(
+  1,
+  Number.parseInt(process.env.EVOLUTION_STATUS_CONFIRMATION_MAX_ATTEMPTS || "6", 10) || 6,
+);
+const EVOLUTION_STATUS_CONFIRMATION_DELAY_MS = Math.max(
+  500,
+  Number.parseInt(process.env.EVOLUTION_STATUS_CONFIRMATION_DELAY_MS || "2000", 10) || 2_000,
+);
 
 const HARD_CODED_INSTANCE_NAME = (process.env.EVOLUTION_HARD_CODED_INSTANCE_NAME || "").trim();
 const HARD_CODED_INSTANCE_API_KEY = (process.env.EVOLUTION_HARD_CODED_INSTANCE_API_KEY || "").trim();
@@ -392,6 +426,48 @@ async function fetchInstanceRecord(credentials: EvolutionCredentials): Promise<E
   return null;
 }
 
+export async function resolveWhatsappConnectionRuntimeMetadata(input: {
+  id: string;
+  companyId: string;
+  displayName: string;
+  platform?: string;
+  loginIdentifier: string | null;
+  secretCipher: string | null;
+}): Promise<{ profileName: string | null; ownerJid: string | null }> {
+  const fallback = {
+    profileName: null,
+    ownerJid: null,
+  };
+
+  if (input.platform !== "whatsapp") {
+    return fallback;
+  }
+
+  try {
+    const credentials = getConnectionCredentials({
+      id: input.id,
+      companyId: input.companyId,
+      displayName: input.displayName,
+      platform: "whatsapp",
+      loginIdentifier: input.loginIdentifier,
+      secretCipher: input.secretCipher,
+    });
+    const instance = await fetchInstanceRecord(credentials);
+    const profileName = typeof instance?.profileName === "string" && instance.profileName.trim().length > 0
+      ? instance.profileName.trim()
+      : null;
+    const ownerJid = typeof instance?.ownerJid === "string" && instance.ownerJid.trim().length > 0
+      ? instance.ownerJid.trim()
+      : null;
+    return {
+      profileName,
+      ownerJid,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
 async function ensureInstanceExists(credentials: EvolutionCredentials): Promise<void> {
   try {
     const existing = await fetchInstanceRecord(credentials);
@@ -638,14 +714,133 @@ function extractRemoteJid(payload: EvolutionSendStatusResponse): string {
   return payload?.key?.remoteJid ?? "status@broadcast";
 }
 
-function buildTextStatusPayload(content: string): Record<string, unknown> {
+function normalizeStatusRecipients(rawContacts: unknown): {
+  recipients: string[];
+  contactsTotal: number;
+  contactsRejectedGroups: number;
+  contactsRejectedInvalid: number;
+  contactsRejectedLid: number;
+} {
+  if (!Array.isArray(rawContacts)) {
+    return {
+      recipients: [],
+      contactsTotal: 0,
+      contactsRejectedGroups: 0,
+      contactsRejectedInvalid: 0,
+      contactsRejectedLid: 0,
+    };
+  }
+
+  const recipients = new Set<string>();
+  let contactsRejectedGroups = 0;
+  let contactsRejectedInvalid = 0;
+  let contactsRejectedLid = 0;
+  for (const entry of rawContacts) {
+    if (!entry || typeof entry !== "object") {
+      contactsRejectedInvalid += 1;
+      continue;
+    }
+
+    const contact = entry as EvolutionContactRecord;
+    const remoteJid = typeof contact.remoteJid === "string" ? contact.remoteJid.trim() : "";
+    if (!remoteJid) {
+      contactsRejectedInvalid += 1;
+      continue;
+    }
+
+    if (remoteJid === "0@s.whatsapp.net") {
+      contactsRejectedInvalid += 1;
+      continue;
+    }
+
+    if (contact.isGroup === true || (typeof contact.type === "string" && contact.type.toLowerCase() === "group")) {
+      contactsRejectedGroups += 1;
+      continue;
+    }
+
+    if (remoteJid.endsWith("@g.us")) {
+      contactsRejectedGroups += 1;
+      continue;
+    }
+
+    if (remoteJid.endsWith("@lid")) {
+      // @lid costuma gerar entrega inconsistente em statusJidList.
+      contactsRejectedLid += 1;
+      continue;
+    }
+
+    if (!remoteJid.endsWith("@s.whatsapp.net")) {
+      contactsRejectedInvalid += 1;
+      continue;
+    }
+
+    recipients.add(remoteJid);
+  }
+
+  return {
+    recipients: Array.from(recipients),
+    contactsTotal: rawContacts.length,
+    contactsRejectedGroups,
+    contactsRejectedInvalid,
+    contactsRejectedLid,
+  };
+}
+
+async function resolveStatusRecipients(credentials: EvolutionCredentials): Promise<StatusRecipientsResolution> {
+  const contacts = await evolutionRequest<unknown>(
+    credentials,
+    `/chat/findContacts/${encodeURIComponent(credentials.instanceName)}`,
+    {
+      method: "POST",
+      jsonBody: {
+        where: {},
+      },
+    },
+  );
+
+  const normalized = normalizeStatusRecipients(contacts);
+  let ownerJid: string | null = null;
+  try {
+    const instance = await fetchInstanceRecord(credentials);
+    const candidateOwner = typeof instance?.ownerJid === "string" ? instance.ownerJid.trim() : "";
+    if (candidateOwner.endsWith("@s.whatsapp.net")) {
+      ownerJid = candidateOwner;
+    }
+  } catch {
+    // sem ownerJid; continua com lista de contatos.
+  }
+
+  const recipients = [...normalized.recipients];
+  if (ownerJid) {
+    const existingIndex = recipients.indexOf(ownerJid);
+    if (existingIndex > 0) {
+      recipients.splice(existingIndex, 1);
+      recipients.unshift(ownerJid);
+    } else if (existingIndex === -1) {
+      recipients.unshift(ownerJid);
+    }
+  }
+
+  return {
+    recipients,
+    ownerJid,
+    ownerIncluded: ownerJid ? recipients.includes(ownerJid) : false,
+    contactsTotal: normalized.contactsTotal,
+    contactsRejectedGroups: normalized.contactsRejectedGroups,
+    contactsRejectedInvalid: normalized.contactsRejectedInvalid,
+    contactsRejectedLid: normalized.contactsRejectedLid,
+  };
+}
+
+function buildTextStatusPayload(content: string, recipients: string[]): Record<string, unknown> {
   return {
     type: "text",
     content,
     caption: "",
     backgroundColor: EVOLUTION_STATUS_TEXT_BACKGROUND,
     font: EVOLUTION_STATUS_TEXT_FONT,
-    allContacts: true,
+    statusJidList: recipients,
+    allContacts: false,
   };
 }
 
@@ -653,6 +848,7 @@ function buildMediaStatusPayload(input: {
   statusType: "image" | "video" | "audio";
   dataUrl: string;
   caption: string;
+  recipients: string[];
 }): Record<string, unknown> {
   return {
     type: input.statusType,
@@ -660,7 +856,8 @@ function buildMediaStatusPayload(input: {
     caption: input.caption || "",
     backgroundColor: EVOLUTION_STATUS_TEXT_BACKGROUND,
     font: EVOLUTION_STATUS_TEXT_FONT,
-    allContacts: true,
+    statusJidList: input.recipients,
+    allContacts: false,
   };
 }
 
@@ -680,6 +877,64 @@ function assertAuthorizedState(state: string | null): void {
   }
 
   throw new Error(`WHATSAPP_INSTANCE_STATE_${state ?? "UNKNOWN"}`);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function hasPersistedStatusMessage(
+  credentials: EvolutionCredentials,
+  messageId: string,
+): Promise<boolean> {
+  const payload = await evolutionRequest<EvolutionFindMessagesResponse>(
+    credentials,
+    `/chat/findMessages/${encodeURIComponent(credentials.instanceName)}`,
+    {
+      method: "POST",
+      jsonBody: {
+        where: {
+          key: {
+            id: messageId,
+            remoteJid: "status@broadcast",
+            fromMe: true,
+          },
+        },
+        offset: 1,
+        page: 1,
+      },
+    },
+  );
+
+  const total = payload?.messages?.total ?? 0;
+  const records = Array.isArray(payload?.messages?.records) ? payload.messages.records.length : 0;
+  return total > 0 || records > 0;
+}
+
+async function waitStatusPersistenceConfirmation(
+  credentials: EvolutionCredentials,
+  messageId: string | null,
+): Promise<boolean> {
+  if (!messageId) {
+    return false;
+  }
+
+  for (let attempt = 1; attempt <= EVOLUTION_STATUS_CONFIRMATION_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const persisted = await hasPersistedStatusMessage(credentials, messageId);
+      if (persisted) {
+        return true;
+      }
+    } catch {
+      // Tenta novamente; falhas transitórias não devem derrubar o envio.
+    }
+
+    if (attempt < EVOLUTION_STATUS_CONFIRMATION_MAX_ATTEMPTS) {
+      await delay(EVOLUTION_STATUS_CONFIRMATION_DELAY_MS);
+    }
+  }
+
+  return false;
 }
 
 export function getWhatsappConnectionOverlay(connectionId: string): Partial<Record<string, unknown>> {
@@ -822,17 +1077,27 @@ export async function executeWhatsappJobWithEvolutionApi(
   connection: ConnectionIdentity,
   job: JobIdentity,
   uploadsDir: string,
-): Promise<{ remoteJid: string; messageId: string | null }> {
+): Promise<{ remoteJid: string; messageId: string | null; confirmed: boolean }> {
   const credentials = getConnectionCredentials(connection);
   await ensureInstanceExists(credentials);
   const state = await getEffectiveConnectionState(credentials);
   assertAuthorizedState(state);
+  const statusRecipients = await resolveStatusRecipients(credentials);
+  if (statusRecipients.recipients.length === 0) {
+    throw new Error("WHATSAPP_STATUS_RECIPIENTS_NOT_FOUND");
+  }
 
   await appendWhatsappDiagnosticLog({
     companyId: connection.companyId,
     level: "INFO",
-    errorCode: "WHATSAPP_STATUS_BROADCAST_ALL",
-    message: `Job ${job.id} enviando status com allContacts=true via Evolution API.`,
+    errorCode: "WHATSAPP_STATUS_RECIPIENTS_READY",
+    message:
+      `Job ${job.id} enviando status para ${statusRecipients.recipients.length} recipients válidos ` +
+      `(ownerIncluded=${statusRecipients.ownerIncluded ? "yes" : "no"}; ` +
+      `contactsTotal=${statusRecipients.contactsTotal}; ` +
+      `droppedGroups=${statusRecipients.contactsRejectedGroups}; ` +
+      `droppedLid=${statusRecipients.contactsRejectedLid}; ` +
+      `droppedInvalid=${statusRecipients.contactsRejectedInvalid}) via Evolution API.`,
   });
 
   const route = `/message/sendStatus/${encodeURIComponent(credentials.instanceName)}`;
@@ -850,12 +1115,16 @@ export async function executeWhatsappJobWithEvolutionApi(
 
     const response = await evolutionRequest<EvolutionSendStatusResponse>(credentials, route, {
       method: "POST",
-      jsonBody: buildTextStatusPayload(message),
+      jsonBody: buildTextStatusPayload(message, statusRecipients.recipients),
     });
+
+    const messageId = extractMessageId(response);
+    const confirmed = await waitStatusPersistenceConfirmation(credentials, messageId);
 
     return {
       remoteJid: extractRemoteJid(response),
-      messageId: extractMessageId(response),
+      messageId,
+      confirmed,
     };
   }
 
@@ -882,11 +1151,16 @@ export async function executeWhatsappJobWithEvolutionApi(
       statusType,
       dataUrl,
       caption,
+      recipients: statusRecipients.recipients,
     }),
   });
 
+  const messageId = extractMessageId(response);
+  const confirmed = await waitStatusPersistenceConfirmation(credentials, messageId);
+
   return {
     remoteJid: extractRemoteJid(response),
-    messageId: extractMessageId(response),
+    messageId,
+    confirmed,
   };
 }

@@ -1,4 +1,13 @@
-import { useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type DragEvent,
+  type FormEvent,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import type { IconType } from "react-icons";
 import {
   FiAlertCircle,
@@ -11,6 +20,8 @@ import {
   FiImage,
   FiLink2,
   FiUsers,
+  FiUser,
+  FiCreditCard,
   FiWifi,
   FiX,
   FiEye,
@@ -27,6 +38,7 @@ type ViewKey =
   | "dashboard"
   | "profile"
   | "plan"
+  | "planConfig"
   | "companies"
   | "agents"
   | "scheduler"
@@ -67,6 +79,10 @@ type SocialConnection = {
   qrGeneratedAt?: string | null;
   workerLastSeenAt?: string | null;
   qrMessage?: string | null;
+  instagramUsername?: string | null;
+  instagramUserId?: string | null;
+  whatsappProfileName?: string | null;
+  whatsappOwnerJid?: string | null;
 };
 
 type Job = {
@@ -152,7 +168,93 @@ type AuthUser = {
   id: string;
   name: string;
   username: string;
+  timeZone: string;
   role: string;
+  billingStatus?: string;
+  billingPlanName?: string | null;
+  billingPlanCode?: string | null;
+  billingIsBlocked?: boolean;
+  billingBlockMessage?: string | null;
+  billingEndsAt?: string | null;
+  billingTrialEndsAt?: string | null;
+};
+
+type BillingPlan = {
+  id: string;
+  code: string;
+  name: string;
+  description: string | null;
+  isActive: boolean;
+  isTrial: boolean;
+  maxProfiles: number;
+  maxConnections: number;
+  maxMonthlyPublications: number;
+  monthlyPriceCents: number | null;
+  yearlyPriceCents: number | null;
+  stripeProductId: string | null;
+  stripeMonthlyPriceId: string | null;
+  stripeYearlyPriceId: string | null;
+  stripePixMonthlyPriceId: string | null;
+  stripePixYearlyPriceId: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type StripeCatalogProduct = {
+  id: string;
+  name: string;
+  active: boolean;
+  defaultPriceId: string | null;
+};
+
+type StripeCatalogResponse = {
+  products: StripeCatalogProduct[];
+  resolvedByProduct: Record<
+    string,
+    {
+      stripeMonthlyPriceId: string | null;
+      stripeYearlyPriceId: string | null;
+      stripePixMonthlyPriceId: string | null;
+      stripePixYearlyPriceId: string | null;
+      stripeMonthlyPriceCents: number | null;
+      stripeYearlyPriceCents: number | null;
+      stripePixMonthlyPriceCents: number | null;
+      stripePixYearlyPriceCents: number | null;
+    }
+  >;
+};
+
+type BillingSettings = {
+  autoTrialEnabled: boolean;
+  autoTrialDays: number;
+  rootDisplayPlanId: string | null;
+};
+
+type BillingMe = {
+  status: string;
+  billingModel: string;
+  cycle: string | null;
+  isBlocked: boolean;
+  blockMessage: string | null;
+  startsAt: string | null;
+  endsAt: string | null;
+  trialEndsAt: string | null;
+  plan: {
+    id: string;
+    code: string;
+    name: string;
+    isTrial: boolean;
+    maxProfiles: number;
+    maxConnections: number;
+    maxMonthlyPublications: number;
+  } | null;
+  usage: {
+    profilesUsed: number;
+    connectionsUsed: number;
+    postsUsedThisMonth: number;
+  };
+  canCancelStripeSubscription?: boolean;
+  stripeCancelAtPeriodEnd?: boolean;
 };
 
 type InstagramOauthWindowMessage = {
@@ -186,6 +288,7 @@ const initialDashboard: Dashboard = {
 const navItems: Array<{ key: ViewKey; label: string; eyebrow?: string; icon: IconType }> = [
   { key: "dashboard", label: "Dashboard", icon: FiHome },
   { key: "companies", label: "Perfis", icon: FiUsers },
+  { key: "planConfig", label: "Configurar planos", icon: FiCreditCard },
   { key: "agents", label: "Conectar contas", icon: FiLink2 },
   { key: "scheduler", label: "Agendar", icon: FiCalendar },
   { key: "media", label: "Midias", icon: FiImage },
@@ -196,6 +299,9 @@ const navItems: Array<{ key: ViewKey; label: string; eyebrow?: string; icon: Ico
 
 const viewHeadingIconByView: Partial<Record<ViewKey, IconType>> = {
   dashboard: FiHome,
+  profile: FiUser,
+  plan: FiCreditCard,
+  planConfig: FiCreditCard,
   agents: FiLink2,
   scheduler: FiCalendar,
   media: FiImage,
@@ -227,10 +333,12 @@ const INSTAGRAM_OAUTH_RESULT_MARKER_QUERY_PARAM = "instagram_oauth";
 const INSTAGRAM_OAUTH_SUCCESS_QUERY_PARAM = "instagram_oauth_success";
 const INSTAGRAM_OAUTH_MESSAGE_QUERY_PARAM = "instagram_oauth_message";
 const INSTAGRAM_OAUTH_CONNECTION_ID_QUERY_PARAM = "instagram_oauth_connection_id";
+const STRIPE_CHECKOUT_RESULT_QUERY_PARAM = "stripeCheckout";
+const STRIPE_CHECKOUT_SESSION_ID_QUERY_PARAM = "session_id";
+const BILLING_PLAN_CHECKOUT_ANCHOR_ID = "billing-plan-checkout";
 const HISTORY_PAGE_SIZE = 10;
 const MEDIA_PAGE_SIZE = 12;
 const NOTICE_PAGE_SIZE = 10;
-const CONTENT_SKELETON_MIN_MS = 1500;
 const INSTAGRAM_IMAGE_MAX_SIZE_BYTES = 8 * 1024 * 1024;
 const INSTAGRAM_MULTI_MEDIA_MAX_FILES = 10;
 const INSTAGRAM_POST_ASPECT_RATIO_MIN = 4 / 5;
@@ -249,11 +357,20 @@ const HISTORY_MONTH_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "11", label: "Novembro" },
   { value: "12", label: "Dezembro" },
 ];
+const DEFAULT_USER_TIME_ZONE = "America/Sao_Paulo";
+const EDIT_PUBLISHED_RESCHEDULE_CONFIRM_STATUSES = new Set([
+  "COMPLETED",
+  "SENT_UNCONFIRMED",
+  "FAILED",
+  "WAITING_LOGIN",
+  "CANCELED",
+]);
 
 const VIEW_ROUTE_MAP: Record<ViewKey, string> = {
   dashboard: "/dashboard",
   profile: "/perfil",
   plan: "/meu-plano",
+  planConfig: "/configurar-planos",
   companies: "/perfis",
   agents: "/conectar-contas",
   scheduler: "/agendar",
@@ -342,11 +459,55 @@ const whatsappTextEmojiGroups: Array<{ label: string; emojis: string[] }> = [
   { label: "Comemoração", emojis: ["🎉", "🥳", "✨", "🎊", "🍾", "🎈"] },
 ];
 
-function formatDate(value: string | null | undefined): string {
+function isValidTimeZone(value: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value }).format(new Date());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeTimeZone(value: string | null | undefined): string {
+  const normalized = (value || "").trim();
+  if (!normalized) {
+    return DEFAULT_USER_TIME_ZONE;
+  }
+  return isValidTimeZone(normalized) ? normalized : DEFAULT_USER_TIME_ZONE;
+}
+
+function listSupportedTimeZones(): string[] {
+  const intlWithSupportedValues = Intl as unknown as {
+    supportedValuesOf?: (key: string) => string[];
+  };
+
+  const raw = intlWithSupportedValues.supportedValuesOf?.("timeZone") ?? [];
+  if (Array.isArray(raw) && raw.length > 0) {
+    const deduped = Array.from(new Set(raw.map((item) => item.trim()).filter((item) => item.length > 0)));
+    if (!deduped.includes(DEFAULT_USER_TIME_ZONE)) {
+      deduped.unshift(DEFAULT_USER_TIME_ZONE);
+    }
+    return deduped.sort((left, right) => left.localeCompare(right));
+  }
+
+  return [DEFAULT_USER_TIME_ZONE, "UTC"];
+}
+
+function formatDate(
+  value: string | null | undefined,
+  timeZone: string = DEFAULT_USER_TIME_ZONE,
+): string {
   if (!value) {
     return "Nao definido";
   }
-  return new Date(value).toLocaleString();
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "Nao definido";
+  }
+
+  return parsed.toLocaleString("pt-BR", {
+    timeZone: normalizeTimeZone(timeZone),
+  });
 }
 
 type AvisoTone = "auth" | "error" | "info" | "success" | "neutral";
@@ -372,12 +533,6 @@ function avisoToneClass(kind: string): string {
   return `notice-tone-${avisoTone(kind)}`;
 }
 
-function toDateTimeLocal(value: string): string {
-  const date = new Date(value);
-  const timezoneOffset = date.getTimezoneOffset() * 60_000;
-  return new Date(date.getTime() - timezoneOffset).toISOString().slice(0, 16);
-}
-
 function resolveJobDisplayTitle(job: Pick<Job, "id" | "title" | "caption">): string {
   const normalizedTitle = job.title?.trim();
   if (normalizedTitle) {
@@ -392,12 +547,121 @@ function resolveJobDisplayTitle(job: Pick<Job, "id" | "title" | "caption">): str
   return `Job ${job.id}`;
 }
 
-function toDateLocal(value: string): string {
-  return toDateTimeLocal(value).slice(0, 10);
+function toDateLocal(value: string, timeZone: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "";
+  }
+
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: normalizeTimeZone(timeZone),
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(parsed);
+
+  const mapped: Record<string, string> = {};
+  for (const part of parts) {
+    if (part.type !== "literal") {
+      mapped[part.type] = part.value;
+    }
+  }
+
+  return `${mapped.year ?? "0000"}-${mapped.month ?? "01"}-${mapped.day ?? "01"}`;
 }
 
-function toTimeLocal(value: string): string {
-  return toDateTimeLocal(value).slice(11, 16);
+function toTimeLocal(value: string, timeZone: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "";
+  }
+
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: normalizeTimeZone(timeZone),
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(parsed);
+
+  const mapped: Record<string, string> = {};
+  for (const part of parts) {
+    if (part.type !== "literal") {
+      mapped[part.type] = part.value;
+    }
+  }
+
+  return `${mapped.hour ?? "00"}:${mapped.minute ?? "00"}`;
+}
+
+function toIsoFromTimeZoneDateTime(
+  dateValue: string,
+  timeValue: string,
+  timeZone: string,
+): string | null {
+  const [yearRaw, monthRaw, dayRaw] = dateValue.split("-").map((part) => Number.parseInt(part, 10));
+  const [hourRaw, minuteRaw] = timeValue.split(":").map((part) => Number.parseInt(part, 10));
+
+  if (
+    !Number.isFinite(yearRaw) ||
+    !Number.isFinite(monthRaw) ||
+    !Number.isFinite(dayRaw) ||
+    !Number.isFinite(hourRaw) ||
+    !Number.isFinite(minuteRaw)
+  ) {
+    return null;
+  }
+
+  const year = yearRaw;
+  const month = monthRaw;
+  const day = dayRaw;
+  const hour = hourRaw;
+  const minute = minuteRaw;
+  const normalizedTimeZone = normalizeTimeZone(timeZone);
+  const targetComparableMs = Date.UTC(year, month - 1, day, hour, minute, 0);
+  let utcMs = targetComparableMs;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: normalizedTimeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).formatToParts(new Date(utcMs));
+
+    const mapped: Record<string, string> = {};
+    for (const part of parts) {
+      if (part.type !== "literal") {
+        mapped[part.type] = part.value;
+      }
+    }
+
+    const observedComparableMs = Date.UTC(
+      Number.parseInt(mapped.year ?? "0", 10),
+      Number.parseInt(mapped.month ?? "1", 10) - 1,
+      Number.parseInt(mapped.day ?? "1", 10),
+      Number.parseInt(mapped.hour ?? "0", 10),
+      Number.parseInt(mapped.minute ?? "0", 10),
+      0,
+    );
+
+    const deltaMs = observedComparableMs - targetComparableMs;
+    if (deltaMs === 0) {
+      break;
+    }
+
+    utcMs -= deltaMs;
+  }
+
+  const result = new Date(utcMs);
+  if (Number.isNaN(result.getTime())) {
+    return null;
+  }
+
+  return result.toISOString();
 }
 
 function parseInstagramOauthWindowMessage(data: unknown): InstagramOauthWindowMessage | null {
@@ -418,9 +682,25 @@ function parseInstagramOauthWindowMessage(data: unknown): InstagramOauthWindowMe
   };
 }
 
-function getCurrentTimeValue(): string {
-  const now = new Date();
-  return `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+function getCurrentTimeValue(
+  timeZone: string = DEFAULT_USER_TIME_ZONE,
+  referenceDate: Date = new Date(),
+): string {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: normalizeTimeZone(timeZone),
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(referenceDate);
+
+  const mapped: Record<string, string> = {};
+  for (const part of parts) {
+    if (part.type !== "literal") {
+      mapped[part.type] = part.value;
+    }
+  }
+
+  return `${mapped.hour ?? "00"}:${mapped.minute ?? "00"}`;
 }
 
 function isVideoPath(filePath: string): boolean {
@@ -596,9 +876,7 @@ function jobStatusLabel(status: string): string {
   }
 }
 
-const BRAZIL_TIME_ZONE = "America/Sao_Paulo";
-
-function toTimeZoneComparableTimestamp(date: Date, timeZone: string): number {
+function getTimeZoneDateParts(date: Date, timeZone: string): Record<string, string> {
   const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone,
     year: "numeric",
@@ -617,6 +895,12 @@ function toTimeZoneComparableTimestamp(date: Date, timeZone: string): number {
     }
   }
 
+  return mapped;
+}
+
+function toTimeZoneComparableTimestamp(date: Date, timeZone: string): number {
+  const mapped = getTimeZoneDateParts(date, timeZone);
+
   return Date.UTC(
     Number.parseInt(mapped.year ?? "0", 10),
     Number.parseInt(mapped.month ?? "1", 10) - 1,
@@ -627,7 +911,15 @@ function toTimeZoneComparableTimestamp(date: Date, timeZone: string): number {
   );
 }
 
-function canToggleJobSchedule(job: Job): boolean {
+function getYearMonthInTimeZone(date: Date, timeZone: string): { year: number; month: number } {
+  const mapped = getTimeZoneDateParts(date, normalizeTimeZone(timeZone));
+  return {
+    year: Number.parseInt(mapped.year ?? "0", 10),
+    month: Number.parseInt(mapped.month ?? "0", 10),
+  };
+}
+
+function canToggleJobSchedule(job: Job, isPastScheduledAtInUserTimeZone: (dateIso: string) => boolean): boolean {
   if (job.publicationState === "DRAFT") {
     return false;
   }
@@ -636,11 +928,15 @@ function canToggleJobSchedule(job: Job): boolean {
     return true;
   }
 
-  if (job.status === "FAILED" && isPastScheduledAt(job.dataPostagem)) {
+  if (job.status === "FAILED" && isPastScheduledAtInUserTimeZone(job.dataPostagem)) {
     return false;
   }
 
   return job.status === "PENDING" || job.status === "WAITING_LOGIN" || job.status === "FAILED";
+}
+
+function shouldRenderUpcomingAsRunning(job: Job, isPastScheduledAtInUserTimeZone: (dateIso: string) => boolean): boolean {
+  return job.status === "RUNNING" || (job.status === "PENDING" && isPastScheduledAtInUserTimeZone(job.dataPostagem));
 }
 
 function jobStatusTone(job: Job): string {
@@ -659,12 +955,92 @@ function jobStatusDisplayLabel(job: Job): string {
   return jobStatusLabel(job.status);
 }
 
-function isPastScheduledAt(dateIso: string): boolean {
+function billingStatusTone(status: string): string {
+  switch ((status || "").toUpperCase()) {
+    case "ACTIVE":
+    case "TRIALING":
+      return "billing-active";
+    case "PAYMENT_REQUIRED":
+      return "billing-paused";
+    case "BLOCKED":
+    case "EXPIRED":
+      return "billing-canceled";
+    default:
+      return "billing-paused";
+  }
+}
+
+function billingStatusDisplayLabel(status: string): string {
+  switch ((status || "").toUpperCase()) {
+    case "ACTIVE":
+    case "TRIALING":
+      return "Ativo";
+    case "PAYMENT_REQUIRED":
+      return "Pausado";
+    case "BLOCKED":
+    case "EXPIRED":
+      return "Cancelado";
+    case "NONE":
+      return "Sem plano";
+    default:
+      return "Pausado";
+  }
+}
+
+function billingModelDisplayLabel(model: string): string {
+  switch ((model || "").toUpperCase()) {
+    case "NONE":
+      return "Sem cobrança";
+    case "TRIAL":
+      return "Trial";
+    case "STRIPE_SUBSCRIPTION":
+      return "Assinatura Stripe";
+    case "PIX_MANUAL":
+      return "Pix avulso Stripe";
+    case "MANUAL":
+      return "Manual";
+    case "ROOT":
+      return "Manual";
+    default:
+      return "Manual";
+  }
+}
+
+function billingSubscriptionTypeDisplayLabel(model: string, cycle: string | null): string {
+  const normalizedModel = (model || "").toUpperCase();
+  const normalizedCycle = (cycle || "").toUpperCase();
+  if (normalizedModel === "STRIPE_SUBSCRIPTION") {
+    return normalizedCycle === "YEARLY" ? "Recorrente anual" : "Recorrente mensal";
+  }
+  if (normalizedModel === "PIX_MANUAL") {
+    return normalizedCycle === "YEARLY" ? "Avulso anual" : "Avulso mensal";
+  }
+  if (normalizedModel === "TRIAL") {
+    return "Trial";
+  }
+  if (normalizedModel === "NONE") {
+    return "Sem cobrança";
+  }
+  return "Manual";
+}
+
+function resolveBillingPlanAmountCents(plan: BillingPlan | null, cycle: string | null): number | null {
+  if (!plan) {
+    return null;
+  }
+  return (cycle || "").toUpperCase() === "YEARLY" ? plan.yearlyPriceCents : plan.monthlyPriceCents;
+}
+
+function isPastScheduledAt(
+  dateIso: string,
+  timeZone: string,
+  currentDateTime: Date,
+): boolean {
   const scheduledAt = new Date(dateIso);
-  const now = new Date();
+  const normalizedTimeZone = normalizeTimeZone(timeZone);
   return (
-    toTimeZoneComparableTimestamp(scheduledAt, BRAZIL_TIME_ZONE) <=
-    toTimeZoneComparableTimestamp(now, BRAZIL_TIME_ZONE)
+    toTimeZoneComparableTimestamp(scheduledAt, normalizedTimeZone) <=
+    toTimeZoneComparableTimestamp(currentDateTime, normalizedTimeZone)
   );
 }
 
@@ -682,6 +1058,21 @@ function connectionStatusLabel(status: SocialConnection["authStatus"]): string {
     default:
       return "Aguardando autenticação";
   }
+}
+
+function resolveWhatsappOwnerNumber(ownerJid: string | null | undefined): string | null {
+  const raw = ownerJid?.trim() || "";
+  if (!raw) {
+    return null;
+  }
+
+  const base = raw.split("@")[0]?.trim() || "";
+  if (!base) {
+    return null;
+  }
+
+  const digits = base.replace(/\D+/g, "");
+  return digits || base;
 }
 
 function isInstagramPublication(publicationType: SchedulerPublicationType): boolean {
@@ -711,12 +1102,6 @@ function initialThemeMode(): ThemeMode {
   }
 
   return "light";
-}
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => {
-    window.setTimeout(resolve, milliseconds);
-  });
 }
 
 function App() {
@@ -751,6 +1136,8 @@ function App() {
   const [profileName, setProfileName] = useState("");
   const [profileUsername, setProfileUsername] = useState("");
   const [profilePassword, setProfilePassword] = useState("");
+  const [profileTimeZone, setProfileTimeZone] = useState(DEFAULT_USER_TIME_ZONE);
+  const [nowTickMs, setNowTickMs] = useState(() => Date.now());
   const [activeView, setActiveView] = useState<ViewKey>(initialViewFromLocation);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [companies, setCompanies] = useState<Company[]>([]);
@@ -783,7 +1170,7 @@ function App() {
   const [publicationType, setPublicationType] = useState<SchedulerPublicationType>("");
   const [publicationState, setPublicationState] = useState<SchedulerPublicationState>("");
   const [scheduledDate, setScheduledDate] = useState("");
-  const [scheduledTime, setScheduledTime] = useState(getCurrentTimeValue);
+  const [scheduledTime, setScheduledTime] = useState(() => getCurrentTimeValue(DEFAULT_USER_TIME_ZONE));
   const [scheduledTimeTouched, setScheduledTimeTouched] = useState(false);
   const [editingJobId, setEditingJobId] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -792,6 +1179,37 @@ function App() {
   const [mediaInfo, setMediaInfo] = useState("");
   const [avisosInfo, setAvisosInfo] = useState("");
   const [noticeAdminInfo, setNoticeAdminInfo] = useState("");
+  const [planInfo, setPlanInfo] = useState("");
+  const [billingMe, setBillingMe] = useState<BillingMe | null>(null);
+  const [billingPlans, setBillingPlans] = useState<BillingPlan[]>([]);
+  const [billingSettings, setBillingSettings] = useState<BillingSettings>({
+    autoTrialEnabled: true,
+    autoTrialDays: 10,
+    rootDisplayPlanId: null,
+  });
+  const [billingLoading, setBillingLoading] = useState(false);
+  const [savingBillingSettings, setSavingBillingSettings] = useState(false);
+  const [creatingPlan, setCreatingPlan] = useState(false);
+  const [planCodeInput, setPlanCodeInput] = useState("");
+  const [planNameInput, setPlanNameInput] = useState("");
+  const [planDescriptionInput, setPlanDescriptionInput] = useState("");
+  const [planIsTrialInput, setPlanIsTrialInput] = useState(false);
+  const [planIsActiveInput, setPlanIsActiveInput] = useState(true);
+  const [planMaxProfilesInput, setPlanMaxProfilesInput] = useState("1");
+  const [planMaxConnectionsInput, setPlanMaxConnectionsInput] = useState("2");
+  const [planMaxMonthlyPublicationsInput, setPlanMaxMonthlyPublicationsInput] = useState("60");
+  const [planStripeProductIdInput, setPlanStripeProductIdInput] = useState("");
+  const [stripeCatalogProducts, setStripeCatalogProducts] = useState<StripeCatalogProduct[]>([]);
+  const [stripeCatalogResolvedByProduct, setStripeCatalogResolvedByProduct] = useState<
+    StripeCatalogResponse["resolvedByProduct"]
+  >({});
+  const [stripeCatalogError, setStripeCatalogError] = useState("");
+  const [checkoutPlanId, setCheckoutPlanId] = useState("");
+  const [checkoutBillingModel, setCheckoutBillingModel] = useState<"" | "STRIPE_SUBSCRIPTION" | "PIX_MANUAL">("");
+  const [checkoutCycle, setCheckoutCycle] = useState<"" | "MONTHLY" | "YEARLY">("");
+  const [startingCheckout, setStartingCheckout] = useState(false);
+  const [cancelingStripeSubscription, setCancelingStripeSubscription] = useState(false);
+  const [editingPlanId, setEditingPlanId] = useState<string | null>(null);
   const [historyFilter, setHistoryFilter] = useState<HistoryFilterKey>(() =>
     parseHistoryFilterKey(readSearchParam(HISTORY_FILTER_QUERY_PARAM)),
   );
@@ -828,11 +1246,38 @@ function App() {
   const noticesBellMobileRef = useRef<HTMLDivElement | null>(null);
   const profileMenuDesktopRef = useRef<HTMLDivElement | null>(null);
   const profileMenuMobileRef = useRef<HTMLDivElement | null>(null);
+  const planEditorSectionRef = useRef<HTMLElement | null>(null);
   const isRootUser = authUser?.username === "root";
+  const supportedTimeZones = useMemo(() => listSupportedTimeZones(), []);
+  const effectiveUserTimeZone = normalizeTimeZone(authUser?.timeZone || DEFAULT_USER_TIME_ZONE);
+  const nowReferenceDate = useMemo(() => new Date(nowTickMs), [nowTickMs]);
+  const isPastScheduledAtForUser = (dateIso: string) =>
+    isPastScheduledAt(dateIso, effectiveUserTimeZone, nowReferenceDate);
   const instagramForcedLocationId = (dashboard.instagramForcedLocationId || "").trim();
   const instagramForcedLocationName =
     (dashboard.instagramForcedLocationName || "").trim() || "Localização fixa do sistema";
   const isInstagramForcedLocationEnabled = instagramForcedLocationId.length > 0;
+  const resolvedStripePriceIdsForSelectedProduct = planStripeProductIdInput
+    ? (stripeCatalogResolvedByProduct[planStripeProductIdInput] ?? null)
+    : null;
+  const availablePaidPlans = useMemo(
+    () => billingPlans.filter((plan) => plan.isActive && !plan.isTrial),
+    [billingPlans],
+  );
+  const selectedCheckoutPlan = checkoutPlanId
+    ? availablePaidPlans.find((plan) => plan.id === checkoutPlanId) ?? null
+    : null;
+  const isCheckoutSelectionReady =
+    Boolean(selectedCheckoutPlan) &&
+    (checkoutBillingModel === "STRIPE_SUBSCRIPTION" || checkoutBillingModel === "PIX_MANUAL") &&
+    (checkoutCycle === "MONTHLY" || checkoutCycle === "YEARLY");
+  const checkoutSelectedPriceCents =
+    selectedCheckoutPlan && (checkoutCycle === "MONTHLY" || checkoutCycle === "YEARLY")
+      ? checkoutCycle === "YEARLY"
+        ? selectedCheckoutPlan.yearlyPriceCents
+        : selectedCheckoutPlan.monthlyPriceCents
+      : null;
+  const checkoutSelectedPriceLabel = formatPriceFromCents(checkoutSelectedPriceCents);
   const isPositiveAuthInfo = authInfo.trim().length > 0;
   const isPositiveSchedulerInfo =
     schedulerInfo === "Midia enviada com sucesso." ||
@@ -857,8 +1302,18 @@ function App() {
   const isTransientMediaInfo = isPositiveMediaInfo;
   const isPositiveAvisosInfo = avisosInfo === "Avisos atualizados.";
   const isPositiveNoticeAdminInfo = noticeAdminInfo === "Aviso enviado com sucesso.";
+  const isPositivePlanInfo =
+    planInfo === "Plano criado com sucesso." ||
+    planInfo === "Plano atualizado com sucesso." ||
+    planInfo === "Plano excluído com sucesso." ||
+    planInfo === "Configurações básicas salvas com sucesso." ||
+    planInfo === "Plano ativado com sucesso pelo Stripe." ||
+    planInfo === "Plano ativado com sucesso.";
   const isTransientAvisosInfo = isPositiveAvisosInfo;
   const isTransientNoticeAdminInfo = isPositiveNoticeAdminInfo;
+  const billingWarningMessage = authUser?.billingIsBlocked
+    ? (authUser.billingBlockMessage || "Conta bloqueada por pagamento pendente. Renove para continuar.")
+    : "";
   const requiresMediaUpload = publicationType !== "" && publicationType !== "whatsapp_status_texto";
   const supportsMultiMediaUpload = publicationType === "instagram_post" || publicationType === "instagram_story";
   const activeAppLogo = themeMode === "dark" ? appLogoAlternative : appLogo;
@@ -930,6 +1385,7 @@ function App() {
       setMediaInfo("");
       setAvisosInfo("");
       setNoticeAdminInfo("");
+      setPlanInfo("");
     }
 
     setNoticesPopoverOpen(false);
@@ -940,6 +1396,42 @@ function App() {
     window.requestAnimationFrame(() => {
       window.scrollTo({ top: 0, behavior: "smooth" });
     });
+  }
+
+  function scrollToBillingCheckoutAnchor() {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const target = window.document.getElementById(BILLING_PLAN_CHECKOUT_ANCHOR_ID);
+    if (!target) {
+      return;
+    }
+
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+
+    const nextUrl = `${buildViewHref("plan")}#${BILLING_PLAN_CHECKOUT_ANCHOR_ID}`;
+    const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (currentUrl !== nextUrl) {
+      window.history.replaceState({}, "", nextUrl);
+    }
+  }
+
+  function navigateToPlanCheckout(event: ReactMouseEvent<HTMLAnchorElement>) {
+    event.preventDefault();
+    navigateToView("plan");
+    window.setTimeout(() => {
+      scrollToBillingCheckoutAnchor();
+    }, 120);
+  }
+
+  async function refreshAuthUserSnapshot(): Promise<void> {
+    try {
+      const response = await api.get<{ user: AuthUser }>("/auth/me");
+      setAuthUser(response.user);
+    } catch {
+      // Mantém o estado atual quando o refresh falha por rede.
+    }
   }
 
   const companyNameMap = useMemo(
@@ -1043,6 +1535,20 @@ function App() {
   }, [isTransientNoticeAdminInfo]);
 
   useEffect(() => {
+    if (!isPositivePlanInfo) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setPlanInfo("");
+    }, 3200);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [isPositivePlanInfo]);
+
+  useEffect(() => {
     if (activeView !== "media" && mediaInfo) {
       setMediaInfo("");
     }
@@ -1059,6 +1565,12 @@ function App() {
       setNoticeAdminInfo("");
     }
   }, [activeView, noticeAdminInfo]);
+
+  useEffect(() => {
+    if (activeView !== "plan" && activeView !== "planConfig" && planInfo) {
+      setPlanInfo("");
+    }
+  }, [activeView, planInfo]);
 
   useEffect(() => {
     if (!mediaInfo || typeof window === "undefined" || !mediaSectionRef.current) {
@@ -1194,6 +1706,81 @@ function App() {
   }, [selectedCompanyId, isRootUser]);
 
   useEffect(() => {
+    if (isRootUser) {
+      return;
+    }
+
+    if (availablePaidPlans.length === 0) {
+      setCheckoutPlanId("");
+      return;
+    }
+
+    setCheckoutPlanId((current) =>
+      current && availablePaidPlans.some((plan) => plan.id === current) ? current : "",
+    );
+  }, [isRootUser, availablePaidPlans]);
+
+  useEffect(() => {
+    if (!authUser || isRootUser) {
+      return;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    const checkoutResult = (params.get(STRIPE_CHECKOUT_RESULT_QUERY_PARAM) || "").trim().toLowerCase();
+    if (!checkoutResult) {
+      return;
+    }
+
+    const cleanupStripeCheckoutParams = () => {
+      params.delete(STRIPE_CHECKOUT_RESULT_QUERY_PARAM);
+      params.delete(STRIPE_CHECKOUT_SESSION_ID_QUERY_PARAM);
+      const nextSearch = params.toString();
+      const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ""}${window.location.hash}`;
+      window.history.replaceState({}, "", nextUrl);
+    };
+
+    if (checkoutResult === "cancel") {
+      setPlanInfo("Checkout cancelado.");
+      cleanupStripeCheckoutParams();
+      return;
+    }
+
+    const sessionId = (params.get(STRIPE_CHECKOUT_SESSION_ID_QUERY_PARAM) || "").trim();
+    if (!sessionId) {
+      setError("Retorno do Stripe sem session_id para confirmar pagamento.");
+      cleanupStripeCheckoutParams();
+      return;
+    }
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const result = await api.postJson<{ applied: boolean; message?: string }>("/billing/checkout/confirm", {
+          sessionId,
+        });
+        if (cancelled) {
+          return;
+        }
+        setError("");
+        setPlanInfo(result.message || (result.applied ? "Plano ativado com sucesso." : "Aguardando confirmação de pagamento."));
+        await refreshAuthUserSnapshot();
+        await loadBillingData({ withSkeleton: false });
+      } catch (confirmError) {
+        if (cancelled) {
+          return;
+        }
+        setError(confirmError instanceof Error ? confirmError.message : "Falha ao confirmar checkout Stripe.");
+      } finally {
+        cleanupStripeCheckoutParams();
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authUser, isRootUser]);
+
+  useEffect(() => {
     if (!activeQrConnection) {
       return;
     }
@@ -1295,7 +1882,7 @@ function App() {
   const visibleNavItems = useMemo(
     () =>
       navItems.filter((item) => {
-        if (item.key === "logs" || item.key === "noticeAdmin") {
+        if (item.key === "logs" || item.key === "noticeAdmin" || item.key === "planConfig") {
           return isRootUser;
         }
 
@@ -1316,30 +1903,52 @@ function App() {
     const eligibleUpcomingJobs = jobsOrderedByCreatedAtDesc.filter(
       (job) =>
         job.publicationState === "PUBLISHED" &&
-        (job.status === "RUNNING" ||
-          (!isPastScheduledAt(job.dataPostagem) &&
-            (job.status === "PENDING" || job.status === "WAITING_LOGIN"))),
+        (job.status === "RUNNING" || job.status === "PENDING" || job.status === "WAITING_LOGIN"),
     );
 
-    const runningJobs = eligibleUpcomingJobs.filter((job) => job.status === "RUNNING");
-    const scheduledJobs = eligibleUpcomingJobs.filter((job) => job.status !== "RUNNING");
-    return [...runningJobs, ...scheduledJobs].slice(0, 5);
-  }, [jobsOrderedByCreatedAtDesc]);
+    return eligibleUpcomingJobs
+      .slice()
+      .sort((left, right) => {
+        const leftRunningLike = shouldRenderUpcomingAsRunning(left, isPastScheduledAtForUser);
+        const rightRunningLike = shouldRenderUpcomingAsRunning(right, isPastScheduledAtForUser);
+
+        if (leftRunningLike !== rightRunningLike) {
+          return leftRunningLike ? -1 : 1;
+        }
+
+        const leftScheduledAt = new Date(left.dataPostagem).getTime();
+        const rightScheduledAt = new Date(right.dataPostagem).getTime();
+        return leftScheduledAt - rightScheduledAt;
+      })
+      .slice(0, 5);
+  }, [effectiveUserTimeZone, jobsOrderedByCreatedAtDesc, nowTickMs]);
 
   const historyAvailableYears = useMemo(
     () =>
-      Array.from(new Set(jobsOrderedByCreatedAtDesc.map((job) => String(new Date(job.dataPostagem).getFullYear())))).sort(
+      Array.from(
+        new Set(
+          jobsOrderedByCreatedAtDesc.map((job) =>
+            String(getYearMonthInTimeZone(new Date(job.dataPostagem), effectiveUserTimeZone).year),
+          ),
+        ),
+      ).sort(
         (left, right) => Number(right) - Number(left),
       ),
-    [jobsOrderedByCreatedAtDesc],
+    [effectiveUserTimeZone, jobsOrderedByCreatedAtDesc],
   );
 
   const mediaAvailableYears = useMemo(
     () =>
-      Array.from(new Set(mediaLibrary.map((media) => String(new Date(media.lastUsedAt).getFullYear())))).sort(
+      Array.from(
+        new Set(
+          mediaLibrary.map((media) =>
+            String(getYearMonthInTimeZone(new Date(media.lastUsedAt), effectiveUserTimeZone).year),
+          ),
+        ),
+      ).sort(
         (left, right) => Number(right) - Number(left),
       ),
-    [mediaLibrary],
+    [effectiveUserTimeZone, mediaLibrary],
   );
 
   const historyFilteredJobs = useMemo(() => {
@@ -1349,7 +1958,7 @@ function App() {
           return jobsOrderedByCreatedAtDesc.filter(
             (job) =>
               job.publicationState === "PUBLISHED" &&
-              !isPastScheduledAt(job.dataPostagem) &&
+              !isPastScheduledAtForUser(job.dataPostagem) &&
               (job.status === "PENDING" || job.status === "WAITING_LOGIN"),
           );
         case "canceled":
@@ -1373,12 +1982,12 @@ function App() {
     })();
 
     return statusFilteredJobs.filter((job) => {
-      const jobDate = new Date(job.dataPostagem);
-      const monthMatches = historyMonthFilter === "all" || jobDate.getMonth() + 1 === Number(historyMonthFilter);
-      const yearMatches = historyYearFilter === "all" || jobDate.getFullYear() === Number(historyYearFilter);
+      const yearMonth = getYearMonthInTimeZone(new Date(job.dataPostagem), effectiveUserTimeZone);
+      const monthMatches = historyMonthFilter === "all" || yearMonth.month === Number(historyMonthFilter);
+      const yearMatches = historyYearFilter === "all" || yearMonth.year === Number(historyYearFilter);
       return monthMatches && yearMatches;
     });
-  }, [historyFilter, historyMonthFilter, historyYearFilter, jobsOrderedByCreatedAtDesc]);
+  }, [effectiveUserTimeZone, historyFilter, historyMonthFilter, historyYearFilter, jobsOrderedByCreatedAtDesc, nowTickMs]);
 
   const mediaFilteredItems = useMemo(() => {
     const statusFilteredMedia = (() => {
@@ -1402,12 +2011,12 @@ function App() {
     })();
 
     return statusFilteredMedia.filter((media) => {
-      const mediaDate = new Date(media.lastUsedAt);
-      const monthMatches = mediaMonthFilter === "all" || mediaDate.getMonth() + 1 === Number(mediaMonthFilter);
-      const yearMatches = mediaYearFilter === "all" || mediaDate.getFullYear() === Number(mediaYearFilter);
+      const yearMonth = getYearMonthInTimeZone(new Date(media.lastUsedAt), effectiveUserTimeZone);
+      const monthMatches = mediaMonthFilter === "all" || yearMonth.month === Number(mediaMonthFilter);
+      const yearMatches = mediaYearFilter === "all" || yearMonth.year === Number(mediaYearFilter);
       return monthMatches && yearMatches;
     });
-  }, [mediaStatusFilter, mediaMonthFilter, mediaYearFilter, mediaLibrary]);
+  }, [effectiveUserTimeZone, mediaStatusFilter, mediaMonthFilter, mediaYearFilter, mediaLibrary]);
 
   const historyTotalPages = useMemo(
     () => Math.max(1, Math.ceil(historyFilteredJobs.length / HISTORY_PAGE_SIZE)),
@@ -1431,7 +2040,6 @@ function App() {
 
   async function loadAll(options?: { withSkeleton?: boolean }): Promise<void> {
     const withSkeleton = options?.withSkeleton ?? true;
-    const loadingStartedAt = withSkeleton ? Date.now() : 0;
     if (withSkeleton) {
       startContentLoading();
     }
@@ -1466,10 +2074,6 @@ function App() {
       setError(loadError instanceof Error ? loadError.message : "Falha ao carregar dados.");
     } finally {
       if (withSkeleton) {
-        const elapsed = Date.now() - loadingStartedAt;
-        if (elapsed < CONTENT_SKELETON_MIN_MS) {
-          await delay(CONTENT_SKELETON_MIN_MS - elapsed);
-        }
         finishContentLoading();
       }
     }
@@ -1477,7 +2081,6 @@ function App() {
 
   async function loadAvisosPage(page: number, options?: { withSkeleton?: boolean }): Promise<void> {
     const withSkeleton = options?.withSkeleton ?? true;
-    const loadingStartedAt = withSkeleton ? Date.now() : 0;
     if (withSkeleton) {
       startContentLoading();
     }
@@ -1500,11 +2103,82 @@ function App() {
       setError(loadAvisosError instanceof Error ? loadAvisosError.message : "Falha ao carregar avisos.");
     } finally {
       if (withSkeleton) {
-        const elapsed = Date.now() - loadingStartedAt;
-        if (elapsed < CONTENT_SKELETON_MIN_MS) {
-          await delay(CONTENT_SKELETON_MIN_MS - elapsed);
-        }
         finishContentLoading();
+      }
+    }
+  }
+
+  function formatPriceFromCents(value: number | null): string {
+    if (value === null || !Number.isFinite(value)) {
+      return "—";
+    }
+    return new Intl.NumberFormat("pt-BR", {
+      style: "currency",
+      currency: "BRL",
+      minimumFractionDigits: 2,
+    }).format(value / 100);
+  }
+
+  function formatCompactPriceFromCents(value: number | null): string {
+    const formatted = formatPriceFromCents(value);
+    return formatted.replace(/^R\$\s?/, "");
+  }
+
+  function formatPlanLimitDisplay(limit: number | null | undefined, planCode?: string | null): string {
+    if (planCode === "ROOT") {
+      return "Ilimitado";
+    }
+    if (limit === null || limit === undefined) {
+      return "0";
+    }
+    return String(limit);
+  }
+
+  async function loadBillingData(options?: { withSkeleton?: boolean }): Promise<void> {
+    const withSkeleton = options?.withSkeleton ?? true;
+    if (withSkeleton) {
+      setBillingLoading(true);
+    }
+
+    try {
+      const [billingMeData, billingPlansData] = await Promise.all([
+        api.get<BillingMe>("/billing/me"),
+        api.get<BillingPlan[]>("/billing/plans"),
+      ]);
+      setBillingMe(billingMeData);
+      setBillingPlans(billingPlansData);
+
+      if (isRootUser) {
+        const [billingSettingsData, stripeCatalogData] = await Promise.all([
+          api.get<BillingSettings>("/billing/settings"),
+          api.get<StripeCatalogResponse>("/billing/stripe/catalog").catch(() => null),
+        ]);
+        setBillingSettings(billingSettingsData);
+        if (stripeCatalogData) {
+          setStripeCatalogProducts(stripeCatalogData.products ?? []);
+          setStripeCatalogResolvedByProduct(stripeCatalogData.resolvedByProduct ?? {});
+          setStripeCatalogError("");
+        } else {
+          setStripeCatalogProducts([]);
+          setStripeCatalogResolvedByProduct({});
+          setStripeCatalogError("Catálogo Stripe indisponível. Configure STRIPE_SECRET_KEY no backend.");
+        }
+      } else {
+        setStripeCatalogProducts([]);
+        setStripeCatalogResolvedByProduct({});
+        setStripeCatalogError("");
+      }
+      setError("");
+    } catch (loadBillingError) {
+      setError(loadBillingError instanceof Error ? loadBillingError.message : "Falha ao carregar plano.");
+      if (isRootUser) {
+        setStripeCatalogProducts([]);
+        setStripeCatalogResolvedByProduct({});
+        setStripeCatalogError("Não foi possível carregar catálogo Stripe.");
+      }
+    } finally {
+      if (withSkeleton) {
+        setBillingLoading(false);
       }
     }
   }
@@ -1571,18 +2245,57 @@ function App() {
   }, [setupKey]);
 
   useEffect(() => {
+    const tick = () => {
+      setNowTickMs(Date.now());
+    };
+
+    tick();
+    const intervalId = window.setInterval(tick, 30_000);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        tick();
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("focus", tick);
+
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("focus", tick);
+    };
+  }, []);
+
+  useEffect(() => {
     if (!authUser) {
       setUnreadAvisosCount(0);
       setRecentAvisos([]);
       return;
     }
 
-    if (activeView === "notices" || activeView === "profile" || activeView === "plan") {
+    if (activeView === "notices" || activeView === "profile" || activeView === "plan" || activeView === "planConfig") {
       return;
     }
 
     void loadAll({ withSkeleton: true });
   }, [selectedCompanyId, authUser, activeView]);
+
+  useEffect(() => {
+    if (!authUser || (activeView !== "plan" && activeView !== "planConfig")) {
+      return;
+    }
+
+    void loadBillingData({ withSkeleton: true });
+  }, [authUser, activeView, isRootUser]);
+
+  useEffect(() => {
+    if (activeView !== "planConfig" || isRootUser) {
+      return;
+    }
+
+    navigateToView("dashboard");
+  }, [activeView, isRootUser]);
 
   useEffect(() => {
     if (!authUser || activeView === "agents" || activeView === "notices") {
@@ -1622,6 +2335,15 @@ function App() {
       window.removeEventListener("focus", handleFocus);
     };
   }, [authUser, activeView, selectedCompanyId, isRootUser]);
+
+  useEffect(() => {
+    if (scheduledTimeTouched) {
+      return;
+    }
+
+    const liveTime = getCurrentTimeValue(effectiveUserTimeZone, nowReferenceDate);
+    setScheduledTime((current) => (current === liveTime ? current : liveTime));
+  }, [effectiveUserTimeZone, nowReferenceDate, scheduledTimeTouched]);
 
   useEffect(() => {
     if (!authUser) {
@@ -1668,6 +2390,7 @@ function App() {
     setProfileName(authUser.name);
     setProfileUsername(authUser.username);
     setProfilePassword("");
+    setProfileTimeZone(normalizeTimeZone(authUser.timeZone));
   }, [authUser]);
 
   useEffect(() => {
@@ -2178,13 +2901,34 @@ function App() {
       }
     }
 
+    const editingCurrentJob = editingJobId ? jobs.find((job) => job.id === editingJobId) ?? null : null;
+    const shouldConfirmPublishedReschedule =
+      editingCurrentJob !== null &&
+      publicationState === "PUBLISHED" &&
+      EDIT_PUBLISHED_RESCHEDULE_CONFIRM_STATUSES.has(editingCurrentJob.status);
+
+    if (
+      shouldConfirmPublishedReschedule &&
+      !window.confirm(
+        "Esta postagem já foi processada. Salvar como Publicado criará um novo agendamento de publicação. Deseja continuar?",
+      )
+    ) {
+      return;
+    }
+
     setSubmittingJob(true);
     setError("");
     setSchedulerInfo(editingJobId ? "Salvando alterações..." : "Agendando postagem...");
 
-    const fallbackTime = getCurrentTimeValue();
+    const fallbackTime = getCurrentTimeValue(effectiveUserTimeZone, nowReferenceDate);
     const effectiveTime = !scheduledTimeTouched ? fallbackTime : scheduledTime || fallbackTime;
-    const effectiveDateTime = `${scheduledDate}T${effectiveTime}`;
+    const scheduledAtIso = toIsoFromTimeZoneDateTime(scheduledDate, effectiveTime, effectiveUserTimeZone);
+    if (!scheduledAtIso) {
+      setSubmittingJob(false);
+      setError("");
+      setSchedulerInfo("Data/hora inválida para o fuso selecionado.");
+      return;
+    }
     const effectiveLocationId =
       requiresInstagramMetadata
         ? (isInstagramForcedLocationEnabled ? instagramForcedLocationId : null)
@@ -2207,7 +2951,7 @@ function App() {
       locationId: effectiveLocationId,
       publicationType,
       publicationState,
-      dataPostagem: new Date(effectiveDateTime).toISOString(),
+      dataPostagem: scheduledAtIso,
     };
 
     try {
@@ -2238,7 +2982,7 @@ function App() {
     setJobCompanyId("");
     setJobSocialConnectionId("");
     setScheduledDate("");
-    setScheduledTime(getCurrentTimeValue());
+    setScheduledTime(getCurrentTimeValue(effectiveUserTimeZone, nowReferenceDate));
     setScheduledTimeTouched(false);
     setPublicationType("");
     setPublicationState("");
@@ -2268,8 +3012,8 @@ function App() {
     setCaption(job.caption ?? "");
     setPublicationType(job.publicationType);
     setPublicationState(job.publicationState === "DRAFT" ? "DRAFT" : "PUBLISHED");
-    setScheduledDate(toDateLocal(job.dataPostagem));
-    setScheduledTime(toTimeLocal(job.dataPostagem));
+    setScheduledDate(toDateLocal(job.dataPostagem, effectiveUserTimeZone));
+    setScheduledTime(toTimeLocal(job.dataPostagem, effectiveUserTimeZone));
     setScheduledTimeTouched(true);
     setActiveView("scheduler");
   }
@@ -2310,7 +3054,7 @@ function App() {
 
     if (
       isActivating &&
-      isPastScheduledAt(job.dataPostagem) &&
+      isPastScheduledAtForUser(job.dataPostagem) &&
       !window.confirm(
         "Este agendamento ja passou. Se ativar agora, a postagem sera publicada imediatamente. Para ter mais controle, edite a data e o horario. Deseja continuar?",
       )
@@ -2343,7 +3087,7 @@ function App() {
       return;
     }
 
-    const willRunImmediately = isPastScheduledAt(job.dataPostagem);
+    const willRunImmediately = isPastScheduledAtForUser(job.dataPostagem);
     if (
       willRunImmediately &&
       !window.confirm(
@@ -2462,6 +3206,252 @@ function App() {
     }
   }
 
+  async function saveBillingSettings(event: FormEvent) {
+    event.preventDefault();
+    setSavingBillingSettings(true);
+    setError("");
+    setPlanInfo("");
+
+    try {
+      const payload = {
+        autoTrialEnabled: billingSettings.autoTrialEnabled,
+        autoTrialDays: billingSettings.autoTrialDays,
+        rootDisplayPlanId: billingSettings.rootDisplayPlanId,
+      };
+      const updated = await api.putJson<BillingSettings>("/billing/settings", payload);
+      setBillingSettings(updated);
+      setPlanInfo("Configurações básicas salvas com sucesso.");
+      await loadBillingData({ withSkeleton: false });
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch (billingError) {
+      setError(billingError instanceof Error ? billingError.message : "Falha ao salvar configuração de trial.");
+    } finally {
+      setSavingBillingSettings(false);
+    }
+  }
+
+  function resetBillingPlanForm() {
+    setEditingPlanId(null);
+    setPlanCodeInput("");
+    setPlanNameInput("");
+    setPlanDescriptionInput("");
+    setPlanIsTrialInput(false);
+    setPlanIsActiveInput(true);
+    setPlanMaxProfilesInput("1");
+    setPlanMaxConnectionsInput("2");
+    setPlanMaxMonthlyPublicationsInput("60");
+    setPlanStripeProductIdInput("");
+  }
+
+  function startBillingPlanEdit(plan: BillingPlan) {
+    setEditingPlanId(plan.id);
+    setPlanCodeInput(plan.code);
+    setPlanNameInput(plan.name);
+    setPlanDescriptionInput(plan.description ?? "");
+    setPlanIsTrialInput(plan.isTrial);
+    setPlanIsActiveInput(plan.isActive);
+    setPlanMaxProfilesInput(String(plan.maxProfiles));
+    setPlanMaxConnectionsInput(String(plan.maxConnections));
+    setPlanMaxMonthlyPublicationsInput(String(plan.maxMonthlyPublications));
+    setPlanStripeProductIdInput(plan.stripeProductId ?? "");
+    window.requestAnimationFrame(() => {
+      const section = planEditorSectionRef.current;
+      if (!section) {
+        return;
+      }
+      const targetTop = section.getBoundingClientRect().top + window.scrollY - 110;
+      window.scrollTo({ top: Math.max(0, targetTop), behavior: "smooth" });
+    });
+  }
+
+  async function createBillingPlan(event: FormEvent) {
+    event.preventDefault();
+    setCreatingPlan(true);
+    setError("");
+    setPlanInfo("");
+
+    try {
+      const maxProfiles = Number.parseInt(planMaxProfilesInput, 10);
+      const maxConnections = Number.parseInt(planMaxConnectionsInput, 10);
+      const maxMonthlyPublications = Number.parseInt(planMaxMonthlyPublicationsInput, 10);
+
+      if (!Number.isFinite(maxProfiles) || maxProfiles <= 0) {
+        throw new Error("Informe um número válido para total de perfis.");
+      }
+      if (!Number.isFinite(maxConnections) || maxConnections <= 0) {
+        throw new Error("Informe um número válido para total de contas.");
+      }
+      if (!Number.isFinite(maxMonthlyPublications) || maxMonthlyPublications <= 0) {
+        throw new Error("Informe um número válido para publicações mensais.");
+      }
+
+      if (!planIsTrialInput && !planStripeProductIdInput.trim()) {
+        throw new Error("Plano pago exige produto Stripe vinculado.");
+      }
+      if (!planIsTrialInput) {
+        const selectedProductId = planStripeProductIdInput.trim();
+        const resolvedStripePrices = selectedProductId
+          ? (stripeCatalogResolvedByProduct[selectedProductId] ?? null)
+          : null;
+
+        if (!resolvedStripePrices) {
+          throw new Error("Não foi possível resolver os preços do produto Stripe selecionado.");
+        }
+
+        const missingPriceKinds: string[] = [];
+        if (!resolvedStripePrices.stripeMonthlyPriceId) {
+          missingPriceKinds.push("assinatura mensal");
+        }
+        if (!resolvedStripePrices.stripeYearlyPriceId) {
+          missingPriceKinds.push("assinatura anual");
+        }
+        if (!resolvedStripePrices.stripePixMonthlyPriceId) {
+          missingPriceKinds.push("PIX mensal");
+        }
+        if (!resolvedStripePrices.stripePixYearlyPriceId) {
+          missingPriceKinds.push("PIX anual");
+        }
+        if (missingPriceKinds.length > 0) {
+          throw new Error(`Produto Stripe sem preços obrigatórios: ${missingPriceKinds.join(", ")}.`);
+        }
+
+        const hasCycleMismatch =
+          resolvedStripePrices.stripeMonthlyPriceCents !== null &&
+          resolvedStripePrices.stripeYearlyPriceCents !== null &&
+          resolvedStripePrices.stripePixMonthlyPriceCents !== null &&
+          resolvedStripePrices.stripePixYearlyPriceCents !== null &&
+          (resolvedStripePrices.stripeMonthlyPriceCents !== resolvedStripePrices.stripePixMonthlyPriceCents ||
+            resolvedStripePrices.stripeYearlyPriceCents !== resolvedStripePrices.stripePixYearlyPriceCents);
+
+        if (hasCycleMismatch) {
+          throw new Error(
+            "Os preços da assinatura e do PIX devem ser iguais por ciclo (mensal com mensal, anual com anual).",
+          );
+        }
+      }
+
+      const trialConflict =
+        planIsTrialInput &&
+        billingPlans.some((plan) => plan.isTrial && (editingPlanId ? plan.id !== editingPlanId : true));
+      if (trialConflict) {
+        throw new Error("Só é permitido 1 plano trial no sistema.");
+      }
+
+      const payload = {
+        code: planCodeInput.trim().toUpperCase(),
+        name: planNameInput.trim(),
+        description: planDescriptionInput.trim(),
+        isActive: planIsActiveInput,
+        isTrial: planIsTrialInput,
+        maxProfiles,
+        maxConnections,
+        maxMonthlyPublications,
+        stripeProductId: planStripeProductIdInput.trim() || null,
+      };
+
+      if (editingPlanId) {
+        await api.putJson(`/billing/plans/${editingPlanId}`, payload);
+      } else {
+        await api.postJson("/billing/plans", payload);
+      }
+
+      resetBillingPlanForm();
+      setPlanInfo(editingPlanId ? "Plano atualizado com sucesso." : "Plano criado com sucesso.");
+      await loadBillingData({ withSkeleton: false });
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch (planError) {
+      setError(
+        planError instanceof Error
+          ? planError.message
+          : editingPlanId
+            ? "Falha ao atualizar plano."
+            : "Falha ao criar plano.",
+      );
+    } finally {
+      setCreatingPlan(false);
+    }
+  }
+
+  async function deleteBillingPlan(plan: BillingPlan) {
+    if (!window.confirm(`Deseja excluir o plano "${plan.name}"?`)) {
+      return;
+    }
+
+    setError("");
+    setPlanInfo("");
+
+    try {
+      await api.delete(`/billing/plans/${plan.id}`);
+      if (editingPlanId === plan.id) {
+        resetBillingPlanForm();
+      }
+      setPlanInfo("Plano excluído com sucesso.");
+      await loadBillingData({ withSkeleton: false });
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch (planError) {
+      setError(planError instanceof Error ? planError.message : "Falha ao excluir plano.");
+    }
+  }
+
+  async function startStripeCheckout(event: FormEvent) {
+    event.preventDefault();
+    if (!checkoutPlanId) {
+      setError("Selecione um plano para iniciar o checkout.");
+      return;
+    }
+    if (checkoutBillingModel !== "STRIPE_SUBSCRIPTION" && checkoutBillingModel !== "PIX_MANUAL") {
+      setError("Selecione um modo de cobrança para iniciar o checkout.");
+      return;
+    }
+    if (checkoutCycle !== "MONTHLY" && checkoutCycle !== "YEARLY") {
+      setError("Selecione um ciclo para iniciar o checkout.");
+      return;
+    }
+
+    setStartingCheckout(true);
+    setError("");
+    setPlanInfo("");
+
+    try {
+      const result = await api.postJson<{ sessionId: string; url: string | null }>("/billing/checkout/start", {
+        planId: checkoutPlanId,
+        billingModel: checkoutBillingModel,
+        cycle: checkoutCycle,
+      });
+
+      if (!result.url) {
+        throw new Error("Stripe não retornou URL de checkout para esta sessão.");
+      }
+
+      window.location.href = result.url;
+    } catch (checkoutError) {
+      setError(checkoutError instanceof Error ? checkoutError.message : "Falha ao iniciar checkout Stripe.");
+      setStartingCheckout(false);
+    }
+  }
+
+  async function cancelStripeSubscription() {
+    if (!window.confirm("Deseja cancelar a assinatura recorrente no fim do ciclo atual?")) {
+      return;
+    }
+
+    setCancelingStripeSubscription(true);
+    setError("");
+    setPlanInfo("");
+
+    try {
+      const result = await api.postJson<{ message?: string }>("/billing/subscription/cancel", {});
+      setPlanInfo(result.message || "Assinatura marcada para cancelamento no fim do ciclo atual.");
+      await refreshAuthUserSnapshot();
+      await loadBillingData({ withSkeleton: false });
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch (cancelError) {
+      setError(cancelError instanceof Error ? cancelError.message : "Falha ao cancelar assinatura.");
+    } finally {
+      setCancelingStripeSubscription(false);
+    }
+  }
+
   async function retryJob(jobId: string) {
     setError("");
     setRetryingJobId(jobId);
@@ -2519,6 +3509,7 @@ function App() {
       setError("");
       setAuthInfo("");
       setAuthError("");
+      setProfileTimeZone(DEFAULT_USER_TIME_ZONE);
       setNoticesPopoverOpen(false);
       setProfileMenuOpen(false);
       setActiveView("dashboard");
@@ -2567,6 +3558,7 @@ function App() {
         name: profileName,
         username: profileUsername,
         password: profilePassword,
+        timeZone: profileTimeZone,
       });
 
       setAuthUser(result.user);
@@ -2597,7 +3589,7 @@ function App() {
     setPostTitle("");
     setCaption("");
     setScheduledDate("");
-    setScheduledTime(getCurrentTimeValue());
+    setScheduledTime(getCurrentTimeValue(effectiveUserTimeZone, nowReferenceDate));
     setScheduledTimeTouched(false);
     setActiveView("scheduler");
 
@@ -2612,6 +3604,44 @@ function App() {
 
   function appendEmojiToCaption(emoji: string) {
     setCaption((current) => `${current}${emoji}`);
+  }
+
+  function appendEmojiToBroadcastAvisoMessage(emoji: string) {
+    setBroadcastAvisoMessage((current) => `${current}${emoji}`);
+  }
+
+  function renderQuickEmojiPicker(options: {
+    disabled: boolean;
+    onPick: (emoji: string) => void;
+    label?: string;
+  }) {
+    const { disabled, onPick, label = "Emojis rápidos" } = options;
+
+    return (
+      <div className="emoji-picker-shell">
+        <span>{label}</span>
+        <div className="emoji-group-list">
+          {whatsappTextEmojiGroups.map((group) => (
+            <div key={group.label} className="emoji-group-card">
+              <strong>{group.label}</strong>
+              <div className="emoji-picker-grid">
+                {group.emojis.map((emoji) => (
+                  <button
+                    key={`${group.label}-${emoji}`}
+                    type="button"
+                    className="emoji-chip"
+                    disabled={disabled}
+                    onClick={() => onPick(emoji)}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
   }
 
   function renderProfileMenu(shellRef: { current: HTMLDivElement | null }, extraClassName = "") {
@@ -2695,7 +3725,7 @@ function App() {
                   <article key={aviso.id} className={`notice-popover-item ${avisoToneClass(aviso.kind)}`}>
                     <strong>{aviso.title}</strong>
                     <span>{aviso.message}</span>
-                    <small>{formatDate(aviso.createdAt)}</small>
+                    <small>{formatDate(aviso.createdAt, effectiveUserTimeZone)}</small>
                   </article>
                 ))
               )}
@@ -2891,7 +3921,12 @@ function App() {
           <article className="panel-card full-width-panel">
             <div className="section-head">
               <div>
-                <h2>Próximos Agendamentos</h2>
+                <div className="view-title-with-icon">
+                  <span className="view-title-icon" aria-hidden="true">
+                    <FiCalendar />
+                  </span>
+                  <h2>Próximos Agendamentos</h2>
+                </div>
               </div>
               <div className="inline-actions">
                 <button
@@ -2907,47 +3942,51 @@ function App() {
               {upcomingJobs.length === 0 ? (
                 <div className="empty-state">Nao ha proximos agendamentos nesse filtro.</div>
               ) : (
-                upcomingJobs.map((job) => (
-                  <div
-                    key={job.id}
-                    className={`row-card${job.status === "RUNNING" ? " row-card-running-live" : ""}`}
-                  >
-                    <div>
-                      <strong>{resolveJobDisplayTitle(job)}</strong>
-                      <div className="meta-pill-row">
-                        {renderPublicationTypePill(job.publicationType)}
-                        <span className="unit-pill">
-                          {`Perfil: ${companyNameMap[job.companyId] || "Perfil removido"}`}
-                        </span>
+                upcomingJobs.map((job) => {
+                  const isRunningLike = shouldRenderUpcomingAsRunning(job, isPastScheduledAtForUser);
+
+                  return (
+                    <div
+                      key={job.id}
+                      className={`row-card${isRunningLike ? " row-card-running-live" : ""}`}
+                    >
+                      <div>
+                        <strong>{resolveJobDisplayTitle(job)}</strong>
+                        <div className="meta-pill-row">
+                          {renderPublicationTypePill(job.publicationType)}
+                          <span className="unit-pill">
+                            {`Perfil: ${companyNameMap[job.companyId] || "Perfil removido"}`}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="inline-actions">
+                        <span>{formatDate(job.dataPostagem, effectiveUserTimeZone)}</span>
+                        {isRunningLike ? (
+                          <span className="status-pill status-running-live">
+                            <span className="status-pill-spinner" aria-hidden="true" />
+                            Executando
+                          </span>
+                        ) : (
+                          <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
+                        )}
+                        {canToggleJobSchedule(job, isPastScheduledAtForUser) ? (
+                          <button
+                            type="button"
+                            className={job.status === "CANCELED" ? "activate-button" : "ghost-button"}
+                            onClick={() => void toggleJobSchedule(job)}
+                            disabled={togglingScheduleJobId === job.id}
+                          >
+                            {togglingScheduleJobId === job.id
+                              ? "Salvando..."
+                              : job.status === "CANCELED"
+                                ? "Ativar agendamento"
+                                : "Cancelar agendamento"}
+                          </button>
+                        ) : null}
                       </div>
                     </div>
-                    <div className="inline-actions">
-                      <span>{formatDate(job.dataPostagem)}</span>
-                      {job.status === "RUNNING" ? (
-                        <span className="status-pill status-running-live">
-                          <span className="status-pill-spinner" aria-hidden="true" />
-                          Executando
-                        </span>
-                      ) : (
-                        <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
-                      )}
-                      {canToggleJobSchedule(job) ? (
-                        <button
-                          type="button"
-                          className={job.status === "CANCELED" ? "activate-button" : "ghost-button"}
-                          onClick={() => void toggleJobSchedule(job)}
-                          disabled={togglingScheduleJobId === job.id}
-                        >
-                          {togglingScheduleJobId === job.id
-                            ? "Salvando..."
-                            : job.status === "CANCELED"
-                              ? "Ativar agendamento"
-                              : "Cancelar agendamento"}
-                        </button>
-                      ) : null}
-                    </div>
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
           </article>
@@ -3180,36 +4219,63 @@ function App() {
     return (
       <div className="view-stack">
         <section className="panel-card view-stack">
-          <h2 className="profile-page-title">Minha Conta</h2>
+          <div className="section-head">
+            {renderSectionTitleWithIcon("profile", "Meu perfil", "conta")}
+          </div>
           <form onSubmit={saveProfile} className="form-stack">
-            <input
-              value={profileName}
-              onChange={(event) => setProfileName(event.target.value)}
-              placeholder="Nome"
-              required
-              minLength={2}
-              maxLength={80}
-              title="Informe o seu nome."
-            />
-            <input
-              value={profileUsername}
-              onChange={(event) => setProfileUsername(event.target.value)}
-              placeholder="Usuário"
-              required
-              minLength={3}
-              maxLength={32}
-              pattern="^[a-zA-Z0-9._-]+$"
-              title="Use apenas letras, números, ponto, traço ou underscore."
-            />
-            <input
-              type="password"
-              value={profilePassword}
-              onChange={(event) => setProfilePassword(event.target.value)}
-              placeholder="Senha"
-              minLength={8}
-              maxLength={128}
-              title="Preencha apenas se quiser alterar a sua senha."
-            />
+            <label className="field-label">
+              <span>Fuso horário</span>
+              <select
+                value={profileTimeZone}
+                onChange={(event) => setProfileTimeZone(event.target.value)}
+                required
+                title="Define o fuso horário usado para hora atual e exibição de datas."
+              >
+                {supportedTimeZones.map((timeZone) => (
+                  <option key={timeZone} value={timeZone}>
+                    {timeZone}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <small className="field-hint">Fuso horário do painel (usado para hora atual e datas).</small>
+            <label className="field-label">
+              <span>Nome</span>
+              <input
+                value={profileName}
+                onChange={(event) => setProfileName(event.target.value)}
+                placeholder="Nome"
+                required
+                minLength={2}
+                maxLength={80}
+                title="Informe o seu nome."
+              />
+            </label>
+            <label className="field-label">
+              <span>Usuário</span>
+              <input
+                value={profileUsername}
+                onChange={(event) => setProfileUsername(event.target.value)}
+                placeholder="Usuário"
+                required
+                minLength={3}
+                maxLength={32}
+                pattern="^[a-zA-Z0-9._-]+$"
+                title="Use apenas letras, números, ponto, traço ou underscore."
+              />
+            </label>
+            <label className="field-label">
+              <span>Senha</span>
+              <input
+                type="password"
+                value={profilePassword}
+                onChange={(event) => setProfilePassword(event.target.value)}
+                placeholder="Senha"
+                minLength={8}
+                maxLength={128}
+                title="Preencha apenas se quiser alterar a sua senha."
+              />
+            </label>
             <small className="field-hint">Deixe a senha em branco para não alterar.</small>
             <button type="submit">Salvar</button>
           </form>
@@ -3219,7 +4285,452 @@ function App() {
   }
 
   function renderPlan() {
-    return <section className="plan-empty-view" aria-label="Meu plano" />;
+    const activeBillingPlan =
+      billingMe?.plan?.id && billingPlans.length > 0
+        ? billingPlans.find((plan) => plan.id === billingMe.plan?.id) ?? null
+        : null;
+    const activeBillingAmountCents = resolveBillingPlanAmountCents(activeBillingPlan, billingMe?.cycle ?? null);
+    const activeBillingAmountLabel =
+      billingMe?.plan?.isTrial || billingMe?.billingModel === "TRIAL"
+        ? "Grátis"
+        : formatPriceFromCents(activeBillingAmountCents);
+
+    return (
+      <div className="view-stack">
+        <section className="panel-card view-stack" aria-label="Meu plano">
+          <div className="section-head">
+            {renderSectionTitleWithIcon("plan", "Meu plano", "assinatura")}
+          </div>
+
+          {planInfo ? <div className={`info-banner${isPositivePlanInfo ? " info-banner-success" : ""}`}>{planInfo}</div> : null}
+
+          {billingLoading ? (
+            <div className="empty-state">Carregando plano...</div>
+          ) : billingMe ? (
+            <div className="table-list">
+              <div className="row-card billing-row-card">
+                <div className="view-stack billing-summary-stack">
+                  <div className="billing-summary-inline">
+                    <strong>{billingMe.plan?.name || "Sem plano ativo"}</strong>
+                    <span className={`status-pill status-${billingStatusTone(billingMe.status)}`}>{`Status: ${billingStatusDisplayLabel(billingMe.status)}`}</span>
+                    <span className="status-pill status-billing-active">{`Valor: ${activeBillingAmountLabel}`}</span>
+                    <span className="unit-pill billing-model-pill">{`Cobrança: ${billingModelDisplayLabel(billingMe.billingModel)}`}</span>
+                    <span className="unit-pill billing-model-pill">{`Tipo: ${billingSubscriptionTypeDisplayLabel(billingMe.billingModel, billingMe.cycle)}`}</span>
+                    {billingMe.canCancelStripeSubscription ? (
+                      <button
+                        type="button"
+                        className="billing-cancel-button"
+                        onClick={() => void cancelStripeSubscription()}
+                        disabled={cancelingStripeSubscription}
+                      >
+                        {cancelingStripeSubscription ? "Cancelando assinatura..." : "Cancelar assinatura"}
+                      </button>
+                    ) : null}
+                  </div>
+                  {billingMe.blockMessage ? <span>{billingMe.blockMessage}</span> : null}
+                  {billingMe.trialEndsAt ? (
+                    <span>{`Trial até ${formatDate(billingMe.trialEndsAt, effectiveUserTimeZone)}`}</span>
+                  ) : null}
+                  {billingMe.endsAt ? (
+                    <span>{`Vigência até ${formatDate(billingMe.endsAt, effectiveUserTimeZone)}`}</span>
+                  ) : null}
+                  {billingMe.stripeCancelAtPeriodEnd ? (
+                    <span className="billing-plan-note">Assinatura já marcada para cancelamento no fim do ciclo.</span>
+                  ) : null}
+                </div>
+              </div>
+              <div className="row-card billing-row-card">
+                <div className="billing-usage-inline">
+                  <strong>Uso do ciclo atual</strong>
+                  <div className="meta-pill-row">
+                    <span className="unit-pill unit-pill-plan">{`Perfis: ${billingMe.usage.profilesUsed}/${formatPlanLimitDisplay(billingMe.plan?.maxProfiles, billingMe.plan?.code)}`}</span>
+                    <span className="unit-pill unit-pill-plan">{`Contas: ${billingMe.usage.connectionsUsed}/${formatPlanLimitDisplay(billingMe.plan?.maxConnections, billingMe.plan?.code)}`}</span>
+                    <span className="unit-pill unit-pill-plan">{`Publicações/mês: ${billingMe.usage.postsUsedThisMonth}/${formatPlanLimitDisplay(
+                      billingMe.plan?.maxMonthlyPublications,
+                      billingMe.plan?.code,
+                    )}`}</span>
+                  </div>
+                </div>
+              </div>
+              {!isRootUser ? (
+                <div id={BILLING_PLAN_CHECKOUT_ANCHOR_ID} className="row-card billing-row-card">
+                  <form onSubmit={startStripeCheckout} className="form-stack">
+                    <strong>Pagamento Stripe (teste)</strong>
+                    <label className="field-label">
+                      <span>Plano</span>
+                      <select
+                        value={checkoutPlanId}
+                        onChange={(event) => setCheckoutPlanId(event.target.value)}
+                        required
+                        disabled={availablePaidPlans.length === 0}
+                      >
+                        <option value="">Selecione um plano</option>
+                        {availablePaidPlans.map((plan) => (
+                          <option key={plan.id} value={plan.id}>
+                            {`${plan.name} (${plan.code})`}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="field-label">
+                      <span>Modo de cobrança</span>
+                      <select
+                        value={checkoutBillingModel}
+                        onChange={(event) =>
+                          setCheckoutBillingModel(
+                            event.target.value === "PIX_MANUAL"
+                              ? "PIX_MANUAL"
+                              : event.target.value === "STRIPE_SUBSCRIPTION"
+                                ? "STRIPE_SUBSCRIPTION"
+                                : "",
+                          )
+                        }
+                        required
+                      >
+                        <option value="">Selecione um modo de cobrança</option>
+                        <option value="STRIPE_SUBSCRIPTION">Assinatura recorrente</option>
+                        <option value="PIX_MANUAL">PIX avulso</option>
+                      </select>
+                    </label>
+                    <label className="field-label">
+                      <span>Ciclo</span>
+                      <select
+                        value={checkoutCycle}
+                        onChange={(event) =>
+                          setCheckoutCycle(event.target.value === "YEARLY" ? "YEARLY" : event.target.value === "MONTHLY" ? "MONTHLY" : "")
+                        }
+                        required
+                      >
+                        <option value="">Selecione um ciclo</option>
+                        <option value="MONTHLY">Mensal</option>
+                        <option value="YEARLY">Anual</option>
+                      </select>
+                    </label>
+                    {isCheckoutSelectionReady ? (
+                      <>
+                        <strong className="checkout-price-preview">{`Valor: ${checkoutSelectedPriceLabel}`}</strong>
+                        <button
+                          type="submit"
+                          className="stripe-pay-button"
+                          disabled={startingCheckout || availablePaidPlans.length === 0}
+                        >
+                          {startingCheckout ? "Abrindo checkout..." : "Pagar com Stripe"}
+                        </button>
+                      </>
+                    ) : null}
+                    <small className="field-hint">
+                      O link abre no Checkout oficial do Stripe e volta automaticamente para esta tela.
+                    </small>
+                  </form>
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <div className="empty-state">Não foi possível carregar os dados do plano.</div>
+          )}
+        </section>
+      </div>
+    );
+  }
+
+  function renderPlanConfig() {
+    if (!isRootUser) {
+      return (
+        <section className="panel-card view-stack">
+          <div className="empty-state">Apenas root pode acessar esta tela.</div>
+        </section>
+      );
+    }
+
+    return (
+      <div className="view-stack">
+        {planInfo ? <div className={`info-banner${isPositivePlanInfo ? " info-banner-success" : ""}`}>{planInfo}</div> : null}
+
+        <section className="panel-card view-stack" aria-label="Configurações básicas">
+          <div className="section-head">
+            {renderSectionTitleWithIcon("planConfig", "Configurações básicas", "root")}
+          </div>
+          <form onSubmit={saveBillingSettings} className="form-stack">
+            <label className="field-label">
+              <span>Trial automático para novas contas</span>
+              <select
+                value={billingSettings.autoTrialEnabled ? "enabled" : "disabled"}
+                onChange={(event) =>
+                  setBillingSettings((current) => ({
+                    ...current,
+                    autoTrialEnabled: event.target.value === "enabled",
+                  }))
+                }
+              >
+                <option value="enabled">Ativado</option>
+                <option value="disabled">Desativado</option>
+              </select>
+            </label>
+            <label className="field-label">
+              <span>Dias de trial automático</span>
+              <input
+                type="number"
+                min={0}
+                max={60}
+                value={billingSettings.autoTrialDays}
+                onChange={(event) =>
+                  setBillingSettings((current) => ({
+                    ...current,
+                    autoTrialDays: Math.max(0, Math.min(60, Number.parseInt(event.target.value || "0", 10) || 0)),
+                  }))
+                }
+              />
+            </label>
+            <small className="field-hint">
+              Limites do plano trial são gerados automaticamente com base nos dias informados e no plano Start.
+            </small>
+            <label className="field-label">
+              <span>Plano padrão do root</span>
+              <select
+                value={billingSettings.rootDisplayPlanId ?? ""}
+                onChange={(event) =>
+                  setBillingSettings((current) => ({
+                    ...current,
+                    rootDisplayPlanId: event.target.value || null,
+                  }))
+                }
+              >
+                <option value="">Automático (maior plano ativo)</option>
+                {billingPlans.map((plan) => (
+                  <option key={plan.id} value={plan.id}>
+                    {`${plan.name} (${plan.code})`}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button type="submit" disabled={savingBillingSettings}>
+              {savingBillingSettings ? "Salvando..." : "Salvar configuração"}
+            </button>
+          </form>
+        </section>
+
+        <section ref={planEditorSectionRef} className="panel-card view-stack" aria-label="Cadastrar plano">
+          <div className="section-head">
+            {renderSectionTitleWithIcon("planConfig", editingPlanId ? "Editar plano" : "Cadastrar plano", "root")}
+          </div>
+          <form onSubmit={createBillingPlan} className="form-stack">
+            <label className="field-label">
+              <span>Código</span>
+              <input
+                value={planCodeInput}
+                onChange={(event) => setPlanCodeInput(event.target.value.toUpperCase())}
+                placeholder="START"
+                required
+              />
+            </label>
+            <label className="field-label">
+              <span>Nome</span>
+              <input
+                value={planNameInput}
+                onChange={(event) => setPlanNameInput(event.target.value)}
+                placeholder="Plano Start"
+                required
+              />
+            </label>
+            <label className="field-label">
+              <span>Descrição</span>
+              <input
+                value={planDescriptionInput}
+                onChange={(event) => setPlanDescriptionInput(event.target.value)}
+                placeholder="Descrição opcional"
+              />
+            </label>
+            <label className="field-label">
+              <span>Tipo</span>
+              <select
+                value={planIsTrialInput ? "trial" : "paid"}
+                onChange={(event) => setPlanIsTrialInput(event.target.value === "trial")}
+              >
+                <option value="paid">Pago</option>
+                <option value="trial">Trial</option>
+              </select>
+            </label>
+            <label className="field-label">
+              <span>Status do plano</span>
+              <select
+                value={planIsActiveInput ? "active" : "inactive"}
+                onChange={(event) => setPlanIsActiveInput(event.target.value === "active")}
+              >
+                <option value="active">Ativo</option>
+                <option value="inactive">Inativo</option>
+              </select>
+            </label>
+            <label className="field-label">
+              <span>Total de perfis</span>
+              <input
+                type="number"
+                min={1}
+                value={planMaxProfilesInput}
+                onChange={(event) => setPlanMaxProfilesInput(event.target.value)}
+                required
+              />
+            </label>
+            <label className="field-label">
+              <span>Total de contas</span>
+              <input
+                type="number"
+                min={1}
+                value={planMaxConnectionsInput}
+                onChange={(event) => setPlanMaxConnectionsInput(event.target.value)}
+                required
+              />
+            </label>
+            <label className="field-label">
+              <span>Publicações por mês</span>
+              <input
+                type="number"
+                min={1}
+                value={planMaxMonthlyPublicationsInput}
+                onChange={(event) => setPlanMaxMonthlyPublicationsInput(event.target.value)}
+                required
+              />
+            </label>
+            {!planIsTrialInput ? (
+              <>
+                <label className="field-label">
+                  <span>Produto Stripe (obrigatório em plano pago)</span>
+                  <select
+                    value={planStripeProductIdInput}
+                    onChange={(event) => setPlanStripeProductIdInput(event.target.value)}
+                  >
+                    <option value="">Sem vínculo de produto</option>
+                    {stripeCatalogProducts.map((product) => (
+                      <option key={product.id} value={product.id}>
+                        {`${product.name} (${product.id})`}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="field-label">
+                  <span>Preço mensal (auto)</span>
+                  <input
+                    value={formatPriceFromCents(resolvedStripePriceIdsForSelectedProduct?.stripeMonthlyPriceCents ?? null)}
+                    placeholder="Definido automaticamente pelo produto"
+                    disabled
+                    readOnly
+                  />
+                </label>
+                <label className="field-label">
+                  <span>Preço anual (auto)</span>
+                  <input
+                    value={formatPriceFromCents(resolvedStripePriceIdsForSelectedProduct?.stripeYearlyPriceCents ?? null)}
+                    placeholder="Definido automaticamente pelo produto"
+                    disabled
+                    readOnly
+                  />
+                </label>
+                <label className="field-label">
+                  <span>Price assinatura mensal (auto)</span>
+                  <input
+                    value={resolvedStripePriceIdsForSelectedProduct?.stripeMonthlyPriceId ?? ""}
+                    placeholder="Definido automaticamente pelo produto"
+                    disabled
+                    readOnly
+                  />
+                </label>
+                <label className="field-label">
+                  <span>Price assinatura anual (auto)</span>
+                  <input
+                    value={resolvedStripePriceIdsForSelectedProduct?.stripeYearlyPriceId ?? ""}
+                    placeholder="Definido automaticamente pelo produto"
+                    disabled
+                    readOnly
+                  />
+                </label>
+                <label className="field-label">
+                  <span>Price PIX mensal (auto)</span>
+                  <input
+                    value={resolvedStripePriceIdsForSelectedProduct?.stripePixMonthlyPriceId ?? ""}
+                    placeholder="Definido automaticamente pelo produto"
+                    disabled
+                    readOnly
+                  />
+                </label>
+                <label className="field-label">
+                  <span>Price PIX anual (auto)</span>
+                  <input
+                    value={resolvedStripePriceIdsForSelectedProduct?.stripePixYearlyPriceId ?? ""}
+                    placeholder="Definido automaticamente pelo produto"
+                    disabled
+                    readOnly
+                  />
+                </label>
+                <small className="field-hint">
+                  Ao selecionar o produto Stripe, os preços são vinculados automaticamente e não podem ser editados.
+                </small>
+              </>
+            ) : null}
+            {stripeCatalogError ? <small className="field-hint">{stripeCatalogError}</small> : null}
+            <div className="inline-actions">
+              <button type="submit" disabled={creatingPlan}>
+                {creatingPlan ? "Salvando..." : editingPlanId ? "Salvar alterações" : "Cadastrar plano"}
+              </button>
+              {editingPlanId ? (
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={resetBillingPlanForm}
+                  disabled={creatingPlan}
+                >
+                  Cancelar edição
+                </button>
+              ) : null}
+            </div>
+          </form>
+        </section>
+
+        <section className="panel-card view-stack" aria-label="Planos cadastrados">
+          <div className="section-head">
+            {renderSectionTitleWithIcon("planConfig", "Planos", "root")}
+          </div>
+          <div className="table-list">
+            {billingPlans.map((plan) => (
+              <div key={plan.id} className="row-card billing-row-card billing-plan-catalog-row">
+                <div className="billing-plan-row-inline">
+                  <strong>{`${plan.name} (${plan.code})`}</strong>
+                  <span className={`status-pill ${plan.isActive ? "status-billing-active" : "status-billing-paused"}`}>
+                    {plan.isActive ? "Ativo" : "Pausado"}
+                  </span>
+                  <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{plan.isTrial ? "Trial" : "Pago"}</span>
+                  <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{`Perfis: ${plan.maxProfiles}`}</span>
+                  <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{`Contas: ${plan.maxConnections}`}</span>
+                  <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{`Posts/mês: ${plan.maxMonthlyPublications}`}</span>
+                  {plan.isTrial ? (
+                    <span className="billing-plan-note">Plano de trial sem cobrança.</span>
+                  ) : null}
+                  {!plan.isTrial ? (
+                    <span className="billing-plan-note">
+                      {`Assinatura: ${formatCompactPriceFromCents(plan.monthlyPriceCents)}/${formatCompactPriceFromCents(plan.yearlyPriceCents)}`}
+                    </span>
+                  ) : null}
+                  {!plan.isTrial ? (
+                    <span className="billing-plan-note">
+                      {`PIX: ${formatCompactPriceFromCents(plan.monthlyPriceCents)}/${formatCompactPriceFromCents(plan.yearlyPriceCents)}`}
+                    </span>
+                  ) : null}
+                  <button type="button" className="ghost-button" onClick={() => startBillingPlanEdit(plan)}>
+                    Editar
+                  </button>
+                  <button
+                    type="button"
+                    className="danger-button"
+                    onClick={() => void deleteBillingPlan(plan)}
+                  >
+                    Excluir
+                  </button>
+                </div>
+              </div>
+            ))}
+            {billingPlans.length === 0 ? <div className="empty-state">Nenhum plano cadastrado.</div> : null}
+          </div>
+        </section>
+      </div>
+    );
   }
 
   function renderCompanies() {
@@ -3246,7 +4757,7 @@ function App() {
               <div>
                 <strong>{company.name}</strong>
               </div>
-              <span>{formatDate(company.createdAt)}</span>
+              <span>{formatDate(company.createdAt, effectiveUserTimeZone)}</span>
             </div>
           ))}
         </div>
@@ -3298,8 +4809,27 @@ function App() {
                   <span className="unit-pill">
                     {`Perfil: ${companyNameMap[connection.companyId] || "Perfil removido"}`}
                   </span>
+                  {connection.platform === "instagram" && connection.authStatus === "CONNECTED" && connection.instagramUsername ? (
+                    <span className="unit-pill connection-detail-pill">{`Conta: @${connection.instagramUsername}`}</span>
+                  ) : null}
+                  {connection.platform === "instagram" &&
+                  connection.authStatus === "CONNECTED" &&
+                  !connection.instagramUsername &&
+                  connection.instagramUserId ? (
+                    <span className="unit-pill connection-detail-pill">{`Conta ID: ${connection.instagramUserId}`}</span>
+                  ) : null}
                   {connection.platform === "whatsapp" && connection.authStatus === "CONNECTED" ? (
-                    <span className="connection-connected-text">Conectado</span>
+                    (() => {
+                      const ownerNumber = resolveWhatsappOwnerNumber(connection.whatsappOwnerJid);
+                      return ownerNumber ? (
+                        <span className="unit-pill connection-detail-pill">{ownerNumber}</span>
+                      ) : null;
+                    })()
+                  ) : null}
+                  {connection.authStatus === "CONNECTED" ? (
+                    <span className={`connection-connected-text connection-connected-text-${connection.platform}`}>
+                      Conectado
+                    </span>
                   ) : null}
                 </div>
               </div>
@@ -3606,29 +5136,10 @@ function App() {
             publicationType === "whatsapp_status_midia" ||
             publicationType === "whatsapp_status_texto" ||
             requiresInstagramMetadata) ? (
-            <div className="emoji-picker-shell">
-              <span>Emojis rápidos</span>
-              <div className="emoji-group-list">
-                {whatsappTextEmojiGroups.map((group) => (
-                  <div key={group.label} className="emoji-group-card">
-                    <strong>{group.label}</strong>
-                    <div className="emoji-picker-grid">
-                      {group.emojis.map((emoji) => (
-                        <button
-                          key={`${group.label}-${emoji}`}
-                          type="button"
-                          className="emoji-chip"
-                          disabled={submittingJob}
-                          onClick={() => appendEmojiToCaption(emoji)}
-                        >
-                          {emoji}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
+            renderQuickEmojiPicker({
+              disabled: submittingJob,
+              onPick: appendEmojiToCaption,
+            })
           ) : null}
 
           {requiresInstagramMetadata ? (
@@ -3757,7 +5268,7 @@ function App() {
                   <span className="unit-pill">{`Perfil: ${companyNameMap[job.companyId] || "Perfil removido"}`}</span>
                 </div>
                 {job.locationName ? <span>Localização: {job.locationName}</span> : null}
-                <span>{formatDate(job.dataPostagem)}</span>
+                <span>{formatDate(job.dataPostagem, effectiveUserTimeZone)}</span>
               </div>
               <div className="inline-actions">
                 <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
@@ -3771,7 +5282,7 @@ function App() {
                     {publishingDraftJobId === job.id ? "Publicando..." : "Publicar"}
                   </button>
                 ) : null}
-                {canToggleJobSchedule(job) ? (
+                {canToggleJobSchedule(job, isPastScheduledAtForUser) ? (
                   <button
                     type="button"
                     className={job.status === "CANCELED" ? "activate-button" : "ghost-button"}
@@ -3855,7 +5366,7 @@ function App() {
                   </a>
                 ) : null}
               </div>
-              <span>{formatDate(log.createdAt)}</span>
+              <span>{formatDate(log.createdAt, effectiveUserTimeZone)}</span>
             </div>
           ))}
           {filteredLogs.length === 0 ? <div className="empty-state">Nenhum alerta de erro para este perfil.</div> : null}
@@ -3886,7 +5397,7 @@ function App() {
               <div>
                 <strong>{aviso.title}</strong>
                 <span>{aviso.message}</span>
-                <span>{formatDate(aviso.createdAt)}</span>
+                <span>{formatDate(aviso.createdAt, effectiveUserTimeZone)}</span>
               </div>
               <div className="inline-actions">
                 <span className={`status-pill ${aviso.readAt ? "status-completed" : "status-pending"}`}>
@@ -3940,6 +5451,10 @@ function App() {
             maxLength={2000}
             required
           />
+          {renderQuickEmojiPicker({
+            disabled: broadcastAvisoSubmitting,
+            onPick: appendEmojiToBroadcastAvisoMessage,
+          })}
           <button type="submit" disabled={broadcastAvisoSubmitting}>
             {broadcastAvisoSubmitting ? "Enviando..." : "Enviar aviso global"}
           </button>
@@ -4164,7 +5679,12 @@ function App() {
   }
 
   function renderPlanSkeleton() {
-    return <section className="plan-empty-view" aria-label="Carregando plano" />;
+    return (
+      <section className="panel-card view-stack skeleton-shell" aria-busy="true">
+        {renderSkeletonSectionHead()}
+        <div className="plan-empty-view" />
+      </section>
+    );
   }
 
   function renderContentSkeleton() {
@@ -4190,6 +5710,7 @@ function App() {
       case "profile":
         return renderProfileSkeleton();
       case "plan":
+      case "planConfig":
         return renderPlanSkeleton();
       default:
         return renderDashboardSkeleton();
@@ -4206,6 +5727,8 @@ function App() {
         return renderProfile();
       case "plan":
         return renderPlan();
+      case "planConfig":
+        return renderPlanConfig();
       case "companies":
         return renderCompanies();
       case "agents":
@@ -4331,6 +5854,20 @@ function App() {
 
         {error ? <div className="error-banner">{error}</div> : null}
         {authInfo ? <div className={`info-banner${isPositiveAuthInfo ? " info-banner-success" : ""}`}>{authInfo}</div> : null}
+        {billingWarningMessage ? (
+          <div className="info-banner info-banner-warning">
+            <span>{billingWarningMessage}</span>
+            {!isRootUser ? (
+              <a
+                href={`${buildViewHref("plan")}#${BILLING_PLAN_CHECKOUT_ANCHOR_ID}`}
+                className="billing-warning-link"
+                onClick={navigateToPlanCheckout}
+              >
+                Ir para pagamento
+              </a>
+            ) : null}
+          </div>
+        ) : null}
 
         {renderContent()}
 
@@ -4443,10 +5980,10 @@ function App() {
                 )}
                 <div className="qr-meta">
                   {activeQrConnection?.qrGeneratedAt ? (
-                    <span>Gerado em {formatDate(activeQrConnection.qrGeneratedAt)}</span>
+                    <span>Gerado em {formatDate(activeQrConnection.qrGeneratedAt, effectiveUserTimeZone)}</span>
                   ) : null}
                   {activeQrConnection?.workerLastSeenAt ? (
-                    <span>Última atualização em {formatDate(activeQrConnection.workerLastSeenAt)}</span>
+                    <span>Última atualização em {formatDate(activeQrConnection.workerLastSeenAt, effectiveUserTimeZone)}</span>
                   ) : null}
                 </div>
                 {activeQrState !== "CONNECTED" ? (
