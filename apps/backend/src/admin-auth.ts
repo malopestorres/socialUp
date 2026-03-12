@@ -5,6 +5,7 @@ export type AdminUserAuth = {
   id: string;
   username: string;
   name: string;
+  timeZone: string;
   role: string;
 };
 
@@ -33,6 +34,7 @@ export async function adminAuthMiddleware(
       id: true,
       username: true,
       name: true,
+      timeZone: true,
       role: true,
     },
   });

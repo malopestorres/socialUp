@@ -8,6 +8,7 @@ apps/backend/dev.db
 apps/backend/dev.db-journal
 apps/backend/prisma/dev.db
 apps/backend/prisma/dev.db-journal
+apps/backend/src/generated/
 apps/backend/.socialup-server/
 apps/backend/uploads/*
 !apps/backend/uploads/.gitkeep

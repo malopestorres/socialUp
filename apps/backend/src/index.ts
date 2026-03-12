@@ -7,6 +7,7 @@ import { readFileSync, statSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import Stripe from "stripe";
 import type { PublicationState, PublicationType, WhatsappMode } from "@socialup/shared";
 import { z } from "zod";
 import { adminAuthMiddleware, type AdminUserAuth } from "./admin-auth.js";
@@ -18,10 +19,19 @@ import {
   executeInstagramJobWithGraphApi,
   isInstagramLoginRequiredErrorMessage,
   listInstagramLocationCandidatesForConnection,
+  resolveInstagramConnectionRuntimeMetadata,
   refreshInstagramAccessTokenForConnection,
   type InstagramLocationSuggestion,
   searchInstagramLocationsForConnection,
 } from "./instagram-graph-api.js";
+import {
+  closeRabbitMqInfra,
+  enqueueJobExecutionMessage,
+  startJobExecutionConsumer,
+  type JobExecutionPlatform,
+  type JobExecutionQueueMessage,
+} from "./infra-rabbitmq.js";
+import { acquireDistributedLock, isDistributedLockHeld, closeRedisInfra } from "./infra-redis.js";
 import { prisma } from "./prisma.js";
 import { createRandomToken, verifyPassword, hashPassword } from "./security.js";
 import {
@@ -30,6 +40,7 @@ import {
   executeWhatsappJobWithEvolutionApi,
   getWhatsappConnectionOverlay,
   isWhatsappEvolutionHardcodedEnabled,
+  resolveWhatsappConnectionRuntimeMetadata,
   requestWhatsappQr,
 } from "./whatsapp-evolution-api.js";
 
@@ -72,10 +83,94 @@ const INSTAGRAM_TOKEN_KEEPALIVE_BATCH_SIZE = parseEnvPositiveInt(
   process.env.INSTAGRAM_TOKEN_KEEPALIVE_BATCH_SIZE,
   25,
 );
+const INSTAGRAM_KEEPALIVE_FORCE_DISCONNECT_ON_LOGIN_REQUIRED = parseEnvBoolean(
+  process.env.INSTAGRAM_KEEPALIVE_FORCE_DISCONNECT_ON_LOGIN_REQUIRED,
+  false,
+);
+const JOB_DISPATCH_INTERVAL_MS = parseEnvPositiveInt(process.env.JOB_DISPATCH_INTERVAL_MS, 10_000);
+const JOB_DISPATCH_BATCH_SIZE = parseEnvPositiveInt(process.env.JOB_DISPATCH_BATCH_SIZE, 10);
+const JOB_CONSUMER_CONNECTION_LOCK_MS = parseEnvPositiveInt(process.env.JOB_CONSUMER_CONNECTION_LOCK_MS, 15 * 60 * 1000);
+const RABBITMQ_CONSUMER_RETRY_DELAY_MS = parseEnvPositiveInt(process.env.RABBITMQ_CONSUMER_RETRY_DELAY_MS, 10_000);
+const DEFAULT_USER_TIME_ZONE = "America/Sao_Paulo";
+const STRIPE_SECRET_KEY = (process.env.STRIPE_SECRET_KEY || "").trim();
+const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
+const STRIPE_WEBHOOK_PATH = "/billing/stripe/webhook";
+const STRIPE_CHECKOUT_SUCCESS_URL = (process.env.STRIPE_CHECKOUT_SUCCESS_URL || "").trim();
+const STRIPE_CHECKOUT_CANCEL_URL = (process.env.STRIPE_CHECKOUT_CANCEL_URL || "").trim();
+const STRIPE_PIX_CHECKOUT_EXPIRES_HOURS = parseEnvPositiveInt(process.env.STRIPE_PIX_CHECKOUT_EXPIRES_HOURS, 24);
+const BILLING_SETTING_AUTO_TRIAL_ENABLED = "billing.autoTrialEnabled";
+const BILLING_SETTING_AUTO_TRIAL_DAYS = "billing.autoTrialDays";
+const BILLING_SETTING_ROOT_DISPLAY_PLAN_ID = "billing.rootDisplayPlanId";
+const BILLING_TRIAL_PLAN_CODE = "FREE_TRIAL";
+const BILLING_TRIAL_REFERENCE_DAYS = 30;
+const DEFAULT_AUTO_TRIAL_ENABLED = true;
+const DEFAULT_AUTO_TRIAL_DAYS = 10;
+
+type DefaultPlanSeed = {
+  code: string;
+  name: string;
+  description: string;
+  isTrial: boolean;
+  maxProfiles: number;
+  maxConnections: number;
+  maxMonthlyPublications: number;
+  monthlyPriceCents: number | null;
+  yearlyPriceCents: number | null;
+};
+
+const DEFAULT_BILLING_TRIAL_PLAN: DefaultPlanSeed = {
+  code: "FREE_TRIAL",
+  name: "Free Trial",
+  description: "Teste por 10 dias com limites reduzidos.",
+  isTrial: true,
+  maxProfiles: 1,
+  maxConnections: 2,
+  maxMonthlyPublications: 30,
+  monthlyPriceCents: null,
+  yearlyPriceCents: null,
+};
+
+let stripeClientSingleton: Stripe | null = null;
+
+type StripeWebhookRequest = Request & {
+  rawBody?: Buffer;
+};
 
 function parseEnvPositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt((value || "").trim(), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseEnvBoolean(value: string | undefined, fallback: boolean): boolean {
+  const normalized = (value || "").trim().toLowerCase();
+  if (!normalized) {
+    return fallback;
+  }
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
+function isValidIanaTimeZone(value: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value }).format(new Date());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeUserTimeZone(value: string | null | undefined): string {
+  const normalized = (value || "").trim();
+  if (!normalized) {
+    return DEFAULT_USER_TIME_ZONE;
+  }
+
+  return isValidIanaTimeZone(normalized) ? normalized : DEFAULT_USER_TIME_ZONE;
 }
 
 function formatMegabytes(bytes: number): string {
@@ -451,7 +546,16 @@ function applyConnectionWorkerOverlay(connection: {
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(
+  express.json({
+    verify: (request, _response, buffer) => {
+      const requestUrl = (request as { url?: string }).url || "";
+      if (requestUrl.startsWith(STRIPE_WEBHOOK_PATH)) {
+        (request as StripeWebhookRequest).rawBody = Buffer.from(buffer);
+      }
+    },
+  }),
+);
 app.use("/uploads", express.static(uploadsDir));
 
 const storage = multer.diskStorage({
@@ -509,6 +613,7 @@ const updateProfileSchema = z.object({
   name: z.string().min(2).max(80),
   username: z.string().min(3).max(32).regex(/^[a-z0-9._-]+$/i),
   password: z.string().min(8).max(128).optional().or(z.literal("")),
+  timeZone: z.string().trim().min(1).max(80).optional().nullable(),
 });
 
 const publicationStateSchema = z.enum(["PUBLISHED", "DRAFT"]);
@@ -571,6 +676,47 @@ const avisoRecentQuerySchema = z.object({
 const createBroadcastAvisoSchema = z.object({
   title: z.string().trim().min(2).max(120),
   message: z.string().trim().min(2).max(2000),
+});
+
+const createPlanSchema = z.object({
+  code: z.string().trim().min(2).max(40).regex(/^[A-Z0-9_]+$/),
+  name: z.string().trim().min(2).max(80),
+  description: z.string().trim().max(240).optional().nullable(),
+  isActive: z.boolean().optional().default(true),
+  isTrial: z.boolean().optional().default(false),
+  maxProfiles: z.coerce.number().int().min(1).max(5000),
+  maxConnections: z.coerce.number().int().min(1).max(20000),
+  maxMonthlyPublications: z.coerce.number().int().min(1).max(2000000),
+  stripeProductId: z.string().trim().max(120).optional().nullable(),
+});
+
+const updatePlanSchema = createPlanSchema.partial().refine((payload) => Object.keys(payload).length > 0, {
+  message: "Informe ao menos um campo para atualização.",
+});
+
+const updateBillingSettingsSchema = z.object({
+  autoTrialEnabled: z.boolean().optional(),
+  autoTrialDays: z.coerce.number().int().min(0).max(60).optional(),
+  rootDisplayPlanId: z.string().trim().min(1).optional().nullable(),
+});
+
+const assignUserPlanSchema = z.object({
+  userId: z.string().trim().min(1),
+  planId: z.string().trim().min(1),
+  status: z.enum(["ACTIVE", "PAYMENT_REQUIRED", "BLOCKED"]).optional().default("ACTIVE"),
+  billingModel: z.enum(["TRIAL", "STRIPE_SUBSCRIPTION", "PIX_MANUAL", "MANUAL"]).optional().default("MANUAL"),
+  cycle: z.enum(["MONTHLY", "YEARLY"]).optional().nullable(),
+  endsAt: z.string().datetime().optional().nullable(),
+});
+
+const startStripeCheckoutSchema = z.object({
+  planId: z.string().trim().min(1),
+  billingModel: z.enum(["STRIPE_SUBSCRIPTION", "PIX_MANUAL"]),
+  cycle: z.enum(["MONTHLY", "YEARLY"]),
+});
+
+const confirmStripeCheckoutSchema = z.object({
+  sessionId: z.string().trim().min(1),
 });
 
 const instagramLocationSuggestionsQuerySchema = z.object({
@@ -856,6 +1002,7 @@ function ensureInstagramMetadata(
 }
 
 async function ensureMatchingConnection(input: {
+  request: Request & { adminUser?: AdminUserAuth };
   socialConnectionId: string;
   companyId: string;
   publicationType: PublicationType;
@@ -866,6 +1013,7 @@ async function ensureMatchingConnection(input: {
     select: {
       id: true,
       companyId: true,
+      createdByUserId: true,
       platform: true,
       authStatus: true,
     },
@@ -887,6 +1035,16 @@ async function ensureMatchingConnection(input: {
         code: "custom",
         path: ["socialConnectionId"],
         message: "A conta social precisa pertencer ao mesmo perfil da postagem.",
+      },
+    ]);
+  }
+
+  if (!isRootUser(input.request) && connection.createdByUserId !== input.request.adminUser?.id) {
+    throw new z.ZodError([
+      {
+        code: "custom",
+        path: ["socialConnectionId"],
+        message: "A conta social precisa pertencer ao usuário autenticado.",
       },
     ]);
   }
@@ -952,6 +1110,26 @@ function isRootUser(request: Request & { adminUser?: AdminUserAuth }): boolean {
   return request.adminUser?.username === "root";
 }
 
+function companyVisibilityWhere(
+  request: Request & { adminUser?: AdminUserAuth },
+  companyId?: string,
+) {
+  return {
+    id: companyId ?? undefined,
+    createdByUserId: isRootUser(request) ? undefined : request.adminUser?.id,
+  };
+}
+
+function connectionVisibilityWhere(
+  request: Request & { adminUser?: AdminUserAuth },
+  companyId?: string,
+) {
+  return {
+    companyId: companyId ?? undefined,
+    createdByUserId: isRootUser(request) ? undefined : request.adminUser?.id,
+  };
+}
+
 function jobVisibilityWhere(
   request: Request & { adminUser?: AdminUserAuth },
   companyId?: string,
@@ -961,6 +1139,1055 @@ function jobVisibilityWhere(
     companyId: companyId ?? undefined,
     status: status ?? undefined,
     createdByUserId: isRootUser(request) ? undefined : request.adminUser?.id,
+  };
+}
+
+function normalizePlanCode(value: string): string {
+  return value.trim().toUpperCase().replace(/[^A-Z0-9_]/g, "_");
+}
+
+function trimNullable(value?: string | null): string | null {
+  const normalized = (value || "").trim();
+  return normalized ? normalized : null;
+}
+
+function ensureStripeClient(): Stripe {
+  if (!STRIPE_SECRET_KEY) {
+    throw new Error("Integração Stripe não configurada. Defina STRIPE_SECRET_KEY no backend.");
+  }
+
+  if (!stripeClientSingleton) {
+    stripeClientSingleton = new Stripe(STRIPE_SECRET_KEY);
+  }
+
+  return stripeClientSingleton;
+}
+
+function appendQueryParam(rawUrl: string, key: string, value: string): string {
+  if (!rawUrl.trim()) {
+    return rawUrl;
+  }
+
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.searchParams.set(key, value);
+    return parsed.toString();
+  } catch {
+    const separator = rawUrl.includes("?") ? "&" : "?";
+    return `${rawUrl}${separator}${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+  }
+}
+
+function buildStripeCheckoutSuccessUrl(): string {
+  const fallbackUrl = "http://localhost:5173/meu-plano?stripeCheckout=success&session_id={CHECKOUT_SESSION_ID}";
+  let url = STRIPE_CHECKOUT_SUCCESS_URL || fallbackUrl;
+
+  if (!url.includes("{CHECKOUT_SESSION_ID}")) {
+    url = appendQueryParam(url, "session_id", "{CHECKOUT_SESSION_ID}");
+  }
+  if (!/[?&]stripeCheckout=/.test(url)) {
+    url = appendQueryParam(url, "stripeCheckout", "success");
+  }
+  return url;
+}
+
+function buildStripeCheckoutCancelUrl(): string {
+  const fallbackUrl = "http://localhost:5173/meu-plano?stripeCheckout=cancel";
+  let url = STRIPE_CHECKOUT_CANCEL_URL || fallbackUrl;
+  if (!/[?&]stripeCheckout=/.test(url)) {
+    url = appendQueryParam(url, "stripeCheckout", "cancel");
+  }
+  return url;
+}
+
+function addBillingCycleWindow(fromDate: Date, cycle: "MONTHLY" | "YEARLY"): Date {
+  const next = new Date(fromDate.getTime());
+  if (cycle === "YEARLY") {
+    next.setFullYear(next.getFullYear() + 1);
+    return next;
+  }
+  next.setMonth(next.getMonth() + 1);
+  return next;
+}
+
+type StripeBillingModel = "STRIPE_SUBSCRIPTION" | "PIX_MANUAL";
+type StripeBillingCycle = "MONTHLY" | "YEARLY";
+
+function parseStripeBillingModel(value: string | null | undefined): StripeBillingModel | null {
+  if (value === "STRIPE_SUBSCRIPTION" || value === "PIX_MANUAL") {
+    return value;
+  }
+  return null;
+}
+
+function parseStripeBillingCycle(value: string | null | undefined): StripeBillingCycle | null {
+  if (value === "MONTHLY" || value === "YEARLY") {
+    return value;
+  }
+  return null;
+}
+
+async function applyStripeCheckoutSessionActivation(session: Stripe.Checkout.Session): Promise<{
+  applied: boolean;
+  userId: string | null;
+  billingModel: StripeBillingModel | null;
+  cycle: StripeBillingCycle | null;
+  message: string;
+}> {
+  const metadataUserId = trimNullable(session.metadata?.socialupUserId);
+  const sessionUserId = trimNullable(session.client_reference_id);
+  const userId = metadataUserId || sessionUserId;
+  const planId = trimNullable(session.metadata?.socialupPlanId);
+  const billingModel = parseStripeBillingModel(trimNullable(session.metadata?.socialupBillingModel));
+  const cycle = parseStripeBillingCycle(trimNullable(session.metadata?.socialupCycle));
+  const stripePriceId = trimNullable(session.metadata?.socialupPriceId);
+
+  if (!userId || !planId || !billingModel || !cycle) {
+    return {
+      applied: false,
+      userId,
+      billingModel,
+      cycle,
+      message: "Checkout sem metadados obrigatórios.",
+    };
+  }
+
+  const plan = await prisma.plan.findUnique({
+    where: { id: planId },
+    select: { id: true, isActive: true, isTrial: true },
+  });
+  if (!plan || !plan.isActive || plan.isTrial) {
+    return {
+      applied: false,
+      userId,
+      billingModel,
+      cycle,
+      message: "Plano inválido para ativação via Stripe.",
+    };
+  }
+
+  if (billingModel === "PIX_MANUAL" && session.payment_status !== "paid") {
+    return {
+      applied: false,
+      userId,
+      billingModel,
+      cycle,
+      message: "Pagamento PIX ainda não confirmado.",
+    };
+  }
+
+  const now = new Date();
+  const stripeCustomerId = typeof session.customer === "string" ? session.customer : null;
+  const stripeSubscriptionIdFromSession = (() => {
+    if (typeof session.subscription === "string") {
+      return session.subscription;
+    }
+    if (
+      session.subscription &&
+      typeof session.subscription === "object" &&
+      "id" in session.subscription &&
+      typeof session.subscription.id === "string"
+    ) {
+      return session.subscription.id;
+    }
+    return null;
+  })();
+  const stripeSubscriptionId =
+    billingModel === "STRIPE_SUBSCRIPTION" ? stripeSubscriptionIdFromSession : null;
+  const endsAt = billingModel === "PIX_MANUAL" ? addBillingCycleWindow(now, cycle) : null;
+
+  await prisma.userPlanSubscription.upsert({
+    where: { userId },
+    update: {
+      planId: plan.id,
+      status: "ACTIVE",
+      billingModel,
+      cycle,
+      startsAt: now,
+      endsAt,
+      trialEndsAt: null,
+      blockedReason: null,
+      stripeCustomerId,
+      stripeSubscriptionId,
+      stripePriceId,
+    },
+    create: {
+      userId,
+      planId: plan.id,
+      status: "ACTIVE",
+      billingModel,
+      cycle,
+      startsAt: now,
+      endsAt,
+      trialEndsAt: null,
+      blockedReason: null,
+      stripeCustomerId,
+      stripeSubscriptionId,
+      stripePriceId,
+    },
+  });
+
+  return {
+    applied: true,
+    userId,
+    billingModel,
+    cycle,
+    message: "Plano ativado com sucesso pelo Stripe.",
+  };
+}
+
+async function updateSubscriptionStatusFromStripe(input: {
+  userId?: string | null;
+  stripeSubscriptionId?: string | null;
+  stripeCustomerId?: string | null;
+  status: "ACTIVE" | "PAYMENT_REQUIRED" | "EXPIRED" | "BLOCKED";
+  blockedReason?: string | null;
+  clearEndsAt?: boolean;
+}): Promise<{
+  updated: boolean;
+  userId: string | null;
+}> {
+  const normalizedUserId = trimNullable(input.userId);
+  const normalizedStripeSubscriptionId = trimNullable(input.stripeSubscriptionId);
+  const normalizedStripeCustomerId = trimNullable(input.stripeCustomerId);
+
+  let subscription:
+    | {
+        id: string;
+        userId: string;
+      }
+    | null = null;
+
+  if (normalizedUserId) {
+    subscription = await prisma.userPlanSubscription.findUnique({
+      where: { userId: normalizedUserId },
+      select: { id: true, userId: true },
+    });
+  }
+
+  if (!subscription && normalizedStripeSubscriptionId) {
+    subscription = await prisma.userPlanSubscription.findFirst({
+      where: { stripeSubscriptionId: normalizedStripeSubscriptionId },
+      select: { id: true, userId: true },
+    });
+  }
+
+  if (!subscription && normalizedStripeCustomerId) {
+    subscription = await prisma.userPlanSubscription.findFirst({
+      where: { stripeCustomerId: normalizedStripeCustomerId },
+      select: { id: true, userId: true },
+    });
+  }
+
+  if (!subscription) {
+    return { updated: false, userId: null };
+  }
+
+  await prisma.userPlanSubscription.update({
+    where: { id: subscription.id },
+    data: {
+      status: input.status,
+      blockedReason: input.blockedReason ?? null,
+      ...(input.clearEndsAt ? { endsAt: null } : {}),
+    },
+  });
+
+  return { updated: true, userId: subscription.userId };
+}
+
+async function handleStripePixSessionUnpaid(session: Stripe.Checkout.Session, reason: string): Promise<void> {
+  const billingModel = parseStripeBillingModel(trimNullable(session.metadata?.socialupBillingModel));
+  if (billingModel !== "PIX_MANUAL") {
+    return;
+  }
+
+  const metadataUserId = trimNullable(session.metadata?.socialupUserId);
+  const sessionUserId = trimNullable(session.client_reference_id);
+  const userId = metadataUserId || sessionUserId;
+  if (!userId) {
+    return;
+  }
+
+  const currentSubscription = await prisma.userPlanSubscription.findUnique({
+    where: { userId },
+    select: {
+      status: true,
+      billingModel: true,
+      endsAt: true,
+    },
+  });
+
+  if (!currentSubscription) {
+    return;
+  }
+
+  const now = Date.now();
+  const stillInsideActiveWindow =
+    currentSubscription.status === "ACTIVE" &&
+    currentSubscription.billingModel === "PIX_MANUAL" &&
+    currentSubscription.endsAt !== null &&
+    currentSubscription.endsAt.getTime() > now;
+  if (stillInsideActiveWindow) {
+    return;
+  }
+
+  const result = await updateSubscriptionStatusFromStripe({
+    userId,
+    status: "PAYMENT_REQUIRED",
+    blockedReason: reason,
+  });
+  if (result.updated && result.userId) {
+    await appendBillingAvisoSafely({
+      userId: result.userId,
+      title: "Pagamento pendente",
+      message: reason,
+      kind: "BILLING_PENDING",
+    });
+  }
+}
+
+async function handleStripeWebhookEvent(event: Stripe.Event): Promise<void> {
+  switch (event.type) {
+    case "checkout.session.completed":
+    case "checkout.session.async_payment_succeeded": {
+      const session = event.data.object as Stripe.Checkout.Session;
+      const activation = await applyStripeCheckoutSessionActivation(session);
+      if (activation.applied && activation.userId) {
+        await appendBillingAvisoSafely({
+          userId: activation.userId,
+          title: "Pagamento confirmado",
+          message:
+            activation.billingModel === "PIX_MANUAL"
+              ? "Pagamento PIX confirmado. Plano ativo."
+              : "Assinatura ativa e confirmada pelo Stripe.",
+          kind: "BILLING_PAID",
+        });
+      }
+      return;
+    }
+    case "checkout.session.expired":
+    case "checkout.session.async_payment_failed": {
+      const session = event.data.object as Stripe.Checkout.Session;
+      await handleStripePixSessionUnpaid(
+        session,
+        "Cobrança PIX expirada ou não paga no prazo. Sua conta foi bloqueada até a regularização.",
+      );
+      return;
+    }
+    case "invoice.payment_failed": {
+      const invoice = event.data.object as Stripe.Invoice;
+      const invoiceSubscriptionId = trimNullable((invoice as { subscription?: unknown }).subscription as string | null);
+      const result = await updateSubscriptionStatusFromStripe({
+        stripeSubscriptionId: invoiceSubscriptionId,
+        stripeCustomerId: typeof invoice.customer === "string" ? invoice.customer : null,
+        status: "PAYMENT_REQUIRED",
+        blockedReason: "Falha no pagamento recorrente. Regularize para continuar usando o painel.",
+      });
+      if (result.updated && result.userId) {
+        await appendBillingAvisoSafely({
+          userId: result.userId,
+          title: "Pagamento pendente",
+          message: "Falha no pagamento recorrente. A conta foi bloqueada até regularização.",
+          kind: "BILLING_PENDING",
+        });
+      }
+      return;
+    }
+    case "invoice.paid": {
+      const invoice = event.data.object as Stripe.Invoice;
+      const invoiceSubscriptionId = trimNullable((invoice as { subscription?: unknown }).subscription as string | null);
+      const result = await updateSubscriptionStatusFromStripe({
+        stripeSubscriptionId: invoiceSubscriptionId,
+        stripeCustomerId: typeof invoice.customer === "string" ? invoice.customer : null,
+        status: "ACTIVE",
+        blockedReason: null,
+        clearEndsAt: true,
+      });
+      if (result.updated && result.userId) {
+        await appendBillingAvisoSafely({
+          userId: result.userId,
+          title: "Pagamento confirmado",
+          message: "Pagamento recorrente confirmado. A conta está ativa.",
+          kind: "BILLING_PAID",
+        });
+      }
+      return;
+    }
+    case "customer.subscription.deleted": {
+      const subscription = event.data.object as Stripe.Subscription;
+      const result = await updateSubscriptionStatusFromStripe({
+        stripeSubscriptionId: subscription.id,
+        stripeCustomerId: typeof subscription.customer === "string" ? subscription.customer : null,
+        status: "EXPIRED",
+        blockedReason: "Assinatura cancelada no Stripe. Renove para continuar usando o painel.",
+      });
+      if (result.updated && result.userId) {
+        await appendBillingAvisoSafely({
+          userId: result.userId,
+          title: "Assinatura cancelada",
+          message: "Assinatura cancelada no Stripe. Renove para recuperar acesso.",
+          kind: "BILLING_EXPIRED",
+        });
+      }
+      return;
+    }
+    case "customer.subscription.updated": {
+      const subscription = event.data.object as Stripe.Subscription;
+      const normalizedStatus = (subscription.status || "").toLowerCase();
+      const isHealthy = normalizedStatus === "active" || normalizedStatus === "trialing";
+      const result = await updateSubscriptionStatusFromStripe({
+        stripeSubscriptionId: subscription.id,
+        stripeCustomerId: typeof subscription.customer === "string" ? subscription.customer : null,
+        status: isHealthy ? "ACTIVE" : "PAYMENT_REQUIRED",
+        blockedReason: isHealthy
+          ? null
+          : "Assinatura com pendência no Stripe. Regularize para continuar usando o painel.",
+        clearEndsAt: isHealthy,
+      });
+      if (result.updated && result.userId) {
+        await appendBillingAvisoSafely({
+          userId: result.userId,
+          title: isHealthy ? "Assinatura ativa" : "Assinatura com pendência",
+          message: isHealthy
+            ? "Assinatura recorrente ativa no Stripe."
+            : "Assinatura recorrente com pendência no Stripe. Conta bloqueada até regularização.",
+          kind: isHealthy ? "BILLING_PAID" : "BILLING_PENDING",
+        });
+      }
+      return;
+    }
+    default:
+      return;
+  }
+}
+
+type ResolvedStripePlanPriceIds = {
+  stripeMonthlyPriceId: string | null;
+  stripeYearlyPriceId: string | null;
+  stripePixMonthlyPriceId: string | null;
+  stripePixYearlyPriceId: string | null;
+  stripeMonthlyPriceCents: number | null;
+  stripeYearlyPriceCents: number | null;
+  stripePixMonthlyPriceCents: number | null;
+  stripePixYearlyPriceCents: number | null;
+};
+
+const EMPTY_STRIPE_PLAN_PRICE_IDS: ResolvedStripePlanPriceIds = {
+  stripeMonthlyPriceId: null,
+  stripeYearlyPriceId: null,
+  stripePixMonthlyPriceId: null,
+  stripePixYearlyPriceId: null,
+  stripeMonthlyPriceCents: null,
+  stripeYearlyPriceCents: null,
+  stripePixMonthlyPriceCents: null,
+  stripePixYearlyPriceCents: null,
+};
+
+function normalizeStripeSearchText(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLowerCase()
+    .trim();
+}
+
+function stripePriceContainsAnyTag(price: Stripe.Price, tags: string[]): boolean {
+  const searchableParts: string[] = [];
+  if (price.nickname) {
+    searchableParts.push(price.nickname);
+  }
+  if (price.lookup_key) {
+    searchableParts.push(price.lookup_key);
+  }
+  for (const metadataValue of Object.values(price.metadata || {})) {
+    searchableParts.push(String(metadataValue || ""));
+  }
+
+  const searchable = normalizeStripeSearchText(searchableParts.join(" "));
+  if (!searchable) {
+    return false;
+  }
+
+  return tags.some((tag) => searchable.includes(normalizeStripeSearchText(tag)));
+}
+
+function resolveStripePlanPriceIdsFromPriceList(prices: Stripe.Price[]): ResolvedStripePlanPriceIds {
+  const activePrices = prices.filter((price) => price.active);
+  const recurringPrices = activePrices.filter((price) => price.type === "recurring");
+  const oneTimePrices = activePrices.filter((price) => price.type === "one_time");
+
+  const monthlyRecurring = recurringPrices.find(
+    (price) => price.recurring?.interval === "month" && (price.recurring.interval_count ?? 1) === 1,
+  );
+  const yearlyRecurring = recurringPrices.find(
+    (price) =>
+      (price.recurring?.interval === "year" && (price.recurring.interval_count ?? 1) === 1) ||
+      (price.recurring?.interval === "month" && (price.recurring.interval_count ?? 1) === 12),
+  );
+
+  const pixTaggedOneTimePrices = oneTimePrices.filter((price) => stripePriceContainsAnyTag(price, ["pix"]));
+  const oneTimePool = pixTaggedOneTimePrices.length > 0 ? pixTaggedOneTimePrices : oneTimePrices;
+  const oneTimePoolSortedByAmount = [...oneTimePool].sort((left, right) => {
+    const leftAmount = left.unit_amount ?? Number.MAX_SAFE_INTEGER;
+    const rightAmount = right.unit_amount ?? Number.MAX_SAFE_INTEGER;
+    if (leftAmount !== rightAmount) {
+      return leftAmount - rightAmount;
+    }
+    return left.id.localeCompare(right.id);
+  });
+
+  const monthlyRecurringPrice = monthlyRecurring?.unit_amount ?? null;
+  const yearlyRecurringPrice = yearlyRecurring?.unit_amount ?? null;
+
+  const findOneTimeByAmount = (amount: number | null, excludedIds: Set<string>): Stripe.Price | null => {
+    if (amount === null) {
+      return null;
+    }
+    return oneTimePoolSortedByAmount.find((price) => price.unit_amount === amount && !excludedIds.has(price.id)) ?? null;
+  };
+
+  const monthlyPix = oneTimePool.find((price) =>
+    stripePriceContainsAnyTag(price, ["mensal", "monthly", "mes", "month"]),
+  );
+  const yearlyPix = oneTimePool.find((price) =>
+    stripePriceContainsAnyTag(price, ["anual", "annual", "yearly", "ano", "year"]),
+  );
+
+  let stripePixMonthlyPriceId =
+    monthlyPix?.id ??
+    findOneTimeByAmount(monthlyRecurringPrice, new Set())?.id ??
+    oneTimePoolSortedByAmount[0]?.id ??
+    null;
+
+  const usedOneTimeIds = new Set<string>();
+  if (stripePixMonthlyPriceId) {
+    usedOneTimeIds.add(stripePixMonthlyPriceId);
+  }
+
+  let stripePixYearlyPriceId =
+    yearlyPix?.id ??
+    findOneTimeByAmount(yearlyRecurringPrice, usedOneTimeIds)?.id ??
+    oneTimePoolSortedByAmount.find((price) => !usedOneTimeIds.has(price.id))?.id ??
+    oneTimePoolSortedByAmount[0]?.id ??
+    null;
+
+  const monthlyPixPrice =
+    oneTimePoolSortedByAmount.find((price) => price.id === stripePixMonthlyPriceId)?.unit_amount ?? null;
+  const yearlyPixPrice =
+    oneTimePoolSortedByAmount.find((price) => price.id === stripePixYearlyPriceId)?.unit_amount ?? null;
+
+  return {
+    stripeMonthlyPriceId: monthlyRecurring?.id ?? null,
+    stripeYearlyPriceId: yearlyRecurring?.id ?? null,
+    stripePixMonthlyPriceId,
+    stripePixYearlyPriceId,
+    stripeMonthlyPriceCents: monthlyRecurringPrice,
+    stripeYearlyPriceCents: yearlyRecurringPrice,
+    stripePixMonthlyPriceCents: monthlyPixPrice,
+    stripePixYearlyPriceCents: yearlyPixPrice,
+  };
+}
+
+async function resolveStripePlanPriceIdsFromProduct(stripeProductId: string): Promise<ResolvedStripePlanPriceIds> {
+  const stripe = ensureStripeClient();
+  const pricesResponse = await stripe.prices.list({
+    product: stripeProductId,
+    active: true,
+    limit: 100,
+  });
+  return resolveStripePlanPriceIdsFromPriceList(pricesResponse.data);
+}
+
+function listMissingRequiredStripePriceKinds(priceIds: ResolvedStripePlanPriceIds): string[] {
+  const missing: string[] = [];
+  if (!priceIds.stripeMonthlyPriceId) {
+    missing.push("assinatura mensal");
+  }
+  if (!priceIds.stripeYearlyPriceId) {
+    missing.push("assinatura anual");
+  }
+  if (!priceIds.stripePixMonthlyPriceId) {
+    missing.push("PIX mensal");
+  }
+  if (!priceIds.stripePixYearlyPriceId) {
+    missing.push("PIX anual");
+  }
+  return missing;
+}
+
+function hasStripeCyclePriceMismatch(priceIds: ResolvedStripePlanPriceIds): boolean {
+  if (
+    priceIds.stripeMonthlyPriceCents === null ||
+    priceIds.stripeYearlyPriceCents === null ||
+    priceIds.stripePixMonthlyPriceCents === null ||
+    priceIds.stripePixYearlyPriceCents === null
+  ) {
+    return false;
+  }
+
+  return (
+    priceIds.stripeMonthlyPriceCents !== priceIds.stripePixMonthlyPriceCents ||
+    priceIds.stripeYearlyPriceCents !== priceIds.stripePixYearlyPriceCents
+  );
+}
+
+type BillingSettingsSnapshot = {
+  autoTrialEnabled: boolean;
+  autoTrialDays: number;
+  rootDisplayPlanId: string | null;
+};
+
+type BillingAccessSnapshot = {
+  status: string;
+  billingModel: string;
+  cycle: string | null;
+  stripeSubscriptionId: string | null;
+  stripeCancelAtPeriodEnd: boolean;
+  plan: {
+    id: string;
+    code: string;
+    name: string;
+    isTrial: boolean;
+    maxProfiles: number;
+    maxConnections: number;
+    maxMonthlyPublications: number;
+  } | null;
+  usage: {
+    profilesUsed: number;
+    connectionsUsed: number;
+    postsUsedThisMonth: number;
+  };
+  isBlocked: boolean;
+  blockMessage: string | null;
+  startsAt: Date | null;
+  endsAt: Date | null;
+  trialEndsAt: Date | null;
+};
+
+async function getBillingSettingsSnapshot(): Promise<BillingSettingsSnapshot> {
+  const [autoTrialEnabledSetting, autoTrialDaysSetting, rootDisplayPlanIdSetting] = await Promise.all([
+    prisma.appSetting.findUnique({ where: { key: BILLING_SETTING_AUTO_TRIAL_ENABLED } }),
+    prisma.appSetting.findUnique({ where: { key: BILLING_SETTING_AUTO_TRIAL_DAYS } }),
+    prisma.appSetting.findUnique({ where: { key: BILLING_SETTING_ROOT_DISPLAY_PLAN_ID } }),
+  ]);
+
+  const autoTrialEnabled =
+    autoTrialEnabledSetting?.value === undefined
+      ? DEFAULT_AUTO_TRIAL_ENABLED
+      : parseEnvBoolean(autoTrialEnabledSetting.value, DEFAULT_AUTO_TRIAL_ENABLED);
+  const parsedTrialDays = Number.parseInt((autoTrialDaysSetting?.value || "").trim(), 10);
+  const autoTrialDays =
+    Number.isFinite(parsedTrialDays) && parsedTrialDays >= 0 && parsedTrialDays <= 60
+      ? parsedTrialDays
+      : DEFAULT_AUTO_TRIAL_DAYS;
+
+  return {
+    autoTrialEnabled,
+    autoTrialDays,
+    rootDisplayPlanId: trimNullable(rootDisplayPlanIdSetting?.value),
+  };
+}
+
+async function upsertBillingSetting(key: string, value: string): Promise<void> {
+  await prisma.appSetting.upsert({
+    where: { key },
+    update: { value },
+    create: { key, value },
+  });
+}
+
+async function ensureBillingBootstrap(): Promise<void> {
+  const trial = DEFAULT_BILLING_TRIAL_PLAN;
+  await prisma.plan.upsert({
+    where: { code: trial.code },
+    update: {},
+    create: {
+      code: trial.code,
+      name: trial.name,
+      description: trial.description,
+      isActive: true,
+      isTrial: true,
+      maxProfiles: trial.maxProfiles,
+      maxConnections: trial.maxConnections,
+      maxMonthlyPublications: trial.maxMonthlyPublications,
+      monthlyPriceCents: null,
+      yearlyPriceCents: null,
+    },
+  });
+
+  await Promise.all([
+    prisma.appSetting.upsert({
+      where: { key: BILLING_SETTING_AUTO_TRIAL_ENABLED },
+      update: {},
+      create: {
+        key: BILLING_SETTING_AUTO_TRIAL_ENABLED,
+        value: DEFAULT_AUTO_TRIAL_ENABLED ? "true" : "false",
+      },
+    }),
+    prisma.appSetting.upsert({
+      where: { key: BILLING_SETTING_AUTO_TRIAL_DAYS },
+      update: {},
+      create: {
+        key: BILLING_SETTING_AUTO_TRIAL_DAYS,
+        value: String(DEFAULT_AUTO_TRIAL_DAYS),
+      },
+    }),
+    prisma.appSetting.upsert({
+      where: { key: BILLING_SETTING_ROOT_DISPLAY_PLAN_ID },
+      update: {},
+      create: {
+        key: BILLING_SETTING_ROOT_DISPLAY_PLAN_ID,
+        value: "",
+      },
+    }),
+  ]);
+
+  // Limpeza de planos pagos legados criados automaticamente (sem vínculo Stripe e sem assinaturas).
+  await prisma.plan.deleteMany({
+    where: {
+      code: { in: ["START", "BUSINESS"] },
+      isTrial: false,
+      stripeProductId: null,
+      subscriptions: {
+        none: {},
+      },
+    },
+  });
+
+  const settings = await getBillingSettingsSnapshot();
+  await syncTrialPlanLimitsFromSettings(settings.autoTrialDays);
+}
+
+async function getBestActivePlanForDisplay() {
+  return prisma.plan.findFirst({
+    where: { isActive: true },
+    orderBy: [
+      { maxMonthlyPublications: "desc" },
+      { maxConnections: "desc" },
+      { maxProfiles: "desc" },
+      { yearlyPriceCents: "desc" },
+      { monthlyPriceCents: "desc" },
+      { createdAt: "asc" },
+    ],
+  });
+}
+
+async function getRootDisplayPlanForDisplay() {
+  const settings = await getBillingSettingsSnapshot();
+  if (settings.rootDisplayPlanId) {
+    const selectedPlan = await prisma.plan.findUnique({
+      where: { id: settings.rootDisplayPlanId },
+    });
+    if (selectedPlan) {
+      return selectedPlan;
+    }
+  }
+
+  return getBestActivePlanForDisplay();
+}
+
+function clampTrialDaysForLimits(days: number): number {
+  return Math.max(1, Math.min(BILLING_TRIAL_REFERENCE_DAYS, days));
+}
+
+function scaleLimitByTrialDays(value: number, trialDays: number): number {
+  const ratio = clampTrialDaysForLimits(trialDays) / BILLING_TRIAL_REFERENCE_DAYS;
+  const scaled = Math.round(value * ratio);
+  return Math.max(1, scaled);
+}
+
+async function syncTrialPlanLimitsFromSettings(trialDays: number): Promise<void> {
+  const [trialPlan, startPlanByCode] = await Promise.all([
+    prisma.plan.findUnique({
+      where: { code: BILLING_TRIAL_PLAN_CODE },
+      select: { id: true },
+    }),
+    prisma.plan.findUnique({
+      where: { code: "START" },
+      select: { maxProfiles: true, maxConnections: true, maxMonthlyPublications: true },
+    }),
+  ]);
+
+  const trialReferencePlan =
+    startPlanByCode ??
+    (await prisma.plan.findFirst({
+      where: {
+        isActive: true,
+        isTrial: false,
+      },
+      orderBy: [{ createdAt: "asc" }],
+      select: { maxProfiles: true, maxConnections: true, maxMonthlyPublications: true },
+    }));
+
+  if (!trialPlan || !trialReferencePlan) {
+    return;
+  }
+
+  const nextMaxProfiles = scaleLimitByTrialDays(trialReferencePlan.maxProfiles, trialDays);
+  const nextMaxConnections = Math.max(
+    nextMaxProfiles,
+    scaleLimitByTrialDays(trialReferencePlan.maxConnections, trialDays),
+  );
+  const nextMaxMonthlyPublications = scaleLimitByTrialDays(trialReferencePlan.maxMonthlyPublications, trialDays);
+
+  await prisma.plan.update({
+    where: { id: trialPlan.id },
+    data: {
+      maxProfiles: nextMaxProfiles,
+      maxConnections: nextMaxConnections,
+      maxMonthlyPublications: nextMaxMonthlyPublications,
+    },
+  });
+}
+
+function currentMonthBounds(now: Date): { start: Date; end: Date } {
+  const start = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+  const end = new Date(now.getFullYear(), now.getMonth() + 1, 1, 0, 0, 0, 0);
+  return { start, end };
+}
+
+function computeBillingBlockMessage(status: string, planName: string | null): string | null {
+  if (status === "ACTIVE" || status === "TRIALING") {
+    return null;
+  }
+  if (status === "PAYMENT_REQUIRED") {
+    return "Sua conta está sem plano ativo. Renove para continuar usando o painel.";
+  }
+  if (status === "EXPIRED") {
+    return "Seu plano expirou. Renove para continuar usando o painel.";
+  }
+  if (status === "BLOCKED") {
+    return "Sua conta está bloqueada por pagamento pendente. Renove para continuar.";
+  }
+  if (!planName) {
+    return "Sua conta está sem plano ativo. Renove para continuar usando o painel.";
+  }
+  return `Seu acesso ao plano ${planName} está bloqueado.`;
+}
+
+async function resolveUserBillingAccess(userId: string): Promise<BillingAccessSnapshot> {
+  const now = new Date();
+  const monthBounds = currentMonthBounds(now);
+  const [subscription, profilesUsed, connectionsUsed, postsUsedThisMonth] = await Promise.all([
+    prisma.userPlanSubscription.findUnique({
+      where: { userId },
+      include: {
+        plan: {
+          select: {
+            id: true,
+            code: true,
+            name: true,
+            isTrial: true,
+            maxProfiles: true,
+            maxConnections: true,
+            maxMonthlyPublications: true,
+            isActive: true,
+          },
+        },
+      },
+    }),
+    prisma.company.count({
+      where: {
+        createdByUserId: userId,
+      },
+    }),
+    prisma.socialConnection.count({
+      where: {
+        createdByUserId: userId,
+      },
+    }),
+    prisma.job.count({
+      where: {
+        createdByUserId: userId,
+        publicationState: "PUBLISHED",
+        criadoEm: {
+          gte: monthBounds.start,
+          lt: monthBounds.end,
+        },
+      },
+    }),
+  ]);
+
+  if (!subscription) {
+    return {
+      status: "PAYMENT_REQUIRED",
+      billingModel: "NONE",
+      cycle: null,
+      stripeSubscriptionId: null,
+      stripeCancelAtPeriodEnd: false,
+      plan: null,
+      usage: {
+        profilesUsed,
+        connectionsUsed,
+        postsUsedThisMonth,
+      },
+      isBlocked: true,
+      blockMessage: computeBillingBlockMessage("PAYMENT_REQUIRED", null),
+      startsAt: null,
+      endsAt: null,
+      trialEndsAt: null,
+    };
+  }
+
+  let status = subscription.status;
+  const trialExpired = subscription.trialEndsAt ? subscription.trialEndsAt.getTime() <= now.getTime() : false;
+  const endsAtExpired = subscription.endsAt ? subscription.endsAt.getTime() <= now.getTime() : false;
+  const planIsActive = subscription.plan?.isActive ?? false;
+
+  if ((trialExpired && subscription.billingModel === "TRIAL") || endsAtExpired || !planIsActive || !subscription.planId) {
+    status = "EXPIRED";
+    if (subscription.status !== "EXPIRED") {
+      await prisma.userPlanSubscription.update({
+        where: { id: subscription.id },
+        data: {
+          status: "EXPIRED",
+          blockedReason: planIsActive ? "Plano expirado." : "Plano inativo ou removido.",
+        },
+      });
+    }
+  }
+
+  const isBlocked = status !== "ACTIVE" && status !== "TRIALING";
+  const planName = subscription.plan?.name ?? null;
+
+  return {
+    status,
+    billingModel: subscription.billingModel,
+    cycle: subscription.cycle,
+    stripeSubscriptionId: trimNullable(subscription.stripeSubscriptionId),
+    stripeCancelAtPeriodEnd: Boolean(subscription.endsAt && subscription.billingModel === "STRIPE_SUBSCRIPTION"),
+    plan: subscription.plan
+      ? {
+          id: subscription.plan.id,
+          code: subscription.plan.code,
+          name: subscription.plan.name,
+          isTrial: subscription.plan.isTrial,
+          maxProfiles: subscription.plan.maxProfiles,
+          maxConnections: subscription.plan.maxConnections,
+          maxMonthlyPublications: subscription.plan.maxMonthlyPublications,
+        }
+      : null,
+    usage: {
+      profilesUsed,
+      connectionsUsed,
+      postsUsedThisMonth,
+    },
+    isBlocked,
+    blockMessage: isBlocked ? computeBillingBlockMessage(status, planName) : null,
+    startsAt: subscription.startsAt,
+    endsAt: subscription.endsAt,
+    trialEndsAt: subscription.trialEndsAt,
+  };
+}
+
+async function ensureBillingWritableAccess(request: Request & { adminUser?: AdminUserAuth }): Promise<BillingAccessSnapshot | null> {
+  if (isRootUser(request)) {
+    return null;
+  }
+
+  const userId = request.adminUser?.id;
+  if (!userId) {
+    throw new Error("Sessão inválida para validar plano.");
+  }
+
+  const access = await resolveUserBillingAccess(userId);
+  if (access.isBlocked) {
+    throw new Error(access.blockMessage || "Sua conta está bloqueada para novas operações.");
+  }
+  return access;
+}
+
+async function resolveJobBillingBlockMessage(job: { createdByUserId: string | null }): Promise<string | null> {
+  const userId = job.createdByUserId;
+  if (!userId) {
+    return null;
+  }
+
+  const owner = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { username: true },
+  });
+  if (!owner || owner.username === "root") {
+    return null;
+  }
+
+  const billing = await resolveUserBillingAccess(userId);
+  return billing.isBlocked
+    ? billing.blockMessage || "Conta bloqueada por pagamento pendente. Renove para continuar."
+    : null;
+}
+
+async function failJobDueToBillingBlocked(
+  job: Parameters<typeof appendJobAvisoSafely>[0] & { companyId: string },
+  message: string,
+): Promise<void> {
+  await prisma.job.update({
+    where: { id: job.id },
+    data: {
+      status: "FAILED",
+      completedAt: new Date(),
+      lastError: message,
+    },
+  });
+
+  await appendLog({
+    companyId: job.companyId,
+    level: "WARN",
+    errorCode: "BILLING_BLOCKED",
+    message: `Job ${job.id} bloqueado por billing: ${message}`,
+  });
+
+  await appendJobAvisoSafely(job, {
+    title: "Conta bloqueada",
+    kind: "JOB_FAILED",
+    message,
+  });
+}
+
+async function buildAuthUserPayload(user: {
+  id: string;
+  name: string;
+  username: string;
+  timeZone: string;
+  role: string;
+}): Promise<{
+  id: string;
+  name: string;
+  username: string;
+  timeZone: string;
+  role: string;
+  billingStatus: string;
+  billingPlanName: string | null;
+  billingPlanCode: string | null;
+  billingIsBlocked: boolean;
+  billingBlockMessage: string | null;
+  billingEndsAt: Date | null;
+  billingTrialEndsAt: Date | null;
+}> {
+  if (user.username === "root") {
+    const bestPlan = await getRootDisplayPlanForDisplay();
+    return {
+      ...user,
+      billingStatus: "ACTIVE",
+      billingPlanName: bestPlan?.name ?? "Root",
+      billingPlanCode: bestPlan?.code ?? "ROOT",
+      billingIsBlocked: false,
+      billingBlockMessage: null,
+      billingEndsAt: null,
+      billingTrialEndsAt: null,
+    };
+  }
+
+  const billing = await resolveUserBillingAccess(user.id);
+  return {
+    ...user,
+    billingStatus: billing.status,
+    billingPlanName: billing.plan?.name ?? null,
+    billingPlanCode: billing.plan?.code ?? null,
+    billingIsBlocked: billing.isBlocked,
+    billingBlockMessage: billing.blockMessage,
+    billingEndsAt: billing.endsAt,
+    billingTrialEndsAt: billing.trialEndsAt,
   };
 }
 
@@ -1254,6 +2481,73 @@ function mapConnection(connection: {
   };
 }
 
+type ConnectionRuntimeMetadata = {
+  instagramUsername?: string | null;
+  instagramUserId?: string | null;
+  whatsappProfileName?: string | null;
+  whatsappOwnerJid?: string | null;
+};
+
+async function resolveConnectionRuntimeMetadata(connection: {
+  id: string;
+  companyId: string;
+  platform: string;
+  displayName: string;
+  loginIdentifier: string | null;
+  secretCipher?: string | null;
+  authStatus: string;
+}): Promise<ConnectionRuntimeMetadata> {
+  if (connection.authStatus !== "CONNECTED") {
+    return {};
+  }
+
+  if (connection.platform === "instagram") {
+    try {
+      const metadata = await withTimeout(
+        resolveInstagramConnectionRuntimeMetadata({
+          loginIdentifier: connection.loginIdentifier,
+          secretCipher: connection.secretCipher ?? null,
+        }),
+        3_000,
+        "INSTAGRAM_CONNECTION_METADATA_TIMEOUT",
+      );
+
+      return {
+        instagramUsername: metadata.instagramUsername,
+        instagramUserId: metadata.instagramUserId,
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  if (connection.platform === "whatsapp") {
+    try {
+      const metadata = await withTimeout(
+        resolveWhatsappConnectionRuntimeMetadata({
+          id: connection.id,
+          companyId: connection.companyId,
+          displayName: connection.displayName,
+          platform: connection.platform,
+          loginIdentifier: connection.loginIdentifier,
+          secretCipher: connection.secretCipher ?? null,
+        }),
+        3_000,
+        "WHATSAPP_CONNECTION_METADATA_TIMEOUT",
+      );
+
+      return {
+        whatsappProfileName: metadata.profileName,
+        whatsappOwnerJid: metadata.ownerJid,
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  return {};
+}
+
 function mapAviso(aviso: {
   id: string;
   kind: string;
@@ -1308,6 +2602,24 @@ async function appendAviso(input: {
   });
 }
 
+async function appendBillingAvisoSafely(input: {
+  userId: string;
+  title: string;
+  message: string;
+  kind?: string;
+}): Promise<void> {
+  try {
+    await appendAviso({
+      userId: input.userId,
+      title: input.title,
+      message: input.message,
+      kind: input.kind ?? "BILLING",
+    });
+  } catch (error) {
+    console.error("Failed to append billing aviso", error);
+  }
+}
+
 async function appendJobAvisoSafely(
   job: {
     id: string;
@@ -1346,6 +2658,56 @@ async function appendJobAvisoSafely(
   } catch (error) {
     console.error("Failed to append job aviso", error);
   }
+}
+
+async function failJobDueToConnectionUnavailable(
+  job: {
+    id: string;
+    companyId: string;
+    createdByUserId: string | null;
+    title?: string | null;
+    caption: string | null;
+    publicationType?: string | null;
+    postStory?: boolean;
+    postReel?: boolean;
+    postWhatsapp?: boolean;
+    modoWhatsapp?: string | null;
+  },
+  input: {
+    message: string;
+    errorCode: string;
+  },
+): Promise<void> {
+  const update = await prisma.job.updateMany({
+    where: {
+      id: job.id,
+      status: {
+        in: ["PENDING", "WAITING_LOGIN", "RUNNING"],
+      },
+    },
+    data: {
+      status: "FAILED",
+      lastError: input.message,
+      completedAt: new Date(),
+    },
+  });
+
+  if (update.count === 0) {
+    return;
+  }
+
+  await appendLog({
+    companyId: job.companyId,
+    level: "ERROR",
+    errorCode: input.errorCode,
+    message: `Job ${job.id} falhou: ${input.message}`,
+  });
+
+  await appendJobAvisoSafely(job, {
+    title: "Falha no agendamento",
+    kind: "JOB_FAILED",
+    message: input.message,
+  });
 }
 
 function normalizeAutomationErrorCode(message: string): string {
@@ -1455,9 +2817,25 @@ function isInstagramTransientExecutionError(message: string): boolean {
   return false;
 }
 
-const runningServerJobs = new Set<string>();
-const busyConnections = new Set<string>();
 const instagramLastProactiveTokenRefreshByConnection = new Map<string, number>();
+
+function connectionExecutionLockKey(connectionId: string): string {
+  return `job:connection:executing:${connectionId}`;
+}
+
+async function enqueueJobForExecution(input: {
+  jobId: string;
+  platform: JobExecutionPlatform;
+}): Promise<void> {
+  await enqueueJobExecutionMessage({
+    jobId: input.jobId,
+    platform: input.platform,
+  });
+}
+
+async function isConnectionExecutionInProgress(connectionId: string): Promise<boolean> {
+  return isDistributedLockHeld(connectionExecutionLockKey(connectionId));
+}
 
 function shouldAttemptProactiveInstagramTokenRefresh(connectionId: string, nowMs: number): boolean {
   const lastRefreshedAtMs = instagramLastProactiveTokenRefreshByConnection.get(connectionId) ?? 0;
@@ -1749,6 +3127,370 @@ function parseSequentialStoryPublishedCountFromError(message: string): number | 
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
 
+async function executeInstagramRunningJob(job: {
+  id: string;
+  companyId: string;
+  tentativas: number;
+  filePath: string;
+  caption: string | null;
+  locationName: string | null;
+  publicationType: string;
+  postStory: boolean;
+  postReel: boolean;
+  postWhatsapp: boolean;
+  createdByUserId: string | null;
+}, connection: {
+  id: string;
+  displayName: string;
+  loginIdentifier: string | null;
+  secretCipher: string | null;
+}): Promise<void> {
+  const effectiveConnection = {
+    id: connection.id,
+    loginIdentifier: connection.loginIdentifier,
+    secretCipher: connection.secretCipher,
+  };
+
+  try {
+    await appendLog({
+      companyId: job.companyId,
+      level: "INFO",
+      message: `Job ${job.id} iniciado pelo consumidor RabbitMQ do Instagram.`,
+    });
+
+    const refreshStartedAtMs = Date.now();
+    if (shouldAttemptProactiveInstagramTokenRefresh(connection.id, refreshStartedAtMs)) {
+      markProactiveInstagramTokenRefreshAttempt(connection.id, refreshStartedAtMs);
+
+      try {
+        const refreshed = await refreshInstagramAccessTokenForConnection({
+          secretCipher: effectiveConnection.secretCipher,
+        });
+        const refreshedSecretCipher = encodeSecret(refreshed.accessToken);
+        if (refreshedSecretCipher) {
+          effectiveConnection.secretCipher = refreshedSecretCipher;
+          const refreshedAt = new Date();
+
+          await prisma.socialConnection.update({
+            where: { id: connection.id },
+            data: {
+              secretCipher: refreshedSecretCipher,
+              authStatus: "CONNECTED",
+              lastSeenAt: refreshedAt,
+            },
+          });
+
+          await appendLog({
+            companyId: job.companyId,
+            level: "INFO",
+            message:
+              `Token da conta ${connection.displayName} foi renovado automaticamente antes da execução do job ${job.id}.`,
+          });
+        }
+      } catch (proactiveRefreshError) {
+        const proactiveRefreshMessage = proactiveRefreshError instanceof Error
+          ? proactiveRefreshError.message
+          : "INSTAGRAM_GRAPH_TOKEN_REFRESH_FAILED";
+        const proactiveRefreshRequiresLogin = isInstagramLoginRequiredErrorMessage(proactiveRefreshMessage);
+
+        if (proactiveRefreshRequiresLogin) {
+          await prisma.job.update({
+            where: { id: job.id },
+            data: {
+              status: "WAITING_LOGIN",
+              lastError: "Aguardando autenticação do Instagram.",
+            },
+          });
+
+          await prisma.socialConnection.update({
+            where: { id: connection.id },
+            data: {
+              authStatus: "AUTH_REQUIRED",
+              secretCipher: null,
+              lastAuthAt: null,
+              authLaunchUrl: null,
+              lastSeenAt: null,
+            },
+          });
+
+          await appendLog({
+            companyId: job.companyId,
+            level: "WARN",
+            errorCode: "LOGIN_REQUIRED_INSTAGRAM",
+            message: `Job ${job.id} aguardando novo login antes da execução: ${proactiveRefreshMessage}`,
+          });
+
+          await appendJobAvisoSafely(job, {
+            title: "Aguardando autenticação",
+            kind: "JOB_WAITING_LOGIN",
+            message: "A conta do Instagram precisa ser autenticada para continuar.",
+          });
+          return;
+        }
+
+        await appendLog({
+          companyId: job.companyId,
+          level: "WARN",
+          errorCode: "INSTAGRAM_TOKEN_REFRESH_PRECHECK_FAILED",
+          message:
+            `Falha ao renovar token antes do job ${job.id}. Continuando com o token atual. Erro: ${proactiveRefreshMessage}`,
+        });
+      }
+    }
+
+    await executeInstagramJobWithResolvedMediaBundle(effectiveConnection, job);
+
+    await prisma.job.update({
+      where: { id: job.id },
+      data: {
+        status: "COMPLETED",
+        completedAt: new Date(),
+        lastError: null,
+      },
+    });
+
+    await appendLog({
+      companyId: job.companyId,
+      level: "INFO",
+      message: `Job ${job.id} concluído pelo consumidor RabbitMQ do Instagram.`,
+    });
+
+    await appendJobAvisoSafely(job, {
+      title: "Postagem enviada",
+      kind: "JOB_SENT",
+      message: "Publicacao concluida com sucesso.",
+    });
+  } catch (error) {
+    let message = error instanceof Error ? error.message : "Erro desconhecido no consumidor RabbitMQ do Instagram.";
+    let waitingLogin = isInstagramLoginRequiredErrorMessage(message);
+    const sequentialStoryJob = isSequentialStoryJob(job);
+    const publishedCountBeforeFailure = sequentialStoryJob ? parseSequentialStoryPublishedCountFromError(message) : null;
+    const canRetrySequentialStoryFromStart = sequentialStoryJob && publishedCountBeforeFailure === 0;
+
+    if (waitingLogin && !sequentialStoryJob) {
+      try {
+        const refreshed = await refreshInstagramAccessTokenForConnection({
+          secretCipher: effectiveConnection.secretCipher,
+        });
+        const refreshedSecretCipher = encodeSecret(refreshed.accessToken);
+        const refreshedAt = new Date();
+        effectiveConnection.secretCipher = refreshedSecretCipher;
+        await prisma.socialConnection.update({
+          where: { id: connection.id },
+          data: {
+            secretCipher: refreshedSecretCipher,
+            authStatus: "CONNECTED",
+            lastSeenAt: refreshedAt,
+          },
+        });
+
+        await appendLog({
+          companyId: job.companyId,
+          level: "INFO",
+          message:
+            `Token da conta ${connection.displayName} foi renovado automaticamente. ` +
+            "Retentando publicação sem exigir novo login.",
+        });
+
+        await executeInstagramJobWithResolvedMediaBundle(effectiveConnection, job);
+
+        await prisma.job.update({
+          where: { id: job.id },
+          data: {
+            status: "COMPLETED",
+            completedAt: new Date(),
+            lastError: null,
+          },
+        });
+
+        await appendLog({
+          companyId: job.companyId,
+          level: "INFO",
+          message: `Job ${job.id} concluido após renovacao automatica do token.`,
+        });
+
+        await appendJobAvisoSafely(job, {
+          title: "Postagem enviada",
+          kind: "JOB_SENT",
+          message: "Publicacao concluida com sucesso.",
+        });
+        return;
+      } catch (refreshError) {
+        message = refreshError instanceof Error ? refreshError.message : message;
+        waitingLogin = isInstagramLoginRequiredErrorMessage(message);
+      }
+    } else if (waitingLogin && sequentialStoryJob) {
+      try {
+        const refreshed = await refreshInstagramAccessTokenForConnection({
+          secretCipher: effectiveConnection.secretCipher,
+        });
+        const refreshedSecretCipher = encodeSecret(refreshed.accessToken);
+        const refreshedAt = new Date();
+        effectiveConnection.secretCipher = refreshedSecretCipher;
+        await prisma.socialConnection.update({
+          where: { id: connection.id },
+          data: {
+            secretCipher: refreshedSecretCipher,
+            authStatus: "CONNECTED",
+            lastSeenAt: refreshedAt,
+          },
+        });
+
+        if (canRetrySequentialStoryFromStart) {
+          await appendLog({
+            companyId: job.companyId,
+            level: "INFO",
+            message:
+              `Token da conta ${connection.displayName} foi renovado automaticamente. ` +
+              "Retentando stories em sequência sem exigir novo login.",
+          });
+
+          await executeInstagramJobWithResolvedMediaBundle(effectiveConnection, job);
+
+          await prisma.job.update({
+            where: { id: job.id },
+            data: {
+              status: "COMPLETED",
+              completedAt: new Date(),
+              lastError: null,
+            },
+          });
+
+          await appendLog({
+            companyId: job.companyId,
+            level: "INFO",
+            message: `Job ${job.id} concluido após renovacao automatica do token.`,
+          });
+
+          await appendJobAvisoSafely(job, {
+            title: "Postagem enviada",
+            kind: "JOB_SENT",
+            message: "Publicacao concluida com sucesso.",
+          });
+          return;
+        }
+
+        waitingLogin = false;
+        message = "INSTAGRAM_STORY_SEQUENCE_INTERRUPTED_TOKEN_REFRESHED";
+
+        await appendLog({
+          companyId: job.companyId,
+          level: "WARN",
+          errorCode: "INSTAGRAM_STORY_SEQUENCE_INTERRUPTED",
+          message:
+            `Job ${job.id} (stories em sequência) foi interrompido para evitar duplicação. ` +
+            "Token renovado automaticamente; reenfileire manualmente se quiser continuar.",
+        });
+      } catch (refreshError) {
+        message = refreshError instanceof Error ? refreshError.message : message;
+        waitingLogin = isInstagramLoginRequiredErrorMessage(message);
+
+        await appendLog({
+          companyId: job.companyId,
+          level: "WARN",
+          errorCode: "INSTAGRAM_STORY_SEQUENCE_WAITING_LOGIN",
+          message:
+            canRetrySequentialStoryFromStart
+              ? `Job ${job.id} (stories em sequência) falhou antes do primeiro item, mas não foi possível renovar/reexecutar automaticamente. ` +
+                "Será necessário autenticar e reenfileirar manualmente."
+              : `Job ${job.id} (stories em sequência) não foi retentado automaticamente para evitar duplicação. ` +
+                "Será necessário autenticar e reenfileirar manualmente.",
+        });
+      }
+    }
+
+    const errorCode = normalizeAutomationErrorCode(message);
+    const attemptNumber = Math.max(job.tentativas, 1);
+    const instagramRateLimited = isInstagramTooManyActionsMessage(message);
+    const shouldAutoRetry =
+      !sequentialStoryJob &&
+      !waitingLogin &&
+      isInstagramTransientExecutionError(message) &&
+      attemptNumber < INSTAGRAM_WORKER_AUTO_RETRY_MAX_ATTEMPTS;
+
+    if (shouldAutoRetry) {
+      const retryAt = new Date(Date.now() + INSTAGRAM_WORKER_AUTO_RETRY_DELAY_MS);
+      await prisma.job.update({
+        where: { id: job.id },
+        data: {
+          status: "PENDING",
+          dataPostagem: retryAt,
+          startedAt: null,
+          completedAt: null,
+          lastError: null,
+        },
+      });
+
+      await appendLog({
+        companyId: job.companyId,
+        level: "WARN",
+        errorCode: "INSTAGRAM_AUTO_RETRY_SCHEDULED",
+        message:
+          `Job ${job.id} recebeu erro transitório e será retentado automaticamente ` +
+          `(${attemptNumber}/${INSTAGRAM_WORKER_AUTO_RETRY_MAX_ATTEMPTS}) em ${retryAt.toISOString()}. ` +
+          `Erro original: ${message}`,
+      });
+
+      if (instagramRateLimited && attemptNumber === 1) {
+        await appendJobAvisoSafely(job, {
+          title: "Bloqueio temporario do Instagram",
+          kind: "JOB_RATE_LIMIT",
+          message:
+            "Muitas requisicoes em curto espaco de tempo. Aguarde ate 24 horas para liberacao de postagens e leia nosso FAQ para mais informacoes.",
+        });
+      }
+      return;
+    }
+
+    await prisma.job.update({
+      where: { id: job.id },
+      data: {
+        status: waitingLogin ? "WAITING_LOGIN" : "FAILED",
+        lastError: waitingLogin
+          ? "Aguardando autenticação do Instagram."
+          : sequentialStoryJob
+            ? `${message} (Sequência de stories interrompida; sem retentativa automática para evitar duplicação.)`
+            : message,
+      },
+    });
+
+    if (waitingLogin) {
+      await prisma.socialConnection.update({
+        where: { id: connection.id },
+        data: {
+          authStatus: "AUTH_REQUIRED",
+          secretCipher: null,
+          lastAuthAt: null,
+          authLaunchUrl: null,
+          lastSeenAt: null,
+        },
+      });
+    }
+
+    await appendLog({
+      companyId: job.companyId,
+      level: waitingLogin ? "WARN" : "ERROR",
+      errorCode,
+      message: `Job ${job.id} falhou no consumidor RabbitMQ do Instagram: ${message}`,
+    });
+
+    await appendJobAvisoSafely(
+      job,
+      waitingLogin
+        ? {
+            title: "Aguardando autenticação",
+            kind: "JOB_WAITING_LOGIN",
+            message: "A conta do Instagram precisa ser autenticada para continuar.",
+          }
+        : {
+            title: "Falha no agendamento",
+            kind: "JOB_FAILED",
+            message: summarizeFailureMessageForAviso(normalizePublicationType(job), message),
+          },
+    );
+  }
+}
+
 function startServerInstagramJobWorker(): void {
   const tick = async () => {
     try {
@@ -1766,15 +3508,21 @@ function startServerInstagramJobWorker(): void {
           },
         },
         orderBy: [{ dataPostagem: "asc" }, { criadoEm: "asc" }],
-        take: 10,
+        take: JOB_DISPATCH_BATCH_SIZE,
       });
 
       for (const job of candidateJobs) {
-        if (runningServerJobs.has(job.id)) {
+        const billingBlockedMessage = await resolveJobBillingBlockMessage(job);
+        if (billingBlockedMessage) {
+          await failJobDueToBillingBlocked(job, billingBlockedMessage);
           continue;
         }
 
         if (!job.socialConnectionId) {
+          await failJobDueToConnectionUnavailable(job, {
+            errorCode: "SOCIAL_CONNECTION_MISSING",
+            message: "Conta social removida deste agendamento. Edite o agendamento e selecione uma conta conectada.",
+          });
           continue;
         }
 
@@ -1782,11 +3530,21 @@ function startServerInstagramJobWorker(): void {
           where: {
             id: job.socialConnectionId,
             companyId: job.companyId,
-            platform: platformForPublication(normalizePublicationType(job)),
+            platform: "instagram",
+          },
+          select: {
+            id: true,
+            authStatus: true,
+            secretCipher: true,
           },
         });
 
         if (!connection) {
+          await failJobDueToConnectionUnavailable(job, {
+            errorCode: "SOCIAL_CONNECTION_NOT_FOUND",
+            message:
+              "Conta social deste agendamento não está mais disponível. Edite o agendamento e selecione outra conta conectada.",
+          });
           continue;
         }
 
@@ -1811,7 +3569,7 @@ function startServerInstagramJobWorker(): void {
           continue;
         }
 
-        if (busyConnections.has(connection.id)) {
+        if (await isConnectionExecutionInProgress(connection.id)) {
           continue;
         }
 
@@ -1834,368 +3592,42 @@ function startServerInstagramJobWorker(): void {
           continue;
         }
 
-        runningServerJobs.add(job.id);
-        busyConnections.add(connection.id);
+        try {
+          await enqueueJobForExecution({
+            jobId: job.id,
+            platform: "instagram",
+          });
+        } catch (error) {
+          await prisma.job.update({
+            where: { id: job.id },
+            data: {
+              status: "PENDING",
+              startedAt: null,
+              completedAt: null,
+              tentativas: { decrement: 1 },
+              lastError: "Falha ao enfileirar job para processamento.",
+            },
+          });
 
-        void (async () => {
-          const effectiveConnection = {
-            id: connection.id,
-            loginIdentifier: connection.loginIdentifier,
-            secretCipher: connection.secretCipher,
-          };
-
-          try {
-            await appendLog({
-              companyId: job.companyId,
-              level: "INFO",
-              message: `Job ${job.id} iniciado pelo worker interno do perfil.`,
-            });
-
-            const refreshStartedAtMs = Date.now();
-            if (shouldAttemptProactiveInstagramTokenRefresh(connection.id, refreshStartedAtMs)) {
-              markProactiveInstagramTokenRefreshAttempt(connection.id, refreshStartedAtMs);
-
-              try {
-                const refreshed = await refreshInstagramAccessTokenForConnection({
-                  secretCipher: effectiveConnection.secretCipher,
-                });
-                const refreshedSecretCipher = encodeSecret(refreshed.accessToken);
-                if (refreshedSecretCipher) {
-                  effectiveConnection.secretCipher = refreshedSecretCipher;
-                  const refreshedAt = new Date();
-
-                  await prisma.socialConnection.update({
-                    where: { id: connection.id },
-                    data: {
-                      secretCipher: refreshedSecretCipher,
-                      authStatus: "CONNECTED",
-                      lastSeenAt: refreshedAt,
-                    },
-                  });
-
-                  await appendLog({
-                    companyId: job.companyId,
-                    level: "INFO",
-                    message:
-                      `Token da conta ${connection.displayName} foi renovado automaticamente antes da execução do job ${job.id}.`,
-                  });
-                }
-              } catch (proactiveRefreshError) {
-                const proactiveRefreshMessage = proactiveRefreshError instanceof Error
-                  ? proactiveRefreshError.message
-                  : "INSTAGRAM_GRAPH_TOKEN_REFRESH_FAILED";
-                const proactiveRefreshRequiresLogin = isInstagramLoginRequiredErrorMessage(proactiveRefreshMessage);
-
-                if (proactiveRefreshRequiresLogin) {
-                  await prisma.job.update({
-                    where: { id: job.id },
-                    data: {
-                      status: "WAITING_LOGIN",
-                      lastError: "Aguardando autenticação do Instagram.",
-                    },
-                  });
-
-                  await prisma.socialConnection.update({
-                    where: { id: connection.id },
-                    data: {
-                      authStatus: "AUTH_REQUIRED",
-                      secretCipher: null,
-                      lastAuthAt: null,
-                      authLaunchUrl: null,
-                      lastSeenAt: null,
-                    },
-                  });
-
-                  await appendLog({
-                    companyId: job.companyId,
-                    level: "WARN",
-                    errorCode: "LOGIN_REQUIRED_INSTAGRAM",
-                    message:
-                      `Job ${job.id} aguardando novo login antes da execução: ${proactiveRefreshMessage}`,
-                  });
-
-                  await appendJobAvisoSafely(job, {
-                    title: "Aguardando autenticação",
-                    kind: "JOB_WAITING_LOGIN",
-                    message: "A conta do Instagram precisa ser autenticada para continuar.",
-                  });
-                  return;
-                }
-
-                await appendLog({
-                  companyId: job.companyId,
-                  level: "WARN",
-                  errorCode: "INSTAGRAM_TOKEN_REFRESH_PRECHECK_FAILED",
-                  message:
-                    `Falha ao renovar token antes do job ${job.id}. Continuando com o token atual. Erro: ${proactiveRefreshMessage}`,
-                });
-              }
-            }
-
-            await executeInstagramJobWithResolvedMediaBundle(effectiveConnection, job);
-
-            await prisma.job.update({
-              where: { id: job.id },
-              data: {
-                status: "COMPLETED",
-                completedAt: new Date(),
-                lastError: null,
-              },
-            });
-
-            await appendLog({
-              companyId: job.companyId,
-              level: "INFO",
-              message: `Job ${job.id} concluido pelo worker interno.`,
-            });
-
-            await appendJobAvisoSafely(job, {
-              title: "Postagem enviada",
-              kind: "JOB_SENT",
-              message: "Publicacao concluida com sucesso.",
-            });
-          } catch (error) {
-            let message = error instanceof Error ? error.message : "Erro desconhecido no worker interno.";
-            let waitingLogin = isInstagramLoginRequiredErrorMessage(message);
-            const sequentialStoryJob = isSequentialStoryJob(job);
-            const publishedCountBeforeFailure = sequentialStoryJob
-              ? parseSequentialStoryPublishedCountFromError(message)
-              : null;
-            const canRetrySequentialStoryFromStart = sequentialStoryJob && publishedCountBeforeFailure === 0;
-
-            if (waitingLogin && !sequentialStoryJob) {
-              try {
-                const refreshed = await refreshInstagramAccessTokenForConnection({
-                  secretCipher: effectiveConnection.secretCipher,
-                });
-                const refreshedSecretCipher = encodeSecret(refreshed.accessToken);
-                const refreshedAt = new Date();
-                effectiveConnection.secretCipher = refreshedSecretCipher;
-                await prisma.socialConnection.update({
-                  where: { id: connection.id },
-                  data: {
-                    secretCipher: refreshedSecretCipher,
-                    authStatus: "CONNECTED",
-                    lastSeenAt: refreshedAt,
-                  },
-                });
-
-                await appendLog({
-                  companyId: job.companyId,
-                  level: "INFO",
-                  message:
-                    `Token da conta ${connection.displayName} foi renovado automaticamente. ` +
-                    "Retentando publicação sem exigir novo login.",
-                });
-
-                await executeInstagramJobWithResolvedMediaBundle(effectiveConnection, job);
-
-                await prisma.job.update({
-                  where: { id: job.id },
-                  data: {
-                    status: "COMPLETED",
-                    completedAt: new Date(),
-                    lastError: null,
-                  },
-                });
-
-                await appendLog({
-                  companyId: job.companyId,
-                  level: "INFO",
-                  message: `Job ${job.id} concluido após renovacao automatica do token.`,
-                });
-
-                await appendJobAvisoSafely(job, {
-                  title: "Postagem enviada",
-                  kind: "JOB_SENT",
-                  message: "Publicacao concluida com sucesso.",
-                  });
-                return;
-              } catch (refreshError) {
-                message = refreshError instanceof Error ? refreshError.message : message;
-                waitingLogin = isInstagramLoginRequiredErrorMessage(message);
-              }
-            } else if (waitingLogin && sequentialStoryJob) {
-              try {
-                const refreshed = await refreshInstagramAccessTokenForConnection({
-                  secretCipher: effectiveConnection.secretCipher,
-                });
-                const refreshedSecretCipher = encodeSecret(refreshed.accessToken);
-                const refreshedAt = new Date();
-                effectiveConnection.secretCipher = refreshedSecretCipher;
-                await prisma.socialConnection.update({
-                  where: { id: connection.id },
-                  data: {
-                    secretCipher: refreshedSecretCipher,
-                    authStatus: "CONNECTED",
-                    lastSeenAt: refreshedAt,
-                  },
-                });
-
-                if (canRetrySequentialStoryFromStart) {
-                  await appendLog({
-                    companyId: job.companyId,
-                    level: "INFO",
-                    message:
-                      `Token da conta ${connection.displayName} foi renovado automaticamente. ` +
-                      "Retentando stories em sequência sem exigir novo login.",
-                  });
-
-                  await executeInstagramJobWithResolvedMediaBundle(effectiveConnection, job);
-
-                  await prisma.job.update({
-                    where: { id: job.id },
-                    data: {
-                      status: "COMPLETED",
-                      completedAt: new Date(),
-                      lastError: null,
-                    },
-                  });
-
-                  await appendLog({
-                    companyId: job.companyId,
-                    level: "INFO",
-                    message: `Job ${job.id} concluido após renovacao automatica do token.`,
-                  });
-
-                  await appendJobAvisoSafely(job, {
-                    title: "Postagem enviada",
-                    kind: "JOB_SENT",
-                    message: "Publicacao concluida com sucesso.",
-                  });
-                  return;
-                }
-
-                waitingLogin = false;
-                message = "INSTAGRAM_STORY_SEQUENCE_INTERRUPTED_TOKEN_REFRESHED";
-
-                await appendLog({
-                  companyId: job.companyId,
-                  level: "WARN",
-                  errorCode: "INSTAGRAM_STORY_SEQUENCE_INTERRUPTED",
-                  message:
-                    `Job ${job.id} (stories em sequência) foi interrompido para evitar duplicação. ` +
-                    "Token renovado automaticamente; reenfileire manualmente se quiser continuar.",
-                });
-              } catch (refreshError) {
-                message = refreshError instanceof Error ? refreshError.message : message;
-                waitingLogin = isInstagramLoginRequiredErrorMessage(message);
-
-                await appendLog({
-                  companyId: job.companyId,
-                  level: "WARN",
-                  errorCode: "INSTAGRAM_STORY_SEQUENCE_WAITING_LOGIN",
-                  message:
-                    canRetrySequentialStoryFromStart
-                      ? `Job ${job.id} (stories em sequência) falhou antes do primeiro item, mas não foi possível renovar/reexecutar automaticamente. ` +
-                        "Será necessário autenticar e reenfileirar manualmente."
-                      : `Job ${job.id} (stories em sequência) não foi retentado automaticamente para evitar duplicação. ` +
-                        "Será necessário autenticar e reenfileirar manualmente.",
-                });
-              }
-            }
-
-            const errorCode = normalizeAutomationErrorCode(message);
-            const attemptNumber = job.tentativas + 1;
-            const instagramRateLimited = isInstagramTooManyActionsMessage(message);
-            const shouldAutoRetry =
-              !sequentialStoryJob &&
-              !waitingLogin &&
-              isInstagramTransientExecutionError(message) &&
-              attemptNumber < INSTAGRAM_WORKER_AUTO_RETRY_MAX_ATTEMPTS;
-
-            if (shouldAutoRetry) {
-              const retryAt = new Date(Date.now() + INSTAGRAM_WORKER_AUTO_RETRY_DELAY_MS);
-              await prisma.job.update({
-                where: { id: job.id },
-                data: {
-                  status: "PENDING",
-                  dataPostagem: retryAt,
-                  startedAt: null,
-                  completedAt: null,
-                  lastError: null,
-                },
-              });
-
-              await appendLog({
-                companyId: job.companyId,
-                level: "WARN",
-                errorCode: "INSTAGRAM_AUTO_RETRY_SCHEDULED",
-                message:
-                  `Job ${job.id} recebeu erro transitório e será retentado automaticamente ` +
-                  `(${attemptNumber}/${INSTAGRAM_WORKER_AUTO_RETRY_MAX_ATTEMPTS}) em ${retryAt.toISOString()}. ` +
-                  `Erro original: ${message}`,
-              });
-
-              if (instagramRateLimited && attemptNumber === 1) {
-                await appendJobAvisoSafely(job, {
-                  title: "Bloqueio temporario do Instagram",
-                  kind: "JOB_RATE_LIMIT",
-                  message:
-                    "Muitas requisicoes em curto espaco de tempo. Aguarde ate 24 horas para liberacao de postagens e leia nosso FAQ para mais informacoes.",
-                });
-              }
-              return;
-            }
-
-            await prisma.job.update({
-              where: { id: job.id },
-              data: {
-                status: waitingLogin ? "WAITING_LOGIN" : "FAILED",
-                lastError: waitingLogin
-                  ? "Aguardando autenticação do Instagram."
-                  : sequentialStoryJob
-                    ? `${message} (Sequência de stories interrompida; sem retentativa automática para evitar duplicação.)`
-                    : message,
-              },
-            });
-
-            if (waitingLogin) {
-              await prisma.socialConnection.update({
-                where: { id: connection.id },
-                data: {
-                  authStatus: "AUTH_REQUIRED",
-                  secretCipher: null,
-                  lastAuthAt: null,
-                  authLaunchUrl: null,
-                  lastSeenAt: null,
-                },
-              });
-            }
-
-            await appendLog({
-              companyId: job.companyId,
-              level: waitingLogin ? "WARN" : "ERROR",
-              errorCode,
-              message: `Job ${job.id} falhou no worker interno: ${message}`,
-            });
-
-            await appendJobAvisoSafely(job, waitingLogin
-              ? {
-                  title: "Aguardando autenticação",
-                  kind: "JOB_WAITING_LOGIN",
-                  message: "A conta do Instagram precisa ser autenticada para continuar.",
-                }
-              : {
-                  title: "Falha no agendamento",
-                  kind: "JOB_FAILED",
-                  message: summarizeFailureMessageForAviso(normalizePublicationType(job), message),
-                });
-          } finally {
-            runningServerJobs.delete(job.id);
-            busyConnections.delete(connection.id);
-          }
-        })();
+          await appendLog({
+            companyId: job.companyId,
+            level: "ERROR",
+            errorCode: "RABBITMQ_ENQUEUE_FAILED",
+            message:
+              `Falha ao enfileirar job ${job.id} do Instagram no RabbitMQ. ` +
+              `Erro: ${error instanceof Error ? error.message : "desconhecido"}`,
+          });
+        }
       }
     } catch (error) {
-      console.error("Server Instagram job worker error", error);
+      console.error("Server Instagram job dispatcher error", error);
     }
   };
 
   void tick();
   setInterval(() => {
     void tick();
-  }, 10_000);
+  }, JOB_DISPATCH_INTERVAL_MS);
 }
 
 function startInstagramTokenKeepAliveWorker(): void {
@@ -2217,7 +3649,7 @@ function startInstagramTokenKeepAliveWorker(): void {
       });
 
       for (const connection of candidates) {
-        if (busyConnections.has(connection.id) || !shouldAttemptProactiveInstagramTokenRefresh(connection.id, nowMs)) {
+        if ((await isConnectionExecutionInProgress(connection.id)) || !shouldAttemptProactiveInstagramTokenRefresh(connection.id, nowMs)) {
           continue;
         }
 
@@ -2250,6 +3682,18 @@ function startInstagramTokenKeepAliveWorker(): void {
               message:
                 `Keep-alive do token Instagram falhou para ${connection.displayName}. ` +
                 `Tentará novamente no próximo ciclo. Erro: ${message}`,
+            });
+            continue;
+          }
+
+          if (!INSTAGRAM_KEEPALIVE_FORCE_DISCONNECT_ON_LOGIN_REQUIRED) {
+            await appendLog({
+              companyId: connection.companyId,
+              level: "WARN",
+              errorCode: "INSTAGRAM_TOKEN_KEEPALIVE_LOGIN_REQUIRED_DETECTED",
+              message:
+                `Keep-alive detectou login requerido para ${connection.displayName}, mas a conexão foi mantida. ` +
+                "A desconexão automática ocorrerá apenas se uma publicação falhar por autenticação.",
             });
             continue;
           }
@@ -2288,6 +3732,291 @@ function startInstagramTokenKeepAliveWorker(): void {
   }, INSTAGRAM_TOKEN_KEEPALIVE_INTERVAL_MS);
 }
 
+async function executeWhatsappRunningJob(job: {
+  id: string;
+  companyId: string;
+  caption: string | null;
+  publicationType: string;
+  postStory: boolean;
+  postReel: boolean;
+  postWhatsapp: boolean;
+  modoWhatsapp: string;
+  createdByUserId: string | null;
+}, connection: {
+  id: string;
+  authStatus: string;
+  companyId: string;
+  platform: string;
+  displayName: string;
+  loginIdentifier: string | null;
+  secretCipher: string | null;
+  automationMode: string;
+  authLaunchUrl: string | null;
+  lastAuthAt: Date | null;
+  lastSeenAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}): Promise<void> {
+  try {
+    await appendLog({
+      companyId: job.companyId,
+      level: "INFO",
+      message: `Job ${job.id} iniciado pelo consumidor RabbitMQ do WhatsApp.`,
+    });
+
+    const delivery = await executeWhatsappJobWithEvolutionApi(connection, job, uploadsDir);
+
+    if (delivery.confirmed) {
+      await prisma.job.update({
+        where: { id: job.id },
+        data: {
+          status: "COMPLETED",
+          completedAt: new Date(),
+          lastError: null,
+        },
+      });
+
+      await appendLog({
+        companyId: job.companyId,
+        level: "INFO",
+        errorCode: "WHATSAPP_STATUS_CONFIRMED",
+        message:
+          `Job ${job.id} confirmado no histórico da Evolution API. ` +
+          `remoteJid=${delivery.remoteJid ?? "status@broadcast"} messageId=${delivery.messageId ?? "indisponivel"}`,
+      });
+
+      await appendJobAvisoSafely(job, {
+        title: "Postagem enviada",
+        kind: "JOB_SENT",
+        message: "Publicacao concluida com sucesso.",
+      });
+      return;
+    }
+
+    await prisma.job.update({
+      where: { id: job.id },
+      data: {
+        status: "SENT_UNCONFIRMED",
+        completedAt: new Date(),
+        lastError: null,
+      },
+    });
+
+    await appendLog({
+      companyId: job.companyId,
+      level: "WARN",
+      errorCode: "WHATSAPP_SENT_UNCONFIRMED",
+      message:
+        `Job ${job.id} enviado pelo consumidor RabbitMQ do WhatsApp sem confirmacao de publicacao. ` +
+        `remoteJid=${delivery.remoteJid ?? "status@broadcast"} messageId=${delivery.messageId ?? "indisponivel"}`,
+    });
+
+    await appendJobAvisoSafely(job, {
+      title: "Postagem enviada sem confirmacao",
+      kind: "JOB_SENT_UNCONFIRMED",
+      message: "A API aceitou o envio, mas ainda sem confirmacao final do WhatsApp.",
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Erro desconhecido no consumidor RabbitMQ do WhatsApp.";
+    const waitingLogin = message === "LOGIN_REQUIRED_WHATSAPP";
+    const errorCode = normalizeAutomationErrorCode(message);
+
+    await prisma.job.update({
+      where: { id: job.id },
+      data: {
+        status: waitingLogin ? "WAITING_LOGIN" : "FAILED",
+        lastError: waitingLogin ? "Aguardando autenticação do WhatsApp." : message,
+      },
+    });
+
+    if (waitingLogin) {
+      await prisma.socialConnection.update({
+        where: { id: connection.id },
+        data: {
+          authStatus: "AUTH_REQUIRED",
+        },
+      });
+    }
+
+    await appendLog({
+      companyId: job.companyId,
+      level: waitingLogin ? "WARN" : "ERROR",
+      errorCode,
+      message: `Job ${job.id} falhou no consumidor RabbitMQ do WhatsApp: ${message}`,
+    });
+
+    await appendJobAvisoSafely(
+      job,
+      waitingLogin
+        ? {
+            title: "Aguardando autenticação",
+            kind: "JOB_WAITING_LOGIN",
+            message: "A conta do WhatsApp precisa ser autenticada para continuar.",
+          }
+        : {
+            title: "Falha no agendamento",
+            kind: "JOB_FAILED",
+            message: summarizeFailureMessageForAviso(normalizePublicationType(job), message),
+          },
+    );
+  }
+}
+
+async function processQueuedJobMessage(
+  queueMessage: JobExecutionQueueMessage,
+): Promise<"ack" | "requeue"> {
+  const job = await prisma.job.findUnique({
+    where: { id: queueMessage.jobId },
+  });
+
+  if (!job) {
+    return "ack";
+  }
+
+  if (normalizePublicationState(job.publicationState) !== "PUBLISHED") {
+    return "ack";
+  }
+
+  if (job.status !== "RUNNING") {
+    return "ack";
+  }
+
+  const billingBlockedMessage = await resolveJobBillingBlockMessage(job);
+  if (billingBlockedMessage) {
+    await failJobDueToBillingBlocked(job, billingBlockedMessage);
+    return "ack";
+  }
+
+  const expectedPlatform = platformForPublication(normalizePublicationType(job));
+  if (expectedPlatform !== queueMessage.platform) {
+    return "ack";
+  }
+
+  if (!job.socialConnectionId) {
+    await failJobDueToConnectionUnavailable(job, {
+      errorCode: "SOCIAL_CONNECTION_MISSING",
+      message: "Conta social removida deste agendamento. Edite o agendamento e selecione uma conta conectada.",
+    });
+    return "ack";
+  }
+
+  if (queueMessage.platform === "instagram") {
+    const connection = await prisma.socialConnection.findFirst({
+      where: {
+        id: job.socialConnectionId,
+        companyId: job.companyId,
+        platform: "instagram",
+      },
+    });
+
+    if (!connection) {
+      await failJobDueToConnectionUnavailable(job, {
+        errorCode: "SOCIAL_CONNECTION_NOT_FOUND",
+        message:
+          "Conta social deste agendamento não está mais disponível. Edite o agendamento e selecione outra conta conectada.",
+      });
+      return "ack";
+    }
+
+    const connectionLock = await acquireDistributedLock(
+      connectionExecutionLockKey(connection.id),
+      JOB_CONSUMER_CONNECTION_LOCK_MS,
+    );
+    if (!connectionLock) {
+      return "requeue";
+    }
+
+    try {
+      if (connection.authStatus !== "CONNECTED" || !connection.secretCipher) {
+        await prisma.job.update({
+          where: { id: job.id },
+          data: {
+            status: "WAITING_LOGIN",
+            lastError: "Aguardando autenticação do Instagram.",
+          },
+        });
+
+        await appendJobAvisoSafely(job, {
+          title: "Aguardando autenticação",
+          kind: "JOB_WAITING_LOGIN",
+          message: "A conta do Instagram precisa ser autenticada para continuar.",
+        });
+        return "ack";
+      }
+
+      await executeInstagramRunningJob(job, connection);
+      return "ack";
+    } finally {
+      await connectionLock.release();
+    }
+  }
+
+  const connection = await prisma.socialConnection.findFirst({
+    where: {
+      id: job.socialConnectionId,
+      companyId: job.companyId,
+      platform: "whatsapp",
+    },
+  });
+
+  if (!connection) {
+    await failJobDueToConnectionUnavailable(job, {
+      errorCode: "SOCIAL_CONNECTION_NOT_FOUND",
+      message:
+        "Conta social deste agendamento não está mais disponível. Edite o agendamento e selecione outra conta conectada.",
+    });
+    return "ack";
+  }
+
+  const connectionLock = await acquireDistributedLock(
+    connectionExecutionLockKey(connection.id),
+    JOB_CONSUMER_CONNECTION_LOCK_MS,
+  );
+  if (!connectionLock) {
+    return "requeue";
+  }
+
+  try {
+    if (connection.authStatus !== "CONNECTED") {
+      await prisma.job.update({
+        where: { id: job.id },
+        data: {
+          status: "WAITING_LOGIN",
+          lastError: "Aguardando autenticação do WhatsApp.",
+        },
+      });
+
+      await appendJobAvisoSafely(job, {
+        title: "Aguardando autenticação",
+        kind: "JOB_WAITING_LOGIN",
+        message: "A conta do WhatsApp precisa ser autenticada para continuar.",
+      });
+      return "ack";
+    }
+
+    await executeWhatsappRunningJob(job, connection);
+    return "ack";
+  } finally {
+    await connectionLock.release();
+  }
+}
+
+async function startRabbitJobExecutionConsumer(): Promise<void> {
+  while (true) {
+    try {
+      await startJobExecutionConsumer(async (queueMessage) => processQueuedJobMessage(queueMessage));
+      console.log("RabbitMQ consumer online for job execution.");
+      return;
+    } catch (error) {
+      console.error(
+        `Failed to start RabbitMQ job consumer. Retrying in ${RABBITMQ_CONSUMER_RETRY_DELAY_MS}ms...`,
+        error,
+      );
+      await new Promise((resolve) => setTimeout(resolve, RABBITMQ_CONSUMER_RETRY_DELAY_MS));
+    }
+  }
+}
+
 function startServerWhatsappJobWorker(): void {
   const tick = async () => {
     try {
@@ -2305,11 +4034,21 @@ function startServerWhatsappJobWorker(): void {
           },
         },
         orderBy: [{ dataPostagem: "asc" }, { criadoEm: "asc" }],
-        take: 10,
+        take: JOB_DISPATCH_BATCH_SIZE,
       });
 
       for (const job of candidateJobs) {
-        if (runningServerJobs.has(job.id) || !job.socialConnectionId) {
+        const billingBlockedMessage = await resolveJobBillingBlockMessage(job);
+        if (billingBlockedMessage) {
+          await failJobDueToBillingBlocked(job, billingBlockedMessage);
+          continue;
+        }
+
+        if (!job.socialConnectionId) {
+          await failJobDueToConnectionUnavailable(job, {
+            errorCode: "SOCIAL_CONNECTION_MISSING",
+            message: "Conta social removida deste agendamento. Edite o agendamento e selecione uma conta conectada.",
+          });
           continue;
         }
 
@@ -2318,11 +4057,44 @@ function startServerWhatsappJobWorker(): void {
             id: job.socialConnectionId,
             companyId: job.companyId,
             platform: "whatsapp",
-            authStatus: "CONNECTED",
+          },
+          select: {
+            id: true,
+            authStatus: true,
           },
         });
 
-        if (!connection || busyConnections.has(connection.id)) {
+        if (!connection) {
+          await failJobDueToConnectionUnavailable(job, {
+            errorCode: "SOCIAL_CONNECTION_NOT_FOUND",
+            message:
+              "Conta social deste agendamento não está mais disponível. Edite o agendamento e selecione outra conta conectada.",
+          });
+          continue;
+        }
+
+        if (connection.authStatus !== "CONNECTED") {
+          if (job.status === "PENDING") {
+            await prisma.job.update({
+              where: { id: job.id },
+              data: {
+                status: "WAITING_LOGIN",
+                startedAt: null,
+                completedAt: null,
+                lastError: "Aguardando autenticação do WhatsApp.",
+              },
+            });
+
+            await appendJobAvisoSafely(job, {
+              title: "Aguardando autenticação",
+              kind: "JOB_WAITING_LOGIN",
+              message: "A conta do WhatsApp precisa ser autenticada para continuar.",
+            });
+          }
+          continue;
+        }
+
+        if (await isConnectionExecutionInProgress(connection.id)) {
           continue;
         }
 
@@ -2345,97 +4117,42 @@ function startServerWhatsappJobWorker(): void {
           continue;
         }
 
-        runningServerJobs.add(job.id);
-        busyConnections.add(connection.id);
+        try {
+          await enqueueJobForExecution({
+            jobId: job.id,
+            platform: "whatsapp",
+          });
+        } catch (error) {
+          await prisma.job.update({
+            where: { id: job.id },
+            data: {
+              status: "PENDING",
+              startedAt: null,
+              completedAt: null,
+              tentativas: { decrement: 1 },
+              lastError: "Falha ao enfileirar job para processamento.",
+            },
+          });
 
-        void (async () => {
-          try {
-            await appendLog({
-              companyId: job.companyId,
-              level: "INFO",
-              message: `Job ${job.id} iniciado pelo worker interno do WhatsApp.`,
-            });
-
-            const delivery = await executeWhatsappJobWithEvolutionApi(connection, job, uploadsDir);
-
-            await prisma.job.update({
-              where: { id: job.id },
-              data: {
-                status: "SENT_UNCONFIRMED",
-                completedAt: new Date(),
-                lastError: null,
-              },
-            });
-
-            await appendLog({
-              companyId: job.companyId,
-              level: "WARN",
-              errorCode: "WHATSAPP_SENT_UNCONFIRMED",
-              message: `Job ${job.id} enviado pelo worker interno do WhatsApp sem confirmacao de publicacao. remoteJid=${delivery.remoteJid ?? "status@broadcast"} messageId=${delivery.messageId ?? "indisponivel"}`,
-            });
-
-            await appendJobAvisoSafely(job, {
-              title: "Postagem enviada sem confirmacao",
-              kind: "JOB_SENT_UNCONFIRMED",
-              message: "A API aceitou o envio, mas ainda sem confirmacao final do WhatsApp.",
-            });
-          } catch (error) {
-            const message = error instanceof Error ? error.message : "Erro desconhecido no worker interno do WhatsApp.";
-            const waitingLogin = message === "LOGIN_REQUIRED_WHATSAPP";
-            const errorCode = normalizeAutomationErrorCode(message);
-
-            await prisma.job.update({
-              where: { id: job.id },
-              data: {
-                status: waitingLogin ? "WAITING_LOGIN" : "FAILED",
-                lastError: waitingLogin
-                  ? "Aguardando autenticação do WhatsApp."
-                  : message,
-              },
-            });
-
-            if (waitingLogin) {
-              await prisma.socialConnection.update({
-                where: { id: connection.id },
-                data: {
-                  authStatus: "AUTH_REQUIRED",
-                },
-              });
-            }
-
-            await appendLog({
-              companyId: job.companyId,
-              level: waitingLogin ? "WARN" : "ERROR",
-              errorCode,
-              message: `Job ${job.id} falhou no worker interno do WhatsApp: ${message}`,
-            });
-
-            await appendJobAvisoSafely(job, waitingLogin
-              ? {
-                  title: "Aguardando autenticação",
-                  kind: "JOB_WAITING_LOGIN",
-                  message: "A conta do WhatsApp precisa ser autenticada para continuar.",
-                }
-              : {
-                  title: "Falha no agendamento",
-                  kind: "JOB_FAILED",
-                  message: summarizeFailureMessageForAviso(normalizePublicationType(job), message),
-                });
-          } finally {
-            runningServerJobs.delete(job.id);
-            busyConnections.delete(connection.id);
-          }
-        })();
+          await appendLog({
+            companyId: job.companyId,
+            level: "ERROR",
+            errorCode: "RABBITMQ_ENQUEUE_FAILED",
+            message:
+              `Falha ao enfileirar job ${job.id} do WhatsApp no RabbitMQ. ` +
+              `Erro: ${error instanceof Error ? error.message : "desconhecido"}`,
+          });
+        }
       }
     } catch (error) {
-      console.error("Server WhatsApp job worker error", error);
+      console.error("Server WhatsApp job dispatcher error", error);
     }
   };
 
   void tick();
   setInterval(() => {
     void tick();
-  }, 10_000);
+  }, JOB_DISPATCH_INTERVAL_MS);
 }
 
 app.get("/health", (_request, response) => {
@@ -2469,6 +4186,7 @@ app.get("/auth/setup-access", async (request, response) => {
 
 app.post("/auth/setup-access", async (request, response) => {
   const payload = createUserFromInviteSchema.parse(request.body);
+  const billingSettings = await getBillingSettingsSnapshot();
 
   const invite = await prisma.setupInvite.findFirst({
     where: {
@@ -2492,6 +4210,30 @@ app.post("/auth/setup-access", async (request, response) => {
   }
 
   const user = await prisma.$transaction(async (transaction) => {
+    const now = new Date();
+    const trialPlan = billingSettings.autoTrialEnabled
+      ? await transaction.plan.findFirst({
+          where: {
+            isActive: true,
+            isTrial: true,
+          },
+          orderBy: {
+            createdAt: "asc",
+          },
+        })
+      : null;
+    const fallbackPaidPlan = !trialPlan
+      ? await transaction.plan.findFirst({
+          where: {
+            isActive: true,
+            isTrial: false,
+          },
+          orderBy: {
+            createdAt: "asc",
+          },
+        })
+      : null;
+
     const createdUser = await transaction.user.create({
       data: {
         name: payload.name,
@@ -2504,7 +4246,26 @@ app.post("/auth/setup-access", async (request, response) => {
         name: true,
         username: true,
         role: true,
+        timeZone: true,
         createdAt: true,
+      },
+    });
+
+    const hasAutoTrial = billingSettings.autoTrialEnabled && billingSettings.autoTrialDays > 0 && trialPlan;
+    const trialEndsAt = hasAutoTrial
+      ? new Date(now.getTime() + billingSettings.autoTrialDays * 24 * 60 * 60 * 1000)
+      : null;
+
+    await transaction.userPlanSubscription.create({
+      data: {
+        userId: createdUser.id,
+        planId: hasAutoTrial ? trialPlan.id : fallbackPaidPlan?.id ?? null,
+        status: hasAutoTrial ? "TRIALING" : "PAYMENT_REQUIRED",
+        billingModel: hasAutoTrial ? "TRIAL" : "NONE",
+        startsAt: now,
+        trialEndsAt,
+        endsAt: trialEndsAt,
+        blockedReason: hasAutoTrial ? null : "Aguardando pagamento inicial.",
       },
     });
 
@@ -2516,7 +4277,8 @@ app.post("/auth/setup-access", async (request, response) => {
     return createdUser;
   });
 
-  response.status(201).json(user);
+  const authUserPayload = await buildAuthUserPayload(user);
+  response.status(201).json(authUserPayload);
 });
 
 app.post("/auth/login", async (request, response) => {
@@ -2541,19 +4303,25 @@ app.post("/auth/login", async (request, response) => {
       id: true,
       name: true,
       username: true,
+      timeZone: true,
       role: true,
     },
   });
 
+  const authUserPayload = await buildAuthUserPayload(authenticatedUser);
+
   response.json({
     sessionToken,
-    user: authenticatedUser,
+    user: authUserPayload,
   });
 });
 
 app.get("/auth/me", adminAuthMiddleware, async (request, response) => {
-  const user = (request as Request & { adminUser?: { id: string; name: string; username: string; role: string } }).adminUser!;
-  response.json({ user });
+  const user = (
+    request as Request & { adminUser?: { id: string; name: string; username: string; timeZone: string; role: string } }
+  ).adminUser!;
+  const authUserPayload = await buildAuthUserPayload(user);
+  response.json({ user: authUserPayload });
 });
 
 app.put("/auth/profile", adminAuthMiddleware, async (request, response) => {
@@ -2576,16 +4344,22 @@ app.put("/auth/profile", adminAuthMiddleware, async (request, response) => {
       name: payload.name,
       username: payload.username,
       passwordHash: payload.password ? hashPassword(payload.password) : undefined,
+      timeZone:
+        payload.timeZone === undefined || payload.timeZone === null
+          ? undefined
+          : normalizeUserTimeZone(payload.timeZone),
     },
     select: {
       id: true,
       name: true,
       username: true,
+      timeZone: true,
       role: true,
     },
   });
 
-  response.json({ user: updatedUser });
+  const authUserPayload = await buildAuthUserPayload(updatedUser);
+  response.json({ user: authUserPayload });
 });
 
 app.post("/auth/logout", adminAuthMiddleware, async (request, response) => {
@@ -2753,26 +4527,103 @@ app.get("/oauth/instagram/callback", async (request, response) => {
   }
 });
 
+app.post(STRIPE_WEBHOOK_PATH, async (request, response) => {
+  if (!STRIPE_SECRET_KEY || !STRIPE_WEBHOOK_SECRET) {
+    response.status(503).json({
+      error: "Stripe webhook indisponível. Configure STRIPE_SECRET_KEY e STRIPE_WEBHOOK_SECRET no backend.",
+    });
+    return;
+  }
+
+  const webhookRequest = request as StripeWebhookRequest;
+  const signatureHeader = request.headers["stripe-signature"];
+  const signature = Array.isArray(signatureHeader) ? signatureHeader[0] : signatureHeader;
+  if (!signature) {
+    response.status(400).json({ error: "Cabeçalho stripe-signature ausente." });
+    return;
+  }
+  if (!webhookRequest.rawBody) {
+    response.status(400).json({ error: "Payload raw do webhook não disponível para validação." });
+    return;
+  }
+
+  let event: Stripe.Event;
+  try {
+    const stripe = ensureStripeClient();
+    event = stripe.webhooks.constructEvent(webhookRequest.rawBody, signature, STRIPE_WEBHOOK_SECRET);
+  } catch (error) {
+    response.status(400).json({
+      error: error instanceof Error ? `Assinatura inválida do webhook: ${error.message}` : "Assinatura inválida do webhook.",
+    });
+    return;
+  }
+
+  try {
+    await handleStripeWebhookEvent(event);
+    response.json({ received: true });
+  } catch (error) {
+    console.error("Stripe webhook processing failed", error);
+    response.status(500).json({ error: "Falha ao processar webhook Stripe." });
+  }
+});
+
 app.use(
-  ["/companies", "/connections", "/upload", "/jobs", "/dashboard", "/logs", "/avisos"],
+  ["/companies", "/connections", "/upload", "/jobs", "/dashboard", "/logs", "/avisos", "/billing"],
   adminAuthMiddleware,
+);
+
+app.use(
+  ["/companies", "/connections", "/upload", "/jobs"],
+  async (request, response, next) => {
+    const authRequest = request as Request & { adminUser?: AdminUserAuth };
+    const writableMethod = !["GET", "HEAD", "OPTIONS"].includes(request.method.toUpperCase());
+    if (!writableMethod || isRootUser(authRequest)) {
+      next();
+      return;
+    }
+
+    try {
+      await ensureBillingWritableAccess(authRequest);
+      next();
+    } catch (error) {
+      response.status(402).json({
+        error:
+          error instanceof Error && error.message
+            ? error.message
+            : "Conta bloqueada por pagamento pendente. Renove para continuar.",
+      });
+    }
+  },
 );
 
 app.get("/connections", async (request, response) => {
   const companyId = typeof request.query.companyId === "string" ? request.query.companyId : undefined;
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
   const connections = await prisma.socialConnection.findMany({
-    where: companyId ? { companyId } : undefined,
+    where: connectionVisibilityWhere(authRequest, companyId),
     orderBy: [{ companyId: "asc" }, { createdAt: "desc" }],
   });
 
-  response.json(connections.map((connection) => mapConnection(connection)));
+  const mappedConnections = await Promise.all(
+    connections.map(async (connection) => {
+      const runtimeMetadata = await resolveConnectionRuntimeMetadata(connection);
+      return {
+        ...mapConnection(connection),
+        ...runtimeMetadata,
+      };
+    }),
+  );
+
+  response.json(mappedConnections);
 });
 
 app.get("/connections/:id/instagram-location-candidates", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
   const connection = await prisma.socialConnection.findUnique({
     where: { id: request.params.id },
     select: {
       id: true,
+      createdByUserId: true,
       platform: true,
       secretCipher: true,
     },
@@ -2780,6 +4631,11 @@ app.get("/connections/:id/instagram-location-candidates", async (request, respon
 
   if (!connection || connection.platform !== "instagram") {
     response.status(404).json({ error: "Conta do Instagram não encontrada." });
+    return;
+  }
+
+  if (!isRootUser(authRequest) && connection.createdByUserId !== authRequest.adminUser?.id) {
+    response.status(403).json({ error: "Você não pode consultar localizações desta conta." });
     return;
   }
 
@@ -2815,15 +4671,29 @@ app.get("/connections/:id/instagram-location-candidates", async (request, respon
 
 app.post("/connections", async (request, response) => {
   const payload = createConnectionSchema.parse(request.body);
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
   const loginIdentifier = payload.loginIdentifier?.trim() || null;
   const secretCipher = encodeSecret(payload.secret);
   const company = await prisma.company.findUnique({
     where: { id: payload.companyId },
-    select: { id: true },
+    select: { id: true, createdByUserId: true },
   });
 
   if (!company) {
     response.status(400).json({ error: "Perfil inválido. Selecione um perfil existente." });
+    return;
+  }
+
+  if (!isRootUser(authRequest) && company.createdByUserId !== authRequest.adminUser?.id) {
+    response.status(403).json({ error: "Você não pode adicionar conta em um perfil de outro usuário." });
+    return;
+  }
+
+  const billingAccess = await ensureBillingWritableAccess(authRequest);
+  if (billingAccess && billingAccess.plan && billingAccess.usage.connectionsUsed >= billingAccess.plan.maxConnections) {
+    response.status(409).json({
+      error: `Seu plano atingiu o limite de ${billingAccess.plan.maxConnections} conta(s) conectada(s).`,
+    });
     return;
   }
 
@@ -2843,6 +4713,7 @@ app.post("/connections", async (request, response) => {
   const connection = await prisma.socialConnection.create({
     data: {
       companyId: payload.companyId,
+      createdByUserId: authRequest.adminUser!.id,
       platform: payload.platform,
       displayName: payload.displayName,
       loginIdentifier,
@@ -2864,12 +4735,18 @@ app.post("/connections", async (request, response) => {
 
 app.put("/connections/:id", async (request, response) => {
   const payload = updateConnectionSchema.parse(request.body);
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
   const existingConnection = await prisma.socialConnection.findUnique({
     where: { id: request.params.id },
   });
 
   if (!existingConnection) {
     response.status(404).json({ error: "Conexao nao encontrada." });
+    return;
+  }
+
+  if (!isRootUser(authRequest) && existingConnection.createdByUserId !== authRequest.adminUser?.id) {
+    response.status(403).json({ error: "Você não pode editar uma conta de outro usuário." });
     return;
   }
 
@@ -2903,6 +4780,7 @@ app.put("/connections/:id", async (request, response) => {
 });
 
 app.post("/connections/:id/open-visual-auth", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
   const payload = openVisualAuthSchema.parse(request.body ?? {});
   const connection = await prisma.socialConnection.findUnique({
     where: { id: request.params.id },
@@ -2910,6 +4788,11 @@ app.post("/connections/:id/open-visual-auth", async (request, response) => {
 
   if (!connection) {
     response.status(404).json({ error: "Conexao nao encontrada." });
+    return;
+  }
+
+  if (!isRootUser(authRequest) && connection.createdByUserId !== authRequest.adminUser?.id) {
+    response.status(403).json({ error: "Você não pode autenticar uma conta de outro usuário." });
     return;
   }
 
@@ -2984,12 +4867,18 @@ app.post("/connections/:id/open-visual-auth", async (request, response) => {
 });
 
 app.post("/connections/:id/regenerate-qr", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
   const connection = await prisma.socialConnection.findUnique({
     where: { id: request.params.id },
   });
 
   if (!connection) {
     response.status(404).json({ error: "Conexao nao encontrada." });
+    return;
+  }
+
+  if (!isRootUser(authRequest) && connection.createdByUserId !== authRequest.adminUser?.id) {
+    response.status(403).json({ error: "Você não pode gerar QR para uma conta de outro usuário." });
     return;
   }
 
@@ -3026,12 +4915,18 @@ app.post("/connections/:id/regenerate-qr", async (request, response) => {
 });
 
 app.post("/connections/:id/dismiss-qr", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
   const connection = await prisma.socialConnection.findUnique({
     where: { id: request.params.id },
   });
 
   if (!connection) {
     response.status(404).json({ error: "Conexao nao encontrada." });
+    return;
+  }
+
+  if (!isRootUser(authRequest) && connection.createdByUserId !== authRequest.adminUser?.id) {
+    response.status(403).json({ error: "Você não pode encerrar QR de uma conta de outro usuário." });
     return;
   }
 
@@ -3060,12 +4955,18 @@ app.post("/connections/:id/dismiss-qr", async (request, response) => {
 });
 
 app.post("/connections/:id/disconnect", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
   const connection = await prisma.socialConnection.findUnique({
     where: { id: request.params.id },
   });
 
   if (!connection) {
     response.status(404).json({ error: "Conexao nao encontrada." });
+    return;
+  }
+
+  if (!isRootUser(authRequest) && connection.createdByUserId !== authRequest.adminUser?.id) {
+    response.status(403).json({ error: "Você não pode desconectar conta de outro usuário." });
     return;
   }
 
@@ -3094,12 +4995,18 @@ app.post("/connections/:id/disconnect", async (request, response) => {
 });
 
 app.delete("/connections/:id", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
   const connection = await prisma.socialConnection.findUnique({
     where: { id: request.params.id },
   });
 
   if (!connection) {
     response.status(404).json({ error: "Conexao nao encontrada." });
+    return;
+  }
+
+  if (!isRootUser(authRequest) && connection.createdByUserId !== authRequest.adminUser?.id) {
+    response.status(403).json({ error: "Você não pode excluir conta de outro usuário." });
     return;
   }
 
@@ -3133,7 +5040,9 @@ app.delete("/connections/:id", async (request, response) => {
 });
 
 app.get("/companies", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
   const companies = await prisma.company.findMany({
+    where: companyVisibilityWhere(authRequest),
     orderBy: { createdAt: "desc" },
   });
   response.json(companies);
@@ -3141,7 +5050,21 @@ app.get("/companies", async (request, response) => {
 
 app.post("/companies", async (request, response) => {
   const payload = createCompanySchema.parse(request.body);
-  const company = await prisma.company.create({ data: payload });
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  const billingAccess = await ensureBillingWritableAccess(authRequest);
+  if (billingAccess && billingAccess.plan && billingAccess.usage.profilesUsed >= billingAccess.plan.maxProfiles) {
+    response.status(409).json({
+      error: `Seu plano atingiu o limite de ${billingAccess.plan.maxProfiles} perfil(is).`,
+    });
+    return;
+  }
+
+  const company = await prisma.company.create({
+    data: {
+      ...payload,
+      createdByUserId: authRequest.adminUser!.id,
+    },
+  });
   response.status(201).json(company);
 });
 
@@ -3271,6 +5194,7 @@ app.get("/jobs/instagram-location-suggestions", async (request, response) => {
     select: {
       id: true,
       companyId: true,
+      createdByUserId: true,
       platform: true,
       authStatus: true,
       secretCipher: true,
@@ -3279,6 +5203,11 @@ app.get("/jobs/instagram-location-suggestions", async (request, response) => {
 
   if (!connection || connection.platform !== "instagram") {
     response.status(404).json({ error: "Conta do Instagram não encontrada." });
+    return;
+  }
+
+  if (!isRootUser(authRequest) && connection.createdByUserId !== authRequest.adminUser?.id) {
+    response.status(403).json({ error: "Você não pode buscar sugestões para conta de outro usuário." });
     return;
   }
 
@@ -3372,7 +5301,22 @@ app.get("/jobs", async (request, response) => {
 app.post("/jobs", async (request, response) => {
   const payload = createJobSchema.parse(request.body);
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
-  await ensureMatchingConnection(payload);
+  await ensureMatchingConnection({
+    request: authRequest,
+    ...payload,
+  });
+  const billingAccess = await ensureBillingWritableAccess(authRequest);
+  if (
+    billingAccess &&
+    normalizePublicationState(payload.publicationState) === "PUBLISHED" &&
+    billingAccess.plan &&
+    billingAccess.usage.postsUsedThisMonth >= billingAccess.plan.maxMonthlyPublications
+  ) {
+    response.status(409).json({
+      error: `Seu plano atingiu o limite mensal de ${billingAccess.plan.maxMonthlyPublications} publicação(ões).`,
+    });
+    return;
+  }
   const legacyFields = deriveLegacyJobFields(payload.publicationType);
   const filePath = ensureFilePathForPublication(
     payload.publicationType,
@@ -3423,7 +5367,10 @@ app.post("/jobs", async (request, response) => {
 app.put("/jobs/:id", async (request, response) => {
   const payload = updateJobSchema.parse(request.body);
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
-  await ensureMatchingConnection(payload);
+  await ensureMatchingConnection({
+    request: authRequest,
+    ...payload,
+  });
   const legacyFields = deriveLegacyJobFields(payload.publicationType);
   const filePath = ensureFilePathForPublication(
     payload.publicationType,
@@ -3456,6 +5403,24 @@ app.put("/jobs/:id", async (request, response) => {
     return;
   }
 
+  const nextPublicationState = normalizePublicationState(payload.publicationState ?? existingJob.publicationState);
+  const previousPublicationState = normalizePublicationState(existingJob.publicationState);
+  const willConsumeMonthlyQuota = previousPublicationState !== "PUBLISHED" && nextPublicationState === "PUBLISHED";
+
+  if (!isRootUser(authRequest) && willConsumeMonthlyQuota) {
+    const billingAccess = await ensureBillingWritableAccess(authRequest);
+    if (
+      billingAccess &&
+      billingAccess.plan &&
+      billingAccess.usage.postsUsedThisMonth >= billingAccess.plan.maxMonthlyPublications
+    ) {
+      response.status(409).json({
+        error: `Seu plano atingiu o limite mensal de ${billingAccess.plan.maxMonthlyPublications} publicação(ões).`,
+      });
+      return;
+    }
+  }
+
   const job = await prisma.job.update({
     where: { id: request.params.id },
     data: {
@@ -3466,7 +5431,7 @@ app.put("/jobs/:id", async (request, response) => {
       caption: metadata.caption,
       locationName: metadata.locationName,
       publicationType: payload.publicationType,
-      publicationState: normalizePublicationState(payload.publicationState ?? existingJob.publicationState),
+      publicationState: nextPublicationState,
       postStory: legacyFields.postStory,
       postReel: legacyFields.postReel,
       postWhatsapp: legacyFields.postWhatsapp,
@@ -3601,6 +5566,20 @@ app.post("/jobs/:id/publish", async (request, response) => {
     return;
   }
 
+  if (!isRootUser(authRequest)) {
+    const billingAccess = await ensureBillingWritableAccess(authRequest);
+    if (
+      billingAccess &&
+      billingAccess.plan &&
+      billingAccess.usage.postsUsedThisMonth >= billingAccess.plan.maxMonthlyPublications
+    ) {
+      response.status(409).json({
+        error: `Seu plano atingiu o limite mensal de ${billingAccess.plan.maxMonthlyPublications} publicação(ões).`,
+      });
+      return;
+    }
+  }
+
   const willRunImmediately = existingJob.dataPostagem.getTime() <= Date.now();
   const job = await prisma.job.update({
     where: { id: request.params.id },
@@ -3703,7 +5682,7 @@ app.get("/dashboard", async (request, response) => {
     prisma.job.findMany({ where, select: { status: true, publicationState: true } }),
     prisma.socialConnection.count({
       where: {
-        companyId: companyId ?? undefined,
+        ...connectionVisibilityWhere(authRequest, companyId),
         authStatus: {
           in: ["CONNECTED", "AUTH_IN_PROGRESS"],
         },
@@ -3741,6 +5720,901 @@ app.get("/dashboard", async (request, response) => {
     instagramForcedLocationId: INSTAGRAM_FORCED_LOCATION_ID,
     instagramForcedLocationName: INSTAGRAM_FORCED_LOCATION_ID ? INSTAGRAM_FORCED_LOCATION_NAME : null,
   });
+});
+
+app.get("/billing/me", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  const userId = authRequest.adminUser!.id;
+  const monthBounds = currentMonthBounds(new Date());
+
+  if (isRootUser(authRequest)) {
+    const bestPlan = await getRootDisplayPlanForDisplay();
+    response.json({
+      status: "ACTIVE",
+      billingModel: "MANUAL",
+      cycle: null,
+      isBlocked: false,
+      blockMessage: null,
+      startsAt: null,
+      endsAt: null,
+      trialEndsAt: null,
+      plan: {
+        id: bestPlan?.id ?? "root",
+        code: bestPlan?.code ?? "ROOT",
+        name: bestPlan?.name ?? "Root",
+        isTrial: bestPlan?.isTrial ?? false,
+        maxProfiles: bestPlan?.maxProfiles ?? 999999,
+        maxConnections: bestPlan?.maxConnections ?? 999999,
+        maxMonthlyPublications: bestPlan?.maxMonthlyPublications ?? 999999999,
+      },
+      usage: {
+        profilesUsed: await prisma.company.count(),
+        connectionsUsed: await prisma.socialConnection.count(),
+        postsUsedThisMonth: await prisma.job.count({
+          where: {
+            publicationState: "PUBLISHED",
+            criadoEm: {
+              gte: monthBounds.start,
+              lt: monthBounds.end,
+            },
+          },
+        }),
+      },
+      canCancelStripeSubscription: false,
+      stripeCancelAtPeriodEnd: false,
+    });
+    return;
+  }
+
+  const billing = await resolveUserBillingAccess(userId);
+  response.json({
+    status: billing.status,
+    billingModel: billing.billingModel,
+    cycle: billing.cycle,
+    isBlocked: billing.isBlocked,
+    blockMessage: billing.blockMessage,
+    startsAt: billing.startsAt,
+    endsAt: billing.endsAt,
+    trialEndsAt: billing.trialEndsAt,
+    plan: billing.plan,
+    usage: billing.usage,
+    canCancelStripeSubscription:
+      billing.billingModel === "STRIPE_SUBSCRIPTION" && !billing.stripeCancelAtPeriodEnd,
+    stripeCancelAtPeriodEnd: billing.stripeCancelAtPeriodEnd,
+  });
+});
+
+app.get("/billing/plans", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  const plans = await prisma.plan.findMany({
+    where: isRootUser(authRequest) ? undefined : { isActive: true },
+    orderBy: [{ isTrial: "desc" }, { createdAt: "asc" }],
+  });
+
+  const stripeProductIds = Array.from(
+    new Set(
+      plans
+        .map((plan) => trimNullable(plan.stripeProductId))
+        .filter((value): value is string => Boolean(value)),
+    ),
+  );
+
+  const resolvedStripeByProductId = new Map<string, ResolvedStripePlanPriceIds>();
+  if (stripeProductIds.length > 0 && STRIPE_SECRET_KEY) {
+    try {
+      const stripe = ensureStripeClient();
+      const pricesResponse = await stripe.prices.list({
+        active: true,
+        limit: 100,
+      });
+
+      const pricesByProductId = new Map<string, Stripe.Price[]>();
+      for (const price of pricesResponse.data) {
+        if (typeof price.product !== "string") {
+          continue;
+        }
+        if (!stripeProductIds.includes(price.product)) {
+          continue;
+        }
+        const current = pricesByProductId.get(price.product) ?? [];
+        current.push(price);
+        pricesByProductId.set(price.product, current);
+      }
+
+      for (const stripeProductId of stripeProductIds) {
+        const productPrices = pricesByProductId.get(stripeProductId) ?? [];
+        resolvedStripeByProductId.set(stripeProductId, resolveStripePlanPriceIdsFromPriceList(productPrices));
+      }
+    } catch {
+      // Se Stripe estiver indisponível, mantém os valores persistidos localmente.
+    }
+  }
+
+  response.json(
+    plans.map((plan) => ({
+      id: plan.id,
+      code: plan.code,
+      name: plan.name,
+      description: plan.description,
+      isActive: plan.isActive,
+      isTrial: plan.isTrial,
+      maxProfiles: plan.maxProfiles,
+      maxConnections: plan.maxConnections,
+      maxMonthlyPublications: plan.maxMonthlyPublications,
+      monthlyPriceCents: plan.monthlyPriceCents,
+      yearlyPriceCents: plan.yearlyPriceCents,
+      stripeProductId: plan.stripeProductId,
+      stripeMonthlyPriceId: plan.stripeMonthlyPriceId,
+      stripeYearlyPriceId: plan.stripeYearlyPriceId,
+      stripePixMonthlyPriceId: plan.stripePixMonthlyPriceId,
+      stripePixYearlyPriceId: plan.stripePixYearlyPriceId,
+      createdAt: plan.createdAt,
+      updatedAt: plan.updatedAt,
+      ...(function resolveRuntimeStripeBinding() {
+        const stripeProductId = trimNullable(plan.stripeProductId);
+        if (!stripeProductId) {
+          return {};
+        }
+        const resolved = resolvedStripeByProductId.get(stripeProductId);
+        if (!resolved) {
+          return {};
+        }
+        return {
+          monthlyPriceCents: resolved.stripeMonthlyPriceCents,
+          yearlyPriceCents: resolved.stripeYearlyPriceCents,
+          stripeMonthlyPriceId: resolved.stripeMonthlyPriceId,
+          stripeYearlyPriceId: resolved.stripeYearlyPriceId,
+          stripePixMonthlyPriceId: resolved.stripePixMonthlyPriceId,
+          stripePixYearlyPriceId: resolved.stripePixYearlyPriceId,
+        };
+      })(),
+    })),
+  );
+});
+
+app.get("/billing/stripe/catalog", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  if (!isRootUser(authRequest)) {
+    response.status(403).json({ error: "Apenas root pode listar catálogo Stripe." });
+    return;
+  }
+
+  try {
+    const stripe = ensureStripeClient();
+    const [products, prices] = await Promise.all([
+      stripe.products.list({ active: true, limit: 100 }),
+      stripe.prices.list({ active: true, limit: 100 }),
+    ]);
+
+    const pricesByProductId = new Map<string, Stripe.Price[]>();
+    for (const price of prices.data) {
+      if (typeof price.product !== "string") {
+        continue;
+      }
+      const current = pricesByProductId.get(price.product) ?? [];
+      current.push(price);
+      pricesByProductId.set(price.product, current);
+    }
+
+    const resolvedByProduct: Record<string, ResolvedStripePlanPriceIds> = {};
+    for (const product of products.data) {
+      const productPrices = pricesByProductId.get(product.id) ?? [];
+      resolvedByProduct[product.id] = resolveStripePlanPriceIdsFromPriceList(productPrices);
+    }
+
+    response.json({
+      products: products.data.map((item) => ({
+        id: item.id,
+        name: item.name,
+        active: item.active,
+        defaultPriceId: typeof item.default_price === "string" ? item.default_price : null,
+      })),
+      resolvedByProduct,
+    });
+  } catch (error) {
+    response.status(400).json({
+      error: error instanceof Error ? error.message : "Falha ao carregar catálogo Stripe.",
+    });
+  }
+});
+
+app.post("/billing/checkout/start", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  if (isRootUser(authRequest)) {
+    response.status(409).json({ error: "Conta root não usa checkout de cobrança." });
+    return;
+  }
+
+  const payload = startStripeCheckoutSchema.parse(request.body);
+  const user = authRequest.adminUser;
+  if (!user) {
+    response.status(401).json({ error: "Sessão inválida." });
+    return;
+  }
+
+  const stripe = ensureStripeClient();
+  const [plan, currentSubscription] = await Promise.all([
+    prisma.plan.findUnique({
+      where: { id: payload.planId },
+      select: {
+        id: true,
+        name: true,
+        isTrial: true,
+        isActive: true,
+        stripeProductId: true,
+        stripeMonthlyPriceId: true,
+        stripeYearlyPriceId: true,
+        stripePixMonthlyPriceId: true,
+        stripePixYearlyPriceId: true,
+      },
+    }),
+    prisma.userPlanSubscription.findUnique({
+      where: { userId: user.id },
+      select: { id: true, stripeCustomerId: true },
+    }),
+  ]);
+
+  if (!plan) {
+    response.status(404).json({ error: "Plano não encontrado." });
+    return;
+  }
+  if (!plan.isActive) {
+    response.status(409).json({ error: "Plano inativo no momento." });
+    return;
+  }
+  if (plan.isTrial) {
+    response.status(409).json({ error: "Plano trial não usa checkout Stripe." });
+    return;
+  }
+
+  let resolvedPlanStripePrices: ResolvedStripePlanPriceIds = {
+    stripeMonthlyPriceId: plan.stripeMonthlyPriceId,
+    stripeYearlyPriceId: plan.stripeYearlyPriceId,
+    stripePixMonthlyPriceId: plan.stripePixMonthlyPriceId,
+    stripePixYearlyPriceId: plan.stripePixYearlyPriceId,
+    stripeMonthlyPriceCents: null,
+    stripeYearlyPriceCents: null,
+    stripePixMonthlyPriceCents: null,
+    stripePixYearlyPriceCents: null,
+  };
+
+  if (plan.stripeProductId) {
+    try {
+      resolvedPlanStripePrices = await resolveStripePlanPriceIdsFromProduct(plan.stripeProductId);
+    } catch (error) {
+      response.status(400).json({
+        error:
+          error instanceof Error
+            ? `Falha ao consultar preços do produto Stripe: ${error.message}`
+            : "Falha ao consultar preços do produto Stripe.",
+      });
+      return;
+    }
+
+    const missingPriceKinds = listMissingRequiredStripePriceKinds(resolvedPlanStripePrices);
+    if (missingPriceKinds.length > 0) {
+      response.status(409).json({
+        error: `Produto Stripe sem preços obrigatórios: ${missingPriceKinds.join(", ")}.`,
+      });
+      return;
+    }
+
+    if (hasStripeCyclePriceMismatch(resolvedPlanStripePrices)) {
+      response.status(409).json({
+        error:
+          "Os preços da assinatura e do PIX devem ser iguais por ciclo (mensal com mensal, anual com anual).",
+      });
+      return;
+    }
+  }
+
+  const isSubscriptionMode = payload.billingModel === "STRIPE_SUBSCRIPTION";
+  const selectedPriceId = isSubscriptionMode
+    ? payload.cycle === "MONTHLY"
+      ? trimNullable(resolvedPlanStripePrices.stripeMonthlyPriceId)
+      : trimNullable(resolvedPlanStripePrices.stripeYearlyPriceId)
+    : payload.cycle === "MONTHLY"
+      ? trimNullable(resolvedPlanStripePrices.stripePixMonthlyPriceId)
+      : trimNullable(resolvedPlanStripePrices.stripePixYearlyPriceId);
+
+  if (!selectedPriceId) {
+    response.status(409).json({
+      error: isSubscriptionMode
+        ? "Este plano ainda não possui Price ID de assinatura para o ciclo selecionado."
+        : "Este plano ainda não possui Price ID de PIX avulso para o ciclo selecionado.",
+    });
+    return;
+  }
+
+  let stripeCustomerId = trimNullable(currentSubscription?.stripeCustomerId);
+  if (!stripeCustomerId) {
+    const customer = await stripe.customers.create({
+      name: user.name || user.username,
+      metadata: {
+        socialupUserId: user.id,
+        socialupUsername: user.username,
+      },
+    });
+    stripeCustomerId = customer.id;
+
+    if (currentSubscription) {
+      await prisma.userPlanSubscription.update({
+        where: { id: currentSubscription.id },
+        data: { stripeCustomerId },
+      });
+    } else {
+      await prisma.userPlanSubscription.create({
+        data: {
+          userId: user.id,
+          planId: plan.id,
+          status: "PAYMENT_REQUIRED",
+          billingModel: "NONE",
+          cycle: null,
+          startsAt: new Date(),
+          stripeCustomerId,
+        },
+      });
+    }
+  }
+
+  const metadata = {
+    socialupUserId: user.id,
+    socialupPlanId: plan.id,
+    socialupBillingModel: payload.billingModel,
+    socialupCycle: payload.cycle,
+    socialupPriceId: selectedPriceId,
+  };
+
+  const expiresHours = Math.max(1, Math.min(24, STRIPE_PIX_CHECKOUT_EXPIRES_HOURS));
+  const expiresAtSeconds = Math.floor(Date.now() / 1000) + expiresHours * 60 * 60;
+  const session = await stripe.checkout.sessions.create({
+    mode: isSubscriptionMode ? "subscription" : "payment",
+    customer: stripeCustomerId,
+    success_url: buildStripeCheckoutSuccessUrl(),
+    cancel_url: buildStripeCheckoutCancelUrl(),
+    line_items: [{ price: selectedPriceId, quantity: 1 }],
+    payment_method_types: isSubscriptionMode ? undefined : ["pix"],
+    expires_at: isSubscriptionMode ? undefined : expiresAtSeconds,
+    allow_promotion_codes: isSubscriptionMode ? true : undefined,
+    metadata,
+    subscription_data: isSubscriptionMode ? { metadata } : undefined,
+    payment_intent_data: isSubscriptionMode ? undefined : { metadata },
+    client_reference_id: user.id,
+  });
+
+  response.json({
+    sessionId: session.id,
+    url: session.url,
+  });
+});
+
+app.post("/billing/checkout/confirm", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  if (isRootUser(authRequest)) {
+    response.status(409).json({ error: "Conta root não usa checkout de cobrança." });
+    return;
+  }
+
+  const payload = confirmStripeCheckoutSchema.parse(request.body);
+  const user = authRequest.adminUser;
+  if (!user) {
+    response.status(401).json({ error: "Sessão inválida." });
+    return;
+  }
+
+  const stripe = ensureStripeClient();
+  const session = await stripe.checkout.sessions.retrieve(payload.sessionId, {
+    expand: ["subscription", "payment_intent"],
+  });
+
+  const metadataUserId = trimNullable(session.metadata?.socialupUserId);
+  const sessionUserId = trimNullable(session.client_reference_id);
+  const resolvedUserId = metadataUserId || sessionUserId;
+
+  if (!resolvedUserId || resolvedUserId !== user.id) {
+    response.status(403).json({ error: "Sessão de checkout não pertence ao usuário autenticado." });
+    return;
+  }
+
+  if (session.status !== "complete") {
+    response.json({
+      applied: false,
+      status: session.status,
+      message: "Checkout ainda não concluído. Aguarde a confirmação do Stripe.",
+    });
+    return;
+  }
+
+  const activation = await applyStripeCheckoutSessionActivation(session);
+  if (!activation.applied) {
+    response.status(409).json({ error: activation.message });
+    return;
+  }
+  if (activation.userId !== user.id) {
+    response.status(403).json({ error: "Sessão de checkout não pertence ao usuário autenticado." });
+    return;
+  }
+
+  response.json({
+    applied: true,
+    status: "ACTIVE",
+    billingModel: activation.billingModel,
+    cycle: activation.cycle,
+    message: activation.message,
+  });
+});
+
+app.post("/billing/subscription/cancel", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  if (isRootUser(authRequest)) {
+    response.status(409).json({ error: "Conta root não possui assinatura para cancelar." });
+    return;
+  }
+
+  const user = authRequest.adminUser;
+  if (!user) {
+    response.status(401).json({ error: "Sessão inválida." });
+    return;
+  }
+
+  const currentSubscription = await prisma.userPlanSubscription.findUnique({
+    where: { userId: user.id },
+    select: {
+      id: true,
+      status: true,
+      billingModel: true,
+      stripeSubscriptionId: true,
+      stripeCustomerId: true,
+    },
+  });
+
+  if (!currentSubscription || currentSubscription.billingModel !== "STRIPE_SUBSCRIPTION") {
+    response.status(409).json({ error: "Nenhuma assinatura recorrente ativa para cancelar." });
+    return;
+  }
+
+  let stripeSubscriptionId = trimNullable(currentSubscription.stripeSubscriptionId);
+  const stripeCustomerId = trimNullable(currentSubscription.stripeCustomerId);
+  const stripe = ensureStripeClient();
+  if (!stripeSubscriptionId && stripeCustomerId) {
+    const list = await stripe.subscriptions.list({
+      customer: stripeCustomerId,
+      status: "all",
+      limit: 20,
+    });
+
+    const activeOrPending = list.data.find((subscription) =>
+      ["active", "trialing", "past_due", "unpaid", "incomplete"].includes(subscription.status),
+    );
+
+    if (activeOrPending) {
+      stripeSubscriptionId = activeOrPending.id;
+      await prisma.userPlanSubscription.update({
+        where: { id: currentSubscription.id },
+        data: { stripeSubscriptionId },
+      });
+    }
+  }
+
+  if (!stripeSubscriptionId) {
+    response.status(409).json({ error: "Assinatura recorrente não encontrada no Stripe para cancelar." });
+    return;
+  }
+
+  const stripeSubscriptionResponse = await stripe.subscriptions.update(stripeSubscriptionId, {
+    cancel_at_period_end: true,
+  });
+  const stripeSubscription = stripeSubscriptionResponse as unknown as Stripe.Subscription;
+
+  const currentPeriodEndSeconds = (stripeSubscription.items?.data ?? []).reduce((maxValue, item) => {
+    if (typeof item.current_period_end !== "number") {
+      return maxValue;
+    }
+    return Math.max(maxValue, item.current_period_end);
+  }, 0);
+  const periodEnd = currentPeriodEndSeconds > 0 ? new Date(currentPeriodEndSeconds * 1000) : null;
+
+  await prisma.userPlanSubscription.update({
+    where: { id: currentSubscription.id },
+    data: {
+      endsAt: periodEnd ?? undefined,
+      blockedReason: null,
+      status: stripeSubscription.status === "active" ? "ACTIVE" : currentSubscription.status,
+    },
+  });
+
+  await appendBillingAvisoSafely({
+    userId: user.id,
+    title: "Assinatura em cancelamento",
+    kind: "PLAN_UPDATED",
+    message: "Assinatura marcada para cancelamento no fim do ciclo atual.",
+  });
+
+  response.json({
+    ok: true,
+    endsAt: periodEnd?.toISOString() ?? null,
+    message: "Assinatura marcada para cancelamento no fim do ciclo atual.",
+  });
+});
+
+app.post("/billing/plans", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  if (!isRootUser(authRequest)) {
+    response.status(403).json({ error: "Apenas root pode cadastrar planos." });
+    return;
+  }
+
+  const payload = createPlanSchema.parse(request.body);
+  const normalizedCode = normalizePlanCode(payload.code);
+  const normalizedDescription = trimNullable(payload.description);
+  const normalizedStripeProductId = trimNullable(payload.stripeProductId);
+
+  if (payload.isTrial) {
+    if (normalizedStripeProductId) {
+      response.status(400).json({
+        error: "Plano trial não deve ter produto Stripe vinculado.",
+      });
+      return;
+    }
+
+    const existingTrial = await prisma.plan.findFirst({
+      where: { isTrial: true },
+      select: { id: true, name: true },
+    });
+    if (existingTrial) {
+      response.status(409).json({
+        error: `Já existe um plano trial (${existingTrial.name}). Deixe apenas um trial ativo no sistema.`,
+      });
+      return;
+    }
+  }
+
+  if (!payload.isTrial && !normalizedStripeProductId) {
+    response.status(400).json({
+      error: "Plano pago exige produto Stripe vinculado.",
+    });
+    return;
+  }
+
+  let resolvedStripePriceIds: ResolvedStripePlanPriceIds = EMPTY_STRIPE_PLAN_PRICE_IDS;
+  if (!payload.isTrial && normalizedStripeProductId) {
+    try {
+      resolvedStripePriceIds = await resolveStripePlanPriceIdsFromProduct(normalizedStripeProductId);
+    } catch (error) {
+      response.status(400).json({
+        error:
+          error instanceof Error
+            ? `Falha ao consultar preços do produto Stripe: ${error.message}`
+            : "Falha ao consultar preços do produto Stripe.",
+      });
+      return;
+    }
+
+    const missingPriceKinds = listMissingRequiredStripePriceKinds(resolvedStripePriceIds);
+    if (missingPriceKinds.length > 0) {
+      response.status(409).json({
+        error: `Produto Stripe sem preços obrigatórios: ${missingPriceKinds.join(", ")}.`,
+      });
+      return;
+    }
+
+    if (hasStripeCyclePriceMismatch(resolvedStripePriceIds)) {
+      response.status(409).json({
+        error:
+          "Os preços da assinatura e do PIX devem ser iguais por ciclo (mensal com mensal, anual com anual).",
+      });
+      return;
+    }
+  }
+
+  const plan = await prisma.plan.create({
+    data: {
+      code: normalizedCode,
+      name: payload.name.trim(),
+      description: normalizedDescription,
+      isActive: payload.isActive,
+      isTrial: payload.isTrial,
+      maxProfiles: payload.maxProfiles,
+      maxConnections: payload.maxConnections,
+      maxMonthlyPublications: payload.maxMonthlyPublications,
+      monthlyPriceCents: payload.isTrial ? null : resolvedStripePriceIds.stripeMonthlyPriceCents,
+      yearlyPriceCents: payload.isTrial ? null : resolvedStripePriceIds.stripeYearlyPriceCents,
+      stripeProductId: normalizedStripeProductId,
+      stripeMonthlyPriceId: resolvedStripePriceIds.stripeMonthlyPriceId,
+      stripeYearlyPriceId: resolvedStripePriceIds.stripeYearlyPriceId,
+      stripePixMonthlyPriceId: resolvedStripePriceIds.stripePixMonthlyPriceId,
+      stripePixYearlyPriceId: resolvedStripePriceIds.stripePixYearlyPriceId,
+    },
+  });
+
+  const billingSettings = await getBillingSettingsSnapshot();
+  await syncTrialPlanLimitsFromSettings(billingSettings.autoTrialDays);
+
+  response.status(201).json(plan);
+});
+
+app.put("/billing/plans/:id", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  if (!isRootUser(authRequest)) {
+    response.status(403).json({ error: "Apenas root pode editar planos." });
+    return;
+  }
+
+  const payload = updatePlanSchema.parse(request.body);
+  const existingPlan = await prisma.plan.findUnique({
+    where: { id: request.params.id },
+  });
+  if (!existingPlan) {
+    response.status(404).json({ error: "Plano não encontrado." });
+    return;
+  }
+
+  const isTrial = payload.isTrial ?? existingPlan.isTrial;
+
+  if (isTrial) {
+    const existingTrial = await prisma.plan.findFirst({
+      where: {
+        isTrial: true,
+        id: { not: existingPlan.id },
+      },
+      select: { id: true, name: true },
+    });
+    if (existingTrial) {
+      response.status(409).json({
+        error: `Já existe um plano trial (${existingTrial.name}). Deixe apenas um trial ativo no sistema.`,
+      });
+      return;
+    }
+  }
+
+  const nextStripeProductId = isTrial
+    ? null
+    : payload.stripeProductId !== undefined
+      ? trimNullable(payload.stripeProductId)
+      : existingPlan.stripeProductId;
+
+  if (!isTrial && !nextStripeProductId) {
+    response.status(400).json({
+      error: "Plano pago exige produto Stripe vinculado.",
+    });
+    return;
+  }
+
+  let nextStripePriceIds: ResolvedStripePlanPriceIds = isTrial
+    ? EMPTY_STRIPE_PLAN_PRICE_IDS
+    : {
+        stripeMonthlyPriceId: existingPlan.stripeMonthlyPriceId,
+        stripeYearlyPriceId: existingPlan.stripeYearlyPriceId,
+        stripePixMonthlyPriceId: existingPlan.stripePixMonthlyPriceId,
+        stripePixYearlyPriceId: existingPlan.stripePixYearlyPriceId,
+        stripeMonthlyPriceCents: existingPlan.monthlyPriceCents,
+        stripeYearlyPriceCents: existingPlan.yearlyPriceCents,
+        stripePixMonthlyPriceCents: existingPlan.monthlyPriceCents,
+        stripePixYearlyPriceCents: existingPlan.yearlyPriceCents,
+      };
+
+  if (!isTrial && nextStripeProductId) {
+    try {
+      nextStripePriceIds = await resolveStripePlanPriceIdsFromProduct(nextStripeProductId);
+    } catch (error) {
+      response.status(400).json({
+        error:
+          error instanceof Error
+            ? `Falha ao consultar preços do produto Stripe: ${error.message}`
+            : "Falha ao consultar preços do produto Stripe.",
+      });
+      return;
+    }
+
+    const missingPriceKinds = listMissingRequiredStripePriceKinds(nextStripePriceIds);
+    if (missingPriceKinds.length > 0) {
+      response.status(409).json({
+        error: `Produto Stripe sem preços obrigatórios: ${missingPriceKinds.join(", ")}.`,
+      });
+      return;
+    }
+
+    if (hasStripeCyclePriceMismatch(nextStripePriceIds)) {
+      response.status(409).json({
+        error:
+          "Os preços da assinatura e do PIX devem ser iguais por ciclo (mensal com mensal, anual com anual).",
+      });
+      return;
+    }
+  }
+
+  if (!isTrial && !nextStripeProductId) {
+    nextStripePriceIds = EMPTY_STRIPE_PLAN_PRICE_IDS;
+  }
+
+  const plan = await prisma.plan.update({
+    where: { id: request.params.id },
+    data: {
+      code: payload.code ? normalizePlanCode(payload.code) : undefined,
+      name: payload.name?.trim(),
+      description: payload.description !== undefined ? trimNullable(payload.description) : undefined,
+      isActive: payload.isActive,
+      isTrial: payload.isTrial,
+      maxProfiles: payload.maxProfiles,
+      maxConnections: payload.maxConnections,
+      maxMonthlyPublications: payload.maxMonthlyPublications,
+      monthlyPriceCents: isTrial ? null : nextStripePriceIds.stripeMonthlyPriceCents,
+      yearlyPriceCents: isTrial ? null : nextStripePriceIds.stripeYearlyPriceCents,
+      stripeProductId: nextStripeProductId,
+      stripeMonthlyPriceId: nextStripePriceIds.stripeMonthlyPriceId,
+      stripeYearlyPriceId: nextStripePriceIds.stripeYearlyPriceId,
+      stripePixMonthlyPriceId: nextStripePriceIds.stripePixMonthlyPriceId,
+      stripePixYearlyPriceId: nextStripePriceIds.stripePixYearlyPriceId,
+    },
+  });
+
+  const billingSettings = await getBillingSettingsSnapshot();
+  await syncTrialPlanLimitsFromSettings(billingSettings.autoTrialDays);
+
+  response.json(plan);
+});
+
+app.delete("/billing/plans/:id", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  if (!isRootUser(authRequest)) {
+    response.status(403).json({ error: "Apenas root pode excluir planos." });
+    return;
+  }
+
+  const plan = await prisma.plan.findUnique({
+    where: { id: request.params.id },
+    select: {
+      id: true,
+      code: true,
+      name: true,
+    },
+  });
+
+  if (!plan) {
+    response.status(404).json({ error: "Plano não encontrado." });
+    return;
+  }
+
+  const linkedSubscriptions = await prisma.userPlanSubscription.count({
+    where: {
+      planId: plan.id,
+    },
+  });
+
+  if (linkedSubscriptions > 0) {
+    response.status(409).json({
+      error: "Este plano possui usuários vinculados. Realoque os usuários antes de excluir.",
+    });
+    return;
+  }
+
+  await prisma.plan.delete({
+    where: { id: plan.id },
+  });
+
+  response.status(204).send();
+});
+
+app.get("/billing/settings", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  if (!isRootUser(authRequest)) {
+    response.status(403).json({ error: "Apenas root pode visualizar configurações globais de billing." });
+    return;
+  }
+
+  const settings = await getBillingSettingsSnapshot();
+  response.json(settings);
+});
+
+app.put("/billing/settings", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  if (!isRootUser(authRequest)) {
+    response.status(403).json({ error: "Apenas root pode editar configurações globais de billing." });
+    return;
+  }
+
+  const payload = updateBillingSettingsSchema.parse(request.body);
+  const currentSettings = await getBillingSettingsSnapshot();
+  const nextAutoTrialEnabled = payload.autoTrialEnabled ?? currentSettings.autoTrialEnabled;
+  const nextAutoTrialDays = payload.autoTrialDays ?? currentSettings.autoTrialDays;
+  const nextRootDisplayPlanId =
+    payload.rootDisplayPlanId !== undefined
+      ? trimNullable(payload.rootDisplayPlanId)
+      : currentSettings.rootDisplayPlanId;
+
+  if (nextRootDisplayPlanId) {
+    const exists = await prisma.plan.findUnique({
+      where: { id: nextRootDisplayPlanId },
+      select: { id: true },
+    });
+    if (!exists) {
+      response.status(404).json({ error: "Plano padrão do root não encontrado." });
+      return;
+    }
+  }
+
+  await Promise.all([
+    upsertBillingSetting(BILLING_SETTING_AUTO_TRIAL_ENABLED, nextAutoTrialEnabled ? "true" : "false"),
+    upsertBillingSetting(BILLING_SETTING_AUTO_TRIAL_DAYS, String(nextAutoTrialDays)),
+    upsertBillingSetting(BILLING_SETTING_ROOT_DISPLAY_PLAN_ID, nextRootDisplayPlanId ?? ""),
+  ]);
+
+  await syncTrialPlanLimitsFromSettings(nextAutoTrialDays);
+
+  response.json({
+    autoTrialEnabled: nextAutoTrialEnabled,
+    autoTrialDays: nextAutoTrialDays,
+    rootDisplayPlanId: nextRootDisplayPlanId,
+  });
+});
+
+app.post("/billing/assign-user-plan", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  if (!isRootUser(authRequest)) {
+    response.status(403).json({ error: "Apenas root pode alterar plano de usuários." });
+    return;
+  }
+
+  const payload = assignUserPlanSchema.parse(request.body);
+  const [targetUser, plan] = await Promise.all([
+    prisma.user.findUnique({
+      where: { id: payload.userId },
+      select: { id: true, username: true },
+    }),
+    prisma.plan.findUnique({
+      where: { id: payload.planId },
+      select: { id: true, isTrial: true, isActive: true },
+    }),
+  ]);
+
+  if (!targetUser) {
+    response.status(404).json({ error: "Usuário não encontrado." });
+    return;
+  }
+
+  if (!plan) {
+    response.status(404).json({ error: "Plano não encontrado." });
+    return;
+  }
+
+  if (!plan.isActive) {
+    response.status(409).json({ error: "Não é possível vincular usuário a plano inativo." });
+    return;
+  }
+
+  const now = new Date();
+  const subscription = await prisma.userPlanSubscription.upsert({
+    where: { userId: payload.userId },
+    update: {
+      planId: payload.planId,
+      status: payload.status,
+      billingModel: payload.billingModel,
+      cycle: payload.cycle ?? null,
+      startsAt: now,
+      endsAt: payload.endsAt ? new Date(payload.endsAt) : null,
+      trialEndsAt:
+        payload.billingModel === "TRIAL"
+          ? (payload.endsAt ? new Date(payload.endsAt) : null)
+          : null,
+      blockedReason: payload.status === "BLOCKED" ? "Bloqueado manualmente por root." : null,
+    },
+    create: {
+      userId: payload.userId,
+      planId: payload.planId,
+      status: payload.status,
+      billingModel: payload.billingModel,
+      cycle: payload.cycle ?? null,
+      startsAt: now,
+      endsAt: payload.endsAt ? new Date(payload.endsAt) : null,
+      trialEndsAt:
+        payload.billingModel === "TRIAL"
+          ? (payload.endsAt ? new Date(payload.endsAt) : null)
+          : null,
+      blockedReason: payload.status === "BLOCKED" ? "Bloqueado manualmente por root." : null,
+    },
+  });
+
+  response.json(subscription);
 });
 
 app.get("/logs", async (request, response) => {
@@ -3911,10 +6785,49 @@ app.use((error: unknown, _request: Request, response: Response, _next: NextFunct
 
 const port = Number(process.env.PORT ?? 4000);
 
-startServerInstagramJobWorker();
-startInstagramTokenKeepAliveWorker();
-startServerWhatsappJobWorker();
+let server: ReturnType<typeof app.listen> | null = null;
 
-app.listen(port, () => {
-  console.log(`Backend listening on http://localhost:${port}`);
+async function bootBackend(): Promise<void> {
+  await ensureBillingBootstrap();
+
+  startServerInstagramJobWorker();
+  startInstagramTokenKeepAliveWorker();
+  startServerWhatsappJobWorker();
+  void startRabbitJobExecutionConsumer().catch((error) => {
+    console.error("Failed to start RabbitMQ job consumer", error);
+  });
+
+  server = app.listen(port, () => {
+    console.log(`Backend listening on http://localhost:${port}`);
+  });
+}
+
+void bootBackend().catch((error) => {
+  console.error("Failed to boot backend", error);
+  process.exit(1);
+});
+
+let shuttingDown = false;
+async function shutdownGracefully(signal: string): Promise<void> {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  console.log(`Received ${signal}. Shutting down backend...`);
+
+  if (server) {
+    await new Promise<void>((resolve) => {
+      server?.close(() => resolve());
+    });
+  }
+
+  await Promise.allSettled([closeRabbitMqInfra(), closeRedisInfra()]);
+  process.exit(0);
+}
+
+process.once("SIGINT", () => {
+  void shutdownGracefully("SIGINT");
+});
+process.once("SIGTERM", () => {
+  void shutdownGracefully("SIGTERM");
 });

@@ -1,0 +1,140 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/sqlite-client"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model User {
+  id              String    @id @default(cuid())
+  name            String
+  username        String    @unique
+  passwordHash    String
+  timeZone        String    @default("America/Sao_Paulo")
+  role            String    @default("ADMIN")
+  sessionToken    String?   @unique
+  sessionIssuedAt DateTime?
+  createdAt       DateTime  @default(now())
+  jobs            Job[]
+  receivedAvisos  Aviso[]   @relation("AvisoRecipient")
+  createdAvisos   Aviso[]   @relation("AvisoCreator")
+}
+
+model SetupInvite {
+  id        String   @id @default(cuid())
+  inviteKey String   @unique
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+}
+
+model Company {
+  id          String             @id @default(cuid())
+  name        String
+  createdAt   DateTime           @default(now())
+  connections SocialConnection[]
+  jobs        Job[]
+  logs        AgentLog[]
+  legacyAgents Agent[]
+}
+
+model Job {
+  id                 String            @id @default(cuid())
+  companyId          String
+  createdByUserId    String?
+  socialConnectionId String?
+  filePath           String
+  title              String?
+  caption            String?
+  locationName       String?
+  publicationType    String            @default("instagram_reel")
+  postStory          Boolean           @default(false)
+  postReel           Boolean           @default(false)
+  postWhatsapp       Boolean           @default(false)
+  modoWhatsapp       String
+  dataPostagem       DateTime
+  publicationState   String            @default("PUBLISHED")
+  status             String            @default("PENDING")
+  tentativas         Int               @default(0)
+  criadoEm           DateTime          @default(now())
+  startedAt          DateTime?
+  completedAt        DateTime?
+  lastError          String?
+  company            Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  createdBy          User?             @relation(fields: [createdByUserId], references: [id], onDelete: Cascade)
+  socialConnection   SocialConnection? @relation(fields: [socialConnectionId], references: [id], onDelete: SetNull)
+}
+
+model AgentLog {
+  id             String   @id @default(cuid())
+  companyId      String
+  agentId        String?
+  level          String
+  errorCode      String?
+  message        String
+  screenshotPath String?
+  createdAt      DateTime @default(now())
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  agent          Agent?   @relation(fields: [agentId], references: [id], onDelete: SetNull)
+}
+
+model Agent {
+  id                 String    @id @default(cuid())
+  name               String
+  companyId          String
+  token              String    @unique
+  activationCode     String?   @unique
+  activationStatus   String    @default("PENDING")
+  activationIssuedAt DateTime?
+  activationUsedAt   DateTime?
+  deviceId           String?
+  deviceName         String?
+  revokedAt          DateTime?
+  createdAt          DateTime  @default(now())
+  lastSeenAt         DateTime?
+  company            Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  logs               AgentLog[]
+}
+
+model SocialConnection {
+  id              String   @id @default(cuid())
+  companyId       String
+  platform        String
+  displayName     String
+  loginIdentifier String?
+  secretCipher    String?
+  authStatus      String   @default("AUTH_REQUIRED")
+  automationMode  String   @default("VISUAL")
+  authLaunchUrl   String?
+  lastAuthAt      DateTime?
+  lastSeenAt      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  company         Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  jobs            Job[]
+}
+
+model AppSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+model Aviso {
+  id              String    @id @default(cuid())
+  userId          String
+  createdByUserId String?
+  kind            String    @default("SYSTEM")
+  title           String
+  message         String
+  readAt          DateTime?
+  createdAt       DateTime  @default(now())
+  user            User      @relation("AvisoRecipient", fields: [userId], references: [id], onDelete: Cascade)
+  createdBy       User?     @relation("AvisoCreator", fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt])
+  @@map("avisos")
+}
