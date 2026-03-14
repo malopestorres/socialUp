@@ -25,6 +25,7 @@ type JobIdentity = {
   publicationType: string;
   caption?: string | null;
   filePath?: string | null;
+  whatsappBackgroundColor?: string | null;
 };
 
 type EvolutionCredentials = {
@@ -832,12 +833,17 @@ async function resolveStatusRecipients(credentials: EvolutionCredentials): Promi
   };
 }
 
-function buildTextStatusPayload(content: string, recipients: string[]): Record<string, unknown> {
+function buildTextStatusPayload(
+  content: string,
+  recipients: string[],
+  backgroundColor?: string | null,
+): Record<string, unknown> {
   return {
     type: "text",
     content,
+    linkPreview: true,
     caption: "",
-    backgroundColor: EVOLUTION_STATUS_TEXT_BACKGROUND,
+    backgroundColor: backgroundColor?.trim() || EVOLUTION_STATUS_TEXT_BACKGROUND,
     font: EVOLUTION_STATUS_TEXT_FONT,
     statusJidList: recipients,
     allContacts: false,
@@ -849,12 +855,13 @@ function buildMediaStatusPayload(input: {
   dataUrl: string;
   caption: string;
   recipients: string[];
+  backgroundColor?: string | null;
 }): Record<string, unknown> {
   return {
     type: input.statusType,
     content: input.dataUrl,
     caption: input.caption || "",
-    backgroundColor: EVOLUTION_STATUS_TEXT_BACKGROUND,
+    backgroundColor: input.backgroundColor?.trim() || EVOLUTION_STATUS_TEXT_BACKGROUND,
     font: EVOLUTION_STATUS_TEXT_FONT,
     statusJidList: input.recipients,
     allContacts: false,
@@ -1115,7 +1122,7 @@ export async function executeWhatsappJobWithEvolutionApi(
 
     const response = await evolutionRequest<EvolutionSendStatusResponse>(credentials, route, {
       method: "POST",
-      jsonBody: buildTextStatusPayload(message, statusRecipients.recipients),
+      jsonBody: buildTextStatusPayload(message, statusRecipients.recipients, job.whatsappBackgroundColor),
     });
 
     const messageId = extractMessageId(response);
@@ -1152,6 +1159,7 @@ export async function executeWhatsappJobWithEvolutionApi(
       dataUrl,
       caption,
       recipients: statusRecipients.recipients,
+      backgroundColor: job.whatsappBackgroundColor,
     }),
   });
 

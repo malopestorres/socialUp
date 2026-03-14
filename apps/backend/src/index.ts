@@ -7,6 +7,8 @@ import { readFileSync, statSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { Prisma } from "@prisma/client";
+import sharp from "sharp";
 import Stripe from "stripe";
 import type { PublicationState, PublicationType, WhatsappMode } from "@socialup/shared";
 import { z } from "zod";
@@ -17,8 +19,10 @@ import {
   exchangeInstagramOAuthCodeForConnection,
   executeInstagramCarouselJobWithGraphApi,
   executeInstagramJobWithGraphApi,
+  fetchInstagramPublishedMediaPermalinkWithGraphApi,
   isInstagramLoginRequiredErrorMessage,
   listInstagramLocationCandidatesForConnection,
+  publishInstagramMediaCommentWithGraphApi,
   resolveInstagramConnectionRuntimeMetadata,
   refreshInstagramAccessTokenForConnection,
   type InstagramLocationSuggestion,
@@ -71,9 +75,24 @@ const INSTAGRAM_STORY_SEQUENCE_STEP_DELAY_MS = parseEnvPositiveInt(
   process.env.INSTAGRAM_STORY_SEQUENCE_STEP_DELAY_MS,
   1_500,
 );
+const INSTAGRAM_STORY_SEQUENCE_STEP_RETRY_ATTEMPTS = parseEnvPositiveInt(
+  process.env.INSTAGRAM_STORY_SEQUENCE_STEP_RETRY_ATTEMPTS,
+  3,
+);
+const INSTAGRAM_STORY_SEQUENCE_STEP_RETRY_DELAY_MS = parseEnvPositiveInt(
+  process.env.INSTAGRAM_STORY_SEQUENCE_STEP_RETRY_DELAY_MS,
+  4_000,
+);
+const FAILED_MEDIA_RESCHEDULE_DELAY_MS = parseEnvPositiveInt(
+  process.env.FAILED_MEDIA_RESCHEDULE_DELAY_MS,
+  20 * 60 * 1000,
+);
+const INSTAGRAM_OAUTH_FLOW_RUNTIME = (process.env.INSTAGRAM_OAUTH_FLOW || "instagram_login").trim().toLowerCase();
+const INSTAGRAM_DEFAULT_PROACTIVE_TOKEN_REFRESH_COOLDOWN_MS =
+  INSTAGRAM_OAUTH_FLOW_RUNTIME === "instagram_login" ? 26 * 60 * 60 * 1000 : 30 * 60 * 1000;
 const INSTAGRAM_PROACTIVE_TOKEN_REFRESH_COOLDOWN_MS = parseEnvPositiveInt(
   process.env.INSTAGRAM_PROACTIVE_TOKEN_REFRESH_COOLDOWN_MS,
-  30 * 60 * 1000,
+  INSTAGRAM_DEFAULT_PROACTIVE_TOKEN_REFRESH_COOLDOWN_MS,
 );
 const INSTAGRAM_TOKEN_KEEPALIVE_INTERVAL_MS = parseEnvPositiveInt(
   process.env.INSTAGRAM_TOKEN_KEEPALIVE_INTERVAL_MS,
@@ -87,6 +106,11 @@ const INSTAGRAM_KEEPALIVE_FORCE_DISCONNECT_ON_LOGIN_REQUIRED = parseEnvBoolean(
   process.env.INSTAGRAM_KEEPALIVE_FORCE_DISCONNECT_ON_LOGIN_REQUIRED,
   false,
 );
+const DEFAULT_WHATSAPP_BACKGROUND_COLOR = "#202C33";
+const WHATSAPP_RELINK_POST_CANVAS_WIDTH = 1080;
+const WHATSAPP_RELINK_POST_CANVAS_HEIGHT = 1920;
+const WHATSAPP_RELINK_POST_FOREGROUND_WIDTH = 972;
+const WHATSAPP_RELINK_POST_FOREGROUND_HEIGHT = 1680;
 const JOB_DISPATCH_INTERVAL_MS = parseEnvPositiveInt(process.env.JOB_DISPATCH_INTERVAL_MS, 10_000);
 const JOB_DISPATCH_BATCH_SIZE = parseEnvPositiveInt(process.env.JOB_DISPATCH_BATCH_SIZE, 10);
 const JOB_CONSUMER_CONNECTION_LOCK_MS = parseEnvPositiveInt(process.env.JOB_CONSUMER_CONNECTION_LOCK_MS, 15 * 60 * 1000);
@@ -189,6 +213,7 @@ type ImageDimensions = {
 type JobMediaBundle = {
   files: string[];
   sequential: boolean;
+  captions: Array<string | null>;
 };
 
 function readPngDimensions(buffer: Buffer): ImageDimensions | null {
@@ -301,6 +326,7 @@ function decodeJobMediaBundleStorage(filePath: string | null | undefined): JobMe
     return {
       files: [],
       sequential: false,
+      captions: [],
     };
   }
 
@@ -308,6 +334,7 @@ function decodeJobMediaBundleStorage(filePath: string | null | undefined): JobMe
     return {
       files: [raw],
       sequential: false,
+      captions: [],
     };
   }
 
@@ -316,6 +343,7 @@ function decodeJobMediaBundleStorage(filePath: string | null | undefined): JobMe
     return {
       files: [],
       sequential: false,
+      captions: [],
     };
   }
 
@@ -323,6 +351,7 @@ function decodeJobMediaBundleStorage(filePath: string | null | undefined): JobMe
     const parsed = JSON.parse(Buffer.from(encodedPayload, "base64").toString("utf8")) as {
       files?: unknown;
       sequential?: unknown;
+      captions?: unknown;
     };
 
     const files = Array.isArray(parsed.files)
@@ -331,14 +360,26 @@ function decodeJobMediaBundleStorage(filePath: string | null | undefined): JobMe
           .filter((entry) => entry.length > 0)
       : [];
 
+    const rawCaptions = Array.isArray(parsed.captions) ? parsed.captions : [];
+    const captions = files.map((_, index) => {
+      const value = rawCaptions[index];
+      if (typeof value !== "string") {
+        return null;
+      }
+      const normalized = value.trim();
+      return normalized.length > 0 ? normalized : null;
+    });
+
     return {
       files,
       sequential: parsed.sequential === true,
+      captions,
     };
   } catch {
     return {
       files: [raw],
       sequential: false,
+      captions: [],
     };
   }
 }
@@ -346,12 +387,21 @@ function decodeJobMediaBundleStorage(filePath: string | null | undefined): JobMe
 function encodeJobMediaBundleStorage(input: JobMediaBundle): string {
   const files = input.files.map((entry) => entry.trim()).filter((entry) => entry.length > 0);
   const sequential = input.sequential === true;
+  const captions = files.map((_, index) => {
+    const value = input.captions[index];
+    if (typeof value !== "string") {
+      return null;
+    }
+    const normalized = value.trim();
+    return normalized.length > 0 ? normalized : null;
+  });
+  const hasAnyCaption = captions.some((entry) => Boolean(entry));
 
   if (files.length === 0) {
     return "";
   }
 
-  if (files.length === 1 && !sequential) {
+  if (files.length === 1 && !sequential && !hasAnyCaption) {
     return files[0]!;
   }
 
@@ -359,6 +409,7 @@ function encodeJobMediaBundleStorage(input: JobMediaBundle): string {
     JSON.stringify({
       files,
       sequential,
+      ...(hasAnyCaption ? { captions } : {}),
     }),
     "utf8",
   ).toString("base64");
@@ -623,9 +674,14 @@ const createJobSchema = z.object({
   socialConnectionId: z.string().min(1),
   filePath: z.string().optional().nullable(),
   filePaths: z.array(z.string()).optional().nullable(),
+  fileCaptions: z.array(z.string().max(2000).optional().nullable()).optional().nullable(),
   sequential: z.boolean().optional(),
   title: z.string().trim().max(120).optional().nullable(),
   caption: z.string().optional().nullable(),
+  firstComment: z.string().max(2000).optional().nullable(),
+  whatsappBackgroundColor: z.string().trim().regex(/^#[0-9a-fA-F]{6}$/).optional().nullable(),
+  whatsappRelinkEnabled: z.boolean().optional().default(false),
+  whatsappRelinkConnectionIds: z.array(z.string().trim().min(1)).optional().nullable(),
   locationName: z.string().optional().nullable(),
   locationId: z.string().optional().nullable(),
   publicationType: z.enum([
@@ -636,7 +692,7 @@ const createJobSchema = z.object({
     "whatsapp_status_texto",
   ]),
   publicationState: publicationStateSchema.optional().default("PUBLISHED"),
-  dataPostagem: z.string().datetime(),
+  dataPostagem: z.string().datetime().optional().nullable(),
 });
 
 const updateJobSchema = z.object({
@@ -644,9 +700,14 @@ const updateJobSchema = z.object({
   socialConnectionId: z.string().min(1),
   filePath: z.string().optional().nullable(),
   filePaths: z.array(z.string()).optional().nullable(),
+  fileCaptions: z.array(z.string().max(2000).optional().nullable()).optional().nullable(),
   sequential: z.boolean().optional(),
   title: z.string().trim().max(120).optional().nullable(),
   caption: z.string().optional().nullable(),
+  firstComment: z.string().max(2000).optional().nullable(),
+  whatsappBackgroundColor: z.string().trim().regex(/^#[0-9a-fA-F]{6}$/).optional().nullable(),
+  whatsappRelinkEnabled: z.boolean().optional(),
+  whatsappRelinkConnectionIds: z.array(z.string().trim().min(1)).optional().nullable(),
   locationName: z.string().optional().nullable(),
   locationId: z.string().optional().nullable(),
   publicationType: z.enum([
@@ -657,7 +718,7 @@ const updateJobSchema = z.object({
     "whatsapp_status_texto",
   ]),
   publicationState: publicationStateSchema.optional(),
-  dataPostagem: z.string().datetime(),
+  dataPostagem: z.string().datetime().optional().nullable(),
 });
 
 const deleteUploadQuerySchema = z.object({
@@ -717,6 +778,17 @@ const startStripeCheckoutSchema = z.object({
 
 const confirmStripeCheckoutSchema = z.object({
   sessionId: z.string().trim().min(1),
+});
+
+const billingUserDiscountListQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(50).default(10),
+  query: z.string().trim().max(120).optional().default(""),
+});
+
+const updateBillingUserDiscountSchema = z.object({
+  enabled: z.boolean(),
+  percent: z.coerce.number().int().min(0).max(100),
 });
 
 const instagramLocationSuggestionsQuerySchema = z.object({
@@ -848,20 +920,37 @@ function ensureFilePathForPublication(
   publicationType: PublicationType,
   filePath?: string | null,
   filePaths?: string[] | null,
+  fileCaptions?: Array<string | null | undefined> | null,
   sequential?: boolean,
 ): string {
   if (publicationType === "whatsapp_status_texto") {
     return filePath ?? "";
   }
 
-  const mergedFiles = [
-    ...(Array.isArray(filePaths) ? filePaths : []),
-    filePath ?? "",
-  ]
+  const sourceFiles = (Array.isArray(filePaths) && filePaths.length > 0
+    ? filePaths
+    : [filePath ?? ""])
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0);
+  const sourceCaptions = Array.isArray(fileCaptions) ? fileCaptions : [];
+  const dedupedMedia: Array<{ file: string; caption: string | null }> = [];
+  const seen = new Set<string>();
 
-  const uniqueFiles = Array.from(new Set(mergedFiles));
+  sourceFiles.forEach((entry, index) => {
+    if (seen.has(entry)) {
+      return;
+    }
+    seen.add(entry);
+
+    const rawCaption = sourceCaptions[index];
+    const normalizedCaption = typeof rawCaption === "string" ? rawCaption.trim() : "";
+    dedupedMedia.push({
+      file: entry,
+      caption: normalizedCaption.length > 0 ? normalizedCaption : null,
+    });
+  });
+
+  const uniqueFiles = dedupedMedia.map((entry) => entry.file);
 
   if (uniqueFiles.length === 0) {
     throw createFilePathValidationError("Este tipo de publicacao exige uma midia.");
@@ -885,10 +974,12 @@ function ensureFilePathForPublication(
   }
 
   const validatedFiles = uniqueFiles.map((entry) => validateSingleFilePathForPublication(publicationType, entry));
+  const normalizedCaptions = validatedFiles.map((_, index) => dedupedMedia[index]?.caption ?? null);
 
   return encodeJobMediaBundleStorage({
     files: validatedFiles,
     sequential: normalizedSequential && validatedFiles.length > 1,
+    captions: normalizedCaptions,
   });
 }
 
@@ -956,13 +1047,41 @@ function normalizeJobTitle(value: string | null | undefined): string | null {
   return normalized ? normalized : null;
 }
 
+function normalizeWhatsappBackgroundColor(
+  value: string | null | undefined,
+  enabled: boolean,
+): string | null {
+  if (!enabled) {
+    return null;
+  }
+
+  const normalized = value?.trim().toUpperCase() || DEFAULT_WHATSAPP_BACKGROUND_COLOR;
+  if (/^#[0-9A-F]{6}$/.test(normalized)) {
+    return normalized;
+  }
+
+  return DEFAULT_WHATSAPP_BACKGROUND_COLOR;
+}
+
 function ensureInstagramMetadata(
   publicationType: PublicationType,
   caption?: string | null,
+  fileCaptions?: Array<string | null | undefined> | null,
   locationName?: string | null,
   locationId?: string | null,
 ): { caption: string | null; locationName: string | null } {
   const normalizedCaption = caption?.trim() || null;
+  const normalizedFileCaptions = (Array.isArray(fileCaptions) ? fileCaptions : [])
+    .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+    .filter((entry) => entry.length > 0);
+  const fallbackCaption =
+    normalizedFileCaptions.length === 0
+      ? null
+      : normalizedFileCaptions.length === 1
+        ? normalizedFileCaptions[0]!
+        : normalizedFileCaptions.map((entry, index) => `${index + 1}. ${entry}`).join("\n");
+  const effectiveCaption =
+    publicationType !== "instagram_story" && !normalizedCaption ? fallbackCaption : normalizedCaption;
   const normalizedLocation = locationName?.trim() || null;
   const normalizedLocationId = locationId?.trim() || null;
   const isForcedInstagramLocation =
@@ -974,16 +1093,6 @@ function ensureInstagramMetadata(
       : normalizedLocation;
 
   if (isInstagramPublication(publicationType)) {
-    if (publicationType !== "instagram_story" && !normalizedCaption) {
-      throw new z.ZodError([
-        {
-          code: "custom",
-          path: ["caption"],
-          message: "Legenda obrigatoria para publicacoes do Instagram.",
-        },
-      ]);
-    }
-
     if (effectiveLocationId && !/^\d+$/.test(effectiveLocationId)) {
       throw new z.ZodError([
         {
@@ -996,8 +1105,157 @@ function ensureInstagramMetadata(
   }
 
   return {
-    caption: publicationType === "instagram_story" ? null : normalizedCaption,
+    caption: publicationType === "instagram_story" ? null : effectiveCaption,
     locationName: encodeInstagramLocationStorage(effectiveLocationName, effectiveLocationId),
+  };
+}
+
+function normalizeFirstComment(publicationType: PublicationType, value?: string | null): string | null {
+  if (publicationType !== "instagram_post" && publicationType !== "instagram_reel") {
+    return null;
+  }
+
+  const normalized = value?.trim() || "";
+  return normalized.length > 0 ? normalized : null;
+}
+
+function supportsInstagramWhatsappRelink(publicationType: PublicationType): boolean {
+  return (
+    publicationType === "instagram_post" ||
+    publicationType === "instagram_reel" ||
+    publicationType === "instagram_story"
+  );
+}
+
+function supportsInstagramWhatsappRelinkForJobMedia(
+  publicationType: PublicationType,
+  encodedFilePath: string,
+): boolean {
+  if (!supportsInstagramWhatsappRelink(publicationType)) {
+    return false;
+  }
+
+  if (publicationType !== "instagram_story") {
+    return true;
+  }
+
+  const mediaBundle = decodeJobMediaBundleStorage(encodedFilePath);
+  const mediaFiles = mediaBundle.files.length > 0
+    ? mediaBundle.files
+    : (encodedFilePath?.trim() ? [encodedFilePath.trim()] : []);
+
+  return mediaFiles.length <= 1;
+}
+
+function normalizeWhatsappRelinkConnectionIds(value?: string[] | null): string[] {
+  const source = Array.isArray(value) ? value : [];
+  const unique = new Set<string>();
+  const normalized: string[] = [];
+
+  for (const entry of source) {
+    const trimmed = entry.trim();
+    if (!trimmed || unique.has(trimmed)) {
+      continue;
+    }
+    unique.add(trimmed);
+    normalized.push(trimmed);
+  }
+
+  return normalized;
+}
+
+function parseStoredWhatsappRelinkConnectionIds(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const normalized: string[] = [];
+  const unique = new Set<string>();
+
+  for (const entry of value) {
+    if (typeof entry !== "string") {
+      continue;
+    }
+    const trimmed = entry.trim();
+    if (!trimmed || unique.has(trimmed)) {
+      continue;
+    }
+    unique.add(trimmed);
+    normalized.push(trimmed);
+  }
+
+  return normalized;
+}
+
+async function resolveWhatsappRelinkOptions(input: {
+  request: Request & { adminUser?: AdminUserAuth };
+  publicationType: PublicationType;
+  encodedFilePath: string;
+  enabledValue?: boolean | null;
+  connectionIdsValue?: string[] | null;
+}): Promise<{ enabled: boolean; connectionIds: string[] }> {
+  if (!supportsInstagramWhatsappRelink(input.publicationType)) {
+    return {
+      enabled: false,
+      connectionIds: [],
+    };
+  }
+
+  const enabled = Boolean(input.enabledValue);
+  if (!enabled) {
+    return {
+      enabled: false,
+      connectionIds: [],
+    };
+  }
+
+  if (!supportsInstagramWhatsappRelinkForJobMedia(input.publicationType, input.encodedFilePath)) {
+    throw new z.ZodError([
+      {
+        code: "custom",
+        path: ["whatsappRelinkEnabled"],
+        message: "Relink no WhatsApp para stories funciona apenas com 1 mídia por vez.",
+      },
+    ]);
+  }
+
+  const normalizedIds = normalizeWhatsappRelinkConnectionIds(input.connectionIdsValue);
+  if (normalizedIds.length === 0) {
+    throw new z.ZodError([
+      {
+        code: "custom",
+        path: ["whatsappRelinkConnectionIds"],
+        message: "Selecione ao menos uma conta de WhatsApp para relink.",
+      },
+    ]);
+  }
+
+  const allowedConnections = await prisma.socialConnection.findMany({
+    where: {
+      id: { in: normalizedIds },
+      platform: "whatsapp",
+      authStatus: "CONNECTED",
+      createdByUserId: isRootUser(input.request) ? undefined : input.request.adminUser?.id,
+    },
+    select: {
+      id: true,
+    },
+  });
+
+  if (allowedConnections.length !== normalizedIds.length) {
+    throw new z.ZodError([
+      {
+        code: "custom",
+        path: ["whatsappRelinkConnectionIds"],
+        message: "Selecione apenas contas de WhatsApp conectadas e permitidas para seu usuário.",
+      },
+    ]);
+  }
+
+  const allowedSet = new Set(allowedConnections.map((connection) => connection.id));
+  return {
+    enabled: true,
+    connectionIds: normalizedIds.filter((id) => allowedSet.has(id)),
   };
 }
 
@@ -1161,6 +1419,47 @@ function ensureStripeClient(): Stripe {
   }
 
   return stripeClientSingleton;
+}
+
+async function createStripeCouponForUserDiscount(input: {
+  stripe: Stripe;
+  userId: string;
+  username: string;
+  percent: number;
+}): Promise<string | null> {
+  const normalizedPercent = Math.max(0, Math.min(100, Math.trunc(input.percent)));
+  if (normalizedPercent <= 0) {
+    return null;
+  }
+
+  const coupon = await input.stripe.coupons.create({
+    duration: "forever",
+    percent_off: normalizedPercent,
+    name: `SocialUp ${normalizedPercent}% @${input.username}`,
+    metadata: {
+      socialupUserId: input.userId,
+      socialupDiscountPercent: String(normalizedPercent),
+    },
+  });
+
+  return coupon.id;
+}
+
+async function resolveStripeSubscriptionIdFromCustomer(input: {
+  stripe: Stripe;
+  stripeCustomerId: string;
+}): Promise<string | null> {
+  const list = await input.stripe.subscriptions.list({
+    customer: input.stripeCustomerId,
+    status: "all",
+    limit: 20,
+  });
+
+  const activeOrPending = list.data.find((subscription) =>
+    ["active", "trialing", "past_due", "unpaid", "incomplete"].includes(subscription.status),
+  );
+
+  return activeOrPending?.id ?? null;
 }
 
 function appendQueryParam(rawUrl: string, key: string, value: string): string {
@@ -2727,6 +3026,18 @@ function summarizeFailureMessageForAviso(publicationType: PublicationType, rawMe
   const normalized = rawMessage.trim().toLowerCase();
 
   if (publicationType === "instagram_post" || publicationType === "instagram_reel" || publicationType === "instagram_story") {
+    if (normalized.includes("story_sequence_step_failed")) {
+      const partialMatch = rawMessage.match(/story_sequence_published_count=(\d+);step=(\d+);total=(\d+)/i);
+      if (partialMatch) {
+        const publishedCount = Number.parseInt(partialMatch[1] ?? "0", 10);
+        const totalCount = Number.parseInt(partialMatch[3] ?? "0", 10);
+        if (publishedCount > 0 && totalCount > 0) {
+          return `Sequência interrompida após retentativas automáticas: ${publishedCount}/${totalCount} stories foram publicados. Use o botão para reagendar apenas o restante em 20 minutos.`;
+        }
+      }
+      return "Sequência de stories interrompida após retentativas automáticas. Use o botão para reagendar a mídia em 20 minutos.";
+    }
+
     if (normalized.includes("aspect ratio is not supported") || normalized.includes("aspect_ratio")) {
       return "A proporção da mídia não é suportada para este formato do Instagram.";
     }
@@ -2903,12 +3214,351 @@ function resolvePublicUploadUrl(filePath: string): string {
   return baseUrl.toString();
 }
 
+function buildInstagramRelinkShareUrl(jobId: string): string | null {
+  const normalizedJobId = jobId.trim();
+  if (!normalizedJobId || !INSTAGRAM_GRAPH_PUBLIC_BASE_URL) {
+    return null;
+  }
+
+  const baseUrl = new URL(INSTAGRAM_GRAPH_PUBLIC_BASE_URL);
+  const basePath = baseUrl.pathname === "/" ? "" : baseUrl.pathname.replace(/\/+$/, "");
+  baseUrl.pathname = `${basePath}/share/instagram/${encodeURIComponent(normalizedJobId)}`;
+  baseUrl.search = "";
+  baseUrl.hash = "";
+  return baseUrl.toString();
+}
+
+function buildInstagramSharePreviewCardUrl(jobId: string): string | null {
+  const normalizedJobId = jobId.trim();
+  if (!normalizedJobId || !INSTAGRAM_GRAPH_PUBLIC_BASE_URL) {
+    return null;
+  }
+
+  const baseUrl = new URL(INSTAGRAM_GRAPH_PUBLIC_BASE_URL);
+  const basePath = baseUrl.pathname === "/" ? "" : baseUrl.pathname.replace(/\/+$/, "");
+  baseUrl.pathname = `${basePath}/share/instagram/${encodeURIComponent(normalizedJobId)}/preview.svg`;
+  baseUrl.search = "";
+  baseUrl.hash = "";
+  return baseUrl.toString();
+}
+
+function isPreviewableImagePath(filePath: string): boolean {
+  return /\.(jpe?g|png|webp)$/i.test(filePath.trim());
+}
+
+function resolveInstagramSharePreviewImageUrl(filePath: string | null | undefined): string | null {
+  const mediaBundle = decodeJobMediaBundleStorage(filePath);
+  const imagePath = mediaBundle.files.find((entry) => isPreviewableImagePath(entry));
+  if (!imagePath) {
+    return null;
+  }
+
+  try {
+    return resolvePublicUploadUrl(imagePath);
+  } catch {
+    return null;
+  }
+}
+
+async function ensureWhatsappRelinkMediaFileForPublication(input: {
+  jobId: string;
+  publicationType: PublicationType;
+  sourceFilePath: string;
+}): Promise<string> {
+  const normalizedSourceFilePath = input.sourceFilePath.trim();
+  if (!normalizedSourceFilePath) {
+    return normalizedSourceFilePath;
+  }
+
+  if (input.publicationType !== "instagram_post" || !isPreviewableImagePath(normalizedSourceFilePath)) {
+    return normalizedSourceFilePath;
+  }
+
+  const absoluteSourcePath = resolveUploadFilePath(normalizedSourceFilePath);
+  const sourceStat = statSync(absoluteSourcePath);
+  const cacheKey = createHash("sha1")
+    .update(`${normalizedSourceFilePath}:${sourceStat.size}:${sourceStat.mtimeMs}`)
+    .digest("hex")
+    .slice(0, 16);
+  const outputFileName = `${input.jobId}-wa-relink-${cacheKey}.jpg`;
+  const absoluteOutputPath = path.join(uploadsDir, outputFileName);
+  const relativeOutputPath = `/uploads/${outputFileName}`;
+
+  try {
+    statSync(absoluteOutputPath);
+    return relativeOutputPath;
+  } catch {
+    // Arquivo ainda não foi gerado; segue para composição abaixo.
+  }
+
+  const foregroundBuffer = await sharp(absoluteSourcePath)
+    .rotate()
+    .resize(WHATSAPP_RELINK_POST_FOREGROUND_WIDTH, WHATSAPP_RELINK_POST_FOREGROUND_HEIGHT, {
+      fit: "contain",
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    })
+    .png()
+    .toBuffer();
+
+  const darkOverlayBuffer = await sharp({
+    create: {
+      width: WHATSAPP_RELINK_POST_CANVAS_WIDTH,
+      height: WHATSAPP_RELINK_POST_CANVAS_HEIGHT,
+      channels: 4,
+      background: { r: 8, g: 15, b: 32, alpha: 0.22 },
+    },
+  })
+    .png()
+    .toBuffer();
+
+  await sharp(absoluteSourcePath)
+    .rotate()
+    .resize(WHATSAPP_RELINK_POST_CANVAS_WIDTH, WHATSAPP_RELINK_POST_CANVAS_HEIGHT, {
+      fit: "cover",
+      position: "centre",
+    })
+    .blur(42)
+    .composite([
+      {
+        input: darkOverlayBuffer,
+        blend: "over",
+      },
+      {
+        input: foregroundBuffer,
+        gravity: "center",
+      },
+    ])
+    .jpeg({ quality: 90, mozjpeg: true })
+    .toFile(absoluteOutputPath);
+
+  return relativeOutputPath;
+}
+
+type SharePreviewFrameConfig = {
+  label: string;
+  frameWidth: number;
+  frameHeight: number;
+  accentStart: string;
+  accentEnd: string;
+};
+
+function sharePreviewFrameConfigForPublicationType(publicationType: string | null | undefined): SharePreviewFrameConfig {
+  switch ((publicationType || "").trim().toLowerCase()) {
+    case "instagram_story":
+      return {
+        label: "Instagram Story",
+        frameWidth: 292,
+        frameHeight: 520,
+        accentStart: "#8b5cf6",
+        accentEnd: "#ec4899",
+      };
+    case "instagram_reel":
+      return {
+        label: "Instagram Reel",
+        frameWidth: 292,
+        frameHeight: 520,
+        accentStart: "#fb7185",
+        accentEnd: "#f59e0b",
+      };
+    case "tiktok_video":
+      return {
+        label: "TikTok Video",
+        frameWidth: 292,
+        frameHeight: 520,
+        accentStart: "#0f172a",
+        accentEnd: "#111827",
+      };
+    case "instagram_post":
+    default:
+      return {
+        label: "Instagram Post",
+        frameWidth: 360,
+        frameHeight: 450,
+        accentStart: "#f43f5e",
+        accentEnd: "#8b5cf6",
+      };
+  }
+}
+
+function renderInstagramSharePreviewSvg(input: {
+  publicationType: string | null | undefined;
+  previewTitle: string;
+  previewDescription: string;
+  previewImageUrl: string | null;
+}): string {
+  const canvasWidth = 1200;
+  const canvasHeight = 630;
+  const frame = sharePreviewFrameConfigForPublicationType(input.publicationType);
+  const frameX = 72;
+  const frameY = Math.round((canvasHeight - frame.frameHeight) / 2);
+  const infoX = frameX + frame.frameWidth + 64;
+  const infoWidth = canvasWidth - infoX - 72;
+  const previewTitle = escapeHtml(input.previewTitle);
+  const previewDescription = escapeHtml(input.previewDescription);
+  const label = escapeHtml(frame.label);
+  const previewImageUrl = input.previewImageUrl ? escapeHtml(input.previewImageUrl) : null;
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${canvasWidth}" height="${canvasHeight}" viewBox="0 0 ${canvasWidth} ${canvasHeight}" fill="none">
+  <defs>
+    <linearGradient id="fallbackBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="${frame.accentStart}" />
+      <stop offset="100%" stop-color="${frame.accentEnd}" />
+    </linearGradient>
+    <linearGradient id="glassStroke" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="rgba(255,255,255,0.55)" />
+      <stop offset="100%" stop-color="rgba(255,255,255,0.18)" />
+    </linearGradient>
+    <filter id="blurBg" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="32" />
+    </filter>
+    <clipPath id="mediaFrameClip">
+      <rect x="${frameX}" y="${frameY}" width="${frame.frameWidth}" height="${frame.frameHeight}" rx="32" ry="32" />
+    </clipPath>
+  </defs>
+
+  <rect width="${canvasWidth}" height="${canvasHeight}" fill="${previewImageUrl ? "#111827" : "url(#fallbackBg)"}" />
+  ${previewImageUrl ? `<image href="${previewImageUrl}" x="0" y="0" width="${canvasWidth}" height="${canvasHeight}" preserveAspectRatio="xMidYMid slice" filter="url(#blurBg)" />
+  <rect width="${canvasWidth}" height="${canvasHeight}" fill="rgba(15,23,42,0.34)" />` : ""}
+
+  <g>
+    <rect x="${frameX}" y="${frameY}" width="${frame.frameWidth}" height="${frame.frameHeight}" rx="32" ry="32" fill="rgba(255,255,255,0.14)" />
+    ${previewImageUrl ? `<image href="${previewImageUrl}" x="${frameX}" y="${frameY}" width="${frame.frameWidth}" height="${frame.frameHeight}" preserveAspectRatio="xMidYMid slice" clip-path="url(#mediaFrameClip)" />` : `
+    <rect x="${frameX}" y="${frameY}" width="${frame.frameWidth}" height="${frame.frameHeight}" rx="32" ry="32" fill="url(#fallbackBg)" />
+    <circle cx="${frameX + frame.frameWidth / 2}" cy="${frameY + frame.frameHeight / 2}" r="42" fill="rgba(255,255,255,0.18)" />
+    <path d="M ${frameX + frame.frameWidth / 2 - 12} ${frameY + frame.frameHeight / 2 - 18} L ${frameX + frame.frameWidth / 2 - 12} ${frameY + frame.frameHeight / 2 + 18} L ${frameX + frame.frameWidth / 2 + 18} ${frameY + frame.frameHeight / 2} Z" fill="#ffffff" />`}
+    <rect x="${frameX}" y="${frameY}" width="${frame.frameWidth}" height="${frame.frameHeight}" rx="32" ry="32" fill="none" stroke="rgba(255,255,255,0.45)" stroke-width="2" />
+  </g>
+
+  <g>
+    <rect x="${infoX}" y="118" width="170" height="40" rx="20" fill="rgba(255,255,255,0.16)" />
+    <text x="${infoX + 20}" y="144" fill="#ffffff" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="20" font-weight="600">${label}</text>
+    <text x="${infoX}" y="236" fill="#ffffff" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="56" font-weight="700">${previewTitle}</text>
+    <foreignObject x="${infoX}" y="266" width="${infoWidth}" height="172">
+      <div xmlns="http://www.w3.org/1999/xhtml" style="color: rgba(255,255,255,0.92); font: 400 28px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;">
+        ${previewDescription}
+      </div>
+    </foreignObject>
+    <rect x="${infoX}" y="484" width="236" height="54" rx="27" fill="rgba(255,255,255,0.94)" />
+    <text x="${infoX + 26}" y="518" fill="#111827" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="24" font-weight="600">Abrir conteúdo</text>
+  </g>
+</svg>`;
+}
+
+function renderInstagramShareLandingPage(input: {
+  shareUrl: string;
+  redirectUrl: string;
+  previewTitle: string;
+  previewDescription: string;
+  previewImageUrl: string | null;
+}): string {
+  const shareUrl = escapeHtml(input.shareUrl);
+  const redirectUrl = escapeHtml(input.redirectUrl);
+  const previewTitle = escapeHtml(input.previewTitle);
+  const previewDescription = escapeHtml(input.previewDescription);
+  const previewImageUrl = input.previewImageUrl ? escapeHtml(input.previewImageUrl) : null;
+
+  return `<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${previewTitle}</title>
+    <meta name="description" content="${previewDescription}" />
+    <meta property="og:type" content="website" />
+    <meta property="og:locale" content="pt_BR" />
+    <meta property="og:title" content="${previewTitle}" />
+    <meta property="og:description" content="${previewDescription}" />
+    <meta property="og:url" content="${shareUrl}" />
+    <meta property="og:site_name" content="Compartilhamento" />
+    ${previewImageUrl ? `<meta property="og:image" content="${previewImageUrl}" />
+    <meta property="og:image:secure_url" content="${previewImageUrl}" />
+    <meta property="og:image:alt" content="${previewTitle}" />` : ""}
+    <meta name="twitter:card" content="${previewImageUrl ? "summary_large_image" : "summary"}" />
+    <meta name="twitter:title" content="${previewTitle}" />
+    <meta name="twitter:description" content="${previewDescription}" />
+    ${previewImageUrl ? `<meta name="twitter:image" content="${previewImageUrl}" />` : ""}
+    <meta http-equiv="refresh" content="0; url=${redirectUrl}" />
+    <style>
+      :root {
+        color-scheme: light;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        background: linear-gradient(180deg, #fafafa 0%, #f3f4f6 100%);
+        color: #111827;
+        font: 400 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      main {
+        width: min(100%, 420px);
+        background: rgba(255, 255, 255, 0.96);
+        border: 1px solid #e5e7eb;
+        border-radius: 20px;
+        padding: 28px 24px;
+        text-align: center;
+        box-shadow: 0 24px 48px rgba(15, 23, 42, 0.08);
+      }
+
+      h1 {
+        margin: 0 0 8px;
+        font-size: 1.05rem;
+        font-weight: 600;
+      }
+
+      p {
+        margin: 0;
+        color: #4b5563;
+      }
+
+      a {
+        color: #111827;
+        font-weight: 600;
+      }
+    </style>
+    <script>
+      window.location.replace(${JSON.stringify(input.redirectUrl)});
+    </script>
+  </head>
+  <body>
+    <main>
+      <h1>${previewTitle}</h1>
+      <p>Abrindo a publicação do Instagram...</p>
+      <p style="margin-top: 12px;">Se o redirecionamento não acontecer, <a href="${redirectUrl}">toque aqui</a>.</p>
+    </main>
+  </body>
+</html>`;
+}
+
 function appendStorySequenceCacheBuster(mediaUrl: string, jobId: string, index: number, fileName: string): string {
   const targetUrl = new URL(mediaUrl);
   targetUrl.searchParams.set("_su_story_job", jobId);
   targetUrl.searchParams.set("_su_story_idx", String(index + 1));
   targetUrl.searchParams.set("_su_story_file", fileName);
   targetUrl.searchParams.set("_su_story_ts", String(Date.now()));
+  return targetUrl.toString();
+}
+
+function appendInstagramMediaCacheBuster(
+  mediaUrl: string,
+  jobId: string,
+  fileName: string,
+  variant: string,
+): string {
+  const targetUrl = new URL(mediaUrl);
+  targetUrl.searchParams.set("_su_job", jobId);
+  targetUrl.searchParams.set("_su_media", fileName);
+  targetUrl.searchParams.set("_su_variant", variant);
+  targetUrl.searchParams.set("_su_ts", String(Date.now()));
   return targetUrl.toString();
 }
 
@@ -2939,6 +3589,278 @@ function storySequenceFileAudit(filePath: string): { fileName: string; fingerpri
   }
 }
 
+async function publishInstagramFirstCommentIfConfigured(input: {
+  connection: {
+    secretCipher: string | null;
+  };
+  job: {
+    id: string;
+    companyId?: string;
+    publicationType?: string | null;
+    postStory?: boolean;
+    postReel?: boolean;
+    postWhatsapp?: boolean;
+    firstComment?: string | null;
+  };
+  publishedMediaId: string;
+}): Promise<void> {
+  const publicationType = normalizePublicationType(input.job);
+  if (publicationType !== "instagram_post" && publicationType !== "instagram_reel") {
+    return;
+  }
+
+  const comment = input.job.firstComment?.trim() || "";
+  if (!comment) {
+    return;
+  }
+
+  try {
+    await publishInstagramMediaCommentWithGraphApi(
+      {
+        secretCipher: input.connection.secretCipher,
+      },
+      {
+        mediaId: input.publishedMediaId,
+        message: comment,
+      },
+    );
+
+    if (input.job.companyId) {
+      await appendLog({
+        companyId: input.job.companyId,
+        level: "INFO",
+        message: `Primeiro comentário publicado automaticamente no job ${input.job.id}.`,
+      });
+    }
+  } catch (error) {
+    if (input.job.companyId) {
+      await appendLog({
+        companyId: input.job.companyId,
+        level: "WARN",
+        errorCode: "INSTAGRAM_FIRST_COMMENT_FAILED",
+        message:
+          `Postagem ${input.job.id} foi publicada, mas o primeiro comentário falhou: ` +
+          `${error instanceof Error ? error.message : "erro desconhecido"}`,
+      });
+    }
+  }
+}
+
+function buildWhatsappRelinkMediaCaption(input: {
+  publicationType: PublicationType;
+  caption: string | null;
+  permalink: string;
+}): string {
+  const normalizedPermalink = input.permalink.trim();
+  if (!normalizedPermalink) {
+    return "";
+  }
+
+  if (input.publicationType === "instagram_story") {
+    return normalizedPermalink;
+  }
+
+  const normalizedCaption = input.caption?.trim() || "";
+  if (!normalizedCaption) {
+    return normalizedPermalink;
+  }
+
+  const suffix = `\n\n${normalizedPermalink}`;
+  const maxCaptionLength = 1024;
+  const availableCaptionLength = maxCaptionLength - suffix.length;
+
+  if (availableCaptionLength <= 0) {
+    return normalizedPermalink;
+  }
+
+  const trimmedCaption =
+    normalizedCaption.length <= availableCaptionLength
+      ? normalizedCaption
+      : `${normalizedCaption.slice(0, Math.max(0, availableCaptionLength - 3)).trimEnd()}...`;
+
+  return `${trimmedCaption}${suffix}`;
+}
+
+async function dispatchWhatsappRelinkJobsForInstagramPublication(input: {
+  job: {
+    id: string;
+    companyId: string;
+    createdByUserId: string | null;
+    filePath: string;
+    title?: string | null;
+    caption: string | null;
+    whatsappBackgroundColor?: string | null;
+    publicationType?: string | null;
+    whatsappRelinkEnabled: boolean;
+    whatsappRelinkConnectionIds: unknown;
+    whatsappRelinkDispatchedAt: Date | null;
+  };
+  connection: {
+    secretCipher: string | null;
+  };
+  publishedMediaId: string | null;
+}): Promise<void> {
+  const publicationType = normalizePublicationType(input.job);
+  if (
+    !supportsInstagramWhatsappRelink(publicationType) ||
+    !supportsInstagramWhatsappRelinkForJobMedia(publicationType, input.job.filePath)
+  ) {
+    return;
+  }
+
+  if (!input.job.whatsappRelinkEnabled || input.job.whatsappRelinkDispatchedAt) {
+    return;
+  }
+
+  const configuredConnectionIds = parseStoredWhatsappRelinkConnectionIds(input.job.whatsappRelinkConnectionIds);
+  if (configuredConnectionIds.length === 0) {
+    return;
+  }
+
+  const publishedMediaId = input.publishedMediaId?.trim() || "";
+  if (!publishedMediaId) {
+    await appendLog({
+      companyId: input.job.companyId,
+      level: "WARN",
+      errorCode: "WHATSAPP_RELINK_MEDIA_ID_MISSING",
+      message:
+        `Job ${input.job.id} concluiu no Instagram, mas sem mediaId para gerar relink no WhatsApp.`,
+    });
+    return;
+  }
+
+  let permalink: string | null = null;
+  try {
+    permalink = await fetchInstagramPublishedMediaPermalinkWithGraphApi(
+      {
+        secretCipher: input.connection.secretCipher,
+      },
+      publishedMediaId,
+    );
+  } catch (error) {
+    await appendLog({
+      companyId: input.job.companyId,
+      level: "WARN",
+      errorCode: "WHATSAPP_RELINK_PERMALINK_FAILED",
+      message:
+        `Job ${input.job.id} não conseguiu buscar permalink para relink no WhatsApp: ` +
+        `${error instanceof Error ? error.message : "erro desconhecido"}`,
+    });
+  }
+
+  if (!permalink) {
+    await appendLog({
+      companyId: input.job.companyId,
+      level: "WARN",
+      errorCode: "WHATSAPP_RELINK_PERMALINK_MISSING",
+      message: `Job ${input.job.id} não retornou permalink para relink no WhatsApp.`,
+    });
+    return;
+  }
+
+  const targetConnections = await prisma.socialConnection.findMany({
+    where: {
+      id: { in: configuredConnectionIds },
+      platform: "whatsapp",
+      authStatus: "CONNECTED",
+    },
+    select: {
+      id: true,
+      companyId: true,
+    },
+  });
+  const targetConnectionMap = new Map(targetConnections.map((connection) => [connection.id, connection]));
+  const targetConnectionsInOrder = configuredConnectionIds
+    .map((id) => targetConnectionMap.get(id))
+    .filter((connection): connection is { id: string; companyId: string } => Boolean(connection));
+  if (targetConnectionsInOrder.length === 0) {
+    await appendLog({
+      companyId: input.job.companyId,
+      level: "WARN",
+      errorCode: "WHATSAPP_RELINK_CONNECTIONS_NOT_FOUND",
+      message:
+        `Job ${input.job.id} não encontrou contas de WhatsApp válidas para relink.`,
+    });
+    return;
+  }
+
+  const mediaBundle = decodeJobMediaBundleStorage(input.job.filePath);
+  const firstMediaFilePath = mediaBundle.files[0] ?? input.job.filePath?.trim() ?? "";
+  if (!firstMediaFilePath) {
+    await appendLog({
+      companyId: input.job.companyId,
+      level: "WARN",
+      errorCode: "WHATSAPP_RELINK_MEDIA_FILE_MISSING",
+      message: `Job ${input.job.id} não encontrou mídia para criar o relink no WhatsApp.`,
+    });
+    return;
+  }
+
+  let relinkSourceFilePath = firstMediaFilePath;
+  try {
+    relinkSourceFilePath = await ensureWhatsappRelinkMediaFileForPublication({
+      jobId: input.job.id,
+      publicationType,
+      sourceFilePath: firstMediaFilePath,
+    });
+  } catch (error) {
+    relinkSourceFilePath = firstMediaFilePath;
+    await appendLog({
+      companyId: input.job.companyId,
+      level: "WARN",
+      errorCode: "WHATSAPP_RELINK_MEDIA_RENDER_FAILED",
+      message:
+        `Job ${input.job.id} não conseguiu preparar a mídia vertical do relink e seguirá com o arquivo original: ` +
+        `${error instanceof Error ? error.message : "erro desconhecido"}`,
+    });
+  }
+
+  const relinkText = buildWhatsappRelinkMediaCaption({
+    publicationType,
+    caption: input.job.caption,
+    permalink,
+  });
+  const now = new Date();
+  for (const whatsappConnection of targetConnectionsInOrder) {
+    await prisma.job.create({
+      data: {
+        companyId: whatsappConnection.companyId,
+        createdByUserId: input.job.createdByUserId,
+        socialConnectionId: whatsappConnection.id,
+        filePath: relinkSourceFilePath,
+        title: input.job.title ? `${input.job.title} (Relink)` : "Relink Instagram",
+        caption: relinkText,
+        firstComment: null,
+        locationName: null,
+        whatsappBackgroundColor: null,
+        publicationType: "whatsapp_status_midia",
+        publicationState: "PUBLISHED",
+        postStory: false,
+        postReel: false,
+        postWhatsapp: true,
+        modoWhatsapp: "texto",
+        dataPostagem: now,
+      },
+    });
+  }
+
+  await prisma.job.update({
+    where: { id: input.job.id },
+    data: {
+      whatsappRelinkDispatchedAt: now,
+      instagramPermalink: permalink,
+    },
+  });
+
+  await appendLog({
+    companyId: input.job.companyId,
+    level: "INFO",
+    message:
+      `Job ${input.job.id} criou ${targetConnectionsInOrder.length} status de relink no WhatsApp ` +
+      `com permalink ${permalink}.`,
+  });
+}
+
 async function executeInstagramJobWithResolvedMediaBundle(
   connection: {
     id: string;
@@ -2950,13 +3872,14 @@ async function executeInstagramJobWithResolvedMediaBundle(
     companyId?: string;
     filePath: string;
     caption: string | null;
+    firstComment: string | null;
     locationName: string | null;
     publicationType?: string | null;
     postStory?: boolean;
     postReel?: boolean;
     postWhatsapp?: boolean;
   },
-): Promise<void> {
+): Promise<{ publishedMediaId: string | null }> {
   const normalizedPublicationType = normalizePublicationType(job);
   if (!isInstagramPublication(normalizedPublicationType)) {
     throw new Error(`UNSUPPORTED_SERVER_PUBLICATION_TYPE:${normalizedPublicationType}`);
@@ -2977,8 +3900,15 @@ async function executeInstagramJobWithResolvedMediaBundle(
       throw new Error("INSTAGRAM_CAROUSEL_REQUIRES_SEQUENTIAL_FLAG");
     }
 
-    const mediaUrls = mediaFiles.map((filePath) => resolvePublicUploadUrl(filePath));
-    await executeInstagramCarouselJobWithGraphApi(
+    const mediaUrls = mediaFiles.map((filePath, index) =>
+      appendInstagramMediaCacheBuster(
+        resolvePublicUploadUrl(filePath),
+        job.id,
+        path.basename(filePath) || `carousel-${index + 1}`,
+        `carousel-${index + 1}`,
+      ),
+    );
+    const published = await executeInstagramCarouselJobWithGraphApi(
       {
         id: connection.id,
         loginIdentifier: connection.loginIdentifier,
@@ -2989,10 +3919,19 @@ async function executeInstagramJobWithResolvedMediaBundle(
         caption: job.caption,
         locationName: locationMetadata.locationName,
         locationId: locationMetadata.locationId,
+        fileAltTexts: mediaBundle.captions,
       },
       mediaUrls,
     );
-    return;
+
+    await publishInstagramFirstCommentIfConfigured({
+      connection,
+      job,
+      publishedMediaId: published.publishedMediaId,
+    });
+    return {
+      publishedMediaId: published.publishedMediaId,
+    };
   }
 
   if (normalizedPublicationType === "instagram_story" && mediaFiles.length > 1) {
@@ -3010,26 +3949,48 @@ async function executeInstagramJobWithResolvedMediaBundle(
         index,
         audit.fileName,
       );
-      let published: {
-        creationId: string;
-        publishedMediaId: string;
-      };
       try {
-        published = await executeInstagramJobWithGraphApi(
-          {
+        const published = await executeInstagramStorySequenceStepWithRetry({
+          connection: {
             id: connection.id,
             loginIdentifier: connection.loginIdentifier,
             secretCipher: connection.secretCipher,
           },
-          {
-            id: job.id,
-            publicationType: normalizedPublicationType,
-            caption: job.caption,
-            locationName: locationMetadata.locationName,
-            locationId: locationMetadata.locationId,
-          },
+          job,
+          locationMetadata,
           mediaUrl,
-        );
+          altText: mediaBundle.captions[index] ?? null,
+          index,
+          total: mediaFiles.length,
+          fileName: audit.fileName,
+        });
+
+        const creationId = published.creationId?.trim() || "";
+        if (creationId) {
+          if (createdStoryIds.has(creationId)) {
+            throw new Error("INSTAGRAM_STORY_SEQUENCE_DUPLICATE_CREATION_ID");
+          }
+          createdStoryIds.add(creationId);
+        }
+
+        const publishedMediaId = published.publishedMediaId?.trim() || "";
+        if (publishedMediaId) {
+          if (publishedStoryIds.has(publishedMediaId)) {
+            throw new Error("INSTAGRAM_STORY_SEQUENCE_DUPLICATE_PUBLISH_ID");
+          }
+          publishedStoryIds.add(publishedMediaId);
+        }
+
+        if (job.companyId) {
+          await appendLog({
+            companyId: job.companyId,
+            level: "INFO",
+            message:
+              `Job ${job.id} story ${index + 1}/${mediaFiles.length} publicado em sequência. ` +
+              `arquivo=${audit.fileName} mediaId=${publishedMediaId || "indisponivel"} ` +
+              `hash=${audit.fingerprint.slice(0, 12)}.`,
+          });
+        }
       } catch (sequenceStepError) {
         const stepMessage = sequenceStepError instanceof Error
           ? sequenceStepError.message
@@ -3046,42 +4007,23 @@ async function executeInstagramJobWithResolvedMediaBundle(
         );
       }
 
-      const creationId = published.creationId?.trim() || "";
-      if (creationId) {
-        if (createdStoryIds.has(creationId)) {
-          throw new Error("INSTAGRAM_STORY_SEQUENCE_DUPLICATE_CREATION_ID");
-        }
-        createdStoryIds.add(creationId);
-      }
-
-      const publishedMediaId = published.publishedMediaId?.trim() || "";
-      if (publishedMediaId) {
-        if (publishedStoryIds.has(publishedMediaId)) {
-          throw new Error("INSTAGRAM_STORY_SEQUENCE_DUPLICATE_PUBLISH_ID");
-        }
-        publishedStoryIds.add(publishedMediaId);
-      }
-
-      if (job.companyId) {
-        await appendLog({
-          companyId: job.companyId,
-          level: "INFO",
-          message:
-            `Job ${job.id} story ${index + 1}/${mediaFiles.length} publicado em sequência. ` +
-            `arquivo=${audit.fileName} mediaId=${publishedMediaId || "indisponivel"} ` +
-            `hash=${audit.fingerprint.slice(0, 12)}.`,
-        });
-      }
-
       if (index < mediaFiles.length - 1 && INSTAGRAM_STORY_SEQUENCE_STEP_DELAY_MS > 0) {
         await new Promise((resolve) => setTimeout(resolve, INSTAGRAM_STORY_SEQUENCE_STEP_DELAY_MS));
       }
     }
-    return;
+    return {
+      publishedMediaId: null,
+    };
   }
 
-  const mediaUrl = resolvePublicUploadUrl(mediaFiles[0]!);
-  await executeInstagramJobWithGraphApi(
+  const firstMediaFilePath = mediaFiles[0]!;
+  const mediaUrl = appendInstagramMediaCacheBuster(
+    resolvePublicUploadUrl(firstMediaFilePath),
+    job.id,
+    path.basename(firstMediaFilePath) || "media",
+    normalizedPublicationType,
+  );
+  const published = await executeInstagramJobWithGraphApi(
     {
       id: connection.id,
       loginIdentifier: connection.loginIdentifier,
@@ -3093,9 +4035,20 @@ async function executeInstagramJobWithResolvedMediaBundle(
       caption: job.caption,
       locationName: locationMetadata.locationName,
       locationId: locationMetadata.locationId,
+      altText: mediaBundle.captions[0] ?? null,
     },
     mediaUrl,
   );
+
+  await publishInstagramFirstCommentIfConfigured({
+    connection,
+    job,
+    publishedMediaId: published.publishedMediaId,
+  });
+
+  return {
+    publishedMediaId: published.publishedMediaId,
+  };
 }
 
 function isSequentialStoryJob(input: {
@@ -3127,17 +4080,189 @@ function parseSequentialStoryPublishedCountFromError(message: string): number | 
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
 
+function parseSequentialStoryFailureMetadata(message: string): {
+  publishedCount: number;
+  step: number;
+  total: number;
+} | null {
+  const match = message.match(/STORY_SEQUENCE_PUBLISHED_COUNT=(\d+);STEP=(\d+);TOTAL=(\d+)/i);
+  if (!match || !match[1] || !match[2] || !match[3]) {
+    return null;
+  }
+
+  const publishedCount = Number.parseInt(match[1], 10);
+  const step = Number.parseInt(match[2], 10);
+  const total = Number.parseInt(match[3], 10);
+  if (!Number.isFinite(publishedCount) || !Number.isFinite(step) || !Number.isFinite(total)) {
+    return null;
+  }
+
+  return {
+    publishedCount: Math.max(0, publishedCount),
+    step: Math.max(1, step),
+    total: Math.max(1, total),
+  };
+}
+
+function isRetryableInstagramStoryStepError(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  if (normalized.includes("/media_publish:")) {
+    return false;
+  }
+
+  if (normalized.includes("media_fetch_invalid_type") || normalized.includes("media_url_invalid")) {
+    return true;
+  }
+
+  return isInstagramTransientExecutionError(message);
+}
+
+async function executeInstagramStorySequenceStepWithRetry(input: {
+  connection: {
+    id: string;
+    loginIdentifier: string | null;
+    secretCipher: string | null;
+  };
+  job: {
+    id: string;
+    companyId?: string;
+    caption: string | null;
+    locationName: string | null;
+    publicationType?: string | null;
+  };
+  locationMetadata: {
+    locationName: string | null;
+    locationId: string | null;
+  };
+  mediaUrl: string;
+  altText: string | null;
+  index: number;
+  total: number;
+  fileName: string;
+}): Promise<{
+  creationId: string;
+  publishedMediaId: string;
+}> {
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= INSTAGRAM_STORY_SEQUENCE_STEP_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      return await executeInstagramJobWithGraphApi(
+        {
+          id: input.connection.id,
+          loginIdentifier: input.connection.loginIdentifier,
+          secretCipher: input.connection.secretCipher,
+        },
+        {
+          id: input.job.id,
+          publicationType: normalizePublicationType(input.job),
+          caption: input.job.caption,
+          locationName: input.locationMetadata.locationName,
+          locationId: input.locationMetadata.locationId,
+          altText: input.altText,
+        },
+        input.mediaUrl,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "INSTAGRAM_STORY_SEQUENCE_STEP_FAILED";
+      lastError = error instanceof Error ? error : new Error(message);
+      const retryable = isRetryableInstagramStoryStepError(message);
+      const isLastAttempt = attempt >= INSTAGRAM_STORY_SEQUENCE_STEP_RETRY_ATTEMPTS;
+
+      if (!retryable || isLastAttempt) {
+        throw lastError;
+      }
+
+      if (input.job.companyId) {
+        await appendLog({
+          companyId: input.job.companyId,
+          level: "WARN",
+          errorCode: "INSTAGRAM_STORY_STEP_AUTO_RETRY",
+          message:
+            `Job ${input.job.id} story ${input.index + 1}/${input.total} falhou na tentativa ${attempt}. ` +
+            `Nova tentativa automática em ${INSTAGRAM_STORY_SEQUENCE_STEP_RETRY_DELAY_MS}ms. ` +
+            `arquivo=${input.fileName}. Erro: ${message}`,
+        });
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, INSTAGRAM_STORY_SEQUENCE_STEP_RETRY_DELAY_MS));
+    }
+  }
+
+  throw lastError ?? new Error("INSTAGRAM_STORY_SEQUENCE_STEP_FAILED");
+}
+
+function buildReschedulableMediaBundleForJob(job: {
+  filePath: string;
+  publicationType?: string | null;
+  postStory?: boolean;
+  postReel?: boolean;
+  postWhatsapp?: boolean;
+  lastError?: string | null;
+}): {
+  encodedFilePath: string;
+  mediaCount: number;
+  totalCount: number;
+  remainingOnly: boolean;
+} {
+  const normalizedPublicationType = normalizePublicationType(job);
+  const mediaBundle = decodeJobMediaBundleStorage(job.filePath);
+  const mediaFiles = mediaBundle.files.length > 0
+    ? mediaBundle.files
+    : (job.filePath?.trim() ? [job.filePath.trim()] : []);
+
+  if (mediaFiles.length === 0) {
+    throw new Error("INSTAGRAM_GRAPH_MEDIA_URL_INVALID");
+  }
+
+  if (normalizedPublicationType === "instagram_story" && mediaBundle.sequential && mediaFiles.length > 1) {
+    const failureMetadata = parseSequentialStoryFailureMetadata(job.lastError ?? "");
+    const publishedCount = failureMetadata?.publishedCount ?? 0;
+
+    if (publishedCount > 0 && publishedCount < mediaFiles.length) {
+      const remainingFiles = mediaFiles.slice(publishedCount);
+      const remainingCaptions = mediaBundle.captions.slice(publishedCount);
+      return {
+        encodedFilePath: encodeJobMediaBundleStorage({
+          files: remainingFiles,
+          sequential: remainingFiles.length > 1,
+          captions: remainingCaptions,
+        }),
+        mediaCount: remainingFiles.length,
+        totalCount: mediaFiles.length,
+        remainingOnly: true,
+      };
+    }
+  }
+
+  return {
+    encodedFilePath: job.filePath,
+    mediaCount: mediaFiles.length,
+    totalCount: mediaFiles.length,
+    remainingOnly: false,
+  };
+}
+
 async function executeInstagramRunningJob(job: {
   id: string;
   companyId: string;
   tentativas: number;
   filePath: string;
   caption: string | null;
+  firstComment: string | null;
   locationName: string | null;
   publicationType: string;
   postStory: boolean;
   postReel: boolean;
   postWhatsapp: boolean;
+  whatsappRelinkEnabled: boolean;
+  whatsappRelinkConnectionIds: unknown;
+  whatsappRelinkDispatchedAt: Date | null;
+  instagramPermalink: string | null;
   createdByUserId: string | null;
 }, connection: {
   id: string;
@@ -3238,7 +4363,15 @@ async function executeInstagramRunningJob(job: {
       }
     }
 
-    await executeInstagramJobWithResolvedMediaBundle(effectiveConnection, job);
+    const executionResult = await executeInstagramJobWithResolvedMediaBundle(effectiveConnection, job);
+
+    await dispatchWhatsappRelinkJobsForInstagramPublication({
+      job,
+      connection: {
+        secretCipher: effectiveConnection.secretCipher,
+      },
+      publishedMediaId: executionResult.publishedMediaId,
+    });
 
     await prisma.job.update({
       where: { id: job.id },
@@ -3292,7 +4425,15 @@ async function executeInstagramRunningJob(job: {
             "Retentando publicação sem exigir novo login.",
         });
 
-        await executeInstagramJobWithResolvedMediaBundle(effectiveConnection, job);
+        const executionResult = await executeInstagramJobWithResolvedMediaBundle(effectiveConnection, job);
+
+        await dispatchWhatsappRelinkJobsForInstagramPublication({
+          job,
+          connection: {
+            secretCipher: effectiveConnection.secretCipher,
+          },
+          publishedMediaId: executionResult.publishedMediaId,
+        });
 
         await prisma.job.update({
           where: { id: job.id },
@@ -3345,7 +4486,15 @@ async function executeInstagramRunningJob(job: {
               "Retentando stories em sequência sem exigir novo login.",
           });
 
-          await executeInstagramJobWithResolvedMediaBundle(effectiveConnection, job);
+          const executionResult = await executeInstagramJobWithResolvedMediaBundle(effectiveConnection, job);
+
+          await dispatchWhatsappRelinkJobsForInstagramPublication({
+            job,
+            connection: {
+              secretCipher: effectiveConnection.secretCipher,
+            },
+            publishedMediaId: executionResult.publishedMediaId,
+          });
 
           await prisma.job.update({
             where: { id: job.id },
@@ -4527,6 +5676,91 @@ app.get("/oauth/instagram/callback", async (request, response) => {
   }
 });
 
+app.get("/share/instagram/:jobId", async (request, response) => {
+  const jobId = request.params.jobId?.trim() || "";
+  if (!jobId) {
+    response.status(404).type("html").send("Compartilhamento não encontrado.");
+    return;
+  }
+
+  const job = await prisma.job.findUnique({
+    where: { id: jobId },
+    select: {
+      id: true,
+      caption: true,
+      filePath: true,
+      instagramPermalink: true,
+      publicationType: true,
+      postStory: true,
+      postReel: true,
+      postWhatsapp: true,
+      modoWhatsapp: true,
+    },
+  });
+
+  if (!job || !job.instagramPermalink || !isInstagramPublication(normalizePublicationType(job))) {
+    response.status(404).type("html").send("Compartilhamento não encontrado.");
+    return;
+  }
+
+  const shareUrl =
+    buildInstagramRelinkShareUrl(job.id) ||
+    `${request.protocol}://${request.get("host") || "localhost:4000"}${request.originalUrl}`;
+  const previewTitle = "Veja esta publicação no Instagram";
+  const previewDescription =
+    compactAvisoText(job.caption, 160) || "Abra o link para visualizar o conteúdo no Instagram.";
+  const previewImageUrl = buildInstagramSharePreviewCardUrl(job.id);
+
+  response.setHeader("Cache-Control", "public, max-age=300");
+  response.type("html").send(
+    renderInstagramShareLandingPage({
+      shareUrl,
+      redirectUrl: job.instagramPermalink,
+      previewTitle,
+      previewDescription,
+      previewImageUrl,
+    }),
+  );
+});
+
+app.get("/share/instagram/:jobId/preview.svg", async (request, response) => {
+  const jobId = request.params.jobId?.trim() || "";
+  if (!jobId) {
+    response.status(404).type("text/plain").send("Preview não encontrado.");
+    return;
+  }
+
+  const job = await prisma.job.findUnique({
+    where: { id: jobId },
+    select: {
+      id: true,
+      caption: true,
+      filePath: true,
+      publicationType: true,
+    },
+  });
+
+  if (!job) {
+    response.status(404).type("text/plain").send("Preview não encontrado.");
+    return;
+  }
+
+  const previewTitle = "Veja esta publicação no Instagram";
+  const previewDescription =
+    compactAvisoText(job.caption, 160) || "Abra o link para visualizar o conteúdo no Instagram.";
+  const previewImageUrl = resolveInstagramSharePreviewImageUrl(job.filePath);
+
+  response.setHeader("Cache-Control", "public, max-age=300");
+  response.type("image/svg+xml").send(
+    renderInstagramSharePreviewSvg({
+      publicationType: job.publicationType,
+      previewTitle,
+      previewDescription,
+      previewImageUrl,
+    }),
+  );
+});
+
 app.post(STRIPE_WEBHOOK_PATH, async (request, response) => {
   if (!STRIPE_SECRET_KEY || !STRIPE_WEBHOOK_SECRET) {
     response.status(503).json({
@@ -5150,10 +6384,13 @@ app.delete("/upload", async (request, response) => {
         ? mediaBundle.files
         : (job.filePath?.trim() ? [job.filePath.trim()] : []);
       const nextFiles = currentFiles.filter((entry) => entry !== normalizedFilePath);
+      const nextCaptions = currentFiles.map((_, index) => mediaBundle.captions[index] ?? null)
+        .filter((_, index) => currentFiles[index] !== normalizedFilePath);
       const nextFilePath = nextFiles.length > 0
         ? encodeJobMediaBundleStorage({
             files: nextFiles,
             sequential: mediaBundle.sequential && nextFiles.length > 1,
+            captions: nextCaptions,
           })
         : "";
 
@@ -5275,9 +6512,15 @@ app.get("/jobs", async (request, response) => {
         socialConnectionId: job.socialConnectionId,
         filePath: mediaBundle.files[0] ?? job.filePath,
         filePaths: mediaBundle.files,
+        fileCaptions: mediaBundle.captions,
         sequential: mediaBundle.sequential,
         title: job.title,
         caption: job.caption,
+        firstComment: job.firstComment,
+        whatsappBackgroundColor: job.whatsappBackgroundColor ?? null,
+        whatsappRelinkEnabled: Boolean(job.whatsappRelinkEnabled),
+        whatsappRelinkConnectionIds: parseStoredWhatsappRelinkConnectionIds(job.whatsappRelinkConnectionIds),
+        instagramPermalink: job.instagramPermalink ?? null,
         locationName: locationMetadata.locationName,
         locationId: locationMetadata.locationId,
         publicationType: normalizePublicationType(job),
@@ -5301,6 +6544,7 @@ app.get("/jobs", async (request, response) => {
 app.post("/jobs", async (request, response) => {
   const payload = createJobSchema.parse(request.body);
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  const normalizedPublicationState = normalizePublicationState(payload.publicationState);
   await ensureMatchingConnection({
     request: authRequest,
     ...payload,
@@ -5308,7 +6552,7 @@ app.post("/jobs", async (request, response) => {
   const billingAccess = await ensureBillingWritableAccess(authRequest);
   if (
     billingAccess &&
-    normalizePublicationState(payload.publicationState) === "PUBLISHED" &&
+    normalizedPublicationState === "PUBLISHED" &&
     billingAccess.plan &&
     billingAccess.usage.postsUsedThisMonth >= billingAccess.plan.maxMonthlyPublications
   ) {
@@ -5322,6 +6566,7 @@ app.post("/jobs", async (request, response) => {
     payload.publicationType,
     payload.filePath,
     payload.filePaths,
+    payload.fileCaptions,
     payload.sequential,
   );
   const resolvedLocation = await resolveAutomaticInstagramLocation({
@@ -5333,10 +6578,39 @@ app.post("/jobs", async (request, response) => {
   const metadata = ensureInstagramMetadata(
     payload.publicationType,
     payload.caption,
+    payload.fileCaptions,
     resolvedLocation.locationName,
     resolvedLocation.locationId,
   );
+  const firstComment = normalizeFirstComment(payload.publicationType, payload.firstComment);
+  const relinkOptions = await resolveWhatsappRelinkOptions({
+    request: authRequest,
+    publicationType: payload.publicationType,
+    encodedFilePath: filePath,
+    enabledValue: payload.whatsappRelinkEnabled,
+    connectionIdsValue: payload.whatsappRelinkConnectionIds,
+  });
+  const whatsappBackgroundColor = normalizeWhatsappBackgroundColor(
+    payload.whatsappBackgroundColor,
+    payload.publicationType === "whatsapp_status_texto" ||
+      payload.publicationType === "whatsapp_status_midia" ||
+      relinkOptions.enabled,
+  );
   const normalizedTitle = normalizeJobTitle(payload.title);
+  let scheduledAt = new Date();
+
+  if (normalizedPublicationState === "PUBLISHED") {
+    if (!payload.dataPostagem) {
+      response.status(400).json({ error: "Data e horário são obrigatórios para publicação." });
+      return;
+    }
+    scheduledAt = new Date(payload.dataPostagem);
+    if (Number.isNaN(scheduledAt.getTime())) {
+      response.status(400).json({ error: "Data/hora inválida." });
+      return;
+    }
+  }
+
   const job = await prisma.job.create({
     data: {
       companyId: payload.companyId,
@@ -5345,21 +6619,30 @@ app.post("/jobs", async (request, response) => {
       filePath,
       title: normalizedTitle,
       caption: metadata.caption,
+      firstComment,
+      whatsappBackgroundColor,
+      whatsappRelinkEnabled: relinkOptions.enabled,
+      whatsappRelinkConnectionIds: relinkOptions.enabled ? relinkOptions.connectionIds : Prisma.DbNull,
+      whatsappRelinkDispatchedAt: null,
+      instagramPermalink: null,
       locationName: metadata.locationName,
       publicationType: payload.publicationType,
-      publicationState: normalizePublicationState(payload.publicationState),
+      publicationState: normalizedPublicationState,
       postStory: legacyFields.postStory,
       postReel: legacyFields.postReel,
       postWhatsapp: legacyFields.postWhatsapp,
       modoWhatsapp: legacyFields.modoWhatsapp,
-      dataPostagem: new Date(payload.dataPostagem),
+      dataPostagem: scheduledAt,
     },
   });
 
   await appendLog({
     companyId: payload.companyId,
     level: "INFO",
-    message: `Job ${job.id} agendado para ${job.dataPostagem.toISOString()}.`,
+    message:
+      normalizedPublicationState === "DRAFT"
+        ? `Job ${job.id} salvo como rascunho com data e hora indefinida.`
+        : `Job ${job.id} agendado para ${job.dataPostagem.toISOString()}.`,
   });
   response.status(201).json(job);
 });
@@ -5376,6 +6659,7 @@ app.put("/jobs/:id", async (request, response) => {
     payload.publicationType,
     payload.filePath,
     payload.filePaths,
+    payload.fileCaptions,
     payload.sequential,
   );
   const resolvedLocation = await resolveAutomaticInstagramLocation({
@@ -5387,9 +6671,11 @@ app.put("/jobs/:id", async (request, response) => {
   const metadata = ensureInstagramMetadata(
     payload.publicationType,
     payload.caption,
+    payload.fileCaptions,
     resolvedLocation.locationName,
     resolvedLocation.locationId,
   );
+  const firstComment = normalizeFirstComment(payload.publicationType, payload.firstComment);
   const normalizedTitle = normalizeJobTitle(payload.title);
   const existingJob = await prisma.job.findUnique({ where: { id: request.params.id } });
 
@@ -5402,6 +6688,21 @@ app.put("/jobs/:id", async (request, response) => {
     response.status(403).json({ error: "Voce nao pode editar esta postagem." });
     return;
   }
+
+  const existingRelinkConnectionIds = parseStoredWhatsappRelinkConnectionIds(existingJob.whatsappRelinkConnectionIds);
+  const relinkOptions = await resolveWhatsappRelinkOptions({
+    request: authRequest,
+    publicationType: payload.publicationType,
+    encodedFilePath: filePath,
+    enabledValue: payload.whatsappRelinkEnabled ?? existingJob.whatsappRelinkEnabled,
+    connectionIdsValue: payload.whatsappRelinkConnectionIds ?? existingRelinkConnectionIds,
+  });
+  const whatsappBackgroundColor = normalizeWhatsappBackgroundColor(
+    payload.whatsappBackgroundColor ?? existingJob.whatsappBackgroundColor,
+    payload.publicationType === "whatsapp_status_texto" ||
+      payload.publicationType === "whatsapp_status_midia" ||
+      relinkOptions.enabled,
+  );
 
   const nextPublicationState = normalizePublicationState(payload.publicationState ?? existingJob.publicationState);
   const previousPublicationState = normalizePublicationState(existingJob.publicationState);
@@ -5421,6 +6722,19 @@ app.put("/jobs/:id", async (request, response) => {
     }
   }
 
+  let scheduledAt = new Date();
+  if (nextPublicationState === "PUBLISHED") {
+    if (!payload.dataPostagem) {
+      response.status(400).json({ error: "Data e horário são obrigatórios para publicação." });
+      return;
+    }
+    scheduledAt = new Date(payload.dataPostagem);
+    if (Number.isNaN(scheduledAt.getTime())) {
+      response.status(400).json({ error: "Data/hora inválida." });
+      return;
+    }
+  }
+
   const job = await prisma.job.update({
     where: { id: request.params.id },
     data: {
@@ -5429,6 +6743,12 @@ app.put("/jobs/:id", async (request, response) => {
       filePath,
       title: normalizedTitle,
       caption: metadata.caption,
+      firstComment,
+      whatsappBackgroundColor,
+      whatsappRelinkEnabled: relinkOptions.enabled,
+      whatsappRelinkConnectionIds: relinkOptions.enabled ? relinkOptions.connectionIds : Prisma.DbNull,
+      whatsappRelinkDispatchedAt: null,
+      instagramPermalink: null,
       locationName: metadata.locationName,
       publicationType: payload.publicationType,
       publicationState: nextPublicationState,
@@ -5436,7 +6756,7 @@ app.put("/jobs/:id", async (request, response) => {
       postReel: legacyFields.postReel,
       postWhatsapp: legacyFields.postWhatsapp,
       modoWhatsapp: legacyFields.modoWhatsapp,
-      dataPostagem: new Date(payload.dataPostagem),
+      dataPostagem: scheduledAt,
       status: "PENDING",
       tentativas: 0,
       startedAt: null,
@@ -5448,7 +6768,10 @@ app.put("/jobs/:id", async (request, response) => {
   await appendLog({
     companyId: payload.companyId,
     level: "INFO",
-    message: `Job ${job.id} foi editado e reagendado para ${job.dataPostagem.toISOString()}.`,
+    message:
+      nextPublicationState === "DRAFT"
+        ? `Job ${job.id} foi editado e salvo como rascunho com data e hora indefinida.`
+        : `Job ${job.id} foi editado e reagendado para ${job.dataPostagem.toISOString()}.`,
   });
 
   response.json(job);
@@ -5492,6 +6815,86 @@ app.post("/jobs/:id/retry", async (request, response) => {
   });
 
   response.json(job);
+});
+
+app.post("/jobs/:id/reschedule-failed-media", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  const existingJob = await prisma.job.findUnique({ where: { id: request.params.id } });
+
+  if (!existingJob) {
+    response.status(404).json({ error: "Job nao encontrado." });
+    return;
+  }
+
+  if (!isRootUser(authRequest) && existingJob.createdByUserId !== authRequest.adminUser?.id) {
+    response.status(403).json({ error: "Voce nao pode reagendar esta postagem." });
+    return;
+  }
+
+  if (normalizePublicationState(existingJob.publicationState) === "DRAFT") {
+    response.status(409).json({ error: "Rascunhos não podem ser reagendados por esta ação." });
+    return;
+  }
+
+  if (existingJob.status !== "FAILED") {
+    response.status(409).json({ error: "Apenas postagens com falha podem usar este reagendamento." });
+    return;
+  }
+
+  if (!isInstagramPublication(normalizePublicationType(existingJob))) {
+    response.status(409).json({ error: "Este reagendamento rápido está disponível apenas para falhas do Instagram." });
+    return;
+  }
+
+  const mediaRetryBundle = buildReschedulableMediaBundleForJob(existingJob);
+  const retryAt = new Date(Date.now() + FAILED_MEDIA_RESCHEDULE_DELAY_MS);
+
+  const job = await prisma.job.create({
+    data: {
+      companyId: existingJob.companyId,
+      createdByUserId: existingJob.createdByUserId,
+      socialConnectionId: existingJob.socialConnectionId,
+      filePath: mediaRetryBundle.encodedFilePath,
+      title: existingJob.title,
+      caption: existingJob.caption,
+      firstComment: existingJob.firstComment,
+      whatsappBackgroundColor: existingJob.whatsappBackgroundColor,
+      whatsappRelinkEnabled: existingJob.whatsappRelinkEnabled,
+      whatsappRelinkConnectionIds: existingJob.whatsappRelinkConnectionIds ?? Prisma.DbNull,
+      whatsappRelinkDispatchedAt: null,
+      instagramPermalink: null,
+      locationName: existingJob.locationName,
+      publicationType: existingJob.publicationType,
+      publicationState: existingJob.publicationState,
+      postStory: existingJob.postStory,
+      postReel: existingJob.postReel,
+      postWhatsapp: existingJob.postWhatsapp,
+      modoWhatsapp: existingJob.modoWhatsapp,
+      dataPostagem: retryAt,
+      status: "PENDING",
+      tentativas: 0,
+      startedAt: null,
+      completedAt: null,
+      lastError: null,
+    },
+  });
+
+  await appendLog({
+    companyId: existingJob.companyId,
+    level: "INFO",
+    message:
+      mediaRetryBundle.remainingOnly
+        ? `Job ${existingJob.id} gerou novo job ${job.id} com ${mediaRetryBundle.mediaCount} mídia(s) restante(s), reagendado para ${retryAt.toISOString()}.`
+        : `Job ${existingJob.id} gerou novo job ${job.id} reagendado para ${retryAt.toISOString()} com ${mediaRetryBundle.mediaCount} mídia(s).`,
+  });
+
+  response.json({
+    job,
+    scheduledAt: retryAt.toISOString(),
+    mediaCount: mediaRetryBundle.mediaCount,
+    totalCount: mediaRetryBundle.totalCount,
+    remainingOnly: mediaRetryBundle.remainingOnly,
+  });
 });
 
 app.post("/jobs/:id/cancel", async (request, response) => {
@@ -5933,7 +7336,7 @@ app.post("/billing/checkout/start", async (request, response) => {
   }
 
   const stripe = ensureStripeClient();
-  const [plan, currentSubscription] = await Promise.all([
+  const [plan, currentSubscription, userBillingSettings] = await Promise.all([
     prisma.plan.findUnique({
       where: { id: payload.planId },
       select: {
@@ -5951,6 +7354,13 @@ app.post("/billing/checkout/start", async (request, response) => {
     prisma.userPlanSubscription.findUnique({
       where: { userId: user.id },
       select: { id: true, stripeCustomerId: true },
+    }),
+    prisma.user.findUnique({
+      where: { id: user.id },
+      select: {
+        billingDiscountEnabled: true,
+        billingDiscountPercent: true,
+      },
     }),
   ]);
 
@@ -6063,7 +7473,25 @@ app.post("/billing/checkout/start", async (request, response) => {
     socialupBillingModel: payload.billingModel,
     socialupCycle: payload.cycle,
     socialupPriceId: selectedPriceId,
+    socialupDiscountPercent:
+      userBillingSettings?.billingDiscountEnabled && userBillingSettings.billingDiscountPercent > 0
+        ? String(userBillingSettings.billingDiscountPercent)
+        : "0",
   };
+
+  const effectiveDiscountPercent =
+    userBillingSettings?.billingDiscountEnabled && userBillingSettings.billingDiscountPercent > 0
+      ? userBillingSettings.billingDiscountPercent
+      : 0;
+  const discountCouponId =
+    effectiveDiscountPercent > 0
+      ? await createStripeCouponForUserDiscount({
+          stripe,
+          userId: user.id,
+          username: user.username,
+          percent: effectiveDiscountPercent,
+        })
+      : null;
 
   const expiresHours = Math.max(1, Math.min(24, STRIPE_PIX_CHECKOUT_EXPIRES_HOURS));
   const expiresAtSeconds = Math.floor(Date.now() / 1000) + expiresHours * 60 * 60;
@@ -6079,6 +7507,7 @@ app.post("/billing/checkout/start", async (request, response) => {
     metadata,
     subscription_data: isSubscriptionMode ? { metadata } : undefined,
     payment_intent_data: isSubscriptionMode ? undefined : { metadata },
+    discounts: discountCouponId ? [{ coupon: discountCouponId }] : undefined,
     client_reference_id: user.id,
   });
 
@@ -6177,18 +7606,13 @@ app.post("/billing/subscription/cancel", async (request, response) => {
   const stripeCustomerId = trimNullable(currentSubscription.stripeCustomerId);
   const stripe = ensureStripeClient();
   if (!stripeSubscriptionId && stripeCustomerId) {
-    const list = await stripe.subscriptions.list({
-      customer: stripeCustomerId,
-      status: "all",
-      limit: 20,
+    const resolvedSubscriptionId = await resolveStripeSubscriptionIdFromCustomer({
+      stripe,
+      stripeCustomerId,
     });
 
-    const activeOrPending = list.data.find((subscription) =>
-      ["active", "trialing", "past_due", "unpaid", "incomplete"].includes(subscription.status),
-    );
-
-    if (activeOrPending) {
-      stripeSubscriptionId = activeOrPending.id;
+    if (resolvedSubscriptionId) {
+      stripeSubscriptionId = resolvedSubscriptionId;
       await prisma.userPlanSubscription.update({
         where: { id: currentSubscription.id },
         data: { stripeSubscriptionId },
@@ -6545,6 +7969,206 @@ app.put("/billing/settings", async (request, response) => {
     autoTrialEnabled: nextAutoTrialEnabled,
     autoTrialDays: nextAutoTrialDays,
     rootDisplayPlanId: nextRootDisplayPlanId,
+  });
+});
+
+app.get("/billing/user-discounts", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  if (!isRootUser(authRequest)) {
+    response.status(403).json({ error: "Apenas root pode listar descontos por usuário." });
+    return;
+  }
+
+  const query = billingUserDiscountListQuerySchema.parse({
+    page: request.query.page,
+    pageSize: request.query.pageSize,
+    query: request.query.query,
+  });
+  const searchText = query.query.trim();
+
+  const where = {
+    username: { not: "root" },
+    ...(searchText
+      ? {
+          OR: [
+            { name: { contains: searchText, mode: "insensitive" as const } },
+            { username: { contains: searchText, mode: "insensitive" as const } },
+          ],
+        }
+      : {}),
+  };
+
+  const [total, users] = await Promise.all([
+    prisma.user.count({ where }),
+    prisma.user.findMany({
+      where,
+      orderBy: [{ createdAt: "desc" }],
+      skip: (query.page - 1) * query.pageSize,
+      take: query.pageSize,
+      select: {
+        id: true,
+        name: true,
+        username: true,
+        role: true,
+        createdAt: true,
+        billingDiscountEnabled: true,
+        billingDiscountPercent: true,
+        subscription: {
+          select: {
+            status: true,
+            billingModel: true,
+            cycle: true,
+            plan: {
+              select: {
+                name: true,
+                code: true,
+              },
+            },
+          },
+        },
+      },
+    }),
+  ]);
+
+  const totalPages = Math.max(1, Math.ceil(total / query.pageSize));
+  response.json({
+    items: users.map((user) => ({
+      id: user.id,
+      name: user.name,
+      username: user.username,
+      role: user.role,
+      createdAt: user.createdAt,
+      billingDiscountEnabled: user.billingDiscountEnabled,
+      billingDiscountPercent: user.billingDiscountPercent,
+      billingStatus: user.subscription?.status ?? "PAYMENT_REQUIRED",
+      billingModel: user.subscription?.billingModel ?? "NONE",
+      billingCycle: user.subscription?.cycle ?? null,
+      billingPlanName: user.subscription?.plan?.name ?? null,
+      billingPlanCode: user.subscription?.plan?.code ?? null,
+    })),
+    page: Math.min(query.page, totalPages),
+    pageSize: query.pageSize,
+    total,
+    totalPages,
+  });
+});
+
+app.put("/billing/user-discounts/:userId", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  if (!isRootUser(authRequest)) {
+    response.status(403).json({ error: "Apenas root pode alterar desconto por usuário." });
+    return;
+  }
+
+  const userId = (request.params.userId || "").trim();
+  if (!userId) {
+    response.status(400).json({ error: "Usuário inválido para atualização do desconto." });
+    return;
+  }
+
+  const payload = updateBillingUserDiscountSchema.parse(request.body);
+  if (payload.enabled && payload.percent <= 0) {
+    response.status(400).json({ error: "Informe um percentual maior que zero para ativar desconto." });
+    return;
+  }
+
+  const targetUser = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true,
+      username: true,
+      billingDiscountEnabled: true,
+      billingDiscountPercent: true,
+      subscription: {
+        select: {
+          id: true,
+          billingModel: true,
+          stripeSubscriptionId: true,
+          stripeCustomerId: true,
+        },
+      },
+    },
+  });
+
+  if (!targetUser) {
+    response.status(404).json({ error: "Usuário não encontrado." });
+    return;
+  }
+
+  if (targetUser.username === "root") {
+    response.status(409).json({ error: "Desconto individual não é aplicável para a conta root." });
+    return;
+  }
+
+  const nextDiscountPercent = payload.enabled ? payload.percent : 0;
+  await prisma.user.update({
+    where: { id: targetUser.id },
+    data: {
+      billingDiscountEnabled: payload.enabled,
+      billingDiscountPercent: nextDiscountPercent,
+    },
+  });
+
+  let stripeSyncWarning: string | null = null;
+  if (STRIPE_SECRET_KEY && targetUser.subscription?.billingModel === "STRIPE_SUBSCRIPTION") {
+    try {
+      const stripe = ensureStripeClient();
+      let stripeSubscriptionId = trimNullable(targetUser.subscription.stripeSubscriptionId);
+      const stripeCustomerId = trimNullable(targetUser.subscription.stripeCustomerId);
+      if (!stripeSubscriptionId && stripeCustomerId) {
+        stripeSubscriptionId = await resolveStripeSubscriptionIdFromCustomer({
+          stripe,
+          stripeCustomerId,
+        });
+        if (stripeSubscriptionId) {
+          await prisma.userPlanSubscription.update({
+            where: { id: targetUser.subscription.id },
+            data: { stripeSubscriptionId },
+          });
+        }
+      }
+
+      if (stripeSubscriptionId) {
+        if (payload.enabled && nextDiscountPercent > 0) {
+          const couponId = await createStripeCouponForUserDiscount({
+            stripe,
+            userId: targetUser.id,
+            username: targetUser.username,
+            percent: nextDiscountPercent,
+          });
+          if (couponId) {
+            await stripe.subscriptions.update(stripeSubscriptionId, {
+              discounts: [{ coupon: couponId }],
+            });
+          }
+        } else {
+          await stripe.subscriptions.update(stripeSubscriptionId, {
+            discounts: [],
+          });
+        }
+      }
+    } catch (error) {
+      stripeSyncWarning =
+        error instanceof Error
+          ? `Desconto salvo, mas houve falha ao sincronizar assinatura ativa no Stripe: ${error.message}`
+          : "Desconto salvo, mas houve falha ao sincronizar assinatura ativa no Stripe.";
+    }
+  }
+
+  await appendBillingAvisoSafely({
+    userId: targetUser.id,
+    kind: "PLAN_UPDATED",
+    title: payload.enabled ? "Desconto ativado" : "Desconto desativado",
+    message: payload.enabled
+      ? `Seu desconto individual de ${nextDiscountPercent}% está ativo para as próximas cobranças.`
+      : "Seu desconto individual foi removido.",
+  });
+
+  response.json({
+    userId: targetUser.id,
+    billingDiscountEnabled: payload.enabled,
+    billingDiscountPercent: nextDiscountPercent,
+    stripeSyncWarning,
   });
 });
 

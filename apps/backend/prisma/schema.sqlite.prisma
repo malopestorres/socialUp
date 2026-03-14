@@ -49,6 +49,11 @@ model Job {
   title              String?
   caption            String?
   locationName       String?
+  whatsappBackgroundColor String?
+  whatsappRelinkEnabled Boolean        @default(false)
+  whatsappRelinkConnectionIds Json?
+  whatsappRelinkDispatchedAt DateTime?
+  instagramPermalink String?
   publicationType    String            @default("instagram_reel")
   postStory          Boolean           @default(false)
   postReel           Boolean           @default(false)

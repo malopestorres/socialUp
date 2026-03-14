@@ -30,9 +30,12 @@ export interface JobDto {
   socialConnectionId: string | null;
   filePath: string;
   filePaths?: string[];
+  fileCaptions?: Array<string | null>;
   sequential?: boolean;
   title?: string | null;
   caption: string | null;
+  firstComment?: string | null;
+  whatsappBackgroundColor?: string | null;
   locationName: string | null;
   publicationType: PublicationType;
   publicationState: PublicationState;

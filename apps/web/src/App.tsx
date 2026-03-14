@@ -7,6 +7,7 @@ import {
   type DragEvent,
   type FormEvent,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import type { IconType } from "react-icons";
 import {
@@ -15,10 +16,17 @@ import {
   FiCalendar,
   FiCheckCircle,
   FiClock,
+  FiDownload,
+  FiEdit3,
   FiFileText,
   FiHome,
   FiImage,
   FiLink2,
+  FiMapPin,
+  FiRotateCcw,
+  FiSmile,
+  FiTrash2,
+  FiType,
   FiUsers,
   FiUser,
   FiCreditCard,
@@ -51,8 +59,40 @@ type ViewKey =
 type ThemeMode = "light" | "dark";
 
 type HistoryFilterKey = "all" | "upcoming" | "canceled" | "sent" | "failed" | "waiting_login" | "draft" | "published";
+type HistoryBulkAction = "" | "SET_PUBLISHED" | "SET_DRAFT" | "SET_SCHEDULE" | "SET_COMPANY";
 type PublicationState = "PUBLISHED" | "DRAFT";
 type SchedulerPublicationState = PublicationState | "";
+type StoryEditorToolMode = "MOVE" | "DRAW";
+
+type StoryEditorStrokePoint = {
+  x: number;
+  y: number;
+};
+
+type StoryEditorStroke = {
+  id: string;
+  color: string;
+  size: number;
+  points: StoryEditorStrokePoint[];
+};
+
+type StoryEditorDecorSticker = {
+  id: string;
+  emoji: string;
+  x: number;
+  y: number;
+};
+
+type StoryEditorTextSticker = {
+  id: string;
+  text: string;
+  x: number;
+  y: number;
+  textColor: string;
+  backgroundColor: string;
+  fontFamily: string;
+  scale: number;
+};
 
 type Company = {
   id: string;
@@ -91,9 +131,15 @@ type Job = {
   socialConnectionId: string | null;
   filePath: string;
   filePaths?: string[];
+  fileCaptions?: Array<string | null>;
   sequential?: boolean;
   title?: string | null;
   caption: string | null;
+  firstComment?: string | null;
+  whatsappBackgroundColor?: string | null;
+  whatsappRelinkEnabled?: boolean;
+  whatsappRelinkConnectionIds?: string[];
+  instagramPermalink?: string | null;
   locationName: string | null;
   locationId?: string | null;
   publicationType:
@@ -120,7 +166,10 @@ type SchedulerUploadedMedia = {
   filePath: string;
   fileName: string;
   fileSizeBytes: number | null;
+  caption?: string | null;
 };
+
+const DEFAULT_WHATSAPP_BACKGROUND_COLOR = "#202C33";
 
 type Log = {
   id: string;
@@ -257,6 +306,29 @@ type BillingMe = {
   stripeCancelAtPeriodEnd?: boolean;
 };
 
+type BillingUserDiscountItem = {
+  id: string;
+  name: string;
+  username: string;
+  role: string;
+  createdAt: string;
+  billingDiscountEnabled: boolean;
+  billingDiscountPercent: number;
+  billingStatus: string;
+  billingModel: string;
+  billingCycle: string | null;
+  billingPlanName: string | null;
+  billingPlanCode: string | null;
+};
+
+type BillingUserDiscountListResponse = {
+  items: BillingUserDiscountItem[];
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+};
+
 type InstagramOauthWindowMessage = {
   type: "socialup-instagram-oauth";
   success: boolean;
@@ -291,8 +363,8 @@ const navItems: Array<{ key: ViewKey; label: string; eyebrow?: string; icon: Ico
   { key: "planConfig", label: "Configurar planos", icon: FiCreditCard },
   { key: "agents", label: "Conectar contas", icon: FiLink2 },
   { key: "scheduler", label: "Agendar", icon: FiCalendar },
-  { key: "media", label: "Midias", icon: FiImage },
   { key: "history", label: "Histórico", icon: FiClock },
+  { key: "media", label: "Midias", icon: FiImage },
   { key: "noticeAdmin", label: "Cadastrar avisos", icon: FiBell },
   { key: "logs", label: "Logs", icon: FiFileText },
 ];
@@ -339,10 +411,42 @@ const BILLING_PLAN_CHECKOUT_ANCHOR_ID = "billing-plan-checkout";
 const HISTORY_PAGE_SIZE = 10;
 const MEDIA_PAGE_SIZE = 12;
 const NOTICE_PAGE_SIZE = 10;
+const BILLING_USER_DISCOUNT_PAGE_SIZE = 8;
 const INSTAGRAM_IMAGE_MAX_SIZE_BYTES = 8 * 1024 * 1024;
 const INSTAGRAM_MULTI_MEDIA_MAX_FILES = 10;
 const INSTAGRAM_POST_ASPECT_RATIO_MIN = 4 / 5;
 const INSTAGRAM_POST_ASPECT_RATIO_MAX = 1.91;
+const STORY_EDITOR_CANVAS_WIDTH = 1080;
+const STORY_EDITOR_CANVAS_HEIGHT = 1920;
+const STORY_EDITOR_STICKER_MIN = 0.08;
+const STORY_EDITOR_STICKER_MAX = 0.92;
+const STORY_EDITOR_DEFAULT_FONT = "K2D";
+const STORY_EDITOR_BRUSH_COLORS = ["#ffffff", "#111827", "#ef4444", "#22c55e", "#3b82f6", "#8b5cf6", "#eab308", "#f97316"];
+const STORY_EDITOR_DECOR_STICKERS = ["😍", "🔥", "✨", "✅", "🎉", "💬", "❤️", "⚡"];
+const STORY_EDITOR_TEXT_COLORS = ["#ffffff", "#111827", "#ef4444", "#22c55e", "#3b82f6", "#8b5cf6", "#eab308", "#ec4899"];
+const STORY_EDITOR_TEXT_BACKGROUNDS = [
+  "transparent",
+  "#111827",
+  "#ffffff",
+  "#ec4899",
+  "#1d4ed8",
+  "#8b5cf6",
+  "#22c55e",
+  "#eab308",
+];
+const STORY_EDITOR_DEFAULT_TEXT_COLOR = STORY_EDITOR_TEXT_COLORS[1] ?? "#111827";
+const STORY_EDITOR_DEFAULT_TEXT_BACKGROUND_COLOR = STORY_EDITOR_TEXT_BACKGROUNDS[2] ?? "#ffffff";
+const STORY_EDITOR_DEFAULT_LOCATION_TEXT_COLOR = STORY_EDITOR_TEXT_COLORS[1] ?? "#111827";
+const STORY_EDITOR_DEFAULT_LOCATION_BACKGROUND_COLOR = STORY_EDITOR_TEXT_BACKGROUNDS[2] ?? "#ffffff";
+const STORY_EDITOR_FONT_OPTIONS = [
+  { value: "K2D", label: "K2D" },
+  { value: "Arial", label: "Arial" },
+  { value: "Comic Sans MS", label: "Comic Sans" },
+  { value: "Trebuchet MS", label: "Trebuchet" },
+  { value: "Georgia", label: "Georgia" },
+  { value: "Courier New", label: "Courier" },
+  { value: "Times New Roman", label: "Times" },
+];
 const HISTORY_MONTH_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "1", label: "Janeiro" },
   { value: "2", label: "Fevereiro" },
@@ -452,11 +556,11 @@ function initialViewFromLocation(): ViewKey {
   return "dashboard";
 }
 
-const whatsappTextEmojiGroups: Array<{ label: string; emojis: string[] }> = [
-  { label: "Atendimento", emojis: ["💬", "📞", "🫶", "🙏", "😊", "🤝"] },
-  { label: "Promoção", emojis: ["🔥", "🎯", "💥", "💖", "🛍️", "📣"] },
-  { label: "Localização", emojis: ["📍", "🗺️", "🚗", "🏥", "🏬", "📌"] },
-  { label: "Comemoração", emojis: ["🎉", "🥳", "✨", "🎊", "🍾", "🎈"] },
+const fullEmojiList = [
+  "😀", "😁", "😂", "😊", "😉", "😍", "😘", "😎", "🤩", "🥳",
+  "🙏", "🤝", "💬", "📞", "🫶", "💖", "🔥", "🎯", "💥", "📣",
+  "🛍️", "📍", "🗺️", "🚗", "🏥", "🏬", "📌", "🎉", "🎊", "✨",
+  "🍾", "🎈", "📸", "🎬", "🚀", "✅", "⚠️", "❤️", "👏", "💡",
 ];
 
 function isValidTimeZone(value: string): boolean {
@@ -498,11 +602,11 @@ function formatDate(
   timeZone: string = DEFAULT_USER_TIME_ZONE,
 ): string {
   if (!value) {
-    return "Nao definido";
+    return "Não definido";
   }
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) {
-    return "Nao definido";
+    return "Não definido";
   }
 
   return parsed.toLocaleString("pt-BR", {
@@ -510,10 +614,30 @@ function formatDate(
   });
 }
 
-type AvisoTone = "auth" | "error" | "info" | "success" | "neutral";
+type AvisoTone = "auth" | "error" | "info" | "success" | "neutral" | "whatsapp";
 
-function avisoTone(kind: string): AvisoTone {
-  const normalizedKind = kind.trim().toUpperCase();
+function isWhatsappAviso(aviso: Pick<Aviso, "kind" | "title" | "message">): boolean {
+  const normalizedKind = aviso.kind.trim().toUpperCase();
+  const normalizedTitle = aviso.title.trim().toUpperCase();
+  const normalizedMessage = aviso.message.trim().toUpperCase();
+
+  if (normalizedKind === "JOB_WHATSAPP_RELINK_CREATED") {
+    return true;
+  }
+
+  if (normalizedTitle === "RELINK NO WHATSAPP") {
+    return true;
+  }
+
+  return normalizedMessage.startsWith("WHATSAPP STATUS");
+}
+
+function avisoTone(aviso: Pick<Aviso, "kind" | "title" | "message">): AvisoTone {
+  if (isWhatsappAviso(aviso)) {
+    return "whatsapp";
+  }
+
+  const normalizedKind = aviso.kind.trim().toUpperCase();
   if (normalizedKind === "JOB_WAITING_LOGIN" || normalizedKind === "JOB_RATE_LIMIT") {
     return "auth";
   }
@@ -529,8 +653,8 @@ function avisoTone(kind: string): AvisoTone {
   return "neutral";
 }
 
-function avisoToneClass(kind: string): string {
-  return `notice-tone-${avisoTone(kind)}`;
+function avisoToneClass(aviso: Pick<Aviso, "kind" | "title" | "message">): string {
+  return `notice-tone-${avisoTone(aviso)}`;
 }
 
 function resolveJobDisplayTitle(job: Pick<Job, "id" | "title" | "caption">): string {
@@ -545,6 +669,28 @@ function resolveJobDisplayTitle(job: Pick<Job, "id" | "title" | "caption">): str
   }
 
   return `Job ${job.id}`;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function loadImageForCanvas(sourceUrl: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.crossOrigin = "anonymous";
+    image.decoding = "async";
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Não foi possível carregar a imagem para edição do story."));
+    image.src = sourceUrl;
+  });
+}
+
+function formatJobScheduledAt(job: Pick<Job, "publicationState" | "dataPostagem">, timeZone: string): string {
+  if (job.publicationState === "DRAFT") {
+    return "Data e hora indefinida";
+  }
+  return formatDate(job.dataPostagem, timeZone);
 }
 
 function toDateLocal(value: string, timeZone: string): string {
@@ -729,6 +875,165 @@ function formatMegabytes(bytes: number): string {
 
 function formatAspectRatio(value: number): string {
   return value.toFixed(2).replace(/\.00$/, "");
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function fileNameWithoutExtension(fileName: string): string {
+  return fileName.replace(/\.[^/.]+$/, "");
+}
+
+function readImageElementFromUrl(sourceUrl: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.crossOrigin = "anonymous";
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Falha ao carregar imagem para o editor."));
+    image.src = sourceUrl;
+  });
+}
+
+function canvasToBlob(
+  canvas: HTMLCanvasElement,
+  type: "image/png" | "image/jpeg",
+  quality?: number,
+): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        reject(new Error("Falha ao gerar imagem editada."));
+        return;
+      }
+      resolve(blob);
+    }, type, quality);
+  });
+}
+
+function InstagramGradientMapPinIcon({
+  className,
+  gradientId,
+}: {
+  className?: string;
+  gradientId: string;
+}) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false">
+      <defs>
+        <linearGradient id={gradientId} x1="0" y1="0" x2="24" y2="24" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stopColor="#8b5cf6" />
+          <stop offset="56%" stopColor="#ec4899" />
+          <stop offset="100%" stopColor="#f59e0b" />
+        </linearGradient>
+      </defs>
+      <path
+        d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"
+        stroke={`url(#${gradientId})`}
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <circle cx="12" cy="10" r="3" stroke={`url(#${gradientId})`} strokeWidth="2" />
+    </svg>
+  );
+}
+
+function drawRoundedRect(
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  radius: number,
+) {
+  const safeRadius = clamp(radius, 0, Math.min(width, height) / 2);
+  context.beginPath();
+  context.moveTo(x + safeRadius, y);
+  context.lineTo(x + width - safeRadius, y);
+  context.quadraticCurveTo(x + width, y, x + width, y + safeRadius);
+  context.lineTo(x + width, y + height - safeRadius);
+  context.quadraticCurveTo(x + width, y + height, x + width - safeRadius, y + height);
+  context.lineTo(x + safeRadius, y + height);
+  context.quadraticCurveTo(x, y + height, x, y + height - safeRadius);
+  context.lineTo(x, y + safeRadius);
+  context.quadraticCurveTo(x, y, x + safeRadius, y);
+  context.closePath();
+}
+
+function storyStrokeSvgPath(points: StoryEditorStrokePoint[]): string {
+  if (points.length === 0) {
+    return "";
+  }
+
+  const [firstPoint, ...rest] = points;
+  if (!firstPoint) {
+    return "";
+  }
+
+  if (rest.length === 0) {
+    return `M ${Math.round(firstPoint.x * 1000)} ${Math.round(firstPoint.y * 1000)}`;
+  }
+
+  let path = `M ${Math.round(firstPoint.x * 1000)} ${Math.round(firstPoint.y * 1000)}`;
+  const allPoints = [firstPoint, ...rest];
+  for (let index = 1; index < allPoints.length - 1; index += 1) {
+    const currentPoint = allPoints[index];
+    const nextPoint = allPoints[index + 1];
+    if (!currentPoint || !nextPoint) {
+      continue;
+    }
+    const midX = (currentPoint.x + nextPoint.x) / 2;
+    const midY = (currentPoint.y + nextPoint.y) / 2;
+    path += ` Q ${Math.round(currentPoint.x * 1000)} ${Math.round(currentPoint.y * 1000)} ${Math.round(midX * 1000)} ${Math.round(midY * 1000)}`;
+  }
+  const lastPoint = allPoints[allPoints.length - 1];
+  if (lastPoint) {
+    path += ` L ${Math.round(lastPoint.x * 1000)} ${Math.round(lastPoint.y * 1000)}`;
+  }
+  return path;
+}
+
+function drawStrokeOnCanvas(
+  context: CanvasRenderingContext2D,
+  points: StoryEditorStrokePoint[],
+  canvasWidth: number,
+  canvasHeight: number,
+) {
+  if (points.length <= 1) {
+    return;
+  }
+
+  const firstPoint = points[0];
+  if (!firstPoint) {
+    return;
+  }
+
+  context.beginPath();
+  context.moveTo(firstPoint.x * canvasWidth, firstPoint.y * canvasHeight);
+
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const currentPoint = points[index];
+    const nextPoint = points[index + 1];
+    if (!currentPoint || !nextPoint) {
+      continue;
+    }
+    const midX = (currentPoint.x + nextPoint.x) / 2;
+    const midY = (currentPoint.y + nextPoint.y) / 2;
+    context.quadraticCurveTo(
+      currentPoint.x * canvasWidth,
+      currentPoint.y * canvasHeight,
+      midX * canvasWidth,
+      midY * canvasHeight,
+    );
+  }
+
+  const lastPoint = points[points.length - 1];
+  if (lastPoint) {
+    context.lineTo(lastPoint.x * canvasWidth, lastPoint.y * canvasHeight);
+  }
+
+  context.stroke();
 }
 
 function requiresInstagramImageSizeLimit(
@@ -936,7 +1241,10 @@ function canToggleJobSchedule(job: Job, isPastScheduledAtInUserTimeZone: (dateIs
 }
 
 function shouldRenderUpcomingAsRunning(job: Job, isPastScheduledAtInUserTimeZone: (dateIso: string) => boolean): boolean {
-  return job.status === "RUNNING" || (job.status === "PENDING" && isPastScheduledAtInUserTimeZone(job.dataPostagem));
+  return (
+    job.status === "RUNNING" ||
+    (job.status === "PENDING" && (isPastScheduledAtInUserTimeZone(job.dataPostagem) || job.tentativas > 0))
+  );
 }
 
 function jobStatusTone(job: Job): string {
@@ -1083,6 +1391,32 @@ function isInstagramPublication(publicationType: SchedulerPublicationType): bool
   );
 }
 
+function parseStorySequenceFailureMeta(lastError: string | null | undefined): {
+  publishedCount: number;
+  total: number;
+} | null {
+  const raw = (lastError || "").trim();
+  if (!raw) {
+    return null;
+  }
+
+  const match = raw.match(/STORY_SEQUENCE_PUBLISHED_COUNT=(\d+);STEP=(\d+);TOTAL=(\d+)/i);
+  if (!match || !match[1] || !match[3]) {
+    return null;
+  }
+
+  const publishedCount = Number.parseInt(match[1], 10);
+  const total = Number.parseInt(match[3], 10);
+  if (!Number.isFinite(publishedCount) || !Number.isFinite(total)) {
+    return null;
+  }
+
+  return {
+    publishedCount: Math.max(0, publishedCount),
+    total: Math.max(1, total),
+  };
+}
+
 const REMEMBER_ME_STORAGE_KEY = "socialup-remember-me";
 const REMEMBERED_USERNAME_STORAGE_KEY = "socialup-remembered-username";
 const THEME_STORAGE_KEY = "socialup-theme";
@@ -1162,16 +1496,59 @@ function App() {
   const [uploading, setUploading] = useState(false);
   const [uploadedSchedulerMedia, setUploadedSchedulerMedia] = useState<SchedulerUploadedMedia[]>([]);
   const [draggingSchedulerMediaIndex, setDraggingSchedulerMediaIndex] = useState<number | null>(null);
+  const [dragOverSchedulerMediaIndex, setDragOverSchedulerMediaIndex] = useState<number | null>(null);
+  const [mediaCaptionModalIndex, setMediaCaptionModalIndex] = useState<number | null>(null);
+  const [mediaCaptionDraft, setMediaCaptionDraft] = useState("");
+  const [storyEditorMediaIndex, setStoryEditorMediaIndex] = useState<number | null>(null);
+  const [storyEditorLocationEnabled, setStoryEditorLocationEnabled] = useState(false);
+  const [storyEditorLocationText, setStoryEditorLocationText] = useState("");
+  const [storyEditorLocationTextColor, setStoryEditorLocationTextColor] = useState(STORY_EDITOR_DEFAULT_LOCATION_TEXT_COLOR);
+  const [storyEditorLocationBackgroundColor, setStoryEditorLocationBackgroundColor] = useState(
+    STORY_EDITOR_DEFAULT_LOCATION_BACKGROUND_COLOR,
+  );
+  const [storyEditorLocationFontFamily, setStoryEditorLocationFontFamily] = useState(STORY_EDITOR_DEFAULT_FONT);
+  const [storyEditorLocationScale, setStoryEditorLocationScale] = useState(1);
+  const [storyEditorLocationEditing, setStoryEditorLocationEditing] = useState(false);
+  const [storyEditorStickerX, setStoryEditorStickerX] = useState(0.5);
+  const [storyEditorStickerY, setStoryEditorStickerY] = useState(0.18);
+  const [storyEditorToolMode, setStoryEditorToolMode] = useState<StoryEditorToolMode>("MOVE");
+  const [storyEditorBrushColor, setStoryEditorBrushColor] = useState(STORY_EDITOR_BRUSH_COLORS[0] ?? "#ffffff");
+  const [storyEditorBrushSize, setStoryEditorBrushSize] = useState(10);
+  const [storyEditorBrushCursor, setStoryEditorBrushCursor] = useState<{
+    visible: boolean;
+    x: number;
+    y: number;
+  }>({ visible: false, x: 0.5, y: 0.5 });
+  const [storyEditorStrokes, setStoryEditorStrokes] = useState<StoryEditorStroke[]>([]);
+  const [storyEditorDecorStickers, setStoryEditorDecorStickers] = useState<StoryEditorDecorSticker[]>([]);
+  const [storyEditorActiveDecorStickerId, setStoryEditorActiveDecorStickerId] = useState<string | null>(null);
+  const [storyEditorDraggingDecorStickerId, setStoryEditorDraggingDecorStickerId] = useState<string | null>(null);
+  const [storyEditorDecorPickerOpen, setStoryEditorDecorPickerOpen] = useState(false);
+  const [storyEditorTextColor, setStoryEditorTextColor] = useState(STORY_EDITOR_DEFAULT_TEXT_COLOR);
+  const [storyEditorTextBackgroundColor, setStoryEditorTextBackgroundColor] = useState(
+    STORY_EDITOR_DEFAULT_TEXT_BACKGROUND_COLOR,
+  );
+  const [storyEditorTextFontFamily, setStoryEditorTextFontFamily] = useState(STORY_EDITOR_DEFAULT_FONT);
+  const [storyEditorTextScale, setStoryEditorTextScale] = useState(1);
+  const [storyEditorTextStickers, setStoryEditorTextStickers] = useState<StoryEditorTextSticker[]>([]);
+  const [storyEditorActiveTextStickerId, setStoryEditorActiveTextStickerId] = useState<string | null>(null);
+  const [storyEditorDraggingTextStickerId, setStoryEditorDraggingTextStickerId] = useState<string | null>(null);
+  const [storyEditorDraggingSticker, setStoryEditorDraggingSticker] = useState(false);
+  const [storyEditorSaving, setStoryEditorSaving] = useState(false);
   const [uploadDragActive, setUploadDragActive] = useState(false);
   const [jobCompanyId, setJobCompanyId] = useState("");
   const [jobSocialConnectionId, setJobSocialConnectionId] = useState("");
   const [postTitle, setPostTitle] = useState("");
   const [caption, setCaption] = useState("");
+  const [firstCommentEnabled, setFirstCommentEnabled] = useState(false);
+  const [firstComment, setFirstComment] = useState("");
+  const [whatsappBackgroundColor, setWhatsappBackgroundColor] = useState(DEFAULT_WHATSAPP_BACKGROUND_COLOR);
+  const [whatsappRelinkEnabled, setWhatsappRelinkEnabled] = useState(false);
+  const [whatsappRelinkConnectionIds, setWhatsappRelinkConnectionIds] = useState<string[]>([]);
   const [publicationType, setPublicationType] = useState<SchedulerPublicationType>("");
   const [publicationState, setPublicationState] = useState<SchedulerPublicationState>("");
   const [scheduledDate, setScheduledDate] = useState("");
-  const [scheduledTime, setScheduledTime] = useState(() => getCurrentTimeValue(DEFAULT_USER_TIME_ZONE));
-  const [scheduledTimeTouched, setScheduledTimeTouched] = useState(false);
+  const [scheduledTime, setScheduledTime] = useState("");
   const [editingJobId, setEditingJobId] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [schedulerInfo, setSchedulerInfo] = useState("");
@@ -1208,13 +1585,33 @@ function App() {
   const [checkoutBillingModel, setCheckoutBillingModel] = useState<"" | "STRIPE_SUBSCRIPTION" | "PIX_MANUAL">("");
   const [checkoutCycle, setCheckoutCycle] = useState<"" | "MONTHLY" | "YEARLY">("");
   const [startingCheckout, setStartingCheckout] = useState(false);
+  const [rootAssignPlanId, setRootAssignPlanId] = useState("");
+  const [assigningRootPlan, setAssigningRootPlan] = useState(false);
   const [cancelingStripeSubscription, setCancelingStripeSubscription] = useState(false);
+  const [isBillingDiscountModalOpen, setIsBillingDiscountModalOpen] = useState(false);
+  const [billingDiscountUsers, setBillingDiscountUsers] = useState<BillingUserDiscountItem[]>([]);
+  const [billingDiscountUsersLoading, setBillingDiscountUsersLoading] = useState(false);
+  const [billingDiscountSearch, setBillingDiscountSearch] = useState("");
+  const [billingDiscountPage, setBillingDiscountPage] = useState(1);
+  const [billingDiscountTotalPages, setBillingDiscountTotalPages] = useState(1);
+  const [billingDiscountTotal, setBillingDiscountTotal] = useState(0);
+  const [selectedBillingDiscountUserId, setSelectedBillingDiscountUserId] = useState("");
+  const [billingDiscountEnabledInput, setBillingDiscountEnabledInput] = useState(false);
+  const [billingDiscountPercentInput, setBillingDiscountPercentInput] = useState("0");
+  const [savingBillingDiscountUserId, setSavingBillingDiscountUserId] = useState<string | null>(null);
   const [editingPlanId, setEditingPlanId] = useState<string | null>(null);
   const [historyFilter, setHistoryFilter] = useState<HistoryFilterKey>(() =>
     parseHistoryFilterKey(readSearchParam(HISTORY_FILTER_QUERY_PARAM)),
   );
   const [historyMonthFilter, setHistoryMonthFilter] = useState<string>("all");
   const [historyYearFilter, setHistoryYearFilter] = useState<string>("all");
+  const [historySearchQuery, setHistorySearchQuery] = useState("");
+  const [historyBulkAction, setHistoryBulkAction] = useState<HistoryBulkAction>("");
+  const [historyBulkSelectedJobIds, setHistoryBulkSelectedJobIds] = useState<string[]>([]);
+  const [historyBulkDate, setHistoryBulkDate] = useState("");
+  const [historyBulkTime, setHistoryBulkTime] = useState(() => getCurrentTimeValue(DEFAULT_USER_TIME_ZONE));
+  const [historyBulkCompanyId, setHistoryBulkCompanyId] = useState("");
+  const [historyBulkApplying, setHistoryBulkApplying] = useState(false);
   const [mediaStatusFilter, setMediaStatusFilter] = useState<HistoryFilterKey>("all");
   const [mediaMonthFilter, setMediaMonthFilter] = useState<string>("all");
   const [mediaYearFilter, setMediaYearFilter] = useState<string>("all");
@@ -1227,6 +1624,7 @@ function App() {
   const [unreadAvisosCount, setUnreadAvisosCount] = useState(0);
   const [noticesPopoverOpen, setNoticesPopoverOpen] = useState(false);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+  const [openEmojiPickerKey, setOpenEmojiPickerKey] = useState<string | null>(null);
   const [noticesPopoverLoading, setNoticesPopoverLoading] = useState(false);
   const [markingAllAvisosRead, setMarkingAllAvisosRead] = useState(false);
   const [broadcastAvisoTitle, setBroadcastAvisoTitle] = useState("");
@@ -1234,14 +1632,31 @@ function App() {
   const [broadcastAvisoSubmitting, setBroadcastAvisoSubmitting] = useState(false);
   const [contentLoading, setContentLoading] = useState(false);
   const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
+  const [reschedulingFailedMediaJobId, setReschedulingFailedMediaJobId] = useState<string | null>(null);
   const [togglingScheduleJobId, setTogglingScheduleJobId] = useState<string | null>(null);
-  const [publishingDraftJobId, setPublishingDraftJobId] = useState<string | null>(null);
   const [submittingJob, setSubmittingJob] = useState(false);
   const contentLoadingCounterRef = useRef(0);
   const schedulerMediaInputRef = useRef<HTMLInputElement | null>(null);
+  const storyEditorStageRef = useRef<HTMLDivElement | null>(null);
+  const storyEditorStickerDragRef = useRef<{ pointerId: number; offsetX: number; offsetY: number } | null>(null);
+  const storyEditorDecorStickerDragRef = useRef<{
+    pointerId: number;
+    stickerId: string;
+    offsetX: number;
+    offsetY: number;
+  } | null>(null);
+  const storyEditorTextStickerDragRef = useRef<{
+    pointerId: number;
+    stickerId: string;
+    offsetX: number;
+    offsetY: number;
+  } | null>(null);
+  const storyEditorDrawRef = useRef<{ pointerId: number; strokeId: string } | null>(null);
+  const storyEditorMeasureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const mediaSectionRef = useRef<HTMLElement | null>(null);
   const historySectionRef = useRef<HTMLElement | null>(null);
   const avisosSectionRef = useRef<HTMLElement | null>(null);
+  const lastUnreadAvisosCountRef = useRef(0);
   const noticesBellDesktopRef = useRef<HTMLDivElement | null>(null);
   const noticesBellMobileRef = useRef<HTMLDivElement | null>(null);
   const profileMenuDesktopRef = useRef<HTMLDivElement | null>(null);
@@ -1257,6 +1672,30 @@ function App() {
   const instagramForcedLocationName =
     (dashboard.instagramForcedLocationName || "").trim() || "Localização fixa do sistema";
   const isInstagramForcedLocationEnabled = instagramForcedLocationId.length > 0;
+  const storyEditorResolvedLocationName = storyEditorLocationEnabled ? storyEditorLocationText.trim() : "";
+  const activeStoryEditorTextSticker = storyEditorActiveTextStickerId
+    ? (storyEditorTextStickers.find((item) => item.id === storyEditorActiveTextStickerId) ?? null)
+    : null;
+  const storyEditorLocationStickerSize = estimateStoryEditorLocationStickerSize(
+    storyEditorResolvedLocationName || "Sua localização",
+    storyEditorLocationFontFamily,
+    storyEditorLocationScale,
+  );
+  const storyEditorLocationControlsStyle = (() => {
+    const stageRect = storyEditorStageRef.current?.getBoundingClientRect();
+    const stageWidth = stageRect && stageRect.width > 0 ? stageRect.width : 360;
+    const stageHeight = stageRect && stageRect.height > 0 ? stageRect.height : 640;
+    const panelWidth = Math.min(Math.max(stageWidth - 24, 220), 332);
+    const estimatedPanelHeight = 186;
+    const stickerCenterX = storyEditorStickerX * stageWidth;
+    const stickerCenterY = storyEditorStickerY * stageHeight;
+    const desiredTop = stickerCenterY + storyEditorLocationStickerSize.height / 2 + 12;
+    const maxTop = Math.max(stageHeight - estimatedPanelHeight - 12, 12);
+    const top = clamp(desiredTop, 12, maxTop);
+    const left = clamp(stickerCenterX - panelWidth / 2, 12, Math.max(stageWidth - panelWidth - 12, 12));
+
+    return { top, left, width: panelWidth };
+  })();
   const resolvedStripePriceIdsForSelectedProduct = planStripeProductIdInput
     ? (stripeCatalogResolvedByProduct[planStripeProductIdInput] ?? null)
     : null;
@@ -1264,6 +1703,7 @@ function App() {
     () => billingPlans.filter((plan) => plan.isActive && !plan.isTrial),
     [billingPlans],
   );
+  const rootAssignablePlans = useMemo(() => billingPlans.filter((plan) => plan.isActive), [billingPlans]);
   const selectedCheckoutPlan = checkoutPlanId
     ? availablePaidPlans.find((plan) => plan.id === checkoutPlanId) ?? null
     : null;
@@ -1278,6 +1718,9 @@ function App() {
         : selectedCheckoutPlan.monthlyPriceCents
       : null;
   const checkoutSelectedPriceLabel = formatPriceFromCents(checkoutSelectedPriceCents);
+  const selectedBillingDiscountUser = selectedBillingDiscountUserId
+    ? billingDiscountUsers.find((user) => user.id === selectedBillingDiscountUserId) ?? null
+    : null;
   const isPositiveAuthInfo = authInfo.trim().length > 0;
   const isPositiveSchedulerInfo =
     schedulerInfo === "Midia enviada com sucesso." ||
@@ -1292,7 +1735,8 @@ function App() {
     historyInfo === "Postagem reenfileirada para tentativa imediata." ||
     historyInfo === "Agendamento cancelado com sucesso." ||
     historyInfo === "Agendamento ativado com sucesso." ||
-    historyInfo === "Rascunho publicado com sucesso.";
+    historyInfo === "Rascunho publicado com sucesso." ||
+    historyInfo.startsWith("Edição em massa aplicada");
   const isTransientHistoryInfo =
     historyInfo === "Atualizando agendamento..." ||
     historyInfo === "Publicando rascunho..." ||
@@ -1316,6 +1760,11 @@ function App() {
     : "";
   const requiresMediaUpload = publicationType !== "" && publicationType !== "whatsapp_status_texto";
   const supportsMultiMediaUpload = publicationType === "instagram_post" || publicationType === "instagram_story";
+  const supportsFirstComment = publicationType === "instagram_post" || publicationType === "instagram_reel";
+  const supportsWhatsappRelink =
+    publicationType === "instagram_post" ||
+    publicationType === "instagram_reel" ||
+    publicationType === "instagram_story";
   const activeAppLogo = themeMode === "dark" ? appLogoAlternative : appLogo;
   const uploadedFilePath = uploadedSchedulerMedia[0]?.filePath ?? "";
   const uploadedFileName = uploadedSchedulerMedia[0]?.fileName ?? "";
@@ -1324,6 +1773,11 @@ function App() {
   const effectiveSequentialPublishing =
     (publicationType === "instagram_post" || publicationType === "instagram_story") &&
     uploadedMediaCount > 1;
+  const canEnableWhatsappRelink =
+    supportsWhatsappRelink && !(publicationType === "instagram_story" && uploadedMediaCount > 1);
+  const supportsWhatsappBackgroundColor =
+    publicationType === "whatsapp_status_texto" ||
+    publicationType === "whatsapp_status_midia";
   const requiresInstagramMetadata = isInstagramPublication(publicationType);
   const supportsCaption = publicationType !== "" && publicationType !== "instagram_story";
   const captionLabel = publicationType === "whatsapp_status_texto" ? "Texto do status (aceita emojis)" : "Legenda da postagem";
@@ -1334,7 +1788,7 @@ function App() {
   const captionTitle =
     publicationType === "whatsapp_status_texto"
       ? "Digite o texto do status do WhatsApp. Este campo aceita emojis e e obrigatório nesse tipo de publicação."
-      : "Preencha a legenda da postagem. Para Instagram e WhatsApp Status em texto, este campo é obrigatório.";
+      : "Legenda opcional para a postagem.";
 
   function startContentLoading() {
     contentLoadingCounterRef.current += 1;
@@ -1386,6 +1840,12 @@ function App() {
       setAvisosInfo("");
       setNoticeAdminInfo("");
       setPlanInfo("");
+
+      const shouldPrimeContentSkeleton =
+        Boolean(authUser) && view !== "profile" && view !== "plan" && view !== "planConfig" && view !== "notices";
+      if (shouldPrimeContentSkeleton) {
+        setContentLoading(true);
+      }
     }
 
     setNoticesPopoverOpen(false);
@@ -1573,6 +2033,14 @@ function App() {
   }, [activeView, planInfo]);
 
   useEffect(() => {
+    if (activeView === "planConfig" || !isBillingDiscountModalOpen) {
+      return;
+    }
+
+    closeBillingDiscountModal();
+  }, [activeView, isBillingDiscountModalOpen]);
+
+  useEffect(() => {
     if (!mediaInfo || typeof window === "undefined" || !mediaSectionRef.current) {
       return;
     }
@@ -1581,6 +2049,16 @@ function App() {
       mediaSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
   }, [mediaInfo]);
+
+  useEffect(() => {
+    if (!error || typeof window === "undefined") {
+      return;
+    }
+
+    window.requestAnimationFrame(() => {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+  }, [error]);
 
   useEffect(() => {
     if (!noticesPopoverOpen) {
@@ -1647,6 +2125,39 @@ function App() {
       document.removeEventListener("keydown", handleEscape);
     };
   }, [profileMenuOpen]);
+
+  useEffect(() => {
+    if (!openEmojiPickerKey) {
+      return;
+    }
+
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) {
+        setOpenEmojiPickerKey(null);
+        return;
+      }
+
+      if (target.closest(".emoji-picker-shell")) {
+        return;
+      }
+
+      setOpenEmojiPickerKey(null);
+    };
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOpenEmojiPickerKey(null);
+      }
+    };
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [openEmojiPickerKey]);
 
   useEffect(() => {
     const handleInstagramOauthMessage = (event: MessageEvent) => {
@@ -1836,6 +2347,21 @@ function App() {
     );
   }, [connections, jobCompanyId, publicationType]);
 
+  const schedulerWhatsappConnections = useMemo(
+    () =>
+      connections
+        .filter((connection) => connection.platform === "whatsapp" && connection.authStatus === "CONNECTED")
+        .sort((a, b) => {
+          const companyA = companyNameMap[a.companyId] || "";
+          const companyB = companyNameMap[b.companyId] || "";
+          if (companyA !== companyB) {
+            return companyA.localeCompare(companyB);
+          }
+          return a.displayName.localeCompare(b.displayName);
+        }),
+    [companyNameMap, connections],
+  );
+
   const mediaLibrary = useMemo(() => {
     const map = new Map<string, MediaEntry>();
 
@@ -1981,13 +2507,35 @@ function App() {
       }
     })();
 
+    const normalizedSearchQuery = historySearchQuery.trim().toLocaleLowerCase("pt-BR");
+
     return statusFilteredJobs.filter((job) => {
       const yearMonth = getYearMonthInTimeZone(new Date(job.dataPostagem), effectiveUserTimeZone);
       const monthMatches = historyMonthFilter === "all" || yearMonth.month === Number(historyMonthFilter);
       const yearMatches = historyYearFilter === "all" || yearMonth.year === Number(historyYearFilter);
-      return monthMatches && yearMatches;
+      if (!monthMatches || !yearMatches) {
+        return false;
+      }
+
+      if (!normalizedSearchQuery) {
+        return true;
+      }
+
+      const jobTitle = resolveJobDisplayTitle(job);
+      const searchableText = [jobTitle, job.caption ?? ""].join(" ").toLocaleLowerCase("pt-BR");
+
+      return searchableText.includes(normalizedSearchQuery);
     });
-  }, [effectiveUserTimeZone, historyFilter, historyMonthFilter, historyYearFilter, jobsOrderedByCreatedAtDesc, nowTickMs]);
+  }, [
+    companyNameMap,
+    effectiveUserTimeZone,
+    historyFilter,
+    historyMonthFilter,
+    historySearchQuery,
+    historyYearFilter,
+    jobsOrderedByCreatedAtDesc,
+    nowTickMs,
+  ]);
 
   const mediaFilteredItems = useMemo(() => {
     const statusFilteredMedia = (() => {
@@ -2033,10 +2581,51 @@ function App() {
     [historyFilteredJobs, historyPage],
   );
 
+  const historyBulkSelectedJobIdsSet = useMemo(() => new Set(historyBulkSelectedJobIds), [historyBulkSelectedJobIds]);
+  const historyBulkSelectedJobs = useMemo(
+    () => jobs.filter((job) => historyBulkSelectedJobIdsSet.has(job.id)),
+    [jobs, historyBulkSelectedJobIdsSet],
+  );
+
   const paginatedMediaItems = useMemo(
     () => mediaFilteredItems.slice((mediaPage - 1) * MEDIA_PAGE_SIZE, mediaPage * MEDIA_PAGE_SIZE),
     [mediaFilteredItems, mediaPage],
   );
+
+  const mergeConnectionsWithCachedRuntimeData = (
+    previousConnections: SocialConnection[],
+    nextConnections: SocialConnection[],
+  ): SocialConnection[] => {
+    if (previousConnections.length === 0 || nextConnections.length === 0) {
+      return nextConnections;
+    }
+
+    const previousById = new Map(previousConnections.map((connection) => [connection.id, connection]));
+    return nextConnections.map((connection) => {
+      const previous = previousById.get(connection.id);
+      if (!previous) {
+        return connection;
+      }
+
+      if (connection.platform === "instagram" && connection.authStatus === "CONNECTED") {
+        return {
+          ...connection,
+          instagramUsername: connection.instagramUsername || previous.instagramUsername || null,
+          instagramUserId: connection.instagramUserId || previous.instagramUserId || null,
+        };
+      }
+
+      if (connection.platform === "whatsapp" && connection.authStatus === "CONNECTED") {
+        return {
+          ...connection,
+          whatsappProfileName: connection.whatsappProfileName || previous.whatsappProfileName || null,
+          whatsappOwnerJid: connection.whatsappOwnerJid || previous.whatsappOwnerJid || null,
+        };
+      }
+
+      return connection;
+    });
+  };
 
   async function loadAll(options?: { withSkeleton?: boolean }): Promise<void> {
     const withSkeleton = options?.withSkeleton ?? true;
@@ -2057,7 +2646,7 @@ function App() {
         ]);
 
       setCompanies(companiesData);
-      setConnections(connectionsData);
+      setConnections((current) => mergeConnectionsWithCachedRuntimeData(current, connectionsData));
       setJobs(jobsData);
       setLogs(logsData);
       setDashboard(dashboardData);
@@ -2183,6 +2772,112 @@ function App() {
     }
   }
 
+  async function loadBillingDiscountUsers(page: number): Promise<void> {
+    if (!isRootUser) {
+      return;
+    }
+
+    setBillingDiscountUsersLoading(true);
+    try {
+      const params = new URLSearchParams();
+      params.set("page", String(page));
+      params.set("pageSize", String(BILLING_USER_DISCOUNT_PAGE_SIZE));
+      if (billingDiscountSearch.trim()) {
+        params.set("query", billingDiscountSearch.trim());
+      }
+
+      const result = await api.get<BillingUserDiscountListResponse>(`/billing/user-discounts?${params.toString()}`);
+      const nextItems = result.items ?? [];
+      setBillingDiscountUsers(nextItems);
+      setBillingDiscountPage(result.page ?? page);
+      setBillingDiscountTotalPages(Math.max(1, result.totalPages ?? 1));
+      setBillingDiscountTotal(result.total ?? 0);
+      setSelectedBillingDiscountUserId((current) => (nextItems.some((user) => user.id === current) ? current : ""));
+      setError("");
+    } catch (loadDiscountError) {
+      setError(loadDiscountError instanceof Error ? loadDiscountError.message : "Falha ao carregar descontos por usuário.");
+      setBillingDiscountUsers([]);
+      setBillingDiscountTotalPages(1);
+      setBillingDiscountTotal(0);
+      setSelectedBillingDiscountUserId("");
+    } finally {
+      setBillingDiscountUsersLoading(false);
+    }
+  }
+
+  function openBillingDiscountModal() {
+    setPlanInfo("");
+    setError("");
+    setIsBillingDiscountModalOpen(true);
+    setBillingDiscountSearch("");
+    setBillingDiscountPage(1);
+    setBillingDiscountTotalPages(1);
+    setBillingDiscountTotal(0);
+    setBillingDiscountUsers([]);
+    setSelectedBillingDiscountUserId("");
+    setBillingDiscountEnabledInput(false);
+    setBillingDiscountPercentInput("0");
+  }
+
+  function closeBillingDiscountModal() {
+    setIsBillingDiscountModalOpen(false);
+    setSelectedBillingDiscountUserId("");
+    setBillingDiscountEnabledInput(false);
+    setBillingDiscountPercentInput("0");
+    setSavingBillingDiscountUserId(null);
+  }
+
+  function selectBillingDiscountUser(user: BillingUserDiscountItem) {
+    setSelectedBillingDiscountUserId(user.id);
+    setBillingDiscountEnabledInput(user.billingDiscountEnabled);
+    setBillingDiscountPercentInput(String(Math.max(0, user.billingDiscountPercent)));
+  }
+
+  async function saveBillingDiscountForSelectedUser(event: FormEvent) {
+    event.preventDefault();
+    if (!selectedBillingDiscountUser) {
+      setError("Selecione um usuário para aplicar desconto.");
+      return;
+    }
+
+    const parsedPercent = Number.parseInt(billingDiscountPercentInput, 10);
+    if (!Number.isFinite(parsedPercent) || parsedPercent < 0 || parsedPercent > 100) {
+      setError("Percentual inválido. Informe um valor entre 0 e 100.");
+      return;
+    }
+    if (billingDiscountEnabledInput && parsedPercent <= 0) {
+      setError("Para ativar desconto, informe percentual maior que zero.");
+      return;
+    }
+
+    setSavingBillingDiscountUserId(selectedBillingDiscountUser.id);
+    setError("");
+    setPlanInfo("");
+
+    try {
+      const result = await api.putJson<{
+        billingDiscountEnabled: boolean;
+        billingDiscountPercent: number;
+        stripeSyncWarning?: string | null;
+      }>(`/billing/user-discounts/${selectedBillingDiscountUser.id}`, {
+        enabled: billingDiscountEnabledInput,
+        percent: parsedPercent,
+      });
+
+      if (result.stripeSyncWarning) {
+        setError(result.stripeSyncWarning);
+      } else {
+        setError("");
+      }
+      setPlanInfo("Desconto individual atualizado com sucesso.");
+      await loadBillingDiscountUsers(billingDiscountPage);
+    } catch (saveDiscountError) {
+      setError(saveDiscountError instanceof Error ? saveDiscountError.message : "Falha ao salvar desconto individual.");
+    } finally {
+      setSavingBillingDiscountUserId(null);
+    }
+  }
+
   async function refreshLiveData(): Promise<void> {
     try {
       const companyFilter = selectedCompanyId ? `?companyId=${selectedCompanyId}` : "";
@@ -2198,7 +2893,7 @@ function App() {
         logsPromise,
       ]);
 
-      setConnections(connectionsData);
+      setConnections((current) => mergeConnectionsWithCachedRuntimeData(current, connectionsData));
       setJobs(jobsData);
       setDashboard(dashboardData);
 
@@ -2290,6 +2985,41 @@ function App() {
   }, [authUser, activeView, isRootUser]);
 
   useEffect(() => {
+    if (!isRootUser) {
+      return;
+    }
+
+    if (rootAssignPlanId && rootAssignablePlans.some((plan) => plan.id === rootAssignPlanId)) {
+      return;
+    }
+
+    const activeRootPlanId = billingMe?.plan?.id ?? "";
+    if (activeRootPlanId && rootAssignablePlans.some((plan) => plan.id === activeRootPlanId)) {
+      setRootAssignPlanId(activeRootPlanId);
+      return;
+    }
+
+    setRootAssignPlanId("");
+  }, [isRootUser, rootAssignPlanId, rootAssignablePlans, billingMe?.plan?.id]);
+
+  useEffect(() => {
+    if (!isRootUser || !isBillingDiscountModalOpen) {
+      return;
+    }
+
+    void loadBillingDiscountUsers(billingDiscountPage);
+  }, [isRootUser, isBillingDiscountModalOpen, billingDiscountPage, billingDiscountSearch]);
+
+  useEffect(() => {
+    if (!isBillingDiscountModalOpen || !selectedBillingDiscountUser) {
+      return;
+    }
+
+    setBillingDiscountEnabledInput(selectedBillingDiscountUser.billingDiscountEnabled);
+    setBillingDiscountPercentInput(String(Math.max(0, selectedBillingDiscountUser.billingDiscountPercent)));
+  }, [isBillingDiscountModalOpen, selectedBillingDiscountUser]);
+
+  useEffect(() => {
     if (activeView !== "planConfig" || isRootUser) {
       return;
     }
@@ -2337,13 +3067,13 @@ function App() {
   }, [authUser, activeView, selectedCompanyId, isRootUser]);
 
   useEffect(() => {
-    if (scheduledTimeTouched) {
+    if (publicationState !== "DRAFT") {
       return;
     }
 
-    const liveTime = getCurrentTimeValue(effectiveUserTimeZone, nowReferenceDate);
-    setScheduledTime((current) => (current === liveTime ? current : liveTime));
-  }, [effectiveUserTimeZone, nowReferenceDate, scheduledTimeTouched]);
+    setScheduledDate("");
+    setScheduledTime("");
+  }, [publicationState]);
 
   useEffect(() => {
     if (!authUser) {
@@ -2356,7 +3086,13 @@ function App() {
       try {
         const result = await api.get<{ count: number }>("/avisos/unread-count");
         if (!cancelled) {
-          setUnreadAvisosCount(result.count);
+          const nextCount = Math.max(0, result.count);
+          const previousCount = lastUnreadAvisosCountRef.current;
+          lastUnreadAvisosCountRef.current = nextCount;
+          setUnreadAvisosCount(nextCount);
+          if (nextCount > previousCount) {
+            void refreshLiveData();
+          }
         }
       } catch {
         // Mantém o contador atual quando há erro transitório de rede/API.
@@ -2479,8 +3215,153 @@ function App() {
     if (publicationType !== "instagram_post" && publicationType !== "instagram_story" && uploadedSchedulerMedia.length > 1) {
       setUploadedSchedulerMedia((current) => current.slice(0, 1));
       setDraggingSchedulerMediaIndex(null);
+      setDragOverSchedulerMediaIndex(null);
     }
   }, [publicationType, uploadedSchedulerMedia.length]);
+
+  useEffect(() => {
+    if (supportsFirstComment) {
+      return;
+    }
+
+    if (firstCommentEnabled) {
+      setFirstCommentEnabled(false);
+    }
+    if (firstComment) {
+      setFirstComment("");
+    }
+  }, [firstComment, firstCommentEnabled, supportsFirstComment]);
+
+  useEffect(() => {
+    if (!canEnableWhatsappRelink) {
+      if (whatsappRelinkEnabled) {
+        setWhatsappRelinkEnabled(false);
+      }
+      if (whatsappRelinkConnectionIds.length > 0) {
+        setWhatsappRelinkConnectionIds([]);
+      }
+      return;
+    }
+
+    setWhatsappRelinkConnectionIds((current) => {
+      const filtered = current.filter((id) => schedulerWhatsappConnections.some((connection) => connection.id === id));
+      return filtered.length === current.length && filtered.every((id, index) => id === current[index]) ? current : filtered;
+    });
+  }, [canEnableWhatsappRelink, schedulerWhatsappConnections, whatsappRelinkConnectionIds.length, whatsappRelinkEnabled]);
+
+  useEffect(() => {
+    if (mediaCaptionModalIndex === null) {
+      return;
+    }
+    if (mediaCaptionModalIndex < uploadedSchedulerMedia.length) {
+      return;
+    }
+
+    setMediaCaptionModalIndex(null);
+    setMediaCaptionDraft("");
+  }, [mediaCaptionModalIndex, uploadedSchedulerMedia.length]);
+
+  useEffect(() => {
+    if (storyEditorMediaIndex === null) {
+      return;
+    }
+
+    const target = uploadedSchedulerMedia[storyEditorMediaIndex];
+    if (target && isImagePath(target.filePath)) {
+      return;
+    }
+
+    closeStoryEditorModal();
+  }, [storyEditorMediaIndex, uploadedSchedulerMedia]);
+
+  useEffect(() => {
+    if (publicationType === "instagram_story") {
+      return;
+    }
+
+    if (storyEditorMediaIndex !== null) {
+      closeStoryEditorModal();
+    }
+  }, [publicationType, storyEditorMediaIndex]);
+
+  useEffect(() => {
+    if (storyEditorToolMode === "DRAW") {
+      storyEditorStickerDragRef.current = null;
+      storyEditorDecorStickerDragRef.current = null;
+      storyEditorTextStickerDragRef.current = null;
+      setStoryEditorDraggingSticker(false);
+      setStoryEditorDraggingDecorStickerId(null);
+      setStoryEditorDraggingTextStickerId(null);
+      setStoryEditorActiveDecorStickerId(null);
+      setStoryEditorDecorPickerOpen(false);
+      setStoryEditorLocationEditing(false);
+      return;
+    }
+
+    storyEditorDrawRef.current = null;
+    setStoryEditorBrushCursor((current) => (current.visible ? { ...current, visible: false } : current));
+  }, [storyEditorToolMode]);
+
+  useEffect(() => {
+    if (!storyEditorActiveTextStickerId) {
+      return;
+    }
+
+    const activeSticker = storyEditorTextStickers.find((item) => item.id === storyEditorActiveTextStickerId);
+    if (!activeSticker) {
+      setStoryEditorActiveTextStickerId(null);
+      return;
+    }
+
+    setStoryEditorTextColor(activeSticker.textColor);
+    setStoryEditorTextBackgroundColor(activeSticker.backgroundColor);
+    setStoryEditorTextFontFamily(activeSticker.fontFamily);
+    setStoryEditorTextScale(activeSticker.scale);
+  }, [storyEditorActiveTextStickerId, storyEditorTextStickers]);
+
+  useEffect(() => {
+    if (!storyEditorActiveDecorStickerId) {
+      return;
+    }
+
+    if (storyEditorDecorStickers.some((item) => item.id === storyEditorActiveDecorStickerId)) {
+      return;
+    }
+
+    setStoryEditorActiveDecorStickerId(null);
+  }, [storyEditorActiveDecorStickerId, storyEditorDecorStickers]);
+
+  useEffect(() => {
+    const maxLocationScale = getStoryEditorMaxLocationScale(storyEditorLocationText, storyEditorLocationFontFamily);
+    setStoryEditorLocationScale((current) => clamp(current, 0.7, maxLocationScale));
+  }, [storyEditorLocationFontFamily, storyEditorLocationText]);
+
+  useEffect(() => {
+    if (!activeStoryEditorTextSticker) {
+      return;
+    }
+
+    const maxTextScale = getStoryEditorMaxTextScale(activeStoryEditorTextSticker.text, activeStoryEditorTextSticker.fontFamily);
+    setStoryEditorTextScale((current) => clamp(current, 0.7, maxTextScale));
+    setStoryEditorTextStickers((current) => {
+      let hasChanges = false;
+      const next = current.map((item) => {
+        if (item.id !== activeStoryEditorTextSticker.id) {
+          return item;
+        }
+
+        const nextScale = clamp(item.scale, 0.7, maxTextScale);
+        if (nextScale === item.scale) {
+          return item;
+        }
+
+        hasChanges = true;
+        return { ...item, scale: nextScale };
+      });
+
+      return hasChanges ? next : current;
+    });
+  }, [activeStoryEditorTextSticker]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -2512,6 +3393,12 @@ function App() {
       const nextView = initialViewFromLocation();
       const nextHistoryFilter = parseHistoryFilterKey(readSearchParam(HISTORY_FILTER_QUERY_PARAM));
 
+      const shouldPrimeContentSkeleton =
+        Boolean(authUser) && nextView !== "profile" && nextView !== "plan" && nextView !== "planConfig" && nextView !== "notices";
+      if (shouldPrimeContentSkeleton) {
+        setContentLoading(true);
+      }
+
       setActiveView(nextView);
       setHistoryFilter(nextHistoryFilter);
 
@@ -2533,7 +3420,7 @@ function App() {
 
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
-  }, []);
+  }, [authUser]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -2563,11 +3450,28 @@ function App() {
 
   useEffect(() => {
     setHistoryPage(1);
-  }, [historyFilter, historyMonthFilter, historyYearFilter, selectedCompanyId]);
+  }, [historyFilter, historyMonthFilter, historySearchQuery, historyYearFilter, selectedCompanyId]);
 
   useEffect(() => {
     setMediaPage(1);
   }, [mediaStatusFilter, mediaMonthFilter, mediaYearFilter, selectedCompanyId]);
+
+  useEffect(() => {
+    if (historyBulkAction) {
+      return;
+    }
+
+    setHistoryBulkSelectedJobIds([]);
+  }, [historyBulkAction]);
+
+  useEffect(() => {
+    if (historyBulkSelectedJobIds.length === 0) {
+      return;
+    }
+
+    const availableIds = new Set(jobs.map((job) => job.id));
+    setHistoryBulkSelectedJobIds((current) => current.filter((jobId) => availableIds.has(jobId)));
+  }, [jobs, historyBulkSelectedJobIds.length]);
 
   useEffect(() => {
     setHistoryPage((current) => Math.min(Math.max(current, 1), historyTotalPages));
@@ -2742,6 +3646,7 @@ function App() {
           filePath: result.filePath,
           fileName: file.name,
           fileSizeBytes: file.size,
+          caption: null,
         });
       }
 
@@ -2781,6 +3686,7 @@ function App() {
 
   function removeSchedulerUploadedMedia(filePath: string) {
     setUploadedSchedulerMedia((current) => current.filter((item) => item.filePath !== filePath));
+    closeMediaCaptionModal();
   }
 
   function reorderSchedulerUploadedMedia(fromIndex: number, toIndex: number) {
@@ -2803,25 +3709,1040 @@ function App() {
     });
   }
 
-  function handleSchedulerMediaThumbDragStart(index: number) {
-    setDraggingSchedulerMediaIndex(index);
-  }
-
   function handleSchedulerMediaThumbDragEnd() {
     setDraggingSchedulerMediaIndex(null);
+    setDragOverSchedulerMediaIndex(null);
   }
 
-  function handleSchedulerMediaThumbDragOver(event: DragEvent<HTMLDivElement>) {
-    event.preventDefault();
+  function handleSchedulerMediaThumbDragStart(index: number, event: DragEvent<HTMLDivElement>) {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", String(index));
+    setDraggingSchedulerMediaIndex(index);
+    setDragOverSchedulerMediaIndex(index);
   }
 
-  function handleSchedulerMediaThumbDrop(index: number, event: DragEvent<HTMLDivElement>) {
+  function handleSchedulerMediaThumbDragOver(index: number, event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
     if (draggingSchedulerMediaIndex === null) {
       return;
     }
-    reorderSchedulerUploadedMedia(draggingSchedulerMediaIndex, index);
+
+    const targetRect = event.currentTarget.getBoundingClientRect();
+    const shouldInsertAfter = event.clientX >= targetRect.left + targetRect.width / 2;
+    const insertionIndex = shouldInsertAfter ? index + 1 : index;
+    const clampedInsertionIndex = Math.max(0, Math.min(insertionIndex, uploadedSchedulerMedia.length));
+    const nextIndex =
+      draggingSchedulerMediaIndex < clampedInsertionIndex
+        ? clampedInsertionIndex - 1
+        : clampedInsertionIndex;
+
+    setDragOverSchedulerMediaIndex(index);
+    if (nextIndex !== draggingSchedulerMediaIndex) {
+      reorderSchedulerUploadedMedia(draggingSchedulerMediaIndex, nextIndex);
+      setDraggingSchedulerMediaIndex(nextIndex);
+    }
+  }
+
+  function handleSchedulerMediaThumbDrop(index: number, event: DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    setDragOverSchedulerMediaIndex(index);
+    if (draggingSchedulerMediaIndex === null) {
+      return;
+    }
     setDraggingSchedulerMediaIndex(null);
+    setDragOverSchedulerMediaIndex(null);
+  }
+
+  function openMediaCaptionModal(index: number) {
+    const target = uploadedSchedulerMedia[index];
+    if (!target) {
+      return;
+    }
+
+    setMediaCaptionModalIndex(index);
+    setMediaCaptionDraft(target.caption?.trim() || "");
+  }
+
+  function closeMediaCaptionModal() {
+    setMediaCaptionModalIndex(null);
+    setMediaCaptionDraft("");
+  }
+
+  function saveMediaCaptionModal() {
+    if (mediaCaptionModalIndex === null) {
+      return;
+    }
+
+    const normalizedCaption = mediaCaptionDraft.trim();
+    setUploadedSchedulerMedia((current) =>
+      current.map((item, index) =>
+        index === mediaCaptionModalIndex
+          ? {
+              ...item,
+              caption: normalizedCaption.length > 0 ? normalizedCaption : null,
+            }
+          : item,
+      ),
+    );
+    closeMediaCaptionModal();
+  }
+
+  function openStoryEditorModal(index: number) {
+    const target = uploadedSchedulerMedia[index];
+    if (!target || !isImagePath(target.filePath)) {
+      return;
+    }
+
+    storyEditorStickerDragRef.current = null;
+    storyEditorDecorStickerDragRef.current = null;
+    storyEditorTextStickerDragRef.current = null;
+    storyEditorDrawRef.current = null;
+    closeMediaCaptionModal();
+    setStoryEditorMediaIndex(index);
+    setStoryEditorLocationEnabled(isInstagramForcedLocationEnabled);
+    setStoryEditorLocationText(isInstagramForcedLocationEnabled ? instagramForcedLocationName : "");
+    setStoryEditorLocationTextColor(STORY_EDITOR_DEFAULT_LOCATION_TEXT_COLOR);
+    setStoryEditorLocationBackgroundColor(STORY_EDITOR_DEFAULT_LOCATION_BACKGROUND_COLOR);
+    setStoryEditorLocationFontFamily(STORY_EDITOR_DEFAULT_FONT);
+    setStoryEditorLocationScale(1);
+    setStoryEditorLocationEditing(false);
+    setStoryEditorStickerX(0.5);
+    setStoryEditorStickerY(0.18);
+    setStoryEditorToolMode("MOVE");
+    setStoryEditorBrushColor(STORY_EDITOR_BRUSH_COLORS[0] ?? "#ffffff");
+    setStoryEditorBrushSize(10);
+    setStoryEditorBrushCursor({ visible: false, x: 0.5, y: 0.5 });
+    setStoryEditorStrokes([]);
+    setStoryEditorDecorStickers([]);
+    setStoryEditorActiveDecorStickerId(null);
+    setStoryEditorDecorPickerOpen(false);
+    setStoryEditorTextColor(STORY_EDITOR_DEFAULT_TEXT_COLOR);
+    setStoryEditorTextBackgroundColor(STORY_EDITOR_DEFAULT_TEXT_BACKGROUND_COLOR);
+    setStoryEditorTextFontFamily(STORY_EDITOR_DEFAULT_FONT);
+    setStoryEditorTextScale(1);
+    setStoryEditorTextStickers([]);
+    setStoryEditorActiveTextStickerId(null);
+    setStoryEditorDraggingDecorStickerId(null);
+    setStoryEditorDraggingTextStickerId(null);
+    setStoryEditorDraggingSticker(false);
+  }
+
+  function closeStoryEditorModal() {
+    storyEditorStickerDragRef.current = null;
+    storyEditorDecorStickerDragRef.current = null;
+    storyEditorTextStickerDragRef.current = null;
+    storyEditorDrawRef.current = null;
+    setStoryEditorDraggingSticker(false);
+    setStoryEditorDraggingDecorStickerId(null);
+    setStoryEditorDraggingTextStickerId(null);
+    setStoryEditorMediaIndex(null);
+    setStoryEditorLocationEnabled(false);
+    setStoryEditorLocationText("");
+    setStoryEditorLocationTextColor(STORY_EDITOR_DEFAULT_LOCATION_TEXT_COLOR);
+    setStoryEditorLocationBackgroundColor(STORY_EDITOR_DEFAULT_LOCATION_BACKGROUND_COLOR);
+    setStoryEditorLocationFontFamily(STORY_EDITOR_DEFAULT_FONT);
+    setStoryEditorLocationScale(1);
+    setStoryEditorLocationEditing(false);
+    setStoryEditorStickerX(0.5);
+    setStoryEditorStickerY(0.18);
+    setStoryEditorToolMode("MOVE");
+    setStoryEditorBrushColor(STORY_EDITOR_BRUSH_COLORS[0] ?? "#ffffff");
+    setStoryEditorBrushSize(10);
+    setStoryEditorBrushCursor({ visible: false, x: 0.5, y: 0.5 });
+    setStoryEditorStrokes([]);
+    setStoryEditorDecorStickers([]);
+    setStoryEditorActiveDecorStickerId(null);
+    setStoryEditorDecorPickerOpen(false);
+    setStoryEditorTextColor(STORY_EDITOR_DEFAULT_TEXT_COLOR);
+    setStoryEditorTextBackgroundColor(STORY_EDITOR_DEFAULT_TEXT_BACKGROUND_COLOR);
+    setStoryEditorTextFontFamily(STORY_EDITOR_DEFAULT_FONT);
+    setStoryEditorTextScale(1);
+    setStoryEditorTextStickers([]);
+    setStoryEditorActiveTextStickerId(null);
+    setStoryEditorSaving(false);
+  }
+
+  function discardSchedulerSelectedMedia() {
+    closeMediaCaptionModal();
+    closeStoryEditorModal();
+    setUploadedSchedulerMedia([]);
+    setDraggingSchedulerMediaIndex(null);
+    setDragOverSchedulerMediaIndex(null);
+    setUploadDragActive(false);
+    if (schedulerMediaInputRef.current) {
+      schedulerMediaInputRef.current.value = "";
+    }
+  }
+
+  function handlePublicationTypeChange(nextPublicationType: SchedulerPublicationType) {
+    if (nextPublicationType === publicationType) {
+      return;
+    }
+
+    if (uploadedSchedulerMedia.length > 0 || mediaCaptionModalIndex !== null || storyEditorMediaIndex !== null) {
+      discardSchedulerSelectedMedia();
+    } else if (schedulerMediaInputRef.current) {
+      schedulerMediaInputRef.current.value = "";
+    }
+
+    if (nextPublicationType === "instagram_story" && caption) {
+      setCaption("");
+    }
+
+    setError("");
+    setSchedulerInfo("");
+    setPublicationType(nextPublicationType);
+  }
+
+  function handleStoryEditorStickerPointerDown(event: ReactPointerEvent<HTMLButtonElement>) {
+    if (storyEditorSaving || storyEditorToolMode === "DRAW") {
+      return;
+    }
+
+    const stageRect = storyEditorStageRef.current?.getBoundingClientRect();
+    if (!stageRect || stageRect.width <= 0 || stageRect.height <= 0) {
+      return;
+    }
+
+    const stickerCenterX = storyEditorStickerX * stageRect.width;
+    const stickerCenterY = storyEditorStickerY * stageRect.height;
+
+    storyEditorStickerDragRef.current = {
+      pointerId: event.pointerId,
+      offsetX: event.clientX - (stageRect.left + stickerCenterX),
+      offsetY: event.clientY - (stageRect.top + stickerCenterY),
+    };
+
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setStoryEditorActiveTextStickerId(null);
+    setStoryEditorActiveDecorStickerId(null);
+    setStoryEditorDraggingSticker(true);
+  }
+
+  function handleStoryEditorStickerPointerMove(event: ReactPointerEvent<HTMLButtonElement>) {
+    const dragState = storyEditorStickerDragRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    const stageRect = storyEditorStageRef.current?.getBoundingClientRect();
+    if (!stageRect || stageRect.width <= 0 || stageRect.height <= 0) {
+      return;
+    }
+
+    const stickerCenterX = event.clientX - stageRect.left - dragState.offsetX;
+    const stickerCenterY = event.clientY - stageRect.top - dragState.offsetY;
+    const stickerSize = estimateStoryEditorLocationStickerSize(
+      storyEditorResolvedLocationName || "Sua localização",
+      storyEditorLocationFontFamily,
+      storyEditorLocationScale,
+    );
+    const minX = Math.max(STORY_EDITOR_STICKER_MIN * stageRect.width, stickerSize.width / 2 + 8);
+    const maxX = Math.min(STORY_EDITOR_STICKER_MAX * stageRect.width, stageRect.width - stickerSize.width / 2 - 8);
+    const minY = Math.max(STORY_EDITOR_STICKER_MIN * stageRect.height, stickerSize.height / 2 + 8);
+    const maxY = Math.min(STORY_EDITOR_STICKER_MAX * stageRect.height, stageRect.height - stickerSize.height / 2 - 8);
+    const normalizedX = clamp(clamp(stickerCenterX, minX, maxX) / stageRect.width, STORY_EDITOR_STICKER_MIN, STORY_EDITOR_STICKER_MAX);
+    const normalizedY = clamp(clamp(stickerCenterY, minY, maxY) / stageRect.height, STORY_EDITOR_STICKER_MIN, STORY_EDITOR_STICKER_MAX);
+
+    setStoryEditorStickerX(normalizedX);
+    setStoryEditorStickerY(normalizedY);
+  }
+
+  function handleStoryEditorStickerPointerUp(event: ReactPointerEvent<HTMLButtonElement>) {
+    const dragState = storyEditorStickerDragRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    storyEditorStickerDragRef.current = null;
+    setStoryEditorDraggingSticker(false);
+  }
+
+  function storyEditorNormalizedPointFromClient(clientX: number, clientY: number): StoryEditorStrokePoint | null {
+    const stageRect = storyEditorStageRef.current?.getBoundingClientRect();
+    if (!stageRect || stageRect.width <= 0 || stageRect.height <= 0) {
+      return null;
+    }
+
+    return {
+      x: clamp((clientX - stageRect.left) / stageRect.width, 0, 1),
+      y: clamp((clientY - stageRect.top) / stageRect.height, 0, 1),
+    };
+  }
+
+  function updateStoryEditorBrushCursor(clientX: number, clientY: number) {
+    const point = storyEditorNormalizedPointFromClient(clientX, clientY);
+    if (!point) {
+      return;
+    }
+
+    setStoryEditorBrushCursor({
+      visible: true,
+      x: point.x,
+      y: point.y,
+    });
+  }
+
+  function getStoryEditorMeasureContext(): CanvasRenderingContext2D | null {
+    if (typeof document === "undefined") {
+      return null;
+    }
+
+    let canvas = storyEditorMeasureCanvasRef.current;
+    if (!canvas) {
+      canvas = document.createElement("canvas");
+      storyEditorMeasureCanvasRef.current = canvas;
+    }
+
+    return canvas.getContext("2d");
+  }
+
+  function measureStoryEditorTextWidth(text: string, fontSize: number, fontFamily: string): number {
+    const context = getStoryEditorMeasureContext();
+    if (!context) {
+      return Math.max(text.length * fontSize * 0.6, fontSize);
+    }
+
+    context.font = `500 ${fontSize}px ${fontFamily}, K2D, Arial, sans-serif`;
+    return context.measureText(text || " ").width;
+  }
+
+  function estimateStoryEditorTextStickerSize(text: string, fontFamily: string, scale: number) {
+    const normalizedScale = clamp(scale, 0.7, 3);
+    const baseFontSize = 14;
+    const horizontalPadding = 20;
+    const verticalPadding = 12;
+    const textWidth = measureStoryEditorTextWidth(text.trim() || "Texto", baseFontSize, fontFamily);
+    const width = Math.max(textWidth + horizontalPadding, 42) * normalizedScale;
+    const height = Math.max(baseFontSize + verticalPadding, 34) * normalizedScale;
+    return { width, height };
+  }
+
+  function estimateStoryEditorLocationStickerSize(text: string, fontFamily: string, scale: number) {
+    const normalizedScale = clamp(scale, 0.7, 2.2);
+    const baseFontSize = 14;
+    const iconWidth = 14;
+    const horizontalPadding = 12;
+    const textWidth = measureStoryEditorTextWidth(text.trim() || "Sua localização", baseFontSize, fontFamily);
+    const width = Math.max(textWidth + iconWidth + horizontalPadding, 64) * normalizedScale;
+    const height = Math.max(baseFontSize + 14, 36) * normalizedScale;
+    return { width, height };
+  }
+
+  function getStoryEditorMaxStickerScale(baseWidthAtScaleOne: number): number {
+    const stageWidth = storyEditorStageRef.current?.getBoundingClientRect().width ?? 360;
+    const availableWidth = Math.max(stageWidth * (STORY_EDITOR_STICKER_MAX - STORY_EDITOR_STICKER_MIN), 40);
+    return clamp(availableWidth / Math.max(baseWidthAtScaleOne, 1), 0.7, 3);
+  }
+
+  function getStoryEditorMaxLocationScale(locationText: string, fontFamily: string): number {
+    const estimate = estimateStoryEditorLocationStickerSize(locationText, fontFamily, 1);
+    return clamp(getStoryEditorMaxStickerScale(estimate.width), 0.7, 2.2);
+  }
+
+  function getStoryEditorMaxTextScale(text: string, fontFamily: string): number {
+    const estimate = estimateStoryEditorTextStickerSize(text, fontFamily, 1);
+    return getStoryEditorMaxStickerScale(estimate.width);
+  }
+
+  function toggleStoryEditorDrawMode() {
+    setStoryEditorToolMode((current) => (current === "DRAW" ? "MOVE" : "DRAW"));
+    setStoryEditorDecorPickerOpen(false);
+  }
+
+  function toggleStoryEditorDecorPicker() {
+    setStoryEditorToolMode("MOVE");
+    setStoryEditorDecorPickerOpen((current) => !current);
+    setStoryEditorLocationEditing(false);
+    setStoryEditorActiveTextStickerId(null);
+    setStoryEditorActiveDecorStickerId(null);
+  }
+
+  function toggleStoryEditorLocationSticker() {
+    setStoryEditorToolMode("MOVE");
+    setStoryEditorDecorPickerOpen(false);
+    setStoryEditorActiveTextStickerId(null);
+    setStoryEditorActiveDecorStickerId(null);
+
+    if (!storyEditorLocationEnabled) {
+      setStoryEditorLocationEnabled(true);
+      setStoryEditorLocationText(
+        storyEditorResolvedLocationName || (isInstagramForcedLocationEnabled ? instagramForcedLocationName : "Sua localização"),
+      );
+      setStoryEditorLocationEditing(true);
+      return;
+    }
+
+    setStoryEditorLocationEditing((current) => !current);
+  }
+
+  function removeStoryEditorLocationSticker() {
+    setStoryEditorLocationEnabled(false);
+    setStoryEditorLocationText("");
+    setStoryEditorLocationTextColor(STORY_EDITOR_DEFAULT_LOCATION_TEXT_COLOR);
+    setStoryEditorLocationBackgroundColor(STORY_EDITOR_DEFAULT_LOCATION_BACKGROUND_COLOR);
+    setStoryEditorLocationFontFamily(STORY_EDITOR_DEFAULT_FONT);
+    setStoryEditorLocationScale(1);
+    setStoryEditorLocationEditing(false);
+    setStoryEditorActiveDecorStickerId(null);
+  }
+
+  function addStoryEditorDecorSticker(emoji: string) {
+    const nextIndex = storyEditorDecorStickers.length;
+    const offset = Math.min(nextIndex, 4) * 0.04;
+    const stickerId = `decor-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setStoryEditorDecorStickers((current) => [
+      ...current,
+      {
+        id: stickerId,
+        emoji,
+        x: clamp(0.5 + offset, STORY_EDITOR_STICKER_MIN, STORY_EDITOR_STICKER_MAX),
+        y: clamp(0.72 + offset * 0.6, STORY_EDITOR_STICKER_MIN, STORY_EDITOR_STICKER_MAX),
+      },
+    ]);
+    setStoryEditorActiveDecorStickerId(stickerId);
+    setStoryEditorActiveTextStickerId(null);
+    setStoryEditorLocationEditing(false);
+    setStoryEditorDecorPickerOpen(false);
+  }
+
+  function handleStoryEditorDecorStickerPointerDown(
+    stickerId: string,
+    stickerX: number,
+    stickerY: number,
+    event: ReactPointerEvent<HTMLButtonElement>,
+  ) {
+    if (storyEditorSaving || storyEditorToolMode === "DRAW") {
+      return;
+    }
+
+    const stageRect = storyEditorStageRef.current?.getBoundingClientRect();
+    if (!stageRect || stageRect.width <= 0 || stageRect.height <= 0) {
+      return;
+    }
+
+    const stickerCenterX = stickerX * stageRect.width;
+    const stickerCenterY = stickerY * stageRect.height;
+
+    storyEditorDecorStickerDragRef.current = {
+      pointerId: event.pointerId,
+      stickerId,
+      offsetX: event.clientX - (stageRect.left + stickerCenterX),
+      offsetY: event.clientY - (stageRect.top + stickerCenterY),
+    };
+
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setStoryEditorActiveTextStickerId(null);
+    setStoryEditorActiveDecorStickerId(stickerId);
+    setStoryEditorDraggingDecorStickerId(stickerId);
+  }
+
+  function handleStoryEditorDecorStickerPointerMove(event: ReactPointerEvent<HTMLButtonElement>) {
+    const dragState = storyEditorDecorStickerDragRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    const stageRect = storyEditorStageRef.current?.getBoundingClientRect();
+    if (!stageRect || stageRect.width <= 0 || stageRect.height <= 0) {
+      return;
+    }
+
+    const stickerCenterX = event.clientX - stageRect.left - dragState.offsetX;
+    const stickerCenterY = event.clientY - stageRect.top - dragState.offsetY;
+    const nextX = clamp(stickerCenterX / stageRect.width, STORY_EDITOR_STICKER_MIN, STORY_EDITOR_STICKER_MAX);
+    const nextY = clamp(stickerCenterY / stageRect.height, STORY_EDITOR_STICKER_MIN, STORY_EDITOR_STICKER_MAX);
+
+    setStoryEditorDecorStickers((current) =>
+      current.map((item) => (item.id === dragState.stickerId ? { ...item, x: nextX, y: nextY } : item)),
+    );
+  }
+
+  function handleStoryEditorDecorStickerPointerUp(event: ReactPointerEvent<HTMLButtonElement>) {
+    const dragState = storyEditorDecorStickerDragRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    storyEditorDecorStickerDragRef.current = null;
+    setStoryEditorDraggingDecorStickerId(null);
+  }
+
+  function handleStoryEditorTextStickerPointerDown(
+    stickerId: string,
+    stickerX: number,
+    stickerY: number,
+    event: ReactPointerEvent<HTMLButtonElement>,
+  ) {
+    if (storyEditorSaving || storyEditorToolMode === "DRAW") {
+      return;
+    }
+
+    const stageRect = storyEditorStageRef.current?.getBoundingClientRect();
+    if (!stageRect || stageRect.width <= 0 || stageRect.height <= 0) {
+      return;
+    }
+
+    const stickerCenterX = stickerX * stageRect.width;
+    const stickerCenterY = stickerY * stageRect.height;
+
+    storyEditorTextStickerDragRef.current = {
+      pointerId: event.pointerId,
+      stickerId,
+      offsetX: event.clientX - (stageRect.left + stickerCenterX),
+      offsetY: event.clientY - (stageRect.top + stickerCenterY),
+    };
+
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setStoryEditorLocationEditing(false);
+    setStoryEditorDecorPickerOpen(false);
+    setStoryEditorActiveDecorStickerId(null);
+    const activeSticker = storyEditorTextStickers.find((item) => item.id === stickerId);
+    if (activeSticker) {
+      setStoryEditorTextColor(activeSticker.textColor);
+      setStoryEditorTextBackgroundColor(activeSticker.backgroundColor);
+      setStoryEditorTextFontFamily(activeSticker.fontFamily);
+      setStoryEditorTextScale(activeSticker.scale);
+    }
+    setStoryEditorActiveTextStickerId(stickerId);
+    setStoryEditorDraggingTextStickerId(stickerId);
+  }
+
+  function handleStoryEditorTextStickerPointerMove(event: ReactPointerEvent<HTMLButtonElement>) {
+    const dragState = storyEditorTextStickerDragRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    const stageRect = storyEditorStageRef.current?.getBoundingClientRect();
+    if (!stageRect || stageRect.width <= 0 || stageRect.height <= 0) {
+      return;
+    }
+
+    const stickerCenterX = event.clientX - stageRect.left - dragState.offsetX;
+    const stickerCenterY = event.clientY - stageRect.top - dragState.offsetY;
+    setStoryEditorTextStickers((current) =>
+      current.map((item) => {
+        if (item.id !== dragState.stickerId) {
+          return item;
+        }
+
+        const stickerSize = estimateStoryEditorTextStickerSize(item.text, item.fontFamily, item.scale);
+        const minX = Math.max(STORY_EDITOR_STICKER_MIN * stageRect.width, stickerSize.width / 2 + 8);
+        const maxX = Math.min(STORY_EDITOR_STICKER_MAX * stageRect.width, stageRect.width - stickerSize.width / 2 - 8);
+        const minY = Math.max(STORY_EDITOR_STICKER_MIN * stageRect.height, stickerSize.height / 2 + 8);
+        const maxY = Math.min(STORY_EDITOR_STICKER_MAX * stageRect.height, stageRect.height - stickerSize.height / 2 - 8);
+        const nextX = clamp(
+          clamp(stickerCenterX, minX, maxX) / stageRect.width,
+          STORY_EDITOR_STICKER_MIN,
+          STORY_EDITOR_STICKER_MAX,
+        );
+        const nextY = clamp(
+          clamp(stickerCenterY, minY, maxY) / stageRect.height,
+          STORY_EDITOR_STICKER_MIN,
+          STORY_EDITOR_STICKER_MAX,
+        );
+
+        return { ...item, x: nextX, y: nextY };
+      }),
+    );
+  }
+
+  function handleStoryEditorTextStickerPointerUp(event: ReactPointerEvent<HTMLButtonElement>) {
+    const dragState = storyEditorTextStickerDragRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    storyEditorTextStickerDragRef.current = null;
+    setStoryEditorDraggingTextStickerId(null);
+  }
+
+  function addStoryEditorTextSticker() {
+    setStoryEditorToolMode("MOVE");
+    setStoryEditorLocationEditing(false);
+    setStoryEditorDecorPickerOpen(false);
+    setStoryEditorActiveDecorStickerId(null);
+    const initialText = "Digite aqui";
+    const maxScale = getStoryEditorMaxTextScale(initialText, storyEditorTextFontFamily);
+    const initialScale = clamp(storyEditorTextScale, 0.7, maxScale);
+    const nextIndex = storyEditorTextStickers.length;
+    const offset = Math.min(nextIndex, 4) * 0.04;
+    const stickerId = `text-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setStoryEditorTextStickers((current) => [
+      ...current,
+      {
+        id: stickerId,
+        text: initialText,
+        x: clamp(0.5 + offset * 0.4, STORY_EDITOR_STICKER_MIN, STORY_EDITOR_STICKER_MAX),
+        y: clamp(0.5 + offset * 0.6, STORY_EDITOR_STICKER_MIN, STORY_EDITOR_STICKER_MAX),
+        textColor: storyEditorTextColor,
+        backgroundColor: storyEditorTextBackgroundColor,
+        fontFamily: storyEditorTextFontFamily,
+        scale: initialScale,
+      },
+    ]);
+    setStoryEditorTextScale(initialScale);
+    setStoryEditorActiveTextStickerId(stickerId);
+  }
+
+  function updateStoryEditorActiveTextStickerText(nextText: string) {
+    if (!storyEditorActiveTextStickerId) {
+      return;
+    }
+
+    setStoryEditorTextStickers((current) =>
+      current.map((item) => (item.id === storyEditorActiveTextStickerId ? { ...item, text: nextText.slice(0, 120) } : item)),
+    );
+  }
+
+  function updateStoryEditorActiveTextStickerTextColor(nextColor: string) {
+    setStoryEditorTextColor(nextColor);
+    if (!storyEditorActiveTextStickerId) {
+      return;
+    }
+
+    setStoryEditorTextStickers((current) =>
+      current.map((item) => (item.id === storyEditorActiveTextStickerId ? { ...item, textColor: nextColor } : item)),
+    );
+  }
+
+  function updateStoryEditorActiveTextStickerBackground(nextColor: string) {
+    setStoryEditorTextBackgroundColor(nextColor);
+    if (!storyEditorActiveTextStickerId) {
+      return;
+    }
+
+    setStoryEditorTextStickers((current) =>
+      current.map((item) => (item.id === storyEditorActiveTextStickerId ? { ...item, backgroundColor: nextColor } : item)),
+    );
+  }
+
+  function updateStoryEditorActiveTextStickerFontFamily(nextFontFamily: string) {
+    setStoryEditorTextFontFamily(nextFontFamily);
+    if (!storyEditorActiveTextStickerId) {
+      return;
+    }
+
+    setStoryEditorTextStickers((current) =>
+      current.map((item) => (item.id === storyEditorActiveTextStickerId ? { ...item, fontFamily: nextFontFamily } : item)),
+    );
+  }
+
+  function updateStoryEditorActiveTextStickerScale(nextScale: number) {
+    const normalizedScale = clamp(nextScale, 0.7, 3);
+    const maxScale = getStoryEditorMaxTextScale(activeStoryEditorTextSticker?.text || "Texto", storyEditorTextFontFamily);
+    const clampedScale = clamp(normalizedScale, 0.7, maxScale);
+    setStoryEditorTextScale(clampedScale);
+    if (!storyEditorActiveTextStickerId) {
+      return;
+    }
+
+    setStoryEditorTextStickers((current) =>
+      current.map((item) => (item.id === storyEditorActiveTextStickerId ? { ...item, scale: clampedScale } : item)),
+    );
+  }
+
+  function updateStoryEditorLocationFont(nextFontFamily: string) {
+    setStoryEditorLocationFontFamily(nextFontFamily);
+    const maxScale = getStoryEditorMaxLocationScale(storyEditorLocationText, nextFontFamily);
+    setStoryEditorLocationScale((current) => clamp(current, 0.7, maxScale));
+  }
+
+  function updateStoryEditorLocationScale(nextScale: number) {
+    const maxScale = getStoryEditorMaxLocationScale(storyEditorLocationText, storyEditorLocationFontFamily);
+    setStoryEditorLocationScale(clamp(nextScale, 0.7, maxScale));
+  }
+
+  function removeStoryEditorActiveTextSticker() {
+    if (!storyEditorActiveTextStickerId) {
+      return;
+    }
+
+    setStoryEditorTextStickers((current) => current.filter((item) => item.id !== storyEditorActiveTextStickerId));
+    setStoryEditorActiveTextStickerId(null);
+  }
+
+  function removeStoryEditorActiveDecorSticker() {
+    if (!storyEditorActiveDecorStickerId) {
+      return;
+    }
+
+    setStoryEditorDecorStickers((current) => current.filter((item) => item.id !== storyEditorActiveDecorStickerId));
+    setStoryEditorActiveDecorStickerId(null);
+  }
+
+  function clearStoryEditorStrokes() {
+    setStoryEditorStrokes([]);
+    storyEditorDrawRef.current = null;
+    setStoryEditorBrushCursor((current) => (current.visible ? { ...current, visible: false } : current));
+  }
+
+  function handleStoryEditorStagePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (storyEditorSaving || storyEditorToolMode !== "DRAW") {
+      return;
+    }
+
+    const target = event.target as HTMLElement;
+    if (
+      target.closest(".scheduler-story-editor-sticker") ||
+      target.closest(".scheduler-story-editor-sticker-delete") ||
+      target.closest(".scheduler-story-editor-overlay-controls")
+    ) {
+      return;
+    }
+
+    const point = storyEditorNormalizedPointFromClient(event.clientX, event.clientY);
+    if (!point) {
+      return;
+    }
+
+    event.preventDefault();
+    const strokeId = `stroke-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    storyEditorDrawRef.current = { pointerId: event.pointerId, strokeId };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    updateStoryEditorBrushCursor(event.clientX, event.clientY);
+
+    setStoryEditorStrokes((current) => [
+      ...current,
+      {
+        id: strokeId,
+        color: storyEditorBrushColor,
+        size: storyEditorBrushSize,
+        points: [point],
+      },
+    ]);
+  }
+
+  function handleStoryEditorStagePointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    if (storyEditorToolMode === "DRAW") {
+      updateStoryEditorBrushCursor(event.clientX, event.clientY);
+    }
+
+    const drawState = storyEditorDrawRef.current;
+    if (!drawState || drawState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    const coalescedEvents =
+      typeof event.nativeEvent.getCoalescedEvents === "function" ? event.nativeEvent.getCoalescedEvents() : [];
+    const normalizedPoints = coalescedEvents
+      .map((coalescedEvent) => storyEditorNormalizedPointFromClient(coalescedEvent.clientX, coalescedEvent.clientY))
+      .filter((point): point is StoryEditorStrokePoint => point !== null);
+
+    if (normalizedPoints.length === 0) {
+      const fallbackPoint = storyEditorNormalizedPointFromClient(event.clientX, event.clientY);
+      if (fallbackPoint) {
+        normalizedPoints.push(fallbackPoint);
+      }
+    }
+
+    if (normalizedPoints.length === 0) {
+      return;
+    }
+
+    event.preventDefault();
+    setStoryEditorStrokes((current) =>
+      current.map((stroke) =>
+        stroke.id === drawState.strokeId
+          ? {
+              ...stroke,
+              points: [...stroke.points, ...normalizedPoints],
+            }
+          : stroke,
+      ),
+    );
+  }
+
+  function handleStoryEditorStagePointerUp(event: ReactPointerEvent<HTMLDivElement>) {
+    const drawState = storyEditorDrawRef.current;
+    if (!drawState || drawState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    storyEditorDrawRef.current = null;
+  }
+
+  function handleStoryEditorStagePointerEnter(event: ReactPointerEvent<HTMLDivElement>) {
+    if (storyEditorToolMode !== "DRAW") {
+      return;
+    }
+    updateStoryEditorBrushCursor(event.clientX, event.clientY);
+  }
+
+  function handleStoryEditorStagePointerLeave() {
+    setStoryEditorBrushCursor((current) => (current.visible ? { ...current, visible: false } : current));
+  }
+
+  async function saveStoryEditorMedia() {
+    if (storyEditorMediaIndex === null) {
+      return;
+    }
+
+    const target = uploadedSchedulerMedia[storyEditorMediaIndex];
+    if (!target || !isImagePath(target.filePath)) {
+      setSchedulerInfo("Selecione uma imagem válida para editar o story.");
+      return;
+    }
+
+    setStoryEditorSaving(true);
+    setError("");
+    setSchedulerInfo("Aplicando edição experimental do story...");
+
+    try {
+      const imageUrl = `${api.baseUrl}${target.filePath}`;
+      const image = await readImageElementFromUrl(imageUrl);
+      const canvas = document.createElement("canvas");
+      canvas.width = STORY_EDITOR_CANVAS_WIDTH;
+      canvas.height = STORY_EDITOR_CANVAS_HEIGHT;
+      const context = canvas.getContext("2d");
+      if (!context) {
+        throw new Error("Não foi possível iniciar o canvas do editor.");
+      }
+
+      const scale = Math.max(
+        STORY_EDITOR_CANVAS_WIDTH / image.naturalWidth,
+        STORY_EDITOR_CANVAS_HEIGHT / image.naturalHeight,
+      );
+      const drawWidth = image.naturalWidth * scale;
+      const drawHeight = image.naturalHeight * scale;
+      const drawX = (STORY_EDITOR_CANVAS_WIDTH - drawWidth) / 2;
+      const drawY = (STORY_EDITOR_CANVAS_HEIGHT - drawHeight) / 2;
+
+      context.clearRect(0, 0, STORY_EDITOR_CANVAS_WIDTH, STORY_EDITOR_CANVAS_HEIGHT);
+      context.drawImage(image, drawX, drawY, drawWidth, drawHeight);
+
+      if (storyEditorResolvedLocationName) {
+        const stickerBodyText = storyEditorResolvedLocationName;
+        const stickerScale = clamp(storyEditorLocationScale, 0.7, 3);
+        const stickerFontSize = 52 * stickerScale;
+        const stickerPaddingX = 42 * stickerScale;
+        const stickerHeight = 110 * stickerScale;
+        const stickerRadius = 38 * stickerScale;
+        const stickerIconGap = 14 * stickerScale;
+        const stickerMargin = 30;
+        const stickerIconSize = stickerFontSize;
+
+        context.font = `500 ${stickerFontSize}px ${storyEditorLocationFontFamily}, K2D, Arial, sans-serif`;
+        const textWidth = context.measureText(stickerBodyText).width;
+        const stickerWidth = stickerIconSize + stickerIconGap + textWidth + stickerPaddingX * 2;
+        const stickerCenterX = clamp(
+          storyEditorStickerX * STORY_EDITOR_CANVAS_WIDTH,
+          stickerWidth / 2 + stickerMargin,
+          STORY_EDITOR_CANVAS_WIDTH - stickerWidth / 2 - stickerMargin,
+        );
+        const stickerCenterY = clamp(
+          storyEditorStickerY * STORY_EDITOR_CANVAS_HEIGHT,
+          stickerHeight / 2 + stickerMargin,
+          STORY_EDITOR_CANVAS_HEIGHT - stickerHeight / 2 - stickerMargin,
+        );
+        const stickerX = stickerCenterX - stickerWidth / 2;
+        const stickerY = stickerCenterY - stickerHeight / 2;
+        const stickerGradient = context.createLinearGradient(
+          stickerX,
+          stickerY,
+          stickerX + stickerWidth,
+          stickerY + stickerHeight,
+        );
+        stickerGradient.addColorStop(0, "#8b5cf6");
+        stickerGradient.addColorStop(0.56, "#ec4899");
+        stickerGradient.addColorStop(1, "#f59e0b");
+        const hasBackground = storyEditorLocationBackgroundColor !== "transparent";
+
+        if (hasBackground) {
+          drawRoundedRect(context, stickerX, stickerY, stickerWidth, stickerHeight, stickerRadius);
+          context.fillStyle = storyEditorLocationBackgroundColor;
+          context.fill();
+        }
+
+        context.textBaseline = "middle";
+        const textY = stickerY + stickerHeight / 2 + 1;
+        const pinIconLeft = stickerX + stickerPaddingX;
+        const pinIconTop = stickerY + (stickerHeight - stickerIconSize) / 2;
+        const pinPath = new Path2D("M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z");
+        const pinCenter = new Path2D("M15 10a3 3 0 1 1 -6 0a3 3 0 0 1 6 0z");
+        context.save();
+        context.translate(pinIconLeft, pinIconTop);
+        context.scale(stickerIconSize / 24, stickerIconSize / 24);
+        context.strokeStyle = stickerGradient;
+        context.lineWidth = 2;
+        context.lineCap = "round";
+        context.lineJoin = "round";
+        context.stroke(pinPath);
+        context.stroke(pinCenter);
+        context.restore();
+
+        context.fillStyle = storyEditorLocationTextColor;
+        context.fillText(stickerBodyText, stickerX + stickerPaddingX + stickerIconSize + stickerIconGap, textY);
+      }
+
+      if (storyEditorStrokes.length > 0) {
+        const strokeScaleFactor = STORY_EDITOR_CANVAS_WIDTH / 360;
+        for (const stroke of storyEditorStrokes) {
+          if (stroke.points.length === 0) {
+            continue;
+          }
+
+          const lineWidth = clamp(stroke.size * strokeScaleFactor, 4, 80);
+          context.strokeStyle = stroke.color;
+          context.fillStyle = stroke.color;
+          context.lineCap = "round";
+          context.lineJoin = "round";
+          context.lineWidth = lineWidth;
+
+          if (stroke.points.length === 1) {
+            const [singlePoint] = stroke.points;
+            if (!singlePoint) {
+              continue;
+            }
+            context.beginPath();
+            context.arc(
+              singlePoint.x * STORY_EDITOR_CANVAS_WIDTH,
+              singlePoint.y * STORY_EDITOR_CANVAS_HEIGHT,
+              lineWidth / 2,
+              0,
+              Math.PI * 2,
+            );
+            context.fill();
+            continue;
+          }
+
+          drawStrokeOnCanvas(context, stroke.points, STORY_EDITOR_CANVAS_WIDTH, STORY_EDITOR_CANVAS_HEIGHT);
+        }
+      }
+
+      if (storyEditorDecorStickers.length > 0) {
+        context.textAlign = "center";
+        context.textBaseline = "middle";
+        const stickerFontSize = 96;
+        context.font = `500 ${stickerFontSize}px K2D, Apple Color Emoji, Segoe UI Emoji, sans-serif`;
+        for (const sticker of storyEditorDecorStickers) {
+          const centerX = clamp(
+            sticker.x * STORY_EDITOR_CANVAS_WIDTH,
+            STORY_EDITOR_CANVAS_WIDTH * STORY_EDITOR_STICKER_MIN,
+            STORY_EDITOR_CANVAS_WIDTH * STORY_EDITOR_STICKER_MAX,
+          );
+          const centerY = clamp(
+            sticker.y * STORY_EDITOR_CANVAS_HEIGHT,
+            STORY_EDITOR_CANVAS_HEIGHT * STORY_EDITOR_STICKER_MIN,
+            STORY_EDITOR_CANVAS_HEIGHT * STORY_EDITOR_STICKER_MAX,
+          );
+          context.shadowColor = "rgba(15, 23, 42, 0.28)";
+          context.shadowBlur = 8;
+          context.fillText(sticker.emoji, centerX, centerY);
+          context.shadowBlur = 0;
+        }
+      }
+
+      if (storyEditorTextStickers.length > 0) {
+        const textMargin = 24;
+
+        context.textAlign = "center";
+        context.textBaseline = "middle";
+
+        for (const textSticker of storyEditorTextStickers) {
+          const textScale = clamp(textSticker.scale, 0.7, 3);
+          const textFontSize = 52 * textScale;
+          const textLineHeight = textFontSize * 1.18;
+          const textPaddingX = 26 * textScale;
+          const textPaddingY = 18 * textScale;
+
+          const lines = textSticker.text
+            .split(/\n+/)
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0)
+            .slice(0, 4);
+          if (lines.length === 0) {
+            continue;
+          }
+
+          context.font = `500 ${textFontSize}px ${textSticker.fontFamily}, K2D, Arial, sans-serif`;
+          const maxLineWidth = Math.max(...lines.map((line) => context.measureText(line).width));
+          const boxWidth = maxLineWidth + textPaddingX * 2;
+          const boxHeight = lines.length * textLineHeight + textPaddingY * 2;
+          const centerX = clamp(
+            textSticker.x * STORY_EDITOR_CANVAS_WIDTH,
+            boxWidth / 2 + textMargin,
+            STORY_EDITOR_CANVAS_WIDTH - boxWidth / 2 - textMargin,
+          );
+          const centerY = clamp(
+            textSticker.y * STORY_EDITOR_CANVAS_HEIGHT,
+            boxHeight / 2 + textMargin,
+            STORY_EDITOR_CANVAS_HEIGHT - boxHeight / 2 - textMargin,
+          );
+          const boxX = centerX - boxWidth / 2;
+          const boxY = centerY - boxHeight / 2;
+          const hasBackground = textSticker.backgroundColor !== "transparent";
+
+          if (hasBackground) {
+            drawRoundedRect(context, boxX, boxY, boxWidth, boxHeight, 30 * textScale);
+            context.fillStyle = textSticker.backgroundColor;
+            context.fill();
+          }
+
+          context.fillStyle = textSticker.textColor;
+          lines.forEach((line, lineIndex) => {
+            const lineY = boxY + textPaddingY + textLineHeight * lineIndex + textLineHeight / 2;
+            context.fillText(line, centerX, lineY);
+          });
+        }
+      }
+
+      const outputType = "image/jpeg";
+      const blob = await canvasToBlob(canvas, outputType, 0.92);
+      const extension = "jpg";
+      const baseName = fileNameWithoutExtension(target.fileName || `story-${Date.now()}`);
+      const editedFile = new File([blob], `${baseName}-edit.${extension}`, {
+        type: outputType,
+      });
+      const uploaded = await api.postFile("/upload", editedFile);
+      const previousFilePath = target.filePath;
+
+      setUploadedSchedulerMedia((current) =>
+        current.map((item, index) =>
+          index === storyEditorMediaIndex
+            ? {
+                ...item,
+                filePath: uploaded.filePath,
+                fileName: editedFile.name,
+                fileSizeBytes: blob.size,
+              }
+            : item,
+        ),
+      );
+
+      if (previousFilePath) {
+        try {
+          await api.delete(`/upload?filePath=${encodeURIComponent(previousFilePath)}`);
+        } catch {
+          // Ignora limpeza de arquivo antigo para não bloquear o fluxo principal do editor.
+        }
+      }
+
+      closeStoryEditorModal();
+      setSchedulerInfo("Story editado com sucesso.");
+    } catch (storyEditorError) {
+      setError("");
+      setSchedulerInfo(storyEditorError instanceof Error ? storyEditorError.message : "Falha ao salvar edição do story.");
+    } finally {
+      setStoryEditorSaving(false);
+    }
   }
 
   async function uploadMedia(event: ChangeEvent<HTMLInputElement>) {
@@ -2852,6 +4773,23 @@ function App() {
     if (!submittingJob && !uploading) {
       schedulerMediaInputRef.current?.click();
     }
+  }
+
+  function toggleWhatsappRelinkConnectionSelection(connectionId: string) {
+    setWhatsappRelinkConnectionIds((current) => {
+      if (current.includes(connectionId)) {
+        return current.filter((id) => id !== connectionId);
+      }
+      return [...current, connectionId];
+    });
+  }
+
+  function selectAllWhatsappRelinkConnections() {
+    setWhatsappRelinkConnectionIds(schedulerWhatsappConnections.map((connection) => connection.id));
+  }
+
+  function clearWhatsappRelinkConnections() {
+    setWhatsappRelinkConnectionIds([]);
   }
 
   async function createJob(event: FormEvent) {
@@ -2916,14 +4854,21 @@ function App() {
       return;
     }
 
+    if (publicationState === "PUBLISHED" && (!scheduledDate || !scheduledTime)) {
+      setError("");
+      setSchedulerInfo("Preencha data e horário para publicar.");
+      return;
+    }
+
     setSubmittingJob(true);
     setError("");
     setSchedulerInfo(editingJobId ? "Salvando alterações..." : "Agendando postagem...");
 
-    const fallbackTime = getCurrentTimeValue(effectiveUserTimeZone, nowReferenceDate);
-    const effectiveTime = !scheduledTimeTouched ? fallbackTime : scheduledTime || fallbackTime;
-    const scheduledAtIso = toIsoFromTimeZoneDateTime(scheduledDate, effectiveTime, effectiveUserTimeZone);
-    if (!scheduledAtIso) {
+    const scheduledAtIso =
+      publicationState === "PUBLISHED"
+        ? toIsoFromTimeZoneDateTime(scheduledDate, scheduledTime, effectiveUserTimeZone)
+        : null;
+    if (publicationState === "PUBLISHED" && !scheduledAtIso) {
       setSubmittingJob(false);
       setError("");
       setSchedulerInfo("Data/hora inválida para o fuso selecionado.");
@@ -2938,20 +4883,52 @@ function App() {
         ? (isInstagramForcedLocationEnabled ? instagramForcedLocationName : null)
         : null;
     const effectiveCaption = publicationType === "instagram_story" ? null : caption;
+    const normalizedFirstComment =
+      supportsFirstComment && firstCommentEnabled ? firstComment.trim() : "";
+    if (supportsFirstComment && firstCommentEnabled && !normalizedFirstComment) {
+      setSubmittingJob(false);
+      setError("");
+      setSchedulerInfo("Preencha o primeiro comentário ou desative esta opção.");
+      return;
+    }
+    const normalizedWhatsappRelinkConnectionIds = canEnableWhatsappRelink
+      ? whatsappRelinkConnectionIds.filter((id) =>
+        schedulerWhatsappConnections.some((connection) => connection.id === id)
+      )
+      : [];
+    if (canEnableWhatsappRelink && whatsappRelinkEnabled && normalizedWhatsappRelinkConnectionIds.length === 0) {
+      setSubmittingJob(false);
+      setError("");
+      setSchedulerInfo("Selecione ao menos uma conta de WhatsApp para relink.");
+      return;
+    }
+    const fileCaptions = uploadedSchedulerMedia.map((item) => item.caption?.trim() || "");
+    const effectiveWhatsappBackgroundColor =
+      publicationType === "whatsapp_status_texto" || publicationType === "whatsapp_status_midia"
+        ? whatsappBackgroundColor
+        : null;
 
     const payload = {
       companyId: jobCompanyId,
       socialConnectionId: jobSocialConnectionId,
       filePath: uploadedFilePath,
       filePaths: uploadedSchedulerMedia.map((item) => item.filePath),
+      fileCaptions: fileCaptions.some((entry) => entry.length > 0) ? fileCaptions : undefined,
       sequential: effectiveSequentialPublishing,
       title: normalizedTitle,
       caption: effectiveCaption,
+      firstComment: normalizedFirstComment || null,
+      whatsappBackgroundColor: effectiveWhatsappBackgroundColor,
+      whatsappRelinkEnabled: canEnableWhatsappRelink ? whatsappRelinkEnabled : false,
+      whatsappRelinkConnectionIds:
+        canEnableWhatsappRelink && whatsappRelinkEnabled
+          ? normalizedWhatsappRelinkConnectionIds
+          : undefined,
       locationName: effectiveLocationName,
       locationId: effectiveLocationId,
       publicationType,
       publicationState,
-      dataPostagem: scheduledAtIso,
+      dataPostagem: publicationState === "PUBLISHED" ? scheduledAtIso : null,
     };
 
     try {
@@ -2976,14 +4953,53 @@ function App() {
   function resetSchedulerForm() {
     setPostTitle("");
     setCaption("");
+    setFirstComment("");
+    setFirstCommentEnabled(false);
+    setWhatsappBackgroundColor(DEFAULT_WHATSAPP_BACKGROUND_COLOR);
+    setWhatsappRelinkEnabled(false);
+    setWhatsappRelinkConnectionIds([]);
     setUploadedSchedulerMedia([]);
     setDraggingSchedulerMediaIndex(null);
+    setDragOverSchedulerMediaIndex(null);
+    setMediaCaptionModalIndex(null);
+    setMediaCaptionDraft("");
+    storyEditorStickerDragRef.current = null;
+    storyEditorDecorStickerDragRef.current = null;
+    storyEditorTextStickerDragRef.current = null;
+    storyEditorDrawRef.current = null;
+    setStoryEditorMediaIndex(null);
+    setStoryEditorLocationEnabled(false);
+    setStoryEditorLocationText("");
+    setStoryEditorLocationTextColor(STORY_EDITOR_DEFAULT_LOCATION_TEXT_COLOR);
+    setStoryEditorLocationBackgroundColor(STORY_EDITOR_DEFAULT_LOCATION_BACKGROUND_COLOR);
+    setStoryEditorLocationFontFamily(STORY_EDITOR_DEFAULT_FONT);
+    setStoryEditorLocationScale(1);
+    setStoryEditorLocationEditing(false);
+    setStoryEditorStickerX(0.5);
+    setStoryEditorStickerY(0.18);
+    setStoryEditorToolMode("MOVE");
+    setStoryEditorBrushColor(STORY_EDITOR_BRUSH_COLORS[0] ?? "#ffffff");
+    setStoryEditorBrushSize(10);
+    setStoryEditorBrushCursor({ visible: false, x: 0.5, y: 0.5 });
+    setStoryEditorStrokes([]);
+    setStoryEditorDecorStickers([]);
+    setStoryEditorActiveDecorStickerId(null);
+    setStoryEditorDecorPickerOpen(false);
+    setStoryEditorTextColor(STORY_EDITOR_DEFAULT_TEXT_COLOR);
+    setStoryEditorTextBackgroundColor(STORY_EDITOR_DEFAULT_TEXT_BACKGROUND_COLOR);
+    setStoryEditorTextFontFamily(STORY_EDITOR_DEFAULT_FONT);
+    setStoryEditorTextScale(1);
+    setStoryEditorTextStickers([]);
+    setStoryEditorActiveTextStickerId(null);
+    setStoryEditorDraggingDecorStickerId(null);
+    setStoryEditorDraggingTextStickerId(null);
+    setStoryEditorDraggingSticker(false);
+    setStoryEditorSaving(false);
     setUploadDragActive(false);
     setJobCompanyId("");
     setJobSocialConnectionId("");
     setScheduledDate("");
-    setScheduledTime(getCurrentTimeValue(effectiveUserTimeZone, nowReferenceDate));
-    setScheduledTimeTouched(false);
+    setScheduledTime("");
     setPublicationType("");
     setPublicationState("");
     setEditingJobId(null);
@@ -3001,20 +5017,69 @@ function App() {
       .map((entry) => entry.trim())
       .filter((entry) => entry.length > 0);
     setUploadedSchedulerMedia(
-      selectedFiles.map((filePath) => ({
+      selectedFiles.map((filePath, index) => ({
         filePath,
         fileName: filePath.split("/").pop() ?? "",
         fileSizeBytes: null,
+        caption: job.fileCaptions?.[index] ?? null,
       })),
     );
     setDraggingSchedulerMediaIndex(null);
+    setDragOverSchedulerMediaIndex(null);
+    setMediaCaptionModalIndex(null);
+    setMediaCaptionDraft("");
+    storyEditorStickerDragRef.current = null;
+    storyEditorDecorStickerDragRef.current = null;
+    storyEditorTextStickerDragRef.current = null;
+    storyEditorDrawRef.current = null;
+    setStoryEditorMediaIndex(null);
+    setStoryEditorLocationEnabled(false);
+    setStoryEditorLocationText("");
+    setStoryEditorLocationTextColor(STORY_EDITOR_DEFAULT_LOCATION_TEXT_COLOR);
+    setStoryEditorLocationBackgroundColor(STORY_EDITOR_DEFAULT_LOCATION_BACKGROUND_COLOR);
+    setStoryEditorLocationFontFamily(STORY_EDITOR_DEFAULT_FONT);
+    setStoryEditorLocationScale(1);
+    setStoryEditorLocationEditing(false);
+    setStoryEditorStickerX(0.5);
+    setStoryEditorStickerY(0.18);
+    setStoryEditorToolMode("MOVE");
+    setStoryEditorBrushColor(STORY_EDITOR_BRUSH_COLORS[0] ?? "#ffffff");
+    setStoryEditorBrushSize(10);
+    setStoryEditorBrushCursor({ visible: false, x: 0.5, y: 0.5 });
+    setStoryEditorStrokes([]);
+    setStoryEditorDecorStickers([]);
+    setStoryEditorActiveDecorStickerId(null);
+    setStoryEditorDecorPickerOpen(false);
+    setStoryEditorTextColor(STORY_EDITOR_DEFAULT_TEXT_COLOR);
+    setStoryEditorTextBackgroundColor(STORY_EDITOR_DEFAULT_TEXT_BACKGROUND_COLOR);
+    setStoryEditorTextFontFamily(STORY_EDITOR_DEFAULT_FONT);
+    setStoryEditorTextScale(1);
+    setStoryEditorTextStickers([]);
+    setStoryEditorActiveTextStickerId(null);
+    setStoryEditorDraggingDecorStickerId(null);
+    setStoryEditorDraggingTextStickerId(null);
+    setStoryEditorDraggingSticker(false);
+    setStoryEditorSaving(false);
     setPostTitle(job.title?.trim() || job.caption?.trim() || "");
     setCaption(job.caption ?? "");
+    setFirstComment(job.firstComment?.trim() || "");
+    setFirstCommentEnabled(Boolean(job.firstComment?.trim()));
+    setWhatsappBackgroundColor(job.whatsappBackgroundColor?.trim() || DEFAULT_WHATSAPP_BACKGROUND_COLOR);
+    const jobMediaCount = Array.isArray(job.filePaths) && job.filePaths.length > 0 ? job.filePaths.length : (job.filePath ? 1 : 0);
+    const supportsJobWhatsappRelink =
+      job.publicationType === "instagram_post" ||
+      job.publicationType === "instagram_reel" ||
+      (job.publicationType === "instagram_story" && jobMediaCount <= 1);
+    const normalizedJobRelinkConnectionIds = (Array.isArray(job.whatsappRelinkConnectionIds) ? job.whatsappRelinkConnectionIds : [])
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+    setWhatsappRelinkEnabled(supportsJobWhatsappRelink ? Boolean(job.whatsappRelinkEnabled) : false);
+    setWhatsappRelinkConnectionIds(supportsJobWhatsappRelink ? normalizedJobRelinkConnectionIds : []);
     setPublicationType(job.publicationType);
-    setPublicationState(job.publicationState === "DRAFT" ? "DRAFT" : "PUBLISHED");
-    setScheduledDate(toDateLocal(job.dataPostagem, effectiveUserTimeZone));
-    setScheduledTime(toTimeLocal(job.dataPostagem, effectiveUserTimeZone));
-    setScheduledTimeTouched(true);
+    const nextPublicationState = job.publicationState === "DRAFT" ? "DRAFT" : "PUBLISHED";
+    setPublicationState(nextPublicationState);
+    setScheduledDate(nextPublicationState === "DRAFT" ? "" : toDateLocal(job.dataPostagem, effectiveUserTimeZone));
+    setScheduledTime(nextPublicationState === "DRAFT" ? "" : toTimeLocal(job.dataPostagem, effectiveUserTimeZone));
     setActiveView("scheduler");
   }
 
@@ -3082,39 +5147,179 @@ function App() {
     }
   }
 
-  async function publishDraft(job: Job) {
-    if (job.publicationState !== "DRAFT") {
-      return;
-    }
-
-    const willRunImmediately = isPastScheduledAtForUser(job.dataPostagem);
-    if (
-      willRunImmediately &&
-      !window.confirm(
-        "Este rascunho está com data/hora no passado. Ao publicar agora, ele pode executar imediatamente. Deseja continuar?",
-      )
-    ) {
-      return;
-    }
-
-    setError("");
-    setPublishingDraftJobId(job.id);
-    setHistoryInfo("Publicando rascunho...");
-
-    try {
-      await api.postJson(`/jobs/${job.id}/publish`, {});
-      setHistoryInfo("Rascunho publicado com sucesso.");
-      await loadAll();
-    } catch (publishError) {
-      setHistoryInfo("");
-      setError(publishError instanceof Error ? publishError.message : "Falha ao publicar o rascunho.");
-    } finally {
-      setPublishingDraftJobId(null);
-    }
-  }
-
   function openHistoryWithFilter(filter: HistoryFilterKey): void {
     navigateToView("history", { historyFilter: filter });
+  }
+
+  function toggleHistoryBulkJobSelection(jobId: string) {
+    setHistoryBulkSelectedJobIds((current) => {
+      if (current.includes(jobId)) {
+        return current.filter((id) => id !== jobId);
+      }
+      return [...current, jobId];
+    });
+  }
+
+  function cancelHistoryBulkAction() {
+    setHistoryBulkSelectedJobIds([]);
+    setHistoryBulkAction("");
+    setHistoryBulkDate("");
+    setHistoryBulkTime(getCurrentTimeValue(effectiveUserTimeZone, nowReferenceDate));
+    setHistoryBulkCompanyId("");
+  }
+
+  function buildHistoryBulkUpdatePayload(
+    job: Job,
+    options: {
+      publicationState?: PublicationState;
+      dataPostagem?: string;
+      companyId?: string;
+    },
+  ) {
+    const selectedFilePaths = (job.filePaths && job.filePaths.length > 0 ? job.filePaths : [job.filePath])
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+
+    const targetCompanyId = options.companyId ?? job.companyId;
+    let targetSocialConnectionId = job.socialConnectionId ?? "";
+
+    if (options.companyId && targetCompanyId !== job.companyId) {
+      const currentConnection = connections.find((connection) => connection.id === job.socialConnectionId);
+      if (!currentConnection || currentConnection.companyId !== targetCompanyId) {
+        const platform = publicationTypeNetwork(job.publicationType);
+        const fallbackConnection = connections.find(
+          (connection) => connection.companyId === targetCompanyId && connection.platform === platform,
+        );
+        targetSocialConnectionId = fallbackConnection?.id ?? "";
+      }
+    }
+
+    return {
+      companyId: targetCompanyId,
+      socialConnectionId: targetSocialConnectionId,
+      filePath: job.filePath,
+      filePaths: selectedFilePaths.length > 1 ? selectedFilePaths : undefined,
+      fileCaptions: selectedFilePaths.length > 0 ? (job.fileCaptions ?? []) : undefined,
+      sequential: selectedFilePaths.length > 1 ? true : undefined,
+      title: job.title ?? "",
+      caption: job.caption ?? "",
+      firstComment: job.firstComment ?? "",
+      whatsappBackgroundColor: job.whatsappBackgroundColor ?? DEFAULT_WHATSAPP_BACKGROUND_COLOR,
+      whatsappRelinkEnabled: job.whatsappRelinkEnabled ?? false,
+      whatsappRelinkConnectionIds: job.whatsappRelinkConnectionIds ?? [],
+      locationName: job.locationName ?? "",
+      locationId: job.locationId ?? "",
+      publicationType: job.publicationType,
+      publicationState: options.publicationState ?? job.publicationState,
+      dataPostagem: options.dataPostagem ?? job.dataPostagem,
+    };
+  }
+
+  async function applyHistoryBulkEdit(event: FormEvent) {
+    event.preventDefault();
+    if (!historyBulkAction) {
+      setError("Selecione uma ação em massa.");
+      return;
+    }
+
+    if (historyBulkSelectedJobs.length === 0) {
+      setError("Selecione ao menos uma postagem para aplicar a ação em massa.");
+      return;
+    }
+
+    const options: {
+      publicationState?: PublicationState;
+      dataPostagem?: string;
+      companyId?: string;
+    } = {};
+
+    if (historyBulkAction === "SET_PUBLISHED") {
+      if (historyBulkSelectedJobs.some((job) => job.publicationState !== "DRAFT")) {
+        setError("Para marcar como Publicado em massa, selecione apenas postagens em rascunho.");
+        return;
+      }
+      if (!historyBulkDate || !historyBulkTime) {
+        setError("Preencha data e horário para publicar os rascunhos em massa.");
+        return;
+      }
+      const scheduledAtIso = toIsoFromTimeZoneDateTime(historyBulkDate, historyBulkTime, effectiveUserTimeZone);
+      if (!scheduledAtIso) {
+        setError("Data ou horário inválido para publicação em massa.");
+        return;
+      }
+      options.publicationState = "PUBLISHED";
+      options.dataPostagem = scheduledAtIso;
+    }
+    if (historyBulkAction === "SET_DRAFT") {
+      if (historyBulkSelectedJobs.some((job) => job.publicationState !== "PUBLISHED")) {
+        setError("Para marcar como Rascunho em massa, selecione apenas postagens publicadas.");
+        return;
+      }
+      options.publicationState = "DRAFT";
+    }
+    if (historyBulkAction === "SET_SCHEDULE") {
+      if (!historyBulkDate || !historyBulkTime) {
+        setError("Preencha data e horário para alteração em massa.");
+        return;
+      }
+      const scheduledAtIso = toIsoFromTimeZoneDateTime(historyBulkDate, historyBulkTime, effectiveUserTimeZone);
+      if (!scheduledAtIso) {
+        setError("Data ou horário inválido para edição em massa.");
+        return;
+      }
+      options.dataPostagem = scheduledAtIso;
+    }
+    if (historyBulkAction === "SET_COMPANY") {
+      if (!historyBulkCompanyId) {
+        setError("Selecione o perfil de destino para alteração em massa.");
+        return;
+      }
+      options.companyId = historyBulkCompanyId;
+    }
+
+    setHistoryBulkApplying(true);
+    setError("");
+    setHistoryInfo("Aplicando edição em massa...");
+
+    try {
+      const results = await Promise.allSettled(
+        historyBulkSelectedJobs.map(async (job) => {
+          const payload = buildHistoryBulkUpdatePayload(job, options);
+          if (!payload.socialConnectionId) {
+            throw new Error(`Job ${job.id} sem conta vinculada compatível no perfil selecionado.`);
+          }
+          await api.putJson(`/jobs/${job.id}`, payload);
+        }),
+      );
+
+      const successCount = results.filter((result) => result.status === "fulfilled").length;
+      const failedResults = results.filter(
+        (result): result is PromiseRejectedResult => result.status === "rejected",
+      );
+      const failedCount = failedResults.length;
+
+      if (failedCount > 0) {
+        const firstReason = failedResults[0]?.reason;
+        const firstMessage =
+          firstReason instanceof Error ? firstReason.message : "Falha ao atualizar parte dos jobs selecionados.";
+        setError(firstMessage);
+      } else {
+        setError("");
+      }
+
+      setHistoryInfo(
+        failedCount === 0
+          ? `Edição em massa aplicada em ${successCount} postagem(s).`
+          : `Edição em massa parcial: ${successCount} sucesso(s), ${failedCount} falha(s).`,
+      );
+      setHistoryBulkSelectedJobIds([]);
+      await loadAll();
+    } catch (bulkError) {
+      setHistoryInfo("");
+      setError(bulkError instanceof Error ? bulkError.message : "Falha ao aplicar edição em massa.");
+    } finally {
+      setHistoryBulkApplying(false);
+    }
   }
 
   async function toggleNoticesPopover() {
@@ -3393,6 +5598,45 @@ function App() {
     }
   }
 
+  async function assignRootPlan(event: FormEvent) {
+    event.preventDefault();
+    if (!isRootUser || !authUser) {
+      return;
+    }
+    if (!rootAssignPlanId) {
+      setError("Selecione um plano para aplicar no root.");
+      return;
+    }
+
+    const selectedPlan = billingPlans.find((plan) => plan.id === rootAssignPlanId);
+    if (!selectedPlan) {
+      setError("Plano selecionado não encontrado.");
+      return;
+    }
+
+    setAssigningRootPlan(true);
+    setError("");
+    setPlanInfo("");
+    try {
+      await api.postJson("/billing/assign-user-plan", {
+        userId: authUser.id,
+        planId: selectedPlan.id,
+        status: "ACTIVE",
+        billingModel: selectedPlan.isTrial ? "TRIAL" : "MANUAL",
+        cycle: null,
+        endsAt: null,
+      });
+      setPlanInfo(`Plano ${selectedPlan.name} aplicado no root com sucesso.`);
+      await refreshAuthUserSnapshot();
+      await loadBillingData({ withSkeleton: false });
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch (assignError) {
+      setError(assignError instanceof Error ? assignError.message : "Falha ao aplicar plano no root.");
+    } finally {
+      setAssigningRootPlan(false);
+    }
+  }
+
   async function startStripeCheckout(event: FormEvent) {
     event.preventDefault();
     if (!checkoutPlanId) {
@@ -3466,6 +5710,45 @@ function App() {
       setError(retryError instanceof Error ? retryError.message : "Falha ao reenfileirar a postagem.");
     } finally {
       setRetryingJobId(null);
+    }
+  }
+
+  async function rescheduleFailedMedia(job: Job) {
+    const partialMeta = parseStorySequenceFailureMeta(job.lastError);
+    const isPartialStoryFailure =
+      job.publicationType === "instagram_story" &&
+      partialMeta !== null &&
+      partialMeta.publishedCount > 0 &&
+      partialMeta.publishedCount < partialMeta.total;
+
+    setError("");
+    setReschedulingFailedMediaJobId(job.id);
+    setHistoryInfo(
+      isPartialStoryFailure
+        ? "Reagendando apenas as mídias restantes para daqui a 20 minutos..."
+        : "Reagendando a mídia para daqui a 20 minutos...",
+    );
+
+    try {
+      const result = await api.postJson<{
+        scheduledAt: string;
+        mediaCount: number;
+        totalCount: number;
+        remainingOnly: boolean;
+      }>(`/jobs/${job.id}/reschedule-failed-media`, {});
+
+      setHistoryInfo(
+        result.remainingOnly
+          ? `${result.mediaCount} mídia(s) restante(s) reagendadas para daqui a 20 minutos.`
+          : `${result.mediaCount} mídia(s) reagendadas para daqui a 20 minutos.`,
+      );
+      await loadAll();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch (rescheduleError) {
+      setHistoryInfo("");
+      setError(rescheduleError instanceof Error ? rescheduleError.message : "Falha ao reagendar a mídia.");
+    } finally {
+      setReschedulingFailedMediaJobId(null);
     }
   }
 
@@ -3579,18 +5862,23 @@ function App() {
         filePath: media.filePath,
         fileName: media.filePath.split("/").pop() ?? "",
         fileSizeBytes: null,
+        caption: null,
       },
     ]);
     setDraggingSchedulerMediaIndex(null);
+    setDragOverSchedulerMediaIndex(null);
+    setMediaCaptionModalIndex(null);
+    setMediaCaptionDraft("");
     setPublicationType(media.publicationType);
     setPublicationState("");
     setJobCompanyId("");
     setJobSocialConnectionId("");
     setPostTitle("");
     setCaption("");
+    setFirstComment("");
+    setFirstCommentEnabled(false);
     setScheduledDate("");
-    setScheduledTime(getCurrentTimeValue(effectiveUserTimeZone, nowReferenceDate));
-    setScheduledTimeTouched(false);
+    setScheduledTime("");
     setActiveView("scheduler");
 
     if (typeof window !== "undefined") {
@@ -3606,40 +5894,80 @@ function App() {
     setCaption((current) => `${current}${emoji}`);
   }
 
+  function appendEmojiToFirstComment(emoji: string) {
+    setFirstComment((current) => `${current}${emoji}`);
+  }
+
+  function appendEmojiToMediaCaption(emoji: string) {
+    setMediaCaptionDraft((current) => `${current}${emoji}`);
+  }
+
   function appendEmojiToBroadcastAvisoMessage(emoji: string) {
     setBroadcastAvisoMessage((current) => `${current}${emoji}`);
   }
 
   function renderQuickEmojiPicker(options: {
+    pickerKey: string;
     disabled: boolean;
     onPick: (emoji: string) => void;
     label?: string;
+    className?: string;
   }) {
-    const { disabled, onPick, label = "Emojis rápidos" } = options;
+    const { pickerKey, disabled, onPick, label = "Abrir emojis", className = "" } = options;
+    const isOpen = openEmojiPickerKey === pickerKey;
 
     return (
-      <div className="emoji-picker-shell">
-        <span>{label}</span>
-        <div className="emoji-group-list">
-          {whatsappTextEmojiGroups.map((group) => (
-            <div key={group.label} className="emoji-group-card">
-              <strong>{group.label}</strong>
-              <div className="emoji-picker-grid">
-                {group.emojis.map((emoji) => (
+      <div className={`emoji-picker-shell${className ? ` ${className}` : ""}`}>
+        <button
+          type="button"
+          className={`emoji-popover-trigger${disabled ? " emoji-popover-trigger-disabled" : ""}`}
+          onClick={() => {
+            if (disabled) {
+              return;
+            }
+            setOpenEmojiPickerKey((current) => (current === pickerKey ? null : pickerKey));
+          }}
+          aria-label={label}
+          aria-expanded={isOpen}
+          disabled={disabled}
+        >
+          <span>😊</span>
+          <span>+</span>
+        </button>
+        {isOpen ? (
+          <div className="emoji-popover-panel">
+            <div className="emoji-popover-header">
+              <strong>Emojis</strong>
+              <button
+                type="button"
+                className="emoji-popover-close"
+                onClick={() => setOpenEmojiPickerKey(null)}
+                aria-label="Fechar emojis"
+                title="Fechar"
+              >
+                <FiX aria-hidden="true" />
+              </button>
+            </div>
+            <div className="emoji-popover-scroll">
+              <div className="emoji-picker-grid emoji-picker-grid-full">
+                {fullEmojiList.map((emoji) => (
                   <button
-                    key={`${group.label}-${emoji}`}
+                    key={`${pickerKey}-${emoji}`}
                     type="button"
                     className="emoji-chip"
                     disabled={disabled}
-                    onClick={() => onPick(emoji)}
+                    onClick={() => {
+                      onPick(emoji);
+                      setOpenEmojiPickerKey(null);
+                    }}
                   >
                     {emoji}
                   </button>
                 ))}
               </div>
             </div>
-          ))}
-        </div>
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -3722,7 +6050,7 @@ function App() {
                 <div className="empty-state">Nenhum aviso recente.</div>
               ) : (
                 recentAvisos.map((aviso) => (
-                  <article key={aviso.id} className={`notice-popover-item ${avisoToneClass(aviso.kind)}`}>
+                  <article key={aviso.id} className={`notice-popover-item ${avisoToneClass(aviso)}`}>
                     <strong>{aviso.title}</strong>
                     <span>{aviso.message}</span>
                     <small>{formatDate(aviso.createdAt, effectiveUserTimeZone)}</small>
@@ -3940,16 +6268,13 @@ function App() {
             </div>
             <div className="table-list">
               {upcomingJobs.length === 0 ? (
-                <div className="empty-state">Nao ha proximos agendamentos nesse filtro.</div>
+                <div className="empty-state">Não há próximos agendamentos nesse filtro.</div>
               ) : (
                 upcomingJobs.map((job) => {
                   const isRunningLike = shouldRenderUpcomingAsRunning(job, isPastScheduledAtForUser);
 
                   return (
-                    <div
-                      key={job.id}
-                      className={`row-card${isRunningLike ? " row-card-running-live" : ""}`}
-                    >
+                    <div key={job.id} className="row-card">
                       <div>
                         <strong>{resolveJobDisplayTitle(job)}</strong>
                         <div className="meta-pill-row">
@@ -3960,7 +6285,7 @@ function App() {
                         </div>
                       </div>
                       <div className="inline-actions">
-                        <span>{formatDate(job.dataPostagem, effectiveUserTimeZone)}</span>
+                        <span>{formatJobScheduledAt(job, effectiveUserTimeZone)}</span>
                         {isRunningLike ? (
                           <span className="status-pill status-running-live">
                             <span className="status-pill-spinner" aria-hidden="true" />
@@ -3969,7 +6294,7 @@ function App() {
                         ) : (
                           <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
                         )}
-                        {canToggleJobSchedule(job, isPastScheduledAtForUser) ? (
+                        {!isRunningLike && canToggleJobSchedule(job, isPastScheduledAtForUser) ? (
                           <button
                             type="button"
                             className={job.status === "CANCELED" ? "activate-button" : "ghost-button"}
@@ -4294,6 +6619,9 @@ function App() {
       billingMe?.plan?.isTrial || billingMe?.billingModel === "TRIAL"
         ? "Grátis"
         : formatPriceFromCents(activeBillingAmountCents);
+    if (billingLoading) {
+      return renderPlanSkeleton();
+    }
 
     return (
       <div className="view-stack">
@@ -4304,9 +6632,7 @@ function App() {
 
           {planInfo ? <div className={`info-banner${isPositivePlanInfo ? " info-banner-success" : ""}`}>{planInfo}</div> : null}
 
-          {billingLoading ? (
-            <div className="empty-state">Carregando plano...</div>
-          ) : billingMe ? (
+          {billingMe ? (
             <div className="table-list">
               <div className="row-card billing-row-card">
                 <div className="view-stack billing-summary-stack">
@@ -4352,7 +6678,35 @@ function App() {
                   </div>
                 </div>
               </div>
-              {!isRootUser ? (
+              {isRootUser ? (
+                <div id={BILLING_PLAN_CHECKOUT_ANCHOR_ID} className="row-card billing-row-card">
+                  <form onSubmit={assignRootPlan} className="form-stack">
+                    <strong>Selecionar plano (teste root)</strong>
+                    <label className="field-label">
+                      <span>Plano</span>
+                      <select
+                        value={rootAssignPlanId}
+                        onChange={(event) => setRootAssignPlanId(event.target.value)}
+                        required
+                        disabled={rootAssignablePlans.length === 0}
+                      >
+                        <option value="">Selecione um plano</option>
+                        {rootAssignablePlans.map((plan) => (
+                          <option key={plan.id} value={plan.id}>
+                            {`${plan.name} (${plan.code})`}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <button type="submit" disabled={assigningRootPlan || rootAssignablePlans.length === 0}>
+                      {assigningRootPlan ? "Aplicando..." : "Aplicar plano"}
+                    </button>
+                    <small className="field-hint">
+                      Ação de teste para root: troca o plano ativo sem iniciar cobrança Stripe.
+                    </small>
+                  </form>
+                </div>
+              ) : (
                 <div id={BILLING_PLAN_CHECKOUT_ANCHOR_ID} className="row-card billing-row-card">
                   <form onSubmit={startStripeCheckout} className="form-stack">
                     <strong>Pagamento Stripe (teste)</strong>
@@ -4423,7 +6777,7 @@ function App() {
                     </small>
                   </form>
                 </div>
-              ) : null}
+              )}
             </div>
           ) : (
             <div className="empty-state">Não foi possível carregar os dados do plano.</div>
@@ -4442,6 +6796,10 @@ function App() {
       );
     }
 
+    if (billingLoading) {
+      return renderPlanSkeleton();
+    }
+
     return (
       <div className="view-stack">
         {planInfo ? <div className={`info-banner${isPositivePlanInfo ? " info-banner-success" : ""}`}>{planInfo}</div> : null}
@@ -4449,6 +6807,11 @@ function App() {
         <section className="panel-card view-stack" aria-label="Configurações básicas">
           <div className="section-head">
             {renderSectionTitleWithIcon("planConfig", "Configurações básicas", "root")}
+            <div className="inline-actions">
+              <button type="button" className="ghost-button" onClick={openBillingDiscountModal}>
+                Desconto por usuário
+              </button>
+            </div>
           </div>
           <form onSubmit={saveBillingSettings} className="form-stack">
             <label className="field-label">
@@ -4885,6 +7248,12 @@ function App() {
   }
 
   function renderScheduler() {
+    const activeMediaCaptionTarget =
+      mediaCaptionModalIndex !== null ? uploadedSchedulerMedia[mediaCaptionModalIndex] ?? null : null;
+    const activeStoryEditorTarget =
+      storyEditorMediaIndex !== null ? uploadedSchedulerMedia[storyEditorMediaIndex] ?? null : null;
+    const canOpenStoryEditor = publicationType === "instagram_story";
+
     return (
       <section className="panel-card view-stack">
         <div className="section-head">
@@ -4908,7 +7277,7 @@ function App() {
           <div className="form-grid form-grid-three">
             <select
               value={publicationType}
-              onChange={(event) => setPublicationType(event.target.value as SchedulerPublicationType)}
+              onChange={(event) => handlePublicationTypeChange(event.target.value as SchedulerPublicationType)}
               disabled={submittingJob}
               required
             >
@@ -4952,30 +7321,38 @@ function App() {
             />
           </label>
 
-          <div className="form-grid form-grid-two scheduler-top-grid">
+          <div
+            className={`form-grid form-grid-two scheduler-top-grid${publicationState === "DRAFT" ? " scheduler-top-grid-disabled" : ""}`}
+          >
             <input
               type="date"
               value={scheduledDate}
               onChange={(event) => setScheduledDate(event.target.value)}
-              required
+              required={publicationState === "PUBLISHED"}
+              disabled={submittingJob || publicationState === "DRAFT"}
               title="Selecione a data em que a postagem deve ser executada."
             />
             <input
               type="time"
               value={scheduledTime}
-              onChange={(event) => {
-                setScheduledTime(event.target.value);
-                setScheduledTimeTouched(true);
-              }}
-              title="Horário opcional. Se ficar em branco, o sistema usa o horário atual."
+              onChange={(event) => setScheduledTime(event.target.value)}
+              required={publicationState === "PUBLISHED"}
+              disabled={submittingJob || publicationState === "DRAFT"}
+              title="Selecione o horário em que a postagem deve ser executada."
             />
           </div>
 
           <div className="text-chip">
             {publicationState === "DRAFT"
-              ? "Rascunho não entra em execução automática, independente de data e horário."
-              : "Se o horário ficar em branco, a postagem usa o horário atual ao salvar."}
+              ? "Rascunho não entra em execução automática, data e hora são ignorados."
+              : "Publicado exige data e horário preenchidos."}
           </div>
+
+          {publicationType === "instagram_story" ? (
+            <div className="info-banner scheduler-story-editor-warning">
+              Editor de Stories para imagens (experimental)
+            </div>
+          ) : null}
 
           <div className="form-grid form-grid-two">
             <select
@@ -5086,16 +7463,16 @@ function App() {
             </label>
           ) : null}
 
-          {supportsMultiMediaUpload && uploadedMediaCount > 0 ? (
+          {requiresMediaUpload && uploadedMediaCount > 0 ? (
             <div className="scheduler-media-preview-list">
               {uploadedSchedulerMedia.map((media, index) => (
                 <div
                   key={media.filePath}
-                  className={`scheduler-media-preview-item${draggingSchedulerMediaIndex === index ? " scheduler-media-preview-item-dragging" : ""}`}
-                  draggable
-                  onDragStart={() => handleSchedulerMediaThumbDragStart(index)}
+                  className={`scheduler-media-preview-item${supportsMultiMediaUpload && uploadedMediaCount > 1 ? "" : " scheduler-media-preview-item-static"}${draggingSchedulerMediaIndex === index ? " scheduler-media-preview-item-dragging" : ""}${dragOverSchedulerMediaIndex === index ? " scheduler-media-preview-item-drop-target" : ""}`}
+                  draggable={supportsMultiMediaUpload && uploadedMediaCount > 1}
+                  onDragStart={(event) => handleSchedulerMediaThumbDragStart(index, event)}
                   onDragEnd={handleSchedulerMediaThumbDragEnd}
-                  onDragOver={handleSchedulerMediaThumbDragOver}
+                  onDragOver={(event) => handleSchedulerMediaThumbDragOver(index, event)}
                   onDrop={(event) => handleSchedulerMediaThumbDrop(index, event)}
                   title={`Ordem ${index + 1}`}
                 >
@@ -5108,7 +7485,31 @@ function App() {
                   >
                     <FiX />
                   </button>
-                  <img src={`${api.baseUrl}${media.filePath}`} alt={`Prévia ${index + 1}`} />
+                  <button
+                    type="button"
+                    className={`scheduler-media-preview-caption${media.caption?.trim() ? " scheduler-media-preview-caption-filled" : ""}`}
+                    onClick={() => openMediaCaptionModal(index)}
+                    disabled={submittingJob || uploading}
+                  >
+                    {media.caption?.trim() ? "Editar" : "Add. legenda"}
+                  </button>
+                  {canOpenStoryEditor && isImagePath(media.filePath) ? (
+                    <button
+                      type="button"
+                      className="scheduler-media-preview-story-editor"
+                      onClick={() => openStoryEditorModal(index)}
+                      disabled={submittingJob || uploading}
+                      title="Abrir mini editor do story"
+                      aria-label={`Editar story da mídia ${index + 1}`}
+                    >
+                      <span>Edit. story</span>
+                    </button>
+                  ) : null}
+                  {isVideoPath(media.filePath) ? (
+                    <video src={`${api.baseUrl}${media.filePath}`} muted playsInline preload="metadata" />
+                  ) : (
+                    <img src={`${api.baseUrl}${media.filePath}`} alt={`Prévia ${index + 1}`} />
+                  )}
                   <small>{`#${index + 1}`}</small>
                 </div>
               ))}
@@ -5116,8 +7517,17 @@ function App() {
           ) : null}
 
           {supportsCaption ? (
-            <label className="field-shell">
-              <span>{captionLabel}</span>
+            <div className="field-shell">
+              <div className="field-head-with-action">
+                <span>{captionLabel}</span>
+                {renderQuickEmojiPicker({
+                  pickerKey: "scheduler-caption",
+                  disabled: submittingJob,
+                  onPick: appendEmojiToCaption,
+                  label: "Emojis da legenda",
+                  className: "emoji-picker-shell-right",
+                })}
+              </div>
               <textarea
                 value={caption}
                 onChange={(event) => setCaption(event.target.value)}
@@ -5125,30 +7535,140 @@ function App() {
                 placeholder={captionPlaceholder}
                 rows={publicationType === "whatsapp_status_texto" ? 5 : 4}
                 maxLength={2000}
-                required={requiresInstagramMetadata || publicationType === "whatsapp_status_texto"}
+                required={publicationType === "whatsapp_status_texto"}
                 title={captionTitle}
               />
+            </div>
+          ) : null}
+
+          {supportsFirstComment ? (
+            <label className="field-shell scheduler-first-comment-shell">
+              <span>Primeiro comentário</span>
+              <div className="scheduler-sequence-row">
+                <input
+                  type="checkbox"
+                  checked={firstCommentEnabled}
+                  onChange={(event) => setFirstCommentEnabled(event.target.checked)}
+                  disabled={submittingJob}
+                />
+                <small>Publique automaticamente um comentário após o post/reel (opcional).</small>
+              </div>
+              {firstCommentEnabled ? (
+                <>
+                  <div className="field-head-with-action">
+                    <span className="field-head-helper">Texto do primeiro comentário</span>
+                    {renderQuickEmojiPicker({
+                      pickerKey: "scheduler-first-comment",
+                      disabled: submittingJob,
+                      onPick: appendEmojiToFirstComment,
+                      label: "Emojis do primeiro comentário",
+                      className: "emoji-picker-shell-right",
+                    })}
+                  </div>
+                  <textarea
+                    value={firstComment}
+                    onChange={(event) => setFirstComment(event.target.value)}
+                    disabled={submittingJob}
+                    placeholder="Digite o primeiro comentário (aceita emojis)"
+                    rows={4}
+                    maxLength={2000}
+                    required
+                  />
+                </>
+              ) : null}
             </label>
           ) : null}
 
-          {supportsCaption &&
-          (caption.trim().length > 0 ||
-            publicationType === "whatsapp_status_midia" ||
-            publicationType === "whatsapp_status_texto" ||
-            requiresInstagramMetadata) ? (
-            renderQuickEmojiPicker({
-              disabled: submittingJob,
-              onPick: appendEmojiToCaption,
-            })
+          {supportsWhatsappRelink ? (
+            <label className="field-shell scheduler-first-comment-shell">
+              <span>Linkar no WhatsApp Status</span>
+              <div className="scheduler-sequence-row">
+                <input
+                  type="checkbox"
+                  checked={whatsappRelinkEnabled}
+                  onChange={(event) => setWhatsappRelinkEnabled(event.target.checked)}
+                  disabled={submittingJob || !canEnableWhatsappRelink}
+                />
+                <small>
+                  {publicationType === "instagram_story" && !canEnableWhatsappRelink
+                    ? "Relink no momento está disponível apenas para story único"
+                    : "Após publicar no Instagram, cria um status com a primeira mídia e o link do conteúdo para as contas selecionadas."}
+                </small>
+              </div>
+              {whatsappRelinkEnabled && canEnableWhatsappRelink ? (
+                <div className="scheduler-whatsapp-relink-shell">
+                  <div className="scheduler-whatsapp-relink-actions">
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      onClick={selectAllWhatsappRelinkConnections}
+                      disabled={submittingJob || schedulerWhatsappConnections.length === 0}
+                    >
+                      Selecionar todas
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      onClick={clearWhatsappRelinkConnections}
+                      disabled={submittingJob || whatsappRelinkConnectionIds.length === 0}
+                    >
+                      Limpar
+                    </button>
+                  </div>
+                  {schedulerWhatsappConnections.length === 0 ? (
+                    <small>Nenhuma conta de WhatsApp conectada para seu usuário.</small>
+                  ) : (
+                    <div className="scheduler-whatsapp-relink-list">
+                      {schedulerWhatsappConnections.map((connection) => (
+                        <label key={connection.id} className="scheduler-whatsapp-relink-option">
+                          <input
+                            type="checkbox"
+                            checked={whatsappRelinkConnectionIds.includes(connection.id)}
+                            onChange={() => toggleWhatsappRelinkConnectionSelection(connection.id)}
+                            disabled={submittingJob}
+                          />
+                          <span>{`${connection.displayName} (${companyNameMap[connection.companyId] || "Perfil removido"})`}</span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ) : null}
+            </label>
           ) : null}
 
-          {requiresInstagramMetadata ? (
+          {supportsWhatsappBackgroundColor ? (
+            <label className="field-shell">
+              <span>
+                {publicationType === "whatsapp_status_texto" || publicationType === "whatsapp_status_midia"
+                  ? "Cor de fundo do status"
+                  : "Cor de fundo do relink"}
+              </span>
+              <div className="scheduler-color-picker-row">
+                <input
+                  type="color"
+                  value={whatsappBackgroundColor}
+                  onChange={(event) => setWhatsappBackgroundColor(event.target.value.toUpperCase())}
+                  disabled={submittingJob}
+                  className="scheduler-color-picker-input"
+                  aria-label="Selecionar cor de fundo do WhatsApp"
+                />
+                <span className="scheduler-color-picker-value">{whatsappBackgroundColor}</span>
+              </div>
+              <small className="field-hint">
+                {publicationType === "whatsapp_status_texto" || publicationType === "whatsapp_status_midia"
+                  ? "Escolha a cor usada no fundo do status do WhatsApp."
+                  : "Escolha a cor usada no fundo do WhatsApp Status criado pelo relink."}
+              </small>
+            </label>
+          ) : null}
+
+          {requiresInstagramMetadata &&
+          (isInstagramForcedLocationEnabled || publicationType !== "instagram_story") ? (
             <div className="text-chip">
               {isInstagramForcedLocationEnabled
                 ? `Localização fixa ativa: ${instagramForcedLocationName} (#${instagramForcedLocationId}).`
-                : publicationType === "instagram_story"
-                  ? "Story será publicado sem localização pela API oficial."
-                  : "Post/Reel usam automaticamente a localização da Page vinculada à conta Instagram Business. Se não houver localização válida, publica sem localização."}
+                : "Post/Reel usam automaticamente a localização da Page vinculada à conta Instagram Business. Se não houver localização válida, publica sem localização."}
             </div>
           ) : null}
 
@@ -5165,6 +7685,712 @@ function App() {
             </span>
           </button>
         </form>
+
+        {activeMediaCaptionTarget ? (
+          <div
+            className="scheduler-media-caption-modal-backdrop"
+            onClick={() => {
+              if (!submittingJob) {
+                closeMediaCaptionModal();
+              }
+            }}
+          >
+            <section
+              className="scheduler-media-caption-modal"
+              aria-label="Editar legenda da mídia"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="scheduler-media-caption-modal-header">
+                <div>
+                  <strong>{`Legenda da mídia #${(mediaCaptionModalIndex ?? 0) + 1}`}</strong>
+                  <span>{activeMediaCaptionTarget.fileName}</span>
+                </div>
+                <button
+                  type="button"
+                  className="qr-modal-close"
+                  onClick={() => {
+                    if (!submittingJob) {
+                      closeMediaCaptionModal();
+                    }
+                  }}
+                  aria-label="Fechar"
+                  disabled={submittingJob}
+                >
+                  <span className="modal-close-icon" aria-hidden="true">
+                    X
+                  </span>
+                </button>
+              </div>
+              <div className="scheduler-media-caption-modal-preview">
+                {isVideoPath(activeMediaCaptionTarget.filePath) ? (
+                  <video
+                    src={`${api.baseUrl}${activeMediaCaptionTarget.filePath}`}
+                    muted
+                    playsInline
+                    preload="metadata"
+                  />
+                ) : (
+                  <img
+                    src={`${api.baseUrl}${activeMediaCaptionTarget.filePath}`}
+                    alt={`Prévia da mídia ${activeMediaCaptionTarget.fileName}`}
+                  />
+                )}
+              </div>
+              <div className="field-shell">
+                <div className="field-head-with-action">
+                  <span>Legenda da mídia</span>
+                  {renderQuickEmojiPicker({
+                    pickerKey: "scheduler-media-caption",
+                    disabled: submittingJob,
+                    onPick: appendEmojiToMediaCaption,
+                    label: "Emojis da legenda da mídia",
+                    className: "emoji-picker-shell-right",
+                  })}
+                </div>
+                <textarea
+                  value={mediaCaptionDraft}
+                  onChange={(event) => setMediaCaptionDraft(event.target.value)}
+                  disabled={submittingJob}
+                  placeholder="Digite a legenda desta mídia (opcional)"
+                  rows={4}
+                  maxLength={2000}
+                />
+              </div>
+              <div className="scheduler-media-caption-modal-actions">
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={() => setMediaCaptionDraft("")}
+                  disabled={submittingJob}
+                >
+                  Limpar
+                </button>
+                <button type="button" onClick={saveMediaCaptionModal} disabled={submittingJob}>
+                  Salvar legenda
+                </button>
+              </div>
+            </section>
+          </div>
+        ) : null}
+
+        {activeStoryEditorTarget && canOpenStoryEditor ? (
+          <div
+            className="scheduler-story-editor-backdrop"
+            onClick={() => {
+              if (!storyEditorSaving && !submittingJob) {
+                closeStoryEditorModal();
+              }
+            }}
+          >
+            <section
+              className="scheduler-story-editor-modal"
+              aria-label="Mini editor de story"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="scheduler-story-editor-header">
+                <div>
+                  <strong>Mini editor de story (Experimental)</strong>
+                </div>
+                <button
+                  type="button"
+                  className="qr-modal-close"
+                  onClick={() => {
+                    if (!storyEditorSaving && !submittingJob) {
+                      closeStoryEditorModal();
+                    }
+                  }}
+                  aria-label="Fechar"
+                  disabled={storyEditorSaving || submittingJob}
+                >
+                  <span className="modal-close-icon" aria-hidden="true">
+                    X
+                  </span>
+                </button>
+              </div>
+
+              <div className="scheduler-story-editor-toolbar-inline">
+                <button
+                  type="button"
+                  className="scheduler-story-editor-tool-icon"
+                  onClick={addStoryEditorTextSticker}
+                  disabled={storyEditorSaving}
+                  title="Adicionar texto"
+                  aria-label="Adicionar texto"
+                >
+                  <FiType aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  className={`scheduler-story-editor-tool-icon${storyEditorDecorPickerOpen ? " scheduler-story-editor-tool-icon-active" : ""}`}
+                  onClick={toggleStoryEditorDecorPicker}
+                  disabled={storyEditorSaving}
+                  title="Figurinhas"
+                  aria-label="Figurinhas"
+                >
+                  <FiSmile aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  className={`scheduler-story-editor-tool-icon${storyEditorLocationEnabled ? " scheduler-story-editor-tool-icon-active" : ""}`}
+                  onClick={toggleStoryEditorLocationSticker}
+                  disabled={storyEditorSaving}
+                  title="Localização"
+                  aria-label="Localização"
+                >
+                  <FiMapPin aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  className={`scheduler-story-editor-tool-icon${storyEditorToolMode === "DRAW" ? " scheduler-story-editor-tool-icon-active" : ""}`}
+                  onClick={toggleStoryEditorDrawMode}
+                  disabled={storyEditorSaving}
+                  title={storyEditorToolMode === "DRAW" ? "Finalizar rabisco" : "Rabisco"}
+                  aria-label={storyEditorToolMode === "DRAW" ? "Finalizar rabisco" : "Rabisco"}
+                >
+                  <FiEdit3 aria-hidden="true" />
+                </button>
+                {storyEditorStrokes.length > 0 ? (
+                  <button
+                    type="button"
+                    className="scheduler-story-editor-tool-icon"
+                    onClick={() => setStoryEditorStrokes((current) => current.slice(0, -1))}
+                    disabled={storyEditorSaving}
+                    title="Desfazer rabisco"
+                    aria-label="Desfazer rabisco"
+                  >
+                    <FiRotateCcw aria-hidden="true" />
+                  </button>
+                ) : null}
+              </div>
+
+              <div className="scheduler-story-editor-stage-wrap">
+                <div
+                  ref={storyEditorStageRef}
+                  className={`scheduler-story-editor-stage${storyEditorToolMode === "DRAW" ? " scheduler-story-editor-stage-drawing" : ""}`}
+                  onPointerDown={handleStoryEditorStagePointerDown}
+                  onPointerMove={handleStoryEditorStagePointerMove}
+                  onPointerUp={handleStoryEditorStagePointerUp}
+                  onPointerCancel={handleStoryEditorStagePointerUp}
+                  onPointerEnter={handleStoryEditorStagePointerEnter}
+                  onPointerLeave={handleStoryEditorStagePointerLeave}
+                >
+                  {storyEditorDecorPickerOpen ? (
+                    <div className="scheduler-story-editor-overlay-controls scheduler-story-editor-stage-controls-top">
+                      <div className="scheduler-story-editor-inline-panel scheduler-story-editor-inline-panel-decor">
+                        <div className="scheduler-story-editor-inline-emoji-list">
+                          {STORY_EDITOR_DECOR_STICKERS.map((emoji) => (
+                            <button
+                              key={emoji}
+                              type="button"
+                              className="scheduler-story-editor-decor-chip"
+                              onClick={() => addStoryEditorDecorSticker(emoji)}
+                              disabled={storyEditorSaving}
+                            >
+                              {emoji}
+                            </button>
+                          ))}
+                        </div>
+                        <div className="scheduler-story-editor-inline-actions">
+                          {storyEditorDecorStickers.length > 0 ? (
+                            <button
+                              type="button"
+                              className="scheduler-story-editor-inline-clear"
+                              onClick={() => setStoryEditorDecorStickers([])}
+                              disabled={storyEditorSaving}
+                            >
+                              Limpar
+                            </button>
+                          ) : null}
+                          <button
+                            type="button"
+                            className="scheduler-story-editor-inline-icon-button"
+                            onClick={() => setStoryEditorDecorPickerOpen(false)}
+                            disabled={storyEditorSaving}
+                            aria-label="Fechar figurinhas"
+                            title="Fechar figurinhas"
+                          >
+                            <FiX aria-hidden="true" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                  {storyEditorLocationEditing && storyEditorLocationEnabled ? (
+                    <div
+                      className="scheduler-story-editor-overlay-controls scheduler-story-editor-stage-controls-floating"
+                      style={{
+                        top: `${storyEditorLocationControlsStyle.top}px`,
+                        left: `${storyEditorLocationControlsStyle.left}px`,
+                        width: `${storyEditorLocationControlsStyle.width}px`,
+                      }}
+                    >
+                      <div className="scheduler-story-editor-inline-panel scheduler-story-editor-inline-panel-location">
+                        <label className="scheduler-story-editor-inline-input">
+                          <InstagramGradientMapPinIcon
+                            className="scheduler-story-editor-location-pin"
+                            gradientId="story-location-pin-inline-gradient"
+                          />
+                          <input
+                            type="text"
+                            value={storyEditorLocationText}
+                            onChange={(event) => setStoryEditorLocationText(event.target.value.slice(0, 80))}
+                            placeholder="Digite a localização"
+                            disabled={storyEditorSaving}
+                            maxLength={80}
+                            autoFocus
+                          />
+                        </label>
+                        <div className="scheduler-story-editor-text-colors">
+                          <div className="scheduler-story-editor-color-list">
+                            {STORY_EDITOR_TEXT_COLORS.map((color) => (
+                              <button
+                                key={`location-text-${color}`}
+                                type="button"
+                                className={`scheduler-story-editor-color-dot${storyEditorLocationTextColor === color ? " scheduler-story-editor-color-dot-active" : ""}`}
+                                style={{ backgroundColor: color }}
+                                onClick={() => setStoryEditorLocationTextColor(color)}
+                                disabled={storyEditorSaving}
+                                aria-label={`Cor do texto ${color}`}
+                                title={`Cor do texto ${color}`}
+                              />
+                            ))}
+                          </div>
+                          <div className="scheduler-story-editor-color-list">
+                            {STORY_EDITOR_TEXT_BACKGROUNDS.map((color) => (
+                              <button
+                                key={`location-bg-${color}`}
+                                type="button"
+                                className={`scheduler-story-editor-color-dot${storyEditorLocationBackgroundColor === color ? " scheduler-story-editor-color-dot-active" : ""}`}
+                                style={{ backgroundColor: color === "transparent" ? "#ffffff" : color }}
+                                onClick={() => setStoryEditorLocationBackgroundColor(color)}
+                                disabled={storyEditorSaving}
+                                aria-label={`Fundo ${color}`}
+                                title={color === "transparent" ? "Sem fundo" : `Fundo ${color}`}
+                              >
+                                {color === "transparent" ? <span className="scheduler-story-editor-transparent-mark">/</span> : null}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                        <label className="scheduler-story-editor-size-control">
+                          <input
+                            type="range"
+                            min={0.7}
+                            max={getStoryEditorMaxLocationScale(storyEditorLocationText, storyEditorLocationFontFamily)}
+                            step={0.05}
+                            value={storyEditorLocationScale}
+                            onChange={(event) => updateStoryEditorLocationScale(Number.parseFloat(event.target.value) || 1)}
+                            disabled={storyEditorSaving}
+                          />
+                          <strong>{Math.round(storyEditorLocationScale * 100)}%</strong>
+                        </label>
+                        <div className="scheduler-story-editor-inline-actions">
+                          <label className="scheduler-story-editor-inline-font">
+                            <FiType aria-hidden="true" />
+                            <select
+                              value={storyEditorLocationFontFamily}
+                              onChange={(event) => updateStoryEditorLocationFont(event.target.value)}
+                              disabled={storyEditorSaving}
+                            >
+                              {STORY_EDITOR_FONT_OPTIONS.map((fontOption) => (
+                                <option key={`location-font-${fontOption.value}`} value={fontOption.value}>
+                                  {fontOption.label}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <button
+                            type="button"
+                            className="scheduler-story-editor-inline-icon-button"
+                            onClick={removeStoryEditorLocationSticker}
+                            disabled={storyEditorSaving}
+                            aria-label="Remover localização"
+                            title="Remover localização"
+                          >
+                            <FiTrash2 aria-hidden="true" />
+                          </button>
+                          <button
+                            type="button"
+                            className="scheduler-story-editor-inline-icon-button"
+                            onClick={() => setStoryEditorLocationEditing(false)}
+                            disabled={storyEditorSaving}
+                            aria-label="Fechar edição da localização"
+                            title="Fechar edição da localização"
+                          >
+                            <FiX aria-hidden="true" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                  <img src={`${api.baseUrl}${activeStoryEditorTarget.filePath}`} alt="Prévia do story editável" />
+                  {storyEditorLocationEnabled ? (
+                    <>
+                      <button
+                        type="button"
+                        className={`scheduler-story-editor-sticker scheduler-story-editor-location-sticker${storyEditorDraggingSticker ? " scheduler-story-editor-sticker-dragging" : ""}`}
+                        style={{
+                          left: `${storyEditorStickerX * 100}%`,
+                          top: `${storyEditorStickerY * 100}%`,
+                          color: storyEditorLocationTextColor,
+                          background:
+                            storyEditorLocationBackgroundColor === "transparent"
+                              ? "transparent"
+                              : storyEditorLocationBackgroundColor,
+                          borderColor:
+                            storyEditorLocationBackgroundColor === "transparent"
+                              ? "rgba(255, 255, 255, 0.72)"
+                              : "transparent",
+                          fontFamily: `${storyEditorLocationFontFamily}, K2D, Arial, sans-serif`,
+                          transform: `translate(-50%, -50%) scale(${storyEditorLocationScale})`,
+                        }}
+                        onPointerDown={handleStoryEditorStickerPointerDown}
+                        onPointerMove={handleStoryEditorStickerPointerMove}
+                        onPointerUp={handleStoryEditorStickerPointerUp}
+                        onPointerCancel={handleStoryEditorStickerPointerUp}
+                        onClick={() => {
+                          setStoryEditorLocationEditing(true);
+                          setStoryEditorDecorPickerOpen(false);
+                          setStoryEditorActiveTextStickerId(null);
+                          setStoryEditorActiveDecorStickerId(null);
+                        }}
+                        disabled={storyEditorSaving || storyEditorToolMode === "DRAW"}
+                      >
+                        <InstagramGradientMapPinIcon
+                          className="scheduler-story-editor-location-pin"
+                          gradientId="story-location-pin-sticker-gradient"
+                        />
+                        <span>{storyEditorResolvedLocationName || "Sua localização"}</span>
+                      </button>
+                      {storyEditorLocationEditing ? (
+                        <button
+                          type="button"
+                          className="scheduler-story-editor-sticker-delete"
+                          style={{
+                            left: `calc(${storyEditorStickerX * 100}% + ${Math.max(
+                              storyEditorLocationStickerSize.width / 2 - 12,
+                              20,
+                            )}px)`,
+                            top: `calc(${storyEditorStickerY * 100}% - ${Math.max(
+                              storyEditorLocationStickerSize.height / 2 - 2,
+                              18,
+                            )}px)`,
+                          }}
+                          onClick={removeStoryEditorLocationSticker}
+                          disabled={storyEditorSaving}
+                          aria-label="Remover localização"
+                          title="Remover localização"
+                        >
+                          <FiTrash2 aria-hidden="true" />
+                        </button>
+                      ) : null}
+                    </>
+                  ) : null}
+                  {storyEditorDecorStickers.map((sticker) => (
+                    <div key={sticker.id}>
+                      <button
+                        type="button"
+                        className={`scheduler-story-editor-sticker scheduler-story-editor-decor-sticker${storyEditorDraggingDecorStickerId === sticker.id ? " scheduler-story-editor-sticker-dragging" : ""}`}
+                        style={{
+                          left: `${sticker.x * 100}%`,
+                          top: `${sticker.y * 100}%`,
+                        }}
+                        onPointerDown={(event) => handleStoryEditorDecorStickerPointerDown(sticker.id, sticker.x, sticker.y, event)}
+                        onPointerMove={handleStoryEditorDecorStickerPointerMove}
+                        onPointerUp={handleStoryEditorDecorStickerPointerUp}
+                        onPointerCancel={handleStoryEditorDecorStickerPointerUp}
+                        onClick={() => {
+                          setStoryEditorActiveTextStickerId(null);
+                          setStoryEditorLocationEditing(false);
+                          setStoryEditorDecorPickerOpen(false);
+                          setStoryEditorActiveDecorStickerId(sticker.id);
+                        }}
+                        disabled={storyEditorSaving || storyEditorToolMode === "DRAW"}
+                        aria-label={`Figura ${sticker.emoji}`}
+                        title={`Figura ${sticker.emoji}`}
+                      >
+                        <span>{sticker.emoji}</span>
+                      </button>
+                      {storyEditorActiveDecorStickerId === sticker.id ? (
+                        <button
+                          type="button"
+                          className="scheduler-story-editor-sticker-delete"
+                          style={{
+                            left: `calc(${sticker.x * 100}% + 34px)`,
+                            top: `calc(${sticker.y * 100}% - 28px)`,
+                          }}
+                          onClick={removeStoryEditorActiveDecorSticker}
+                          disabled={storyEditorSaving}
+                          aria-label={`Remover figura ${sticker.emoji}`}
+                          title={`Remover figura ${sticker.emoji}`}
+                        >
+                          <FiTrash2 aria-hidden="true" />
+                        </button>
+                      ) : null}
+                    </div>
+                  ))}
+                  {storyEditorTextStickers.map((textSticker) => (
+                    <div key={textSticker.id}>
+                      <button
+                        type="button"
+                        className={`scheduler-story-editor-sticker scheduler-story-editor-text-sticker${storyEditorDraggingTextStickerId === textSticker.id ? " scheduler-story-editor-sticker-dragging" : ""}${storyEditorActiveTextStickerId === textSticker.id ? " scheduler-story-editor-text-sticker-active" : ""}`}
+                        style={{
+                          left: `${textSticker.x * 100}%`,
+                          top: `${textSticker.y * 100}%`,
+                        color: textSticker.textColor,
+                        background: textSticker.backgroundColor === "transparent" ? "transparent" : textSticker.backgroundColor,
+                        borderColor: textSticker.backgroundColor === "transparent" ? "rgba(255, 255, 255, 0.72)" : "transparent",
+                        fontFamily: `${textSticker.fontFamily}, K2D, Arial, sans-serif`,
+                        transform: `translate(-50%, -50%) scale(${textSticker.scale})`,
+                      }}
+                        onPointerDown={(event) =>
+                          handleStoryEditorTextStickerPointerDown(textSticker.id, textSticker.x, textSticker.y, event)}
+                        onPointerMove={handleStoryEditorTextStickerPointerMove}
+                        onPointerUp={handleStoryEditorTextStickerPointerUp}
+                        onPointerCancel={handleStoryEditorTextStickerPointerUp}
+                      onClick={() => {
+                        setStoryEditorActiveTextStickerId(textSticker.id);
+                        setStoryEditorTextColor(textSticker.textColor);
+                        setStoryEditorTextBackgroundColor(textSticker.backgroundColor);
+                        setStoryEditorTextFontFamily(textSticker.fontFamily);
+                        setStoryEditorTextScale(textSticker.scale);
+                        setStoryEditorDecorPickerOpen(false);
+                        setStoryEditorLocationEditing(false);
+                        setStoryEditorActiveDecorStickerId(null);
+                      }}
+                        disabled={storyEditorSaving || storyEditorToolMode === "DRAW"}
+                        aria-label={`Texto ${textSticker.text}`}
+                        title={textSticker.text}
+                      >
+                        <span>{textSticker.text}</span>
+                      </button>
+                      {storyEditorActiveTextStickerId === textSticker.id ? (
+                        <button
+                          type="button"
+                          className="scheduler-story-editor-sticker-delete"
+                          style={{
+                            left: `calc(${textSticker.x * 100}% + ${Math.max(
+                              estimateStoryEditorTextStickerSize(textSticker.text, textSticker.fontFamily, textSticker.scale).width /
+                                2 -
+                                12,
+                              20,
+                            )}px)`,
+                            top: `calc(${textSticker.y * 100}% - ${Math.max(
+                              estimateStoryEditorTextStickerSize(textSticker.text, textSticker.fontFamily, textSticker.scale).height /
+                                2 -
+                                2,
+                              18,
+                            )}px)`,
+                          }}
+                          onClick={removeStoryEditorActiveTextSticker}
+                          disabled={storyEditorSaving}
+                          aria-label="Remover texto"
+                          title="Remover texto"
+                        >
+                          <FiTrash2 aria-hidden="true" />
+                        </button>
+                      ) : null}
+                    </div>
+                  ))}
+                  {storyEditorStrokes.length > 0 ? (
+                    <svg className="scheduler-story-editor-draw-layer" viewBox="0 0 1000 1000" preserveAspectRatio="none">
+                      {storyEditorStrokes.map((stroke) =>
+                        stroke.points.length === 1 ? (
+                          <circle
+                            key={stroke.id}
+                            cx={(stroke.points[0]?.x ?? 0.5) * 1000}
+                            cy={(stroke.points[0]?.y ?? 0.5) * 1000}
+                            r={Math.max(stroke.size * 1.4, 1)}
+                            fill={stroke.color}
+                          />
+                        ) : (
+                          <path
+                            key={stroke.id}
+                            d={storyStrokeSvgPath(stroke.points)}
+                            fill="none"
+                            stroke={stroke.color}
+                            strokeWidth={Math.max(stroke.size * 3, 1)}
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                        ),
+                      )}
+                    </svg>
+                  ) : null}
+                  {storyEditorToolMode === "DRAW" && storyEditorBrushCursor.visible ? (
+                    <span
+                      className="scheduler-story-editor-brush-cursor"
+                      style={{
+                        left: `${storyEditorBrushCursor.x * 100}%`,
+                        top: `${storyEditorBrushCursor.y * 100}%`,
+                        width: `${Math.max(storyEditorBrushSize * 3, 10)}px`,
+                        height: `${Math.max(storyEditorBrushSize * 3, 10)}px`,
+                        borderColor: storyEditorBrushColor,
+                      }}
+                    />
+                  ) : null}
+                  {storyEditorToolMode === "DRAW" ? (
+                    <div className="scheduler-story-editor-overlay-controls scheduler-story-editor-stage-controls-bottom">
+                      <div className="scheduler-story-editor-inline-panel scheduler-story-editor-inline-panel-draw">
+                        <div className="scheduler-story-editor-color-list">
+                          {STORY_EDITOR_BRUSH_COLORS.map((color) => (
+                            <button
+                              key={color}
+                              type="button"
+                              className={`scheduler-story-editor-color-dot${storyEditorBrushColor === color ? " scheduler-story-editor-color-dot-active" : ""}`}
+                              style={{ backgroundColor: color }}
+                              onClick={() => setStoryEditorBrushColor(color)}
+                              disabled={storyEditorSaving}
+                              aria-label={`Selecionar cor ${color}`}
+                              title={`Cor ${color}`}
+                            />
+                          ))}
+                        </div>
+                        <label className="scheduler-story-editor-size-control">
+                          <input
+                            type="range"
+                            min={4}
+                            max={26}
+                            step={1}
+                            value={storyEditorBrushSize}
+                            onChange={(event) => setStoryEditorBrushSize(Number.parseInt(event.target.value, 10) || 10)}
+                            disabled={storyEditorSaving}
+                          />
+                          <strong>{storyEditorBrushSize}px</strong>
+                        </label>
+                        {storyEditorStrokes.length > 0 ? (
+                          <button
+                            type="button"
+                            className="scheduler-story-editor-inline-clear"
+                            onClick={clearStoryEditorStrokes}
+                            disabled={storyEditorSaving}
+                          >
+                            Limpar
+                          </button>
+                        ) : null}
+                        <button
+                          type="button"
+                          className="scheduler-story-editor-inline-icon-button"
+                          onClick={() => {
+                            setStoryEditorToolMode("MOVE");
+                            setStoryEditorBrushCursor((current) => ({ ...current, visible: false }));
+                          }}
+                          disabled={storyEditorSaving}
+                          aria-label="Fechar painel do pincel"
+                          title="Fechar painel do pincel"
+                        >
+                          <FiX aria-hidden="true" />
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                  {activeStoryEditorTextSticker && storyEditorToolMode !== "DRAW" ? (
+                    <div className="scheduler-story-editor-overlay-controls scheduler-story-editor-stage-controls-bottom">
+                      <div className="scheduler-story-editor-inline-panel scheduler-story-editor-inline-panel-text">
+                        <input
+                          type="text"
+                          value={activeStoryEditorTextSticker.text}
+                          onChange={(event) => updateStoryEditorActiveTextStickerText(event.target.value)}
+                          disabled={storyEditorSaving}
+                          placeholder="Digite o texto"
+                          maxLength={120}
+                        />
+                        <div className="scheduler-story-editor-text-colors">
+                          <div className="scheduler-story-editor-color-list">
+                            {STORY_EDITOR_TEXT_COLORS.map((color) => (
+                              <button
+                                key={`text-color-${color}`}
+                                type="button"
+                                className={`scheduler-story-editor-color-dot${storyEditorTextColor === color ? " scheduler-story-editor-color-dot-active" : ""}`}
+                                style={{ backgroundColor: color }}
+                                onClick={() => updateStoryEditorActiveTextStickerTextColor(color)}
+                                disabled={storyEditorSaving}
+                                aria-label={`Cor do texto ${color}`}
+                                title={`Cor do texto ${color}`}
+                              />
+                            ))}
+                          </div>
+                          <div className="scheduler-story-editor-color-list">
+                            {STORY_EDITOR_TEXT_BACKGROUNDS.map((color) => (
+                              <button
+                                key={`text-bg-${color}`}
+                                type="button"
+                                className={`scheduler-story-editor-color-dot${storyEditorTextBackgroundColor === color ? " scheduler-story-editor-color-dot-active" : ""}`}
+                                style={{ backgroundColor: color === "transparent" ? "#ffffff" : color }}
+                                onClick={() => updateStoryEditorActiveTextStickerBackground(color)}
+                                disabled={storyEditorSaving}
+                                aria-label={`Fundo do texto ${color}`}
+                                title={color === "transparent" ? "Sem fundo" : `Fundo ${color}`}
+                              >
+                                {color === "transparent" ? <span className="scheduler-story-editor-transparent-mark">/</span> : null}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                        <label className="scheduler-story-editor-size-control">
+                          <input
+                            type="range"
+                            min={0.7}
+                            max={getStoryEditorMaxTextScale(activeStoryEditorTextSticker.text, storyEditorTextFontFamily)}
+                            step={0.05}
+                            value={storyEditorTextScale}
+                            onChange={(event) =>
+                              updateStoryEditorActiveTextStickerScale(Number.parseFloat(event.target.value) || 1)}
+                            disabled={storyEditorSaving}
+                          />
+                          <strong>{Math.round(storyEditorTextScale * 100)}%</strong>
+                        </label>
+                        <div className="scheduler-story-editor-inline-actions">
+                          <label className="scheduler-story-editor-inline-font">
+                            <FiType aria-hidden="true" />
+                            <select
+                              value={storyEditorTextFontFamily}
+                              onChange={(event) => updateStoryEditorActiveTextStickerFontFamily(event.target.value)}
+                              disabled={storyEditorSaving}
+                            >
+                              {STORY_EDITOR_FONT_OPTIONS.map((fontOption) => (
+                                <option key={`text-font-${fontOption.value}`} value={fontOption.value}>
+                                  {fontOption.label}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <button
+                            type="button"
+                            className="scheduler-story-editor-inline-icon-button"
+                            onClick={removeStoryEditorActiveTextSticker}
+                            disabled={storyEditorSaving}
+                            aria-label="Remover texto"
+                            title="Remover texto"
+                          >
+                            <FiTrash2 aria-hidden="true" />
+                          </button>
+                          <button
+                            type="button"
+                            className="scheduler-story-editor-inline-icon-button"
+                            onClick={() => setStoryEditorActiveTextStickerId(null)}
+                            disabled={storyEditorSaving}
+                            aria-label="Fechar edição de texto"
+                            title="Fechar edição de texto"
+                          >
+                            <FiX aria-hidden="true" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="scheduler-story-editor-actions">
+                <button type="button" onClick={() => void saveStoryEditorMedia()} disabled={storyEditorSaving || submittingJob}>
+                  {storyEditorSaving ? <span className="button-spinner" aria-hidden="true" /> : null}
+                  <span>{storyEditorSaving ? "Salvando..." : "Salvar edição"}</span>
+                </button>
+              </div>
+            </section>
+          </div>
+        ) : null}
       </section>
     );
   }
@@ -5247,8 +8473,124 @@ function App() {
           {renderHistoryMonthFilter()}
           {renderHistoryYearFilter()}
         </div>
+        <form onSubmit={applyHistoryBulkEdit} className="history-bulk-shell">
+          <div className="history-bulk-top">
+            <label className="field-label history-bulk-search-field">
+              <span>Buscar postagem</span>
+              <div className="history-search-input-row">
+                <input
+                  type="search"
+                  value={historySearchQuery}
+                  onChange={(event) => setHistorySearchQuery(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      setHistoryPage(1);
+                    }
+                  }}
+                  placeholder="Título ou legenda"
+                  maxLength={120}
+                  disabled={historyBulkApplying}
+                />
+                <button
+                  type="button"
+                  className="ghost-button history-search-submit-button"
+                  onClick={() => setHistoryPage(1)}
+                  disabled={historyBulkApplying}
+                >
+                  Buscar
+                </button>
+              </div>
+            </label>
+            <label className="field-label history-bulk-action-field">
+              <span>Ação em massa</span>
+              <select
+                value={historyBulkAction}
+                onChange={(event) => setHistoryBulkAction(event.target.value as HistoryBulkAction)}
+                disabled={historyBulkApplying}
+              >
+                <option value="">Selecione uma ação</option>
+                <option value="SET_PUBLISHED">Marcar como Publicado</option>
+                <option value="SET_DRAFT">Marcar como Rascunho</option>
+                <option value="SET_SCHEDULE">Alterar data e horário</option>
+                <option value="SET_COMPANY">Alterar perfil</option>
+              </select>
+            </label>
+          </div>
+          {historyBulkAction ? (
+            <div className="history-bulk-fields">
+              {historyBulkAction === "SET_SCHEDULE" || historyBulkAction === "SET_PUBLISHED" ? (
+                <>
+                  <label className="field-label">
+                    <span>Nova data</span>
+                    <input
+                      type="date"
+                      value={historyBulkDate}
+                      onChange={(event) => setHistoryBulkDate(event.target.value)}
+                      disabled={historyBulkApplying}
+                      required
+                    />
+                  </label>
+                  <label className="field-label">
+                    <span>Novo horário</span>
+                    <input
+                      type="time"
+                      value={historyBulkTime}
+                      onChange={(event) => setHistoryBulkTime(event.target.value)}
+                      disabled={historyBulkApplying}
+                      required
+                    />
+                  </label>
+                </>
+              ) : null}
+              {historyBulkAction === "SET_COMPANY" ? (
+                <label className="field-label">
+                  <span>Perfil de destino</span>
+                  <select
+                    value={historyBulkCompanyId}
+                    onChange={(event) => setHistoryBulkCompanyId(event.target.value)}
+                    disabled={historyBulkApplying}
+                    required
+                  >
+                    <option value="">Selecione o perfil</option>
+                    {companies.map((company) => (
+                      <option key={company.id} value={company.id}>
+                        {company.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+            </div>
+          ) : null}
+          <div className="history-bulk-actions">
+            {historyBulkAction ? (
+              <>
+                <div className="history-bulk-actions-spacer" aria-hidden="true" />
+                <div className="history-bulk-actions-right">
+                  <button
+                    type="submit"
+                    className="history-bulk-apply-button"
+                    disabled={historyBulkApplying || historyBulkSelectedJobIds.length === 0}
+                  >
+                    {historyBulkApplying ? "Aplicando..." : "Aplicar em selecionados"}
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={cancelHistoryBulkAction}
+                    disabled={historyBulkApplying}
+                  >
+                    Cancelar ação
+                  </button>
+                </div>
+              </>
+            ) : null}
+          </div>
+        </form>
         <div className="history-filters-meta">
           <span className="count-pill">{historyFilteredJobs.length} registros</span>
+          <span className="count-pill">{`${historyBulkSelectedJobIds.length} selecionado(s)`}</span>
         </div>
         {historyInfo ? (
           <div
@@ -5260,28 +8602,43 @@ function App() {
         {renderNumericPagination("history-top", historyPage, historyTotalPages, setHistoryPage, historySectionRef)}
         <div className="table-list">
           {paginatedHistoryJobs.map((job) => (
-            <div key={job.id} className="row-card">
+            <div key={job.id} className="row-card history-row-card">
+              {(() => {
+                const storySequenceFailureMeta = parseStorySequenceFailureMeta(job.lastError);
+                const canRescheduleFailedInstagramMedia =
+                  job.publicationState !== "DRAFT" &&
+                  job.status === "FAILED" &&
+                  isInstagramPublication(job.publicationType);
+                const hasPartialStoryFailure =
+                  job.publicationType === "instagram_story" &&
+                  storySequenceFailureMeta !== null &&
+                  storySequenceFailureMeta.publishedCount > 0 &&
+                  storySequenceFailureMeta.publishedCount < storySequenceFailureMeta.total;
+
+                return (
+            <>
               <div>
+                {historyBulkAction ? (
+                  <label className="history-bulk-item-check">
+                    <input
+                      type="checkbox"
+                      checked={historyBulkSelectedJobIdsSet.has(job.id)}
+                      onChange={() => toggleHistoryBulkJobSelection(job.id)}
+                      disabled={historyBulkApplying}
+                    />
+                    <span>Selecionar</span>
+                  </label>
+                ) : null}
                 <strong>{resolveJobDisplayTitle(job)}</strong>
                 <div className="meta-pill-row">
                   {renderPublicationTypePill(job.publicationType)}
                   <span className="unit-pill">{`Perfil: ${companyNameMap[job.companyId] || "Perfil removido"}`}</span>
                 </div>
                 {job.locationName ? <span>Localização: {job.locationName}</span> : null}
-                <span>{formatDate(job.dataPostagem, effectiveUserTimeZone)}</span>
+                <span>{formatJobScheduledAt(job, effectiveUserTimeZone)}</span>
               </div>
               <div className="inline-actions">
                 <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
-                {job.publicationState === "DRAFT" ? (
-                  <button
-                    type="button"
-                    className="activate-button"
-                    onClick={() => void publishDraft(job)}
-                    disabled={publishingDraftJobId === job.id}
-                  >
-                    {publishingDraftJobId === job.id ? "Publicando..." : "Publicar"}
-                  </button>
-                ) : null}
                 {canToggleJobSchedule(job, isPastScheduledAtForUser) ? (
                   <button
                     type="button"
@@ -5303,7 +8660,22 @@ function App() {
                 ) : (
                   <span className="text-chip">Sem midia</span>
                 )}
+                {canRescheduleFailedInstagramMedia ? (
+                  <button
+                    type="button"
+                    className="activate-button"
+                    onClick={() => void rescheduleFailedMedia(job)}
+                    disabled={reschedulingFailedMediaJobId === job.id}
+                  >
+                    {reschedulingFailedMediaJobId === job.id
+                      ? "Reagendando..."
+                      : hasPartialStoryFailure
+                        ? "Reagendar restantes +20 min"
+                        : "Reagendar mídia +20 min"}
+                  </button>
+                ) : null}
                 {job.publicationState !== "DRAFT" &&
+                !canRescheduleFailedInstagramMedia &&
                 (job.status === "FAILED" || job.status === "WAITING_LOGIN" || job.status === "SENT_UNCONFIRMED") ? (
                   <button
                     type="button"
@@ -5321,6 +8693,9 @@ function App() {
                   Excluir
                 </button>
               </div>
+            </>
+                );
+              })()}
             </div>
           ))}
           {historyFilteredJobs.length === 0 ? <div className="empty-state">Nenhum job encontrado neste filtro.</div> : null}
@@ -5393,7 +8768,7 @@ function App() {
 
         <div className="table-list">
           {avisos.map((aviso) => (
-            <div key={aviso.id} className={`row-card notice-row ${avisoToneClass(aviso.kind)}`}>
+            <div key={aviso.id} className={`row-card notice-row ${avisoToneClass(aviso)}`}>
               <div>
                 <strong>{aviso.title}</strong>
                 <span>{aviso.message}</span>
@@ -5401,7 +8776,7 @@ function App() {
               </div>
               <div className="inline-actions">
                 <span className={`status-pill ${aviso.readAt ? "status-completed" : "status-pending"}`}>
-                  {aviso.readAt ? "Lido" : "Nao lido"}
+                  {aviso.readAt ? "Lido" : "Não lido"}
                 </span>
               </div>
             </div>
@@ -5443,18 +8818,26 @@ function App() {
             maxLength={120}
             required
           />
-          <textarea
-            value={broadcastAvisoMessage}
-            onChange={(event) => setBroadcastAvisoMessage(event.target.value)}
-            placeholder="Mensagem para todos os clientes"
-            rows={6}
-            maxLength={2000}
-            required
-          />
-          {renderQuickEmojiPicker({
-            disabled: broadcastAvisoSubmitting,
-            onPick: appendEmojiToBroadcastAvisoMessage,
-          })}
+          <div className="field-shell">
+            <div className="field-head-with-action">
+              <span>Mensagem do aviso</span>
+              {renderQuickEmojiPicker({
+                pickerKey: "notice-admin-message",
+                disabled: broadcastAvisoSubmitting,
+                onPick: appendEmojiToBroadcastAvisoMessage,
+                label: "Emojis da mensagem",
+                className: "emoji-picker-shell-right",
+              })}
+            </div>
+            <textarea
+              value={broadcastAvisoMessage}
+              onChange={(event) => setBroadcastAvisoMessage(event.target.value)}
+              placeholder="Mensagem para todos os clientes"
+              rows={6}
+              maxLength={2000}
+              required
+            />
+          </div>
           <button type="submit" disabled={broadcastAvisoSubmitting}>
             {broadcastAvisoSubmitting ? "Enviando..." : "Enviar aviso global"}
           </button>
@@ -5680,10 +9063,41 @@ function App() {
 
   function renderPlanSkeleton() {
     return (
-      <section className="panel-card view-stack skeleton-shell" aria-busy="true">
-        {renderSkeletonSectionHead()}
-        <div className="plan-empty-view" />
-      </section>
+      <div className="view-stack skeleton-shell" aria-busy="true">
+        <section className="panel-card view-stack">
+          {renderSkeletonSectionHead()}
+          <div className="table-list" aria-hidden="true">
+            <div className="row-card">
+              <div className="skeleton-row-main">
+                <span className="skeleton-line skeleton-line-title" />
+                <div className="meta-pill-row">
+                  <span className="skeleton-line skeleton-line-pill" />
+                  <span className="skeleton-line skeleton-line-pill" />
+                  <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
+                </div>
+              </div>
+            </div>
+            <div className="row-card">
+              <div className="skeleton-row-main">
+                <span className="skeleton-line skeleton-line-title" />
+                <div className="meta-pill-row">
+                  <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
+                  <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
+                  <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
+                </div>
+              </div>
+            </div>
+            <div className="row-card">
+              <div className="form-stack">
+                <span className="skeleton-line skeleton-line-input" />
+                <span className="skeleton-line skeleton-line-input" />
+                <span className="skeleton-line skeleton-line-input" />
+                <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" />
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
     );
   }
 
@@ -5752,7 +9166,11 @@ function App() {
   }
 
   if (!authChecked) {
-    return <div className="auth-shell"><section className="auth-card"><p>Validando acesso...</p></section></div>;
+    return (
+      <div className="auth-boot-loading" role="status" aria-live="polite" aria-label="Carregando aplicativo">
+        <span className="auth-boot-spinner" aria-hidden="true" />
+      </div>
+    );
   }
 
   if (!authUser) {
@@ -5940,6 +9358,130 @@ function App() {
                   <button type="submit">Adicionar conta</button>
                 </div>
               </form>
+            </section>
+          </button>
+        ) : null}
+
+        {isBillingDiscountModalOpen ? (
+          <button
+            type="button"
+            className="connection-create-modal-backdrop"
+            aria-label="Fechar descontos por usuário"
+            onClick={closeBillingDiscountModal}
+          >
+            <section
+              className="connection-create-modal billing-discount-modal"
+              aria-label="Descontos por usuário"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="connection-create-modal-header billing-discount-modal-header">
+                <div>
+                  <strong>Descontos por usuário</strong>
+                </div>
+                <button
+                  type="button"
+                  className="qr-modal-close"
+                  aria-label="Fechar"
+                  title="Fechar"
+                  onClick={closeBillingDiscountModal}
+                >
+                  <span className="modal-close-icon" aria-hidden="true">
+                    ×
+                  </span>
+                </button>
+              </div>
+
+              <div className="billing-discount-modal-grid">
+                <section className="billing-discount-list-shell">
+                  <label className="field-label">
+                    <span>Buscar usuário</span>
+                    <input
+                      value={billingDiscountSearch}
+                      onChange={(event) => {
+                        setBillingDiscountSearch(event.target.value);
+                        setBillingDiscountPage(1);
+                      }}
+                      placeholder="Nome ou usuário"
+                      maxLength={120}
+                    />
+                  </label>
+                  <small className="field-hint">{`${billingDiscountTotal} usuário(s) encontrado(s)`}</small>
+                  <div className="billing-discount-list">
+                    {billingDiscountUsersLoading ? (
+                      <div className="empty-state">Carregando usuários...</div>
+                    ) : billingDiscountUsers.length === 0 ? (
+                      <div className="empty-state">Nenhum usuário encontrado.</div>
+                    ) : (
+                      billingDiscountUsers.map((user) => (
+                        <button
+                          key={user.id}
+                          type="button"
+                          className={`billing-discount-user-button${selectedBillingDiscountUserId === user.id ? " billing-discount-user-button-active" : ""}`}
+                          onClick={() => selectBillingDiscountUser(user)}
+                        >
+                          <span className="billing-discount-user-name">{user.name}</span>
+                          <span className="billing-discount-user-username">{`@${user.username}`}</span>
+                        </button>
+                      ))
+                    )}
+                  </div>
+                  {renderNumericPagination(
+                    "billing-discount-modal",
+                    billingDiscountPage,
+                    billingDiscountTotalPages,
+                    setBillingDiscountPage,
+                  )}
+                </section>
+
+                <section className="billing-discount-editor-shell">
+                  {selectedBillingDiscountUser ? (
+                    <form onSubmit={saveBillingDiscountForSelectedUser} className="form-stack">
+                      <strong>{`Usuário selecionado: ${selectedBillingDiscountUser.name} (@${selectedBillingDiscountUser.username})`}</strong>
+                      <div className="meta-pill-row">
+                        <span className="unit-pill">{`Plano: ${selectedBillingDiscountUser.billingPlanName ?? "Sem plano"}`}</span>
+                        <span className={`status-pill status-${billingStatusTone(selectedBillingDiscountUser.billingStatus)}`}>
+                          {`Status: ${billingStatusDisplayLabel(selectedBillingDiscountUser.billingStatus)}`}
+                        </span>
+                        {selectedBillingDiscountUser.billingDiscountEnabled &&
+                        selectedBillingDiscountUser.billingDiscountPercent > 0 ? (
+                          <span className="unit-pill unit-pill-plan">{`Desconto atual: ${selectedBillingDiscountUser.billingDiscountPercent}%`}</span>
+                        ) : (
+                          <span className="unit-pill">Sem desconto ativo</span>
+                        )}
+                      </div>
+                      <label className="field-label">
+                        <span>Desconto ativo</span>
+                        <select
+                          value={billingDiscountEnabledInput ? "enabled" : "disabled"}
+                          onChange={(event) => setBillingDiscountEnabledInput(event.target.value === "enabled")}
+                        >
+                          <option value="enabled">Ativado</option>
+                          <option value="disabled">Desativado</option>
+                        </select>
+                      </label>
+                      <label className="field-label">
+                        <span>Percentual de desconto (%)</span>
+                        <input
+                          type="number"
+                          min={0}
+                          max={100}
+                          value={billingDiscountPercentInput}
+                          onChange={(event) => setBillingDiscountPercentInput(event.target.value)}
+                          disabled={!billingDiscountEnabledInput}
+                        />
+                      </label>
+                      <small className="field-hint">
+                        Aplica nas próximas cobranças (assinatura ou PIX avulso) e permanece ativo até você desativar.
+                      </small>
+                      <button type="submit" disabled={savingBillingDiscountUserId === selectedBillingDiscountUser.id}>
+                        {savingBillingDiscountUserId === selectedBillingDiscountUser.id ? "Salvando..." : "Salvar desconto"}
+                      </button>
+                    </form>
+                  ) : (
+                    <div className="empty-state">Selecione um usuário na lista para configurar desconto.</div>
+                  )}
+                </section>
+              </div>
             </section>
           </button>
         ) : null}

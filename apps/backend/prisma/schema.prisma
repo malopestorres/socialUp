@@ -14,6 +14,8 @@ model User {
   passwordHash   String
   timeZone       String   @default("America/Sao_Paulo")
   role           String   @default("ADMIN")
+  billingDiscountEnabled Boolean @default(false)
+  billingDiscountPercent Int     @default(0)
   sessionToken   String?  @unique
   sessionIssuedAt DateTime?
   createdAt      DateTime @default(now())
@@ -52,7 +54,13 @@ model Job {
   filePath     String
   title        String?
   caption      String?
+  firstComment String?
   locationName String?
+  whatsappBackgroundColor String?
+  whatsappRelinkEnabled Boolean @default(false)
+  whatsappRelinkConnectionIds Json?
+  whatsappRelinkDispatchedAt DateTime?
+  instagramPermalink String?
   publicationType String @default("instagram_reel")
   postStory    Boolean  @default(false)
   postReel     Boolean  @default(false)

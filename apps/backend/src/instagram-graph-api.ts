@@ -195,6 +195,21 @@ function isInstagramTooManyActionsErrorMessage(message: string): boolean {
   return normalized.includes("user is performing too many actions") || normalized.includes("too many actions");
 }
 
+function isInstagramRefreshTooEarlyErrorMessage(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return (
+    normalized.includes("not been at least 24 hours") ||
+    normalized.includes("has not been 24 hours") ||
+    normalized.includes("can only be refreshed after 24 hours") ||
+    normalized.includes("token must be at least 24 hours old") ||
+    normalized.includes("cannot be refreshed yet")
+  );
+}
+
 function cleanupExpiredOAuthStateEntries(nowMs: number): void {
   for (const [token, entry] of oauthStateByToken.entries()) {
     if (nowMs - entry.createdAtMs > INSTAGRAM_OAUTH_STATE_TTL_MS) {
@@ -463,6 +478,17 @@ async function instagramOauthTokenRequest(code: string): Promise<FacebookOAuthTo
   }
 
   return payload as FacebookOAuthTokenResponse;
+}
+
+async function instagramExchangeLongLivedToken(shortLivedToken: string): Promise<FacebookOAuthTokenResponse> {
+  return graphRequest<FacebookOAuthTokenResponse>("/access_token", {
+    baseUrl: "https://graph.instagram.com",
+    query: {
+      grant_type: "ig_exchange_token",
+      client_secret: INSTAGRAM_OAUTH_APP_SECRET,
+      access_token: shortLivedToken,
+    },
+  });
 }
 
 async function instagramMeRequest(accessToken: string): Promise<InstagramAccountCandidate | null> {
@@ -842,8 +868,11 @@ function buildMediaContainerPayload(input: {
   mediaUrl: string;
   mediaKind: "image" | "video";
   caption: string | null;
+  altText?: string | null;
   locationId?: string | null;
 }): Record<string, string | number | boolean> {
+  const normalizedAltText = input.altText?.trim() || "";
+
   if (input.publicationType === "instagram_post") {
     if (input.mediaKind !== "image") {
       throw new Error("INSTAGRAM_GRAPH_POST_IMAGE_REQUIRED");
@@ -853,6 +882,9 @@ function buildMediaContainerPayload(input: {
       image_url: input.mediaUrl,
       caption: input.caption ?? "",
     };
+    if (normalizedAltText) {
+      payload.alt_text = normalizedAltText.slice(0, 1000);
+    }
     if (input.locationId?.trim()) {
       payload.location_id = input.locationId.trim();
     }
@@ -1065,28 +1097,57 @@ export async function exchangeInstagramOAuthCodeForConnection(input: {
   let effectiveToken = shortLivedToken;
   let effectiveExpiresIn = typeof shortToken.expires_in === "number" ? shortToken.expires_in : null;
 
-  try {
-    const longToken = await graphRequest<FacebookOAuthTokenResponse>("/oauth/access_token", {
-      query: {
-        grant_type: "fb_exchange_token",
-        client_id: INSTAGRAM_OAUTH_APP_ID,
-        client_secret: INSTAGRAM_OAUTH_APP_SECRET,
-        fb_exchange_token: shortLivedToken,
-      },
-    });
+  if (INSTAGRAM_OAUTH_FLOW === "facebook_login") {
+    try {
+      const longToken = await graphRequest<FacebookOAuthTokenResponse>("/oauth/access_token", {
+        query: {
+          grant_type: "fb_exchange_token",
+          client_id: INSTAGRAM_OAUTH_APP_ID,
+          client_secret: INSTAGRAM_OAUTH_APP_SECRET,
+          fb_exchange_token: shortLivedToken,
+        },
+      });
 
-    if (longToken.access_token?.trim()) {
-      effectiveToken = longToken.access_token.trim();
-      effectiveExpiresIn = typeof longToken.expires_in === "number" ? longToken.expires_in : effectiveExpiresIn;
+      if (longToken.access_token?.trim()) {
+        effectiveToken = longToken.access_token.trim();
+        effectiveExpiresIn = typeof longToken.expires_in === "number" ? longToken.expires_in : effectiveExpiresIn;
+      }
+    } catch (error) {
+      if (error instanceof Error && isInstagramLoginRequiredErrorMessage(error.message)) {
+        throw error;
+      }
     }
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      isInstagramLoginRequiredErrorMessage(error.message) &&
-      INSTAGRAM_OAUTH_FLOW === "facebook_login"
-    ) {
-      throw error;
+  } else {
+    try {
+      const longToken = await instagramExchangeLongLivedToken(shortLivedToken);
+      if (longToken.access_token?.trim()) {
+        effectiveToken = longToken.access_token.trim();
+        effectiveExpiresIn = typeof longToken.expires_in === "number" ? longToken.expires_in : effectiveExpiresIn;
+      }
+    } catch {
+      // Compat fallback: alguns apps antigos ainda aceitam o caminho de exchange via Graph/Facebook.
+      try {
+        const fallbackLongToken = await graphRequest<FacebookOAuthTokenResponse>("/oauth/access_token", {
+          query: {
+            grant_type: "fb_exchange_token",
+            client_id: INSTAGRAM_OAUTH_APP_ID,
+            client_secret: INSTAGRAM_OAUTH_APP_SECRET,
+            fb_exchange_token: shortLivedToken,
+          },
+        });
+        if (fallbackLongToken.access_token?.trim()) {
+          effectiveToken = fallbackLongToken.access_token.trim();
+          effectiveExpiresIn =
+            typeof fallbackLongToken.expires_in === "number" ? fallbackLongToken.expires_in : effectiveExpiresIn;
+        }
+      } catch {
+        // Se ambos falharem, mantém o token atual; o refresh worker tentará renovar novamente.
+      }
     }
+  }
+
+  if (INSTAGRAM_OAUTH_FLOW !== "facebook_login" && effectiveToken === shortLivedToken) {
+    throw new Error("INSTAGRAM_GRAPH_OAUTH_LONG_TOKEN_EXCHANGE_FAILED");
   }
 
   const candidates: InstagramAccountCandidate[] = [];
@@ -1176,7 +1237,8 @@ export async function refreshInstagramAccessTokenForConnection(input: {
     }
   };
 
-  if (INSTAGRAM_OAUTH_APP_ID && INSTAGRAM_OAUTH_APP_SECRET) {
+  const shouldUseFacebookExchangeRefresh = INSTAGRAM_OAUTH_FLOW === "facebook_login";
+  if (shouldUseFacebookExchangeRefresh && INSTAGRAM_OAUTH_APP_ID && INSTAGRAM_OAUTH_APP_SECRET) {
     try {
       const exchangedToken = await graphRequest<FacebookOAuthTokenResponse>("/oauth/access_token", {
         query: {
@@ -1198,6 +1260,25 @@ export async function refreshInstagramAccessTokenForConnection(input: {
     } catch (error) {
       pushError(error, "INSTAGRAM_GRAPH_REFRESH_FACEBOOK_FAILED");
     }
+  } else if (INSTAGRAM_OAUTH_APP_SECRET) {
+    // Fluxo Instagram Login: se o token atual ainda for curto, tenta elevar para long-lived.
+    try {
+      const exchangedToken = await instagramExchangeLongLivedToken(currentToken);
+      const nextToken = exchangedToken.access_token?.trim() || "";
+      if (nextToken) {
+        return {
+          accessToken: nextToken,
+          tokenExpiresInSeconds:
+            typeof exchangedToken.expires_in === "number" ? exchangedToken.expires_in : null,
+        };
+      }
+      pushError(
+        new Error("INSTAGRAM_GRAPH_REFRESH_EMPTY_TOKEN_INSTAGRAM_EXCHANGE"),
+        "INSTAGRAM_GRAPH_REFRESH_EMPTY_TOKEN_INSTAGRAM_EXCHANGE",
+      );
+    } catch (error) {
+      pushError(error, "INSTAGRAM_GRAPH_REFRESH_INSTAGRAM_EXCHANGE_FAILED");
+    }
   }
 
   try {
@@ -1218,6 +1299,13 @@ export async function refreshInstagramAccessTokenForConnection(input: {
     }
     pushError(new Error("INSTAGRAM_GRAPH_REFRESH_EMPTY_TOKEN_INSTAGRAM"), "INSTAGRAM_GRAPH_REFRESH_EMPTY_TOKEN_INSTAGRAM");
   } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    if (isInstagramRefreshTooEarlyErrorMessage(message)) {
+      return {
+        accessToken: currentToken,
+        tokenExpiresInSeconds: null,
+      };
+    }
     pushError(error, "INSTAGRAM_GRAPH_REFRESH_INSTAGRAM_FAILED");
   }
 
@@ -1281,6 +1369,7 @@ export async function executeInstagramCarouselJobWithGraphApi(
     caption?: string | null;
     locationName?: string | null;
     locationId?: string | null;
+    fileAltTexts?: Array<string | null>;
   },
   mediaUrls: string[],
 ): Promise<{
@@ -1315,8 +1404,9 @@ export async function executeInstagramCarouselJobWithGraphApi(
   });
 
   const childCreationIds: string[] = [];
-  for (const mediaUrl of normalizedMediaUrls) {
+  for (const [index, mediaUrl] of normalizedMediaUrls.entries()) {
     const mediaKind = inferMediaKind(mediaUrl);
+    const normalizedAltText = job.fileAltTexts?.[index]?.trim() || "";
     const childPayload: Record<string, string | number | boolean> =
       mediaKind === "video"
         ? {
@@ -1328,6 +1418,9 @@ export async function executeInstagramCarouselJobWithGraphApi(
             image_url: mediaUrl,
             is_carousel_item: true,
           };
+    if (mediaKind === "image" && normalizedAltText) {
+      childPayload.alt_text = normalizedAltText.slice(0, 1000);
+    }
 
     const childCreated = await graphRequest<MediaContainerResponse>(`/${instagramUserId}/media`, {
       method: "POST",
@@ -1423,6 +1516,7 @@ export async function executeInstagramJobWithGraphApi(
     caption?: string | null;
     locationName?: string | null;
     locationId?: string | null;
+    altText?: string | null;
   },
   mediaUrl: string,
 ): Promise<{
@@ -1458,6 +1552,7 @@ export async function executeInstagramJobWithGraphApi(
     mediaUrl: normalizedMediaUrl,
     mediaKind,
     caption: job.caption?.trim() || null,
+    altText: job.altText?.trim() || null,
     locationId,
   });
 
@@ -1480,6 +1575,7 @@ export async function executeInstagramJobWithGraphApi(
         mediaUrl: normalizedMediaUrl,
         mediaKind,
         caption: job.caption?.trim() || null,
+        altText: job.altText?.trim() || null,
         locationId: null,
       });
       created = await graphRequest<MediaContainerResponse>(`/${instagramUserId}/media`, {
@@ -1543,4 +1639,67 @@ export async function executeInstagramJobWithGraphApi(
     creationId,
     publishedMediaId,
   };
+}
+
+export async function fetchInstagramPublishedMediaPermalinkWithGraphApi(
+  connection: {
+    secretCipher: string | null;
+  },
+  publishedMediaId: string,
+): Promise<string | null> {
+  const accessToken = decodeSecret(connection.secretCipher);
+  if (!accessToken) {
+    throw new Error("LOGIN_REQUIRED_INSTAGRAM");
+  }
+
+  const mediaId = publishedMediaId.trim();
+  if (!mediaId) {
+    throw new Error("INSTAGRAM_GRAPH_MEDIA_ID_REQUIRED");
+  }
+
+  const payload = await graphRequest<{ permalink?: string }>(`/${mediaId}`, {
+    method: "GET",
+    accessToken,
+    baseUrl: INSTAGRAM_CONTENT_GRAPH_BASE_URL,
+    query: {
+      fields: "permalink",
+    },
+  });
+
+  const permalink = payload.permalink?.trim() || "";
+  return permalink || null;
+}
+
+export async function publishInstagramMediaCommentWithGraphApi(
+  connection: {
+    secretCipher: string | null;
+  },
+  input: {
+    mediaId: string;
+    message: string;
+  },
+): Promise<void> {
+  const accessToken = decodeSecret(connection.secretCipher);
+  if (!accessToken) {
+    throw new Error("LOGIN_REQUIRED_INSTAGRAM");
+  }
+
+  const mediaId = input.mediaId.trim();
+  if (!mediaId) {
+    throw new Error("INSTAGRAM_GRAPH_COMMENT_MEDIA_ID_MISSING");
+  }
+
+  const message = input.message.trim();
+  if (!message) {
+    return;
+  }
+
+  await graphRequest<Record<string, unknown>>(`/${mediaId}/comments`, {
+    method: "POST",
+    accessToken,
+    baseUrl: INSTAGRAM_CONTENT_GRAPH_BASE_URL,
+    body: {
+      message,
+    },
+  });
 }
