@@ -12,9 +12,12 @@ import {
 import type { IconType } from "react-icons";
 import {
   FiAlertCircle,
+  FiBarChart2,
   FiBell,
   FiCalendar,
   FiCheckCircle,
+  FiChevronLeft,
+  FiChevronRight,
   FiClock,
   FiDownload,
   FiEdit3,
@@ -36,6 +39,7 @@ import {
   FiEyeOff,
   FiMoon,
   FiSun,
+  FiTrendingUp,
 } from "react-icons/fi";
 import { FaInstagram, FaWhatsapp } from "react-icons/fa6";
 import { api } from "./api";
@@ -63,6 +67,9 @@ type HistoryBulkAction = "" | "SET_PUBLISHED" | "SET_DRAFT" | "SET_SCHEDULE" | "
 type PublicationState = "PUBLISHED" | "DRAFT";
 type SchedulerPublicationState = PublicationState | "";
 type StoryEditorToolMode = "MOVE" | "DRAW";
+type DashboardTrendRange = "7" | "30" | "90";
+type DashboardTrendNetwork = "all" | "instagram" | "whatsapp";
+type DashboardTrendFocus = "all" | "published" | "failed" | "scheduled";
 
 type StoryEditorStrokePoint = {
   x: number;
@@ -1148,6 +1155,48 @@ function publicationTypeNetwork(publicationType: Job["publicationType"]): "insta
   return "whatsapp";
 }
 
+function dashboardTrendDayKey(date: Date, timeZone: string): string {
+  const parts = getTimeZoneDateParts(date, timeZone);
+  return `${parts.year ?? "0000"}-${parts.month ?? "01"}-${parts.day ?? "01"}`;
+}
+
+function dashboardTrendDayLabel(dayKey: string): string {
+  const [, month = "01", day = "01"] = dayKey.split("-");
+  return `${day}/${month}`;
+}
+
+function dashboardTrendFocusLabel(focus: DashboardTrendFocus): string {
+  switch (focus) {
+    case "published":
+      return "Publicados";
+    case "failed":
+      return "Falhados";
+    case "scheduled":
+      return "Agendados";
+    case "all":
+    default:
+      return "Visão geral";
+  }
+}
+
+function buildDashboardChartPath(values: number[], width: number, height: number): string {
+  if (values.length === 0) {
+    return "";
+  }
+
+  const safeWidth = Math.max(width, 1);
+  const safeHeight = Math.max(height, 1);
+  const maxValue = Math.max(...values, 1);
+
+  return values
+    .map((value, index) => {
+      const x = values.length === 1 ? safeWidth / 2 : (index / (values.length - 1)) * safeWidth;
+      const y = safeHeight - (value / maxValue) * safeHeight;
+      return `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
+    })
+    .join(" ");
+}
+
 function renderPublicationTypePill(publicationType: Job["publicationType"]) {
   const network = publicationTypeNetwork(publicationType);
   const Icon = network === "instagram" ? FaInstagram : FaWhatsapp;
@@ -1481,6 +1530,10 @@ function App() {
   const [avisos, setAvisos] = useState<Aviso[]>([]);
   const [dashboard, setDashboard] = useState<Dashboard>(initialDashboard);
   const [selectedCompanyId, setSelectedCompanyId] = useState<string>("");
+  const [dashboardUpcomingPage, setDashboardUpcomingPage] = useState(0);
+  const [dashboardTrendRange, setDashboardTrendRange] = useState<DashboardTrendRange>("30");
+  const [dashboardTrendNetwork, setDashboardTrendNetwork] = useState<DashboardTrendNetwork>("all");
+  const [dashboardTrendFocus, setDashboardTrendFocus] = useState<DashboardTrendFocus>("all");
   const [companyName, setCompanyName] = useState("");
   const [connectionDisplayName, setConnectionDisplayName] = useState("");
   const [connectionCompanyId, setConnectionCompanyId] = useState("");
@@ -2445,9 +2498,141 @@ function App() {
         const leftScheduledAt = new Date(left.dataPostagem).getTime();
         const rightScheduledAt = new Date(right.dataPostagem).getTime();
         return leftScheduledAt - rightScheduledAt;
-      })
-      .slice(0, 5);
+      });
   }, [effectiveUserTimeZone, jobsOrderedByCreatedAtDesc, nowTickMs]);
+
+  const dashboardUpcomingPages = useMemo(() => {
+    const chunkSize = 2;
+    const pages: Job[][] = [];
+    for (let index = 0; index < upcomingJobs.length; index += chunkSize) {
+      pages.push(upcomingJobs.slice(index, index + chunkSize));
+    }
+    return pages;
+  }, [upcomingJobs]);
+
+  const dashboardChartData = useMemo(() => {
+    const visibleDayKeys: string[] = [];
+    const totalDays = Number.parseInt(dashboardTrendRange, 10);
+    for (let index = 0; index < totalDays; index += 1) {
+      const dayKey = dashboardTrendDayKey(
+        new Date(nowTickMs - (totalDays - 1 - index) * 24 * 60 * 60 * 1000),
+        effectiveUserTimeZone,
+      );
+      if (visibleDayKeys[visibleDayKeys.length - 1] !== dayKey) {
+        visibleDayKeys.push(dayKey);
+      }
+    }
+
+    const buckets = new Map(
+      visibleDayKeys.map((dayKey) => [
+        dayKey,
+        {
+          key: dayKey,
+          label: dashboardTrendDayLabel(dayKey),
+          published: 0,
+          failed: 0,
+          scheduled: 0,
+          total: 0,
+        },
+      ]),
+    );
+
+    const distributionSeed = [
+      { key: "instagram_post", label: "Instagram Posts", network: "instagram" as const, count: 0 },
+      { key: "instagram_reel", label: "Instagram Reels", network: "instagram" as const, count: 0 },
+      { key: "instagram_story", label: "Instagram Stories", network: "instagram" as const, count: 0 },
+      { key: "whatsapp_status_midia", label: "WhatsApp Status Mídia", network: "whatsapp" as const, count: 0 },
+      { key: "whatsapp_status_texto", label: "WhatsApp Status Texto", network: "whatsapp" as const, count: 0 },
+    ];
+    const distributionMap = new Map(distributionSeed.map((entry) => [entry.key, { ...entry }]));
+    const activeCompanies = new Set<string>();
+
+    let publishedTotal = 0;
+    let failedTotal = 0;
+    let scheduledTotal = 0;
+
+    for (const job of filteredJobs) {
+      if (job.publicationState !== "PUBLISHED") {
+        continue;
+      }
+
+      const jobNetwork = publicationTypeNetwork(job.publicationType);
+      if (dashboardTrendNetwork !== "all" && jobNetwork !== dashboardTrendNetwork) {
+        continue;
+      }
+
+      const bucketKey = dashboardTrendDayKey(new Date(job.dataPostagem), effectiveUserTimeZone);
+      const bucket = buckets.get(bucketKey);
+      if (!bucket) {
+        continue;
+      }
+
+      const isPublished = job.status === "COMPLETED" || job.status === "SENT_UNCONFIRMED";
+      const isFailed = job.status === "FAILED";
+      const isScheduled = job.status === "PENDING" || job.status === "WAITING_LOGIN" || job.status === "RUNNING";
+
+      if (isPublished) {
+        bucket.published += 1;
+        publishedTotal += 1;
+      }
+      if (isFailed) {
+        bucket.failed += 1;
+        failedTotal += 1;
+      }
+      if (isScheduled) {
+        bucket.scheduled += 1;
+        scheduledTotal += 1;
+      }
+
+      const matchesFocus =
+        dashboardTrendFocus === "all" ||
+        (dashboardTrendFocus === "published" && isPublished) ||
+        (dashboardTrendFocus === "failed" && isFailed) ||
+        (dashboardTrendFocus === "scheduled" && isScheduled);
+
+      if (matchesFocus) {
+        bucket.total += 1;
+        activeCompanies.add(job.companyId);
+        const distribution = distributionMap.get(job.publicationType);
+        if (distribution) {
+          distribution.count += 1;
+        }
+      }
+    }
+
+    const points = visibleDayKeys.map((dayKey) => buckets.get(dayKey)!);
+    const maxValue = Math.max(
+      1,
+      ...points.map((point) =>
+        dashboardTrendFocus === "all"
+          ? Math.max(point.published, point.failed, point.scheduled)
+          : point.total,
+      ),
+    );
+    const peakPoint = points.reduce<(typeof points)[number] | null>((current, point) => {
+      if (!current || point.total > current.total) {
+        return point;
+      }
+      return current;
+    }, null);
+    const distributionItems = Array.from(distributionMap.values()).sort((left, right) => right.count - left.count);
+    const distributionMax = Math.max(1, ...distributionItems.map((item) => item.count));
+    const deliveryBase = publishedTotal + failedTotal;
+    const deliveryRate = deliveryBase > 0 ? Math.round((publishedTotal / deliveryBase) * 100) : null;
+
+    return {
+      points,
+      maxValue,
+      publishedTotal,
+      failedTotal,
+      scheduledTotal,
+      activeProfiles: activeCompanies.size,
+      peakPoint,
+      distributionItems,
+      distributionMax,
+      deliveryRate,
+    };
+  }, [dashboardTrendRange, dashboardTrendNetwork, dashboardTrendFocus, filteredJobs, effectiveUserTimeZone, nowTickMs]);
 
   const historyAvailableYears = useMemo(
     () =>
@@ -3065,6 +3250,13 @@ function App() {
       window.removeEventListener("focus", handleFocus);
     };
   }, [authUser, activeView, selectedCompanyId, isRootUser]);
+
+  useEffect(() => {
+    setDashboardUpcomingPage((current) => {
+      const maxPage = Math.max(0, dashboardUpcomingPages.length - 1);
+      return Math.min(current, maxPage);
+    });
+  }, [dashboardUpcomingPages.length]);
 
   useEffect(() => {
     if (publicationState !== "DRAFT") {
@@ -6192,61 +6384,75 @@ function App() {
   }
 
   function renderDashboard() {
+    const hasDashboardTrendData =
+      dashboardTrendFocus === "all"
+        ? dashboardChartData.points.some((point) => point.published > 0 || point.failed > 0 || point.scheduled > 0)
+        : dashboardChartData.points.some((point) => point.total > 0);
+    const dashboardXAxisStep = Math.max(1, Math.ceil(dashboardChartData.points.length / 6));
+    const publishedPath = buildDashboardChartPath(
+      dashboardChartData.points.map((point) => point.published),
+      100,
+      100,
+    );
+    const failedPath = buildDashboardChartPath(
+      dashboardChartData.points.map((point) => point.failed),
+      100,
+      100,
+    );
+    const scheduledPath = buildDashboardChartPath(
+      dashboardChartData.points.map((point) => point.scheduled),
+      100,
+      100,
+    );
+    const focusPath = buildDashboardChartPath(
+      dashboardChartData.points.map((point) => point.total),
+      100,
+      100,
+    );
+
     return (
       <div className="view-stack">
-        <section className="hero-card">
-          <div>
-            <span className="eyebrow hero-greeting">
-              Seja Bem vindo, <span className="hero-user-name">{authUser?.username ?? ""}</span>
-            </span>
-            <p>
-              Controle o seu calendario de postagens das redes sociais da sua empresa e perfis separadamente em uma
-              interface clara e intuitiva.
-            </p>
+        <section className="dashboard-top-grid">
+          <div className="stats-grid dashboard-compact-metrics-grid">
+            <article className="metric-card dashboard-compact-metric-card">
+              <span className="metric-label">
+                <span className="metric-icon" aria-hidden="true">
+                  <FiCheckCircle />
+                </span>
+                <span className="metric-label-text">Enviados</span>
+              </span>
+              <strong>{dashboard.completedJobs}</strong>
+            </article>
+            <article className="metric-card dashboard-compact-metric-card">
+              <span className="metric-label">
+                <span className="metric-icon" aria-hidden="true">
+                  <FiClock />
+                </span>
+                <span className="metric-label-text">Pendentes</span>
+              </span>
+              <strong>{dashboard.pendingJobs}</strong>
+            </article>
+            <article className="metric-card dashboard-compact-metric-card">
+              <span className="metric-label">
+                <span className="metric-icon" aria-hidden="true">
+                  <FiWifi />
+                </span>
+                <span className="metric-label-text">Cancelados</span>
+              </span>
+              <strong>{dashboard.canceledJobs}</strong>
+            </article>
+            <article className="metric-card metric-card-failed dashboard-compact-metric-card">
+              <span className="metric-label">
+                <span className="metric-icon" aria-hidden="true">
+                  <FiAlertCircle />
+                </span>
+                <span className="metric-label-text">Falhados</span>
+              </span>
+              <strong className="metric-value-failed">{dashboard.failedJobs}</strong>
+            </article>
           </div>
-        </section>
 
-        <section className="stats-grid">
-          <article className="metric-card">
-            <span className="metric-label">
-              <span className="metric-icon" aria-hidden="true">
-                <FiCheckCircle />
-              </span>
-              <span className="metric-label-text">Enviados</span>
-            </span>
-            <strong>{dashboard.completedJobs}</strong>
-          </article>
-          <article className="metric-card">
-            <span className="metric-label">
-              <span className="metric-icon" aria-hidden="true">
-                <FiClock />
-              </span>
-              <span className="metric-label-text">Pendentes</span>
-            </span>
-            <strong>{dashboard.pendingJobs}</strong>
-          </article>
-          <article className="metric-card">
-            <span className="metric-label">
-              <span className="metric-icon" aria-hidden="true">
-                <FiWifi />
-              </span>
-              <span className="metric-label-text">Cancelados</span>
-            </span>
-            <strong>{dashboard.canceledJobs}</strong>
-          </article>
-          <article className="metric-card metric-card-failed">
-            <span className="metric-label">
-              <span className="metric-icon" aria-hidden="true">
-                <FiAlertCircle />
-              </span>
-              <span className="metric-label-text">Falhados</span>
-            </span>
-            <strong className="metric-value-failed">{dashboard.failedJobs}</strong>
-          </article>
-        </section>
-
-        <section className="content-grid">
-          <article className="panel-card full-width-panel">
+          <section className="panel-card dashboard-upcoming-carousel-panel">
             <div className="section-head">
               <div>
                 <div className="view-title-with-icon">
@@ -6256,67 +6462,277 @@ function App() {
                   <h2>Próximos Agendamentos</h2>
                 </div>
               </div>
-              <div className="inline-actions">
-                <button
-                  type="button"
-                  className="ghost-button view-all-button"
-                  onClick={() => openHistoryWithFilter("upcoming")}
-                >
-                  Ver todos
-                </button>
+              {dashboardUpcomingPages.length > 1 ? (
+                <div className="dashboard-carousel-controls">
+                  <button
+                    type="button"
+                    className="ghost-button dashboard-carousel-arrow"
+                    onClick={() => setDashboardUpcomingPage((current) => Math.max(0, current - 1))}
+                    disabled={dashboardUpcomingPage === 0}
+                    aria-label="Página anterior"
+                  >
+                    <FiChevronLeft />
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost-button dashboard-carousel-arrow"
+                    onClick={() =>
+                      setDashboardUpcomingPage((current) => Math.min(dashboardUpcomingPages.length - 1, current + 1))
+                    }
+                    disabled={dashboardUpcomingPage >= dashboardUpcomingPages.length - 1}
+                    aria-label="Próxima página"
+                  >
+                    <FiChevronRight />
+                  </button>
+                </div>
+              ) : null}
+            </div>
+
+            {upcomingJobs.length === 0 ? (
+              <div className="empty-state dashboard-upcoming-empty-state">Não há próximos agendamentos nesse filtro.</div>
+            ) : (
+              <>
+                <div className="dashboard-carousel-shell">
+                  <div
+                    className="dashboard-carousel-track"
+                    style={{ transform: `translateX(-${dashboardUpcomingPage * 100}%)` }}
+                  >
+                    {dashboardUpcomingPages.map((page, pageIndex) => (
+                      <div key={`dashboard-upcoming-page-${pageIndex}`} className="dashboard-carousel-page">
+                        {page.map((job) => {
+                          const isRunningLike = shouldRenderUpcomingAsRunning(job, isPastScheduledAtForUser);
+
+                          return (
+                            <article key={job.id} className="dashboard-upcoming-card">
+                              <strong>{resolveJobDisplayTitle(job)}</strong>
+                              <div className="meta-pill-row">
+                                {renderPublicationTypePill(job.publicationType)}
+                                <span className="unit-pill">
+                                  {`Perfil: ${companyNameMap[job.companyId] || "Perfil removido"}`}
+                                </span>
+                              </div>
+                              <span className="dashboard-upcoming-card-date">
+                                {formatJobScheduledAt(job, effectiveUserTimeZone)}
+                              </span>
+                              <div className="dashboard-upcoming-card-footer">
+                                {isRunningLike ? (
+                                  <span className="status-pill status-running-live">
+                                    <span className="status-pill-spinner" aria-hidden="true" />
+                                    Executando
+                                  </span>
+                                ) : (
+                                  <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
+                                )}
+                                {!isRunningLike && canToggleJobSchedule(job, isPastScheduledAtForUser) ? (
+                                  <button
+                                    type="button"
+                                    className={job.status === "CANCELED" ? "activate-button" : "ghost-button"}
+                                    onClick={() => void toggleJobSchedule(job)}
+                                    disabled={togglingScheduleJobId === job.id}
+                                  >
+                                    {togglingScheduleJobId === job.id
+                                      ? "Salvando..."
+                                      : job.status === "CANCELED"
+                                        ? "Ativar"
+                                        : "Cancelar"}
+                                  </button>
+                                ) : null}
+                              </div>
+                            </article>
+                          );
+                        })}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {dashboardUpcomingPages.length > 1 ? (
+                  <div className="dashboard-carousel-dots" aria-label="Paginação dos próximos agendamentos">
+                    {dashboardUpcomingPages.map((_, pageIndex) => (
+                      <button
+                        key={`dashboard-upcoming-dot-${pageIndex}`}
+                        type="button"
+                        className={`dashboard-carousel-dot${pageIndex === dashboardUpcomingPage ? " dashboard-carousel-dot-active" : ""}`}
+                        onClick={() => setDashboardUpcomingPage(pageIndex)}
+                        aria-label={`Ir para página ${pageIndex + 1}`}
+                      />
+                    ))}
+                  </div>
+                ) : null}
+              </>
+            )}
+          </section>
+        </section>
+
+        <section className="dashboard-analytics-grid">
+          <article className="panel-card dashboard-chart-panel">
+            <div className="section-head dashboard-chart-head">
+              <div>
+                <div className="view-title-with-icon">
+                  <span className="view-title-icon" aria-hidden="true">
+                    <FiTrendingUp />
+                  </span>
+                  <h2>Crescimento</h2>
+                </div>
+                <small className="field-hint">
+                  {dashboardTrendFocus === "all"
+                    ? "Linha diária com publicações, falhas e agendamentos no período."
+                    : `Linha diária focada em ${dashboardTrendFocusLabel(dashboardTrendFocus).toLocaleLowerCase("pt-BR")}.`}
+                </small>
+              </div>
+              <div className="dashboard-chart-filters">
+                <label className="dashboard-chart-filter">
+                  <span>Período</span>
+                  <select value={dashboardTrendRange} onChange={(event) => setDashboardTrendRange(event.target.value as DashboardTrendRange)}>
+                    <option value="7">7 dias</option>
+                    <option value="30">30 dias</option>
+                    <option value="90">90 dias</option>
+                  </select>
+                </label>
+                <label className="dashboard-chart-filter">
+                  <span>Rede</span>
+                  <select
+                    value={dashboardTrendNetwork}
+                    onChange={(event) => setDashboardTrendNetwork(event.target.value as DashboardTrendNetwork)}
+                  >
+                    <option value="all">Todas</option>
+                    <option value="instagram">Instagram</option>
+                    <option value="whatsapp">WhatsApp</option>
+                  </select>
+                </label>
+                <label className="dashboard-chart-filter">
+                  <span>Visão</span>
+                  <select value={dashboardTrendFocus} onChange={(event) => setDashboardTrendFocus(event.target.value as DashboardTrendFocus)}>
+                    <option value="all">Tudo</option>
+                    <option value="published">Publicados</option>
+                    <option value="failed">Falhados</option>
+                    <option value="scheduled">Agendados</option>
+                  </select>
+                </label>
               </div>
             </div>
-            <div className="table-list">
-              {upcomingJobs.length === 0 ? (
-                <div className="empty-state">Não há próximos agendamentos nesse filtro.</div>
-              ) : (
-                upcomingJobs.map((job) => {
-                  const isRunningLike = shouldRenderUpcomingAsRunning(job, isPastScheduledAtForUser);
 
-                  return (
-                    <div key={job.id} className="row-card">
-                      <div>
-                        <strong>{resolveJobDisplayTitle(job)}</strong>
-                        <div className="meta-pill-row">
-                          {renderPublicationTypePill(job.publicationType)}
-                          <span className="unit-pill">
-                            {`Perfil: ${companyNameMap[job.companyId] || "Perfil removido"}`}
-                          </span>
-                        </div>
-                      </div>
-                      <div className="inline-actions">
-                        <span>{formatJobScheduledAt(job, effectiveUserTimeZone)}</span>
-                        {isRunningLike ? (
-                          <span className="status-pill status-running-live">
-                            <span className="status-pill-spinner" aria-hidden="true" />
-                            Executando
-                          </span>
-                        ) : (
-                          <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
-                        )}
-                        {!isRunningLike && canToggleJobSchedule(job, isPastScheduledAtForUser) ? (
-                          <button
-                            type="button"
-                            className={job.status === "CANCELED" ? "activate-button" : "ghost-button"}
-                            onClick={() => void toggleJobSchedule(job)}
-                            disabled={togglingScheduleJobId === job.id}
-                          >
-                            {togglingScheduleJobId === job.id
-                              ? "Salvando..."
-                              : job.status === "CANCELED"
-                                ? "Ativar agendamento"
-                                : "Cancelar agendamento"}
-                          </button>
-                        ) : null}
-                      </div>
-                    </div>
-                  );
-                })
-              )}
-            </div>
+            {!hasDashboardTrendData ? (
+              <div className="empty-state dashboard-upcoming-empty-state dashboard-line-chart-empty-state">
+                Ainda não há dados suficientes para gerar o gráfico neste filtro.
+              </div>
+            ) : (
+              <>
+                <div className="dashboard-line-chart-shell">
+                  <div className="dashboard-line-chart-grid" aria-hidden="true">
+                    {Array.from({ length: 4 }, (_, index) => (
+                      <span key={`dashboard-grid-line-${index}`} />
+                    ))}
+                  </div>
+                  <svg className="dashboard-line-chart" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+                    {dashboardTrendFocus === "all" ? (
+                      <>
+                        <path d={publishedPath} className="dashboard-line dashboard-line-published" />
+                        <path d={failedPath} className="dashboard-line dashboard-line-failed" />
+                        <path d={scheduledPath} className="dashboard-line dashboard-line-scheduled" />
+                      </>
+                    ) : (
+                      <path d={focusPath} className={`dashboard-line dashboard-line-${dashboardTrendFocus}`} />
+                    )}
+                  </svg>
+                  <div className="dashboard-line-chart-xaxis" aria-hidden="true">
+                    {dashboardChartData.points.map((point, index) => (
+                      <span
+                        key={point.key}
+                        className={
+                          index === 0 ||
+                          index === dashboardChartData.points.length - 1 ||
+                          index % dashboardXAxisStep === 0
+                            ? "dashboard-line-chart-xaxis-label"
+                            : "dashboard-line-chart-xaxis-label dashboard-line-chart-xaxis-label-muted"
+                        }
+                      >
+                        {point.label}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="dashboard-chart-legend">
+                  <span className="dashboard-chart-legend-item">
+                    <span className="dashboard-chart-dot dashboard-chart-dot-published" aria-hidden="true" />
+                    {`Publicados: ${dashboardChartData.publishedTotal}`}
+                  </span>
+                  <span className="dashboard-chart-legend-item">
+                    <span className="dashboard-chart-dot dashboard-chart-dot-failed" aria-hidden="true" />
+                    {`Falhados: ${dashboardChartData.failedTotal}`}
+                  </span>
+                  <span className="dashboard-chart-legend-item">
+                    <span className="dashboard-chart-dot dashboard-chart-dot-scheduled" aria-hidden="true" />
+                    {`Agendados: ${dashboardChartData.scheduledTotal}`}
+                  </span>
+                </div>
+              </>
+            )}
           </article>
 
+          <article className="panel-card dashboard-breakdown-panel">
+            <div className="section-head">
+              <div>
+                <div className="view-title-with-icon">
+                  <span className="view-title-icon" aria-hidden="true">
+                    <FiBarChart2 />
+                  </span>
+                  <h2>Distribuição</h2>
+                </div>
+                <small className="field-hint">Volume por formato dentro do filtro atual.</small>
+              </div>
+            </div>
+
+            <div className="dashboard-breakdown-list">
+              {dashboardChartData.distributionItems.filter((item) => item.count > 0).length === 0 ? (
+                <div className="empty-state dashboard-upcoming-empty-state">Sem movimentação neste recorte.</div>
+              ) : (
+                dashboardChartData.distributionItems
+                  .filter((item) => item.count > 0)
+                  .map((item) => (
+                    <div key={item.key} className="dashboard-breakdown-row">
+                      <div className="dashboard-breakdown-row-head">
+                        <span className="dashboard-breakdown-label">
+                          <span className={`dashboard-breakdown-label-icon dashboard-breakdown-label-icon-${item.network}`} aria-hidden="true">
+                            {item.network === "instagram" ? <FaInstagram /> : <FaWhatsapp />}
+                          </span>
+                          <span>{item.label}</span>
+                        </span>
+                        <strong>{item.count}</strong>
+                      </div>
+                      <div className="dashboard-breakdown-track" aria-hidden="true">
+                        <span
+                          className={`dashboard-breakdown-fill dashboard-breakdown-fill-${item.network}`}
+                          style={{ width: `${Math.max(10, (item.count / dashboardChartData.distributionMax) * 100)}%` }}
+                        />
+                      </div>
+                    </div>
+                  ))
+              )}
+            </div>
+
+            <div className="dashboard-mini-stats">
+              <div className="dashboard-mini-stat">
+                <span>Taxa de sucesso</span>
+                <strong>{dashboardChartData.deliveryRate === null ? "—" : `${dashboardChartData.deliveryRate}%`}</strong>
+              </div>
+              <div className="dashboard-mini-stat">
+                <span>Perfis ativos</span>
+                <strong>{dashboardChartData.activeProfiles}</strong>
+              </div>
+              <div className="dashboard-mini-stat">
+                <span>Pico diário</span>
+                <strong>
+                  {dashboardChartData.peakPoint && dashboardChartData.peakPoint.total > 0
+                    ? `${dashboardChartData.peakPoint.total} em ${dashboardChartData.peakPoint.label}`
+                    : "—"}
+                </strong>
+              </div>
+            </div>
+          </article>
         </section>
+
       </div>
     );
   }
@@ -8890,22 +9306,50 @@ function App() {
   function renderDashboardSkeleton() {
     return (
       <div className="view-stack skeleton-shell" aria-busy="true">
-        <section className="hero-card">
-          <div className="skeleton-stack" aria-hidden="true">
-            <span className="skeleton-line skeleton-line-kicker" />
-            <span className="skeleton-line skeleton-line-heading skeleton-line-heading-wide" />
-            <span className="skeleton-line skeleton-line-text skeleton-line-text-wide" />
-            <span className="skeleton-line skeleton-line-text skeleton-line-text-medium" />
+        <section className="dashboard-top-grid" aria-hidden="true">
+          <div className="stats-grid dashboard-compact-metrics-grid">
+            {Array.from({ length: 4 }, (_, index) => (
+              <article key={`dashboard-metric-skeleton-${index}`} className="metric-card skeleton-metric-card dashboard-compact-metric-card">
+                <span className="skeleton-line skeleton-line-chip" />
+                <span className="skeleton-line skeleton-line-metric-value" />
+              </article>
+            ))}
           </div>
+
+          <section className="panel-card">
+            {renderSkeletonSectionHead()}
+            <div className="dashboard-upcoming-skeleton-grid">
+              {Array.from({ length: 2 }, (_, index) => (
+                <article key={`dashboard-upcoming-skeleton-${index}`} className="dashboard-upcoming-card dashboard-upcoming-card-skeleton">
+                  <span className="skeleton-line skeleton-line-title" />
+                  <div className="meta-pill-row">
+                    <span className="skeleton-line skeleton-line-pill" />
+                    <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
+                  </div>
+                  <span className="skeleton-line skeleton-line-text" />
+                  <div className="dashboard-upcoming-card-footer">
+                    <span className="skeleton-line skeleton-line-chip" />
+                    <span className="skeleton-line skeleton-line-button" />
+                  </div>
+                </article>
+              ))}
+            </div>
+          </section>
         </section>
 
-        <section className="stats-grid" aria-hidden="true">
-          {Array.from({ length: 4 }, (_, index) => (
-            <article key={`dashboard-metric-skeleton-${index}`} className="metric-card skeleton-metric-card">
-              <span className="skeleton-line skeleton-line-chip" />
-              <span className="skeleton-line skeleton-line-metric-value" />
-            </article>
-          ))}
+        <section className="dashboard-analytics-grid" aria-hidden="true">
+          <article className="panel-card">
+            {renderSkeletonSectionHead(3)}
+            <div className="dashboard-chart-skeleton" />
+          </article>
+          <article className="panel-card">
+            {renderSkeletonSectionHead()}
+            <div className="dashboard-breakdown-skeleton">
+              {Array.from({ length: 4 }, (_, index) => (
+                <span key={`dashboard-breakdown-skeleton-${index}`} className="skeleton-line skeleton-line-text-wide" />
+              ))}
+            </div>
+          </article>
         </section>
 
         <section className="content-grid">
