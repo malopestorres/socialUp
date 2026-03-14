@@ -4,10 +4,45 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>SocialUp Local</title>
+    <style>
+      #boot-loader {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #ffffff;
+        z-index: 9999;
+        opacity: 1;
+        transition: opacity 180ms ease;
+      }
+
+      #boot-loader.boot-loader-hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      .boot-spinner {
+        width: 44px;
+        height: 44px;
+        border-radius: 50%;
+        border: 3px solid rgba(157, 23, 77, 0.18);
+        border-top-color: #9d174d;
+        animation: boot-spin 0.75s linear infinite;
+      }
+
+      @keyframes boot-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
   </head>
   <body>
+    <div id="boot-loader" aria-hidden="true">
+      <span class="boot-spinner"></span>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
   </html>
-

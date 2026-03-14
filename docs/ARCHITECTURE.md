@@ -36,7 +36,7 @@ Main frontend files:
 - Frontend layout baseline: top global header (`full-width`, white background) + compact sidebar navigation below it
 - `apps/web/src/assets/logo.svg`: active logo used in panel and login
 - `apps/web/src/assets/fonts/K2D-Thin.woff`, `apps/web/src/assets/fonts/K2D-Medium.woff`: primary UI fonts
-- Quick emoji picker is shared by scheduler caption and root `Cadastrar avisos` message editor (`renderQuickEmojiPicker` in `App.tsx`), using neutral (non-pink) chips.
+- Quick emoji picker is shared by scheduler caption and root `Cadastrar avisos` message editor (`renderQuickEmojiPicker` in `App.tsx`), now as a compact floating popover (quick set + "Ver todos"), preserving lightweight UI.
 
 ## Core Entities
 
@@ -44,9 +44,24 @@ Main frontend files:
 - `Company`: unit/branch
 - `User`: panel admin account
   - Includes `timeZone` (IANA, default `America/Sao_Paulo`) used by frontend for date rendering and "hora atual" logic.
+  - Includes per-user billing discount controls:
+    - `billingDiscountEnabled` (boolean)
+    - `billingDiscountPercent` (0-100)
 - `SocialConnection`: Instagram/WhatsApp account for a company
 - `Job`: scheduled publication
   - New naming field: `title` (short internal title used in UI lists and notifications; legacy jobs still fallback to `caption` when `title` is empty)
+  - Optional field: `firstComment` (Instagram Post/Reel), publicado automaticamente após a mídia principal
+  - Optional relink fields for Instagram Post/Reel/Story único:
+    - `whatsappRelinkEnabled` (boolean)
+    - `whatsappRelinkConnectionIds` (JSON array, multiple WhatsApp accounts)
+    - `whatsappRelinkDispatchedAt` (DateTime)
+    - `instagramPermalink` (string)
+    - Relink now creates `WhatsApp Status (mídia)` using the first media of the Instagram publication.
+    - Caption behavior:
+      - Instagram Post/Reel: original caption + permalink
+      - Instagram Story: permalink only
+      - if caption is empty: permalink only
+    - Instagram Post with image: backend generates a vertical `9:16` relink image with the original media centered and a blurred version of the same media in the background before sending to WhatsApp.
   - Publication state field: `publicationState` (`PUBLISHED` | `DRAFT`)
     - `PUBLISHED`: entra no worker na data/hora agendada
     - `DRAFT`: permanece salvo no histórico e não entra em execução automática
@@ -174,12 +189,16 @@ Current execution consumer:
 - Location failure does not block publishing (optional field).
 - Transient errors may auto-retry by rescheduling job as `PENDING` with delay.
 - Story sequence keeps anti-duplication safeguards and avoids unsafe full-job auto-retry when partial publish already happened.
+- Story sequence step now performs up to `2` silent retries behind the scenes (`3` attempts total counting the first try) before failing the sequence.
+- If a story sequence fails after partial publish, the original job remains `FAILED`, but the UI offers a dedicated action to create a new job only with the remaining media scheduled for `+20 min`.
+- Em `instagram_post` e `instagram_reel`, após publicar a mídia principal, o worker tenta publicar `firstComment` (quando configurado) sem falhar o job principal se o comentário não for aceito.
 
 ## Upload and Media URL Strategy
 
 - Upload endpoint: `POST /upload` (Multer), files under `apps/backend/uploads`.
 - Jobs store `filePath` (`/uploads/...`).
 - No formulário de agendamento, `instagram_post` e `instagram_story` entram automaticamente em modo sequencial quando há mais de 1 mídia enviada (não há toggle manual).
+- O scheduler permite legenda por mídia (`fileCaptions`) via modal em cada miniatura; o backend mantém ordem + legendas no bundle interno da mídia.
 - No formulário de agendamento existe seleção explícita de estado da publicação (`Publicado` ou `Rascunho`).
 - Instagram Graph publish requires public HTTP(S) media URL reachable by Meta.
 - Backend composes this URL from `INSTAGRAM_GRAPH_PUBLIC_BASE_URL + filePath`.
@@ -215,6 +234,7 @@ Jobs:
 - `PUT /jobs/:id`
 - `DELETE /jobs/:id`
 - `POST /jobs/:id/retry`
+- `POST /jobs/:id/reschedule-failed-media` (reagenda a mídia inteira ou apenas o restante de stories sequenciais para `+20 min`)
 - `POST /jobs/:id/cancel`
 - `POST /jobs/:id/activate`
 - `POST /jobs/:id/publish` (publica um rascunho sem editar o restante do job)
@@ -233,6 +253,8 @@ Billing:
 - `POST /billing/checkout/start` (usuário inicia checkout Stripe com `planId`, `billingModel`, `cycle`)
 - `POST /billing/checkout/confirm` (confirma checkout retornado pelo Stripe via `session_id` e aplica plano)
 - `POST /billing/subscription/cancel` (usuário cancela assinatura recorrente para encerrar no fim do ciclo atual)
+- `GET /billing/user-discounts` (root only; lista paginada de usuários com busca para gerenciar desconto individual)
+- `PUT /billing/user-discounts/:userId` (root only; ativa/desativa desconto e percentual individual)
 
 `GET /jobs/instagram-location-suggestions`:
 
@@ -290,6 +312,9 @@ Avisos:
 - `INSTAGRAM_FORCED_LOCATION_ID` (numeric `location_id` fixed for all publicações Instagram)
 - `INSTAGRAM_FORCED_LOCATION_NAME` (label exibido no painel quando o ID fixo está ativo)
 - `INSTAGRAM_STORY_SEQUENCE_STEP_DELAY_MS` (default: `1500`, atraso entre stories sequenciais)
+- `INSTAGRAM_STORY_SEQUENCE_STEP_RETRY_ATTEMPTS` (default: `3`, total de tentativas por story individual)
+- `INSTAGRAM_STORY_SEQUENCE_STEP_RETRY_DELAY_MS` (default: `4000`, intervalo entre retries silenciosos por story)
+- `FAILED_MEDIA_RESCHEDULE_DELAY_MS` (default: `1200000`, reagendamento rápido de mídia restante para `+20 min`)
 - `INSTAGRAM_PROACTIVE_TOKEN_REFRESH_COOLDOWN_MS` (default: `1800000`, cooldown por conexão para refresh proativo)
 - `INSTAGRAM_TOKEN_KEEPALIVE_INTERVAL_MS` (default: `300000`, intervalo do worker de keep-alive)
 - `INSTAGRAM_TOKEN_KEEPALIVE_BATCH_SIZE` (default: `25`, limite de conexões por ciclo do keep-alive)
@@ -336,6 +361,11 @@ Avisos:
 - Ao salvar plano pago, backend valida consistência de valor por ciclo: assinatura mensal = PIX mensal e assinatura anual = PIX anual; se divergir, bloqueia o salvamento.
 - A listagem de planos (`GET /billing/plans`) recalcula os preços a partir do Stripe em tempo de leitura quando há `stripeProductId`, refletindo alterações feitas diretamente no Stripe sem edição manual no painel.
 - `GET /billing/me` também expõe flags de UI para cancelamento de assinatura (`canCancelStripeSubscription`, `stripeCancelAtPeriodEnd`), usadas na tela "Meu plano".
+- Root possui modal de "desconto por usuário" em `Configurar planos`:
+  - busca por nome/usuário + paginação numérica,
+  - grava desconto persistente individual (até remoção manual),
+  - tenta sincronizar desconto imediatamente na assinatura Stripe ativa do usuário (quando existir).
+- `POST /billing/checkout/start` lê desconto individual do usuário e injeta no Stripe Checkout via cupom (`discounts`) quando ativo.
 - Webhook Stripe (`POST /billing/stripe/webhook`) aplica eventos de cobrança em tempo real:
   - `checkout.session.completed` e `checkout.session.async_payment_succeeded`: ativa plano (assinatura/PIX).
   - `checkout.session.expired` e `checkout.session.async_payment_failed`: para PIX avulso vencido/não pago, marca `PAYMENT_REQUIRED` e bloqueia.
