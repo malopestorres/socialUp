@@ -25,6 +25,12 @@ model User {
   subscription   UserPlanSubscription?
   receivedAvisos Aviso[]  @relation("AvisoRecipient")
   createdAvisos  Aviso[]  @relation("AvisoCreator")
+  aiKnowledgeDocuments AiKnowledgeDocument[] @relation("AiKnowledgeDocumentAuthor")
+  aiAgentThreads AiAgentThread[]
+  aiActionLogs   AiActionLog[]
+  aiIncidents    AiIncident[] @relation("AiIncidentUser")
+  aiCreatedIncidents AiIncident[] @relation("AiIncidentCreator")
+  aiUserAlerts   AiUserAlert[]
 }
 
 model SetupInvite {
@@ -195,4 +201,125 @@ model Aviso {
   @@index([userId, readAt])
   @@index([userId, createdAt])
   @@map("avisos")
+}
+
+model AiKnowledgeDocument {
+  id              String   @id @default(cuid())
+  title           String
+  category        String   @default("GENERAL")
+  status          String   @default("ACTIVE")
+  content         String
+  tags            Json?
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  createdBy       User?    @relation("AiKnowledgeDocumentAuthor", fields: [createdByUserId], references: [id], onDelete: SetNull)
+  chunks          AiKnowledgeChunk[]
+
+  @@index([status, category])
+}
+
+model AiKnowledgeChunk {
+  id          String   @id @default(cuid())
+  documentId  String
+  chunkIndex  Int
+  content     String
+  contentHash String
+  embedding   Json?
+  createdAt   DateTime @default(now())
+  document    AiKnowledgeDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, chunkIndex])
+  @@index([documentId])
+}
+
+model AiAgentThread {
+  id            String   @id @default(cuid())
+  userId        String
+  title         String?
+  lastMessageAt DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages      AiAgentMessage[]
+  actionLogs    AiActionLog[]
+
+  @@index([userId, updatedAt])
+}
+
+model AiAgentMessage {
+  id         String   @id @default(cuid())
+  threadId   String
+  role       String
+  content    String
+  toolName   String?
+  toolPayload Json?
+  createdAt  DateTime @default(now())
+  thread     AiAgentThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@index([threadId, createdAt])
+}
+
+model AiActionLog {
+  id           String   @id @default(cuid())
+  userId       String
+  threadId     String?
+  actionName   String
+  status       String
+  inputPayload Json?
+  outputPayload Json?
+  errorMessage String?
+  createdAt    DateTime @default(now())
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  thread       AiAgentThread? @relation(fields: [threadId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([threadId, createdAt])
+}
+
+model AiIncident {
+  id              String   @id @default(cuid())
+  userId          String?
+  createdByUserId String?
+  severity        String   @default("MEDIUM")
+  status          String   @default("OPEN")
+  source          String   @default("BEE_UP")
+  title           String
+  summary         String
+  fingerprint     String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  user            User?    @relation("AiIncidentUser", fields: [userId], references: [id], onDelete: SetNull)
+  createdBy       User?    @relation("AiIncidentCreator", fields: [createdByUserId], references: [id], onDelete: SetNull)
+  events          AiIncidentEvent[]
+
+  @@index([status, severity, createdAt])
+  @@index([userId, createdAt])
+}
+
+model AiIncidentEvent {
+  id         String   @id @default(cuid())
+  incidentId String
+  type       String
+  message    String
+  payload    Json?
+  createdAt  DateTime @default(now())
+  incident   AiIncident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+
+  @@index([incidentId, createdAt])
+}
+
+model AiUserAlert {
+  id        String   @id @default(cuid())
+  userId    String
+  kind      String   @default("BEE_UP")
+  title     String
+  message   String
+  payload   Json?
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt])
 }

@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/bootstrap.ts",
+    "dev": "node ../../scripts/free-port.mjs && tsx watch src/bootstrap.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/bootstrap.js",
     "prisma:generate": "node ../../scripts/run-with-root-env.mjs prisma generate",
