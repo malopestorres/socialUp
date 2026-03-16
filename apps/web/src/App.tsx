@@ -14,6 +14,7 @@ import {
   FiAlertCircle,
   FiBarChart2,
   FiBell,
+  FiMessageSquare,
   FiCalendar,
   FiCheckCircle,
   FiChevronLeft,
@@ -45,12 +46,14 @@ import { FaInstagram, FaWhatsapp } from "react-icons/fa6";
 import { api } from "./api";
 import appLogo from "./assets/logo.svg";
 import appLogoAlternative from "./assets/logo-alternativo.svg";
+import { BeeUpDrawer, BeeUpKnowledgeAdmin, type BeeUpOpenViewKey } from "./bee-up";
 
 type ViewKey =
   | "dashboard"
   | "profile"
   | "plan"
   | "planConfig"
+  | "beeUpAdmin"
   | "companies"
   | "agents"
   | "scheduler"
@@ -368,6 +371,7 @@ const navItems: Array<{ key: ViewKey; label: string; eyebrow?: string; icon: Ico
   { key: "dashboard", label: "Dashboard", icon: FiHome },
   { key: "companies", label: "Perfis", icon: FiUsers },
   { key: "planConfig", label: "Configurar planos", icon: FiCreditCard },
+  { key: "beeUpAdmin", label: "Assistente Bee Up", icon: FiMessageSquare },
   { key: "agents", label: "Conectar contas", icon: FiLink2 },
   { key: "scheduler", label: "Agendar", icon: FiCalendar },
   { key: "history", label: "Histórico", icon: FiClock },
@@ -381,6 +385,7 @@ const viewHeadingIconByView: Partial<Record<ViewKey, IconType>> = {
   profile: FiUser,
   plan: FiCreditCard,
   planConfig: FiCreditCard,
+  beeUpAdmin: FiMessageSquare,
   agents: FiLink2,
   scheduler: FiCalendar,
   media: FiImage,
@@ -482,6 +487,7 @@ const VIEW_ROUTE_MAP: Record<ViewKey, string> = {
   profile: "/perfil",
   plan: "/meu-plano",
   planConfig: "/configurar-planos",
+  beeUpAdmin: "/assistente-bee-up",
   companies: "/perfis",
   agents: "/conectar-contas",
   scheduler: "/agendar",
@@ -490,6 +496,22 @@ const VIEW_ROUTE_MAP: Record<ViewKey, string> = {
   logs: "/logs",
   notices: "/avisos",
   noticeAdmin: "/avisos/cadastrar",
+};
+
+const beeUpViewLabelByView: Record<ViewKey, string> = {
+  dashboard: "Dashboard",
+  profile: "Meu perfil",
+  plan: "Meu plano",
+  planConfig: "Configurar planos",
+  beeUpAdmin: "Assistente Bee Up",
+  companies: "Perfis",
+  agents: "Conectar contas",
+  scheduler: "Agendar",
+  media: "Mídias",
+  history: "Histórico",
+  logs: "Logs",
+  notices: "Avisos",
+  noticeAdmin: "Cadastrar avisos",
 };
 
 function parseHistoryFilterKey(value: string | null | undefined): HistoryFilterKey {
@@ -1187,11 +1209,18 @@ function buildDashboardChartPath(values: number[], width: number, height: number
   const safeWidth = Math.max(width, 1);
   const safeHeight = Math.max(height, 1);
   const maxValue = Math.max(...values, 1);
+  const horizontalPadding = Math.max(safeWidth * 0.025, 2.5);
+  const verticalPadding = Math.max(safeHeight * 0.03, 3);
+  const usableWidth = Math.max(safeWidth - horizontalPadding * 2, 1);
+  const usableHeight = Math.max(safeHeight - verticalPadding * 2, 1);
 
   return values
     .map((value, index) => {
-      const x = values.length === 1 ? safeWidth / 2 : (index / (values.length - 1)) * safeWidth;
-      const y = safeHeight - (value / maxValue) * safeHeight;
+      const x =
+        values.length === 1
+          ? horizontalPadding + usableWidth / 2
+          : horizontalPadding + (index / (values.length - 1)) * usableWidth;
+      const y = verticalPadding + (1 - value / maxValue) * usableHeight;
       return `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
     })
     .join(" ");
@@ -1523,6 +1552,7 @@ function App() {
   const [nowTickMs, setNowTickMs] = useState(() => Date.now());
   const [activeView, setActiveView] = useState<ViewKey>(initialViewFromLocation);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [beeUpOpen, setBeeUpOpen] = useState(false);
   const [companies, setCompanies] = useState<Company[]>([]);
   const [connections, setConnections] = useState<SocialConnection[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -1895,7 +1925,12 @@ function App() {
       setPlanInfo("");
 
       const shouldPrimeContentSkeleton =
-        Boolean(authUser) && view !== "profile" && view !== "plan" && view !== "planConfig" && view !== "notices";
+        Boolean(authUser) &&
+        view !== "profile" &&
+        view !== "plan" &&
+        view !== "planConfig" &&
+        view !== "notices" &&
+        view !== "beeUpAdmin";
       if (shouldPrimeContentSkeleton) {
         setContentLoading(true);
       }
@@ -2461,7 +2496,7 @@ function App() {
   const visibleNavItems = useMemo(
     () =>
       navItems.filter((item) => {
-        if (item.key === "logs" || item.key === "noticeAdmin" || item.key === "planConfig") {
+        if (item.key === "logs" || item.key === "noticeAdmin" || item.key === "planConfig" || item.key === "beeUpAdmin") {
           return isRootUser;
         }
 
@@ -2513,11 +2548,34 @@ function App() {
   const dashboardChartData = useMemo(() => {
     const visibleDayKeys: string[] = [];
     const totalDays = Number.parseInt(dashboardTrendRange, 10);
-    for (let index = 0; index < totalDays; index += 1) {
-      const dayKey = dashboardTrendDayKey(
-        new Date(nowTickMs - (totalDays - 1 - index) * 24 * 60 * 60 * 1000),
-        effectiveUserTimeZone,
-      );
+
+    const relevantFutureScheduledAt = filteredJobs
+      .filter((job) => {
+        if (job.publicationState !== "PUBLISHED") {
+          return false;
+        }
+
+        const jobNetwork = publicationTypeNetwork(job.publicationType);
+        if (dashboardTrendNetwork !== "all" && jobNetwork !== dashboardTrendNetwork) {
+          return false;
+        }
+
+        return job.status === "PENDING" || job.status === "WAITING_LOGIN" || job.status === "RUNNING";
+      })
+      .reduce<number>((latest, job) => {
+        const scheduledAtMs = new Date(job.dataPostagem).getTime();
+        if (scheduledAtMs > latest) {
+          return scheduledAtMs;
+        }
+        return latest;
+      }, nowTickMs);
+
+    const futureWindowCapMs = nowTickMs + (totalDays - 1) * 24 * 60 * 60 * 1000;
+    const visibleRangeEndMs = Math.max(nowTickMs, Math.min(relevantFutureScheduledAt, futureWindowCapMs));
+    const visibleRangeStartMs = nowTickMs - (totalDays - 1) * 24 * 60 * 60 * 1000;
+
+    for (let cursorMs = visibleRangeStartMs; cursorMs <= visibleRangeEndMs; cursorMs += 24 * 60 * 60 * 1000) {
+      const dayKey = dashboardTrendDayKey(new Date(cursorMs), effectiveUserTimeZone);
       if (visibleDayKeys[visibleDayKeys.length - 1] !== dayKey) {
         visibleDayKeys.push(dayKey);
       }
@@ -2569,7 +2627,10 @@ function App() {
 
       const isPublished = job.status === "COMPLETED" || job.status === "SENT_UNCONFIRMED";
       const isFailed = job.status === "FAILED";
-      const isScheduled = job.status === "PENDING" || job.status === "WAITING_LOGIN" || job.status === "RUNNING";
+      // "Agendados" no gráfico representa o volume planejado no calendário,
+      // então todo job salvo como publicação entra nessa série,
+      // mesmo que depois tenha sido publicado ou falhado.
+      const isScheduled = true;
 
       if (isPublished) {
         bucket.published += 1;
@@ -3154,7 +3215,13 @@ function App() {
       return;
     }
 
-    if (activeView === "notices" || activeView === "profile" || activeView === "plan" || activeView === "planConfig") {
+    if (
+      activeView === "notices" ||
+      activeView === "profile" ||
+      activeView === "plan" ||
+      activeView === "planConfig" ||
+      activeView === "beeUpAdmin"
+    ) {
       return;
     }
 
@@ -3205,15 +3272,19 @@ function App() {
   }, [isBillingDiscountModalOpen, selectedBillingDiscountUser]);
 
   useEffect(() => {
-    if (activeView !== "planConfig" || isRootUser) {
+    if (!authChecked || !authUser) {
+      return;
+    }
+
+    if ((activeView !== "planConfig" && activeView !== "beeUpAdmin") || isRootUser) {
       return;
     }
 
     navigateToView("dashboard");
-  }, [activeView, isRootUser]);
+  }, [activeView, authChecked, authUser, isRootUser]);
 
   useEffect(() => {
-    if (!authUser || activeView === "agents" || activeView === "notices") {
+    if (!authUser || activeView === "agents" || activeView === "notices" || activeView === "beeUpAdmin") {
       return;
     }
 
@@ -3586,7 +3657,12 @@ function App() {
       const nextHistoryFilter = parseHistoryFilterKey(readSearchParam(HISTORY_FILTER_QUERY_PARAM));
 
       const shouldPrimeContentSkeleton =
-        Boolean(authUser) && nextView !== "profile" && nextView !== "plan" && nextView !== "planConfig" && nextView !== "notices";
+        Boolean(authUser) &&
+        nextView !== "profile" &&
+        nextView !== "plan" &&
+        nextView !== "planConfig" &&
+        nextView !== "notices" &&
+        nextView !== "beeUpAdmin";
       if (shouldPrimeContentSkeleton) {
         setContentLoading(true);
       }
@@ -6389,6 +6465,12 @@ function App() {
         ? dashboardChartData.points.some((point) => point.published > 0 || point.failed > 0 || point.scheduled > 0)
         : dashboardChartData.points.some((point) => point.total > 0);
     const dashboardXAxisStep = Math.max(1, Math.ceil(dashboardChartData.points.length / 6));
+    const dashboardXAxisLabels = dashboardChartData.points.filter(
+      (point, index) =>
+        index === 0 ||
+        index === dashboardChartData.points.length - 1 ||
+        index % dashboardXAxisStep === 0,
+    );
     const publishedPath = buildDashboardChartPath(
       dashboardChartData.points.map((point) => point.published),
       100,
@@ -6636,17 +6718,8 @@ function App() {
                     )}
                   </svg>
                   <div className="dashboard-line-chart-xaxis" aria-hidden="true">
-                    {dashboardChartData.points.map((point, index) => (
-                      <span
-                        key={point.key}
-                        className={
-                          index === 0 ||
-                          index === dashboardChartData.points.length - 1 ||
-                          index % dashboardXAxisStep === 0
-                            ? "dashboard-line-chart-xaxis-label"
-                            : "dashboard-line-chart-xaxis-label dashboard-line-chart-xaxis-label-muted"
-                        }
-                      >
+                    {dashboardXAxisLabels.map((point) => (
+                      <span key={point.key} className="dashboard-line-chart-xaxis-label">
                         {point.label}
                       </span>
                     ))}
@@ -7201,6 +7274,10 @@ function App() {
         </section>
       </div>
     );
+  }
+
+  function renderBeeUpAdmin() {
+    return <BeeUpKnowledgeAdmin isRootUser={isRootUser} />;
   }
 
   function renderPlanConfig() {
@@ -9569,6 +9646,7 @@ function App() {
         return renderProfileSkeleton();
       case "plan":
       case "planConfig":
+      case "beeUpAdmin":
         return renderPlanSkeleton();
       default:
         return renderDashboardSkeleton();
@@ -9587,6 +9665,8 @@ function App() {
         return renderPlan();
       case "planConfig":
         return renderPlanConfig();
+      case "beeUpAdmin":
+        return renderBeeUpAdmin();
       case "companies":
         return renderCompanies();
       case "agents":
@@ -9987,6 +10067,17 @@ function App() {
           </button>
         ) : null}
       </main>
+
+      <BeeUpDrawer
+        isOpen={beeUpOpen}
+        onOpen={() => setBeeUpOpen(true)}
+        onClose={() => setBeeUpOpen(false)}
+        currentView={beeUpViewLabelByView[activeView]}
+        onOpenView={(view: BeeUpOpenViewKey) => {
+          navigateToView(view as ViewKey);
+          setBeeUpOpen(false);
+        }}
+      />
     </div>
   );
 }

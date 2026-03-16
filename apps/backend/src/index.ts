@@ -13,6 +13,7 @@ import Stripe from "stripe";
 import type { PublicationState, PublicationType, WhatsappMode } from "@socialup/shared";
 import { z } from "zod";
 import { adminAuthMiddleware, type AdminUserAuth } from "./admin-auth.js";
+import { registerBeeUpRoutes } from "./bee-up.js";
 import {
   consumeInstagramOAuthState,
   createInstagramOAuthLaunchUrl,
@@ -44,6 +45,7 @@ import {
   executeWhatsappJobWithEvolutionApi,
   getWhatsappConnectionOverlay,
   isWhatsappEvolutionHardcodedEnabled,
+  resolveWhatsappConnectionRuntimeAuthStatus,
   resolveWhatsappConnectionRuntimeMetadata,
   requestWhatsappQr,
 } from "./whatsapp-evolution-api.js";
@@ -2845,6 +2847,70 @@ async function resolveConnectionRuntimeMetadata(connection: {
   }
 
   return {};
+}
+
+async function syncConnectionRuntimeState(connection: {
+  id: string;
+  companyId: string;
+  platform: string;
+  displayName: string;
+  loginIdentifier: string | null;
+  secretCipher?: string | null;
+  authStatus: string;
+  automationMode: string;
+  authLaunchUrl: string | null;
+  lastAuthAt: Date | null;
+  lastSeenAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}): Promise<typeof connection> {
+  if (connection.platform !== "whatsapp") {
+    return connection;
+  }
+
+  let runtimeAuthStatus: "CONNECTED" | "AUTH_IN_PROGRESS" | "AUTH_REQUIRED" | null = null;
+  try {
+    runtimeAuthStatus = await withTimeout(
+      resolveWhatsappConnectionRuntimeAuthStatus({
+        id: connection.id,
+        companyId: connection.companyId,
+        displayName: connection.displayName,
+        platform: connection.platform,
+        loginIdentifier: connection.loginIdentifier,
+        secretCipher: connection.secretCipher ?? null,
+      }),
+      3_000,
+      "WHATSAPP_CONNECTION_STATUS_TIMEOUT",
+    );
+  } catch {
+    return connection;
+  }
+
+  if (!runtimeAuthStatus || runtimeAuthStatus === connection.authStatus) {
+    return connection;
+  }
+
+  const now = new Date();
+  const updatedConnection = await prisma.socialConnection.update({
+    where: { id: connection.id },
+    data: {
+      authStatus: runtimeAuthStatus,
+      authLaunchUrl: runtimeAuthStatus === "CONNECTED" ? null : connection.authLaunchUrl,
+      lastAuthAt: runtimeAuthStatus === "CONNECTED" ? connection.lastAuthAt ?? now : connection.lastAuthAt,
+      lastSeenAt: runtimeAuthStatus === "AUTH_REQUIRED" ? null : now,
+    },
+  });
+
+  await appendLog({
+    companyId: updatedConnection.companyId,
+    level: runtimeAuthStatus === "AUTH_REQUIRED" ? "WARN" : "INFO",
+    errorCode: "WHATSAPP_CONNECTION_STATE_SYNC",
+    message:
+      `Estado da conta ${updatedConnection.displayName} sincronizado ao abrir conexoes: ` +
+      `${connection.authStatus} -> ${runtimeAuthStatus}.`,
+  });
+
+  return updatedConnection;
 }
 
 function mapAviso(aviso: {
@@ -5802,7 +5868,7 @@ app.post(STRIPE_WEBHOOK_PATH, async (request, response) => {
 });
 
 app.use(
-  ["/companies", "/connections", "/upload", "/jobs", "/dashboard", "/logs", "/avisos", "/billing"],
+  ["/companies", "/connections", "/upload", "/jobs", "/dashboard", "/logs", "/avisos", "/billing", "/bee-up"],
   adminAuthMiddleware,
 );
 
@@ -5830,6 +5896,13 @@ app.use(
   },
 );
 
+registerBeeUpRoutes(app, {
+  isRootUser,
+  resolveUserBillingAccess,
+  requestWhatsappQr,
+  appendLog,
+});
+
 app.get("/connections", async (request, response) => {
   const companyId = typeof request.query.companyId === "string" ? request.query.companyId : undefined;
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
@@ -5840,9 +5913,10 @@ app.get("/connections", async (request, response) => {
 
   const mappedConnections = await Promise.all(
     connections.map(async (connection) => {
-      const runtimeMetadata = await resolveConnectionRuntimeMetadata(connection);
+      const syncedConnection = await syncConnectionRuntimeState(connection);
+      const runtimeMetadata = await resolveConnectionRuntimeMetadata(syncedConnection);
       return {
-        ...mapConnection(connection),
+        ...mapConnection(syncedConnection),
         ...runtimeMetadata,
       };
     }),

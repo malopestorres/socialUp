@@ -469,6 +469,48 @@ export async function resolveWhatsappConnectionRuntimeMetadata(input: {
   }
 }
 
+export async function resolveWhatsappConnectionRuntimeAuthStatus(input: {
+  id: string;
+  companyId: string;
+  displayName: string;
+  platform?: string;
+  loginIdentifier: string | null;
+  secretCipher: string | null;
+}): Promise<"CONNECTED" | "AUTH_IN_PROGRESS" | "AUTH_REQUIRED" | null> {
+  if (input.platform !== "whatsapp") {
+    return null;
+  }
+
+  try {
+    const credentials = getConnectionCredentials({
+      id: input.id,
+      companyId: input.companyId,
+      displayName: input.displayName,
+      platform: "whatsapp",
+      loginIdentifier: input.loginIdentifier,
+      secretCipher: input.secretCipher,
+    });
+    const state = await getEffectiveConnectionState(credentials);
+    const normalized = normalizeState(state);
+
+    if (normalized === "open") {
+      return "CONNECTED";
+    }
+
+    if (normalized === "connecting") {
+      return "AUTH_IN_PROGRESS";
+    }
+
+    if (normalized === "close" || normalized === "closed") {
+      return "AUTH_REQUIRED";
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function ensureInstanceExists(credentials: EvolutionCredentials): Promise<void> {
   try {
     const existing = await fetchInstanceRecord(credentials);
