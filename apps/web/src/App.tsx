@@ -7,13 +7,27 @@ import {
   type DragEvent,
   type FormEvent,
   type MouseEvent as ReactMouseEvent,
+  type ReactNode,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import {
+  DndContext,
+  DragOverlay,
+  PointerSensor,
+  pointerWithin,
+  useDraggable,
+  useDroppable,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+  type DragStartEvent,
+} from "@dnd-kit/core";
 import type { IconType } from "react-icons";
 import {
   FiAlertCircle,
   FiBarChart2,
   FiBell,
+  FiCheck,
   FiMessageSquare,
   FiCalendar,
   FiCheckCircle,
@@ -46,6 +60,7 @@ import { FaInstagram, FaWhatsapp } from "react-icons/fa6";
 import { api } from "./api";
 import appLogo from "./assets/logo.svg";
 import appLogoAlternative from "./assets/logo-alternativo.svg";
+import confettiGif from "./assets/confetti.gif";
 import { BeeUpDrawer, BeeUpKnowledgeAdmin, type BeeUpOpenViewKey } from "./bee-up";
 
 type ViewKey =
@@ -170,6 +185,25 @@ type Job = {
   lastError: string | null;
 };
 
+type HistoryCalendarPageResponse = {
+  year: number;
+  month: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  totalDays: number;
+  totalJobs: number;
+  items: Job[];
+};
+
+type HistoryDraftPageResponse = {
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+  items: Job[];
+};
+
 type SchedulerPublicationType = Job["publicationType"] | "";
 
 type SchedulerUploadedMedia = {
@@ -268,6 +302,7 @@ type StripeCatalogProduct = {
 
 type StripeCatalogResponse = {
   products: StripeCatalogProduct[];
+  pixAvailable?: boolean;
   resolvedByProduct: Record<
     string,
     {
@@ -314,6 +349,7 @@ type BillingMe = {
   };
   canCancelStripeSubscription?: boolean;
   stripeCancelAtPeriodEnd?: boolean;
+  stripePixAvailable?: boolean;
 };
 
 type BillingUserDiscountItem = {
@@ -474,6 +510,9 @@ const HISTORY_MONTH_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "12", label: "Dezembro" },
 ];
 const DEFAULT_USER_TIME_ZONE = "America/Sao_Paulo";
+const HISTORY_CALENDAR_DAY_PAGE_SIZE = 1;
+const HISTORY_CALENDAR_SKELETON_CELL_COUNT = 7;
+const HISTORY_CALENDAR_WEEKDAY_LABELS = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"];
 const EDIT_PUBLISHED_RESCHEDULE_CONFIRM_STATUSES = new Set([
   "COMPLETED",
   "SENT_UNCONFIRMED",
@@ -700,8 +739,56 @@ function resolveJobDisplayTitle(job: Pick<Job, "id" | "title" | "caption">): str
   return `Job ${job.id}`;
 }
 
+function resolveHistoryCalendarTitle(job: Pick<Job, "id" | "title">): string {
+  const normalizedTitle = job.title?.trim();
+  if (normalizedTitle) {
+    return normalizedTitle;
+  }
+
+  return "Sem título";
+}
+
 function clampNumber(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function buildCalendarDayKey(year: number, month: number, day: number): string {
+  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function isCalendarDayInPast(dayKey: string, referenceDayKey: string): boolean {
+  return dayKey < referenceDayKey;
+}
+
+function shiftCalendarMonth(year: number, month: number, delta: number): { year: number; month: number } {
+  const absoluteMonth = year * 12 + (month - 1) + delta;
+  const nextYear = Math.floor(absoluteMonth / 12);
+  const nextMonth = (absoluteMonth % 12 + 12) % 12;
+  return {
+    year: nextYear,
+    month: nextMonth + 1,
+  };
+}
+
+function getDaysInMonth(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0, 12, 0, 0)).getUTCDate();
+}
+
+function getCalendarWeekdayIndex(year: number, month: number, day: number): number {
+  const weekday = new Date(Date.UTC(year, month - 1, day, 12, 0, 0)).getUTCDay();
+  return (weekday + 6) % 7;
+}
+
+function formatHistoryCalendarMonthLabel(year: number, month: number): string {
+  return new Intl.DateTimeFormat("pt-BR", {
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(new Date(Date.UTC(year, month - 1, 1, 12, 0, 0)));
+}
+
+function formatHistoryCalendarTimeZoneLabel(timeZone: string): string {
+  return timeZone.replace(/_/g, " ");
 }
 
 function loadImageForCanvas(sourceUrl: string): Promise<HTMLImageElement> {
@@ -876,6 +963,14 @@ function getCurrentTimeValue(
   }
 
   return `${mapped.hour ?? "00"}:${mapped.minute ?? "00"}`;
+}
+
+function getFutureTimeValue(
+  timeZone: string = DEFAULT_USER_TIME_ZONE,
+  referenceDate: Date = new Date(),
+  offsetMinutes: number = 5,
+): string {
+  return getCurrentTimeValue(timeZone, new Date(referenceDate.getTime() + offsetMinutes * 60_000));
 }
 
 function isVideoPath(filePath: string): boolean {
@@ -1341,6 +1436,66 @@ function jobStatusDisplayLabel(job: Job): string {
   return jobStatusLabel(job.status);
 }
 
+function historyCalendarStatusVisual(job: Job): {
+  icon: IconType;
+  title: string;
+  tone: "draft" | "success" | "warning" | "error" | "neutral";
+} {
+  if (job.publicationState === "DRAFT") {
+    return {
+      icon: FiEdit3,
+      title: "Rascunho",
+      tone: "draft",
+    };
+  }
+
+  switch (job.status) {
+    case "COMPLETED":
+      return {
+        icon: FiCheckCircle,
+        title: "Publicado",
+        tone: "success",
+      };
+    case "SENT_UNCONFIRMED":
+      return {
+        icon: FiClock,
+        title: "Enviado sem confirmação",
+        tone: "warning",
+      };
+    case "WAITING_LOGIN":
+      return {
+        icon: FiAlertCircle,
+        title: "Aguardando autenticação",
+        tone: "warning",
+      };
+    case "FAILED":
+      return {
+        icon: FiX,
+        title: "Falhou",
+        tone: "error",
+      };
+    case "CANCELED":
+      return {
+        icon: FiRotateCcw,
+        title: "Cancelado",
+        tone: "neutral",
+      };
+    case "RUNNING":
+      return {
+        icon: FiClock,
+        title: "Executando",
+        tone: "neutral",
+      };
+    case "PENDING":
+    default:
+      return {
+        icon: FiClock,
+        title: "Aguardando publicação",
+        tone: "neutral",
+      };
+  }
+}
+
 function billingStatusTone(status: string): string {
   switch ((status || "").toUpperCase()) {
     case "ACTIVE":
@@ -1498,6 +1653,7 @@ function parseStorySequenceFailureMeta(lastError: string | null | undefined): {
 const REMEMBER_ME_STORAGE_KEY = "socialup-remember-me";
 const REMEMBERED_USERNAME_STORAGE_KEY = "socialup-remembered-username";
 const THEME_STORAGE_KEY = "socialup-theme";
+const DESKTOP_SIDEBAR_EXPANDED_STORAGE_KEY = "socialup-desktop-sidebar-expanded";
 
 function initialThemeMode(): ThemeMode {
   if (typeof window === "undefined") {
@@ -1514,6 +1670,278 @@ function initialThemeMode(): ThemeMode {
   }
 
   return "light";
+}
+
+type HistoryCalendarCell = {
+  dayKey: string;
+  year: number;
+  month: number;
+  day: number;
+  weekdayLabel: string;
+  inCurrentMonth: boolean;
+  isToday: boolean;
+  isPast: boolean;
+  isFuture: boolean;
+  hasUpcomingJobs: boolean;
+  jobs: Job[];
+};
+
+type HistoryCalendarDayDropZoneProps = {
+  cell: HistoryCalendarCell;
+  disabled: boolean;
+  children: ReactNode;
+  footer?: ReactNode;
+  overlay?: ReactNode;
+};
+
+function HistoryCalendarDayDropZone({ cell, disabled, children, footer, overlay }: HistoryCalendarDayDropZoneProps) {
+  if (!cell.inCurrentMonth) {
+    return <article className="history-calendar-day history-calendar-day-placeholder" aria-hidden="true" />;
+  }
+
+  const { isOver, setNodeRef } = useDroppable({
+    id: `history-day:${cell.dayKey}`,
+    data: {
+      type: "history-day",
+      dayKey: cell.dayKey,
+    },
+    disabled,
+  });
+
+  return (
+    <article
+      ref={setNodeRef}
+      className={`history-calendar-day${cell.inCurrentMonth ? "" : " history-calendar-day-outside"}${
+        cell.isToday ? " history-calendar-day-today" : ""
+      }${cell.isPast ? " history-calendar-day-past" : ""}${cell.isFuture ? " history-calendar-day-future" : ""}${
+        cell.hasUpcomingJobs ? " history-calendar-day-upcoming" : ""
+      }${
+        isOver && !disabled ? " history-calendar-day-drop-target" : ""
+      }`}
+    >
+      {overlay ?? null}
+      <div className="history-calendar-day-head">
+        <div className="history-calendar-day-head-labels">
+          <small>{cell.weekdayLabel}</small>
+          {cell.isToday ? <span className="history-calendar-day-today-label">Hoje</span> : null}
+          {!cell.isToday && cell.isPast && cell.jobs.length > 0 ? (
+            <span className="history-calendar-day-past-label">Passado</span>
+          ) : null}
+          {!cell.isToday && cell.hasUpcomingJobs ? <span className="history-calendar-day-upcoming-label">Próximo</span> : null}
+        </div>
+        <strong>{cell.day}</strong>
+      </div>
+      <div className="history-calendar-day-body">{children}</div>
+      {footer ?? null}
+    </article>
+  );
+}
+
+type HistoryDraftDropZoneProps = {
+  disabled: boolean;
+  children: ReactNode;
+};
+
+function HistoryDraftDropZone({ disabled, children }: HistoryDraftDropZoneProps) {
+  const { isOver, setNodeRef } = useDroppable({
+    id: "history-draft-dropzone",
+    data: {
+      type: "history-draft-dropzone",
+    },
+    disabled,
+  });
+
+  return (
+    <div
+      ref={setNodeRef}
+      className={`history-draft-shell${isOver && !disabled ? " history-draft-shell-drop-target" : ""}`}
+    >
+      {children}
+    </div>
+  );
+}
+
+type HistoryCalendarDraggableCardProps = {
+  job: Job;
+  companyLabel: string;
+  timeLabel: string;
+  canEditTime: boolean;
+  bulkSelectionEnabled: boolean;
+  isSelected: boolean;
+  isSaving: boolean;
+  isEditingTime: boolean;
+  timeValue: string;
+  onToggleSelection: (jobId: string) => void;
+  onStartTimeEdit: (job: Job) => void;
+  onTimeValueChange: (nextValue: string) => void;
+  onSaveTime: (job: Job, nextTime: string) => void;
+  onCancelTimeEdit: () => void;
+  showTimeRow?: boolean;
+  muted?: boolean;
+  staticPreview?: boolean;
+  overlay?: ReactNode;
+};
+
+function HistoryCalendarDraggableCard({
+  job,
+  companyLabel,
+  timeLabel,
+  canEditTime,
+  bulkSelectionEnabled,
+  isSelected,
+  isSaving,
+  isEditingTime,
+  timeValue,
+  onToggleSelection,
+  onStartTimeEdit,
+  onTimeValueChange,
+  onSaveTime,
+  onCancelTimeEdit,
+  showTimeRow = true,
+  muted = false,
+  staticPreview = false,
+  overlay,
+}: HistoryCalendarDraggableCardProps) {
+  const dragDisabled = staticPreview || bulkSelectionEnabled || isSaving || isEditingTime;
+  const publicationNetwork = publicationTypeNetwork(job.publicationType);
+  const PublicationIcon = publicationNetwork === "instagram" ? FaInstagram : FaWhatsapp;
+  const statusVisual = historyCalendarStatusVisual(job);
+  const StatusIcon = statusVisual.icon;
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
+    id: `history-job:${job.id}`,
+    data: {
+      type: "history-job",
+      jobId: job.id,
+    },
+    disabled: dragDisabled,
+  });
+
+  const dragStyle = transform
+    ? {
+        transform: `translate3d(${transform.x}px, ${transform.y}px, 0)`,
+      }
+    : staticPreview
+      ? undefined
+      : undefined;
+
+  const stopPointerPropagation = (event: ReactPointerEvent<HTMLElement>) => {
+    event.stopPropagation();
+  };
+
+  return (
+    <div
+      ref={staticPreview ? undefined : setNodeRef}
+      style={dragStyle}
+      className={`history-calendar-card${
+        staticPreview ? " history-calendar-card-overlay" : ""
+      }${isDragging ? " history-calendar-card-dragging" : ""}${
+        isSaving ? " history-calendar-card-saving" : ""
+      }${muted ? " history-calendar-card-muted" : ""
+      }`}
+      {...(staticPreview ? {} : attributes)}
+      {...(staticPreview ? {} : listeners)}
+    >
+      {overlay ?? null}
+      <div className="history-calendar-card-top">
+        <div className="history-calendar-card-title-wrap">
+          {bulkSelectionEnabled ? (
+            <button
+              type="button"
+              className="history-calendar-card-check"
+              aria-pressed={isSelected}
+              aria-label={isSelected ? "Desmarcar postagem" : "Selecionar postagem"}
+              onPointerDown={stopPointerPropagation}
+              onClick={(event) => {
+                event.stopPropagation();
+                onToggleSelection(job.id);
+              }}
+              disabled={isSaving}
+            >
+              <span className={`history-calendar-card-check-indicator${isSelected ? " history-calendar-card-check-indicator-selected" : ""}`}>
+                {isSelected ? <FiCheck aria-hidden="true" /> : null}
+              </span>
+            </button>
+          ) : null}
+          <strong title={resolveHistoryCalendarTitle(job)}>{resolveHistoryCalendarTitle(job)}</strong>
+        </div>
+      </div>
+      <div className="history-calendar-card-meta">
+        <span className={`history-calendar-card-meta-item history-calendar-card-meta-item-${publicationNetwork}`}>
+          <PublicationIcon className="history-calendar-card-meta-icon" aria-hidden="true" />
+          <span>{publicationTypeLabel(job.publicationType)}</span>
+        </span>
+        <span className="history-calendar-card-meta-item history-calendar-card-meta-item-company">
+          <FiUsers className="history-calendar-card-meta-icon" aria-hidden="true" />
+          <span>{companyLabel}</span>
+        </span>
+      </div>
+      {isEditingTime ? (
+        <div className="history-calendar-time-editor">
+          <input
+            type="time"
+            value={timeValue}
+            onChange={(event) => onTimeValueChange(event.target.value)}
+            onPointerDown={stopPointerPropagation}
+            disabled={isSaving}
+          />
+          <div className="history-calendar-time-editor-actions">
+            <button
+              type="button"
+              className="history-calendar-time-editor-save"
+              onPointerDown={stopPointerPropagation}
+              onClick={() => onSaveTime(job, timeValue)}
+              disabled={isSaving}
+              title="Salvar horário"
+            >
+              <FiCheckCircle />
+            </button>
+            <button
+              type="button"
+              className="history-calendar-time-editor-cancel"
+              onPointerDown={stopPointerPropagation}
+              onClick={onCancelTimeEdit}
+              disabled={isSaving}
+              title="Cancelar edição"
+            >
+              <FiX />
+            </button>
+          </div>
+        </div>
+      ) : showTimeRow ? (
+        <>
+          <div className="history-calendar-card-time-row">
+            <button
+              type="button"
+              className={`history-calendar-time-button${!canEditTime ? " history-calendar-time-button-disabled" : ""}`}
+              onPointerDown={stopPointerPropagation}
+              onClick={() => onStartTimeEdit(job)}
+              disabled={isSaving || !canEditTime}
+              title={canEditTime ? "Editar horário" : "Horário travado para datas passadas"}
+            >
+              {timeLabel}
+            </button>
+            <span
+              className={`history-calendar-status-icon history-calendar-status-icon-${statusVisual.tone}`}
+              title={statusVisual.title}
+              aria-label={statusVisual.title}
+            >
+              <StatusIcon aria-hidden="true" />
+            </span>
+          </div>
+        </>
+      ) : (
+        <div className="history-calendar-card-footer">
+          <span
+            className={`history-calendar-status-icon history-calendar-status-icon-${statusVisual.tone}`}
+            title={statusVisual.title}
+            aria-label={statusVisual.title}
+          >
+            <StatusIcon aria-hidden="true" />
+          </span>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function App() {
@@ -1552,6 +1980,29 @@ function App() {
   const [nowTickMs, setNowTickMs] = useState(() => Date.now());
   const [activeView, setActiveView] = useState<ViewKey>(initialViewFromLocation);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [isDesktopViewport, setIsDesktopViewport] = useState(() => {
+    if (typeof window === "undefined") {
+      return true;
+    }
+
+    return window.innerWidth > 1180;
+  });
+  const [desktopSidebarExpanded, setDesktopSidebarExpanded] = useState(() => {
+    if (typeof window === "undefined") {
+      return true;
+    }
+
+    const stored = window.localStorage.getItem(DESKTOP_SIDEBAR_EXPANDED_STORAGE_KEY);
+    if (stored === "false") {
+      return false;
+    }
+
+    if (stored === "true") {
+      return true;
+    }
+
+    return true;
+  });
   const [beeUpOpen, setBeeUpOpen] = useState(false);
   const [companies, setCompanies] = useState<Company[]>([]);
   const [connections, setConnections] = useState<SocialConnection[]>([]);
@@ -1665,7 +2116,6 @@ function App() {
   >({});
   const [stripeCatalogError, setStripeCatalogError] = useState("");
   const [checkoutPlanId, setCheckoutPlanId] = useState("");
-  const [checkoutBillingModel, setCheckoutBillingModel] = useState<"" | "STRIPE_SUBSCRIPTION" | "PIX_MANUAL">("");
   const [checkoutCycle, setCheckoutCycle] = useState<"" | "MONTHLY" | "YEARLY">("");
   const [startingCheckout, setStartingCheckout] = useState(false);
   const [rootAssignPlanId, setRootAssignPlanId] = useState("");
@@ -1695,6 +2145,33 @@ function App() {
   const [historyBulkTime, setHistoryBulkTime] = useState(() => getCurrentTimeValue(DEFAULT_USER_TIME_ZONE));
   const [historyBulkCompanyId, setHistoryBulkCompanyId] = useState("");
   const [historyBulkApplying, setHistoryBulkApplying] = useState(false);
+  const [historyCalendarMonth, setHistoryCalendarMonth] = useState(() => getYearMonthInTimeZone(new Date(), DEFAULT_USER_TIME_ZONE).month);
+  const [historyCalendarYear, setHistoryCalendarYear] = useState(() => getYearMonthInTimeZone(new Date(), DEFAULT_USER_TIME_ZONE).year);
+  const [historyCalendarDayPages, setHistoryCalendarDayPages] = useState<Record<string, number>>({});
+  const [historyCalendarJobs, setHistoryCalendarJobs] = useState<Job[]>([]);
+  const [historyCalendarVisibleWeekCount, setHistoryCalendarVisibleWeekCount] = useState(0);
+  const [historyCalendarPage, setHistoryCalendarPage] = useState(0);
+  const [historyCalendarTotalPages, setHistoryCalendarTotalPages] = useState(1);
+  const [historyCalendarMonthTotalJobs, setHistoryCalendarMonthTotalJobs] = useState(0);
+  const [historyCalendarLoadingNextWeek, setHistoryCalendarLoadingNextWeek] = useState(false);
+  const [historyDraftJobs, setHistoryDraftJobs] = useState<Job[]>([]);
+  const [historyDraftPage, setHistoryDraftPage] = useState(0);
+  const [historyDraftTotalPages, setHistoryDraftTotalPages] = useState(1);
+  const [historyDraftTotal, setHistoryDraftTotal] = useState(0);
+  const [historyDraftsRequested, setHistoryDraftsRequested] = useState(false);
+  const [historyDraftLoading, setHistoryDraftLoading] = useState(false);
+  const [historyDraftLoadingMore, setHistoryDraftLoadingMore] = useState(false);
+  const [historyPendingDraftPlacementJobId, setHistoryPendingDraftPlacementJobId] = useState<string | null>(null);
+  const [historyPendingDraftPlacementOriginalJob, setHistoryPendingDraftPlacementOriginalJob] = useState<Job | null>(null);
+  const [historyPendingCalendarPlacementJobId, setHistoryPendingCalendarPlacementJobId] = useState<string | null>(null);
+  const [historyPendingCalendarPlacementOriginalJob, setHistoryPendingCalendarPlacementOriginalJob] = useState<Job | null>(null);
+  const [historyPendingCalendarPlacementOriginalDayPages, setHistoryPendingCalendarPlacementOriginalDayPages] = useState<Record<string, number> | null>(null);
+  const [historyCalendarCelebration, setHistoryCalendarCelebration] = useState<{ dayKey: string; token: number } | null>(null);
+  const [historyDraggingJobId, setHistoryDraggingJobId] = useState<string | null>(null);
+  const [historyInlineTimeJobId, setHistoryInlineTimeJobId] = useState<string | null>(null);
+  const [historyInlineTimeValue, setHistoryInlineTimeValue] = useState("");
+  const [historyInlineSavingJobId, setHistoryInlineSavingJobId] = useState<string | null>(null);
+  const [historyPublishModeTransitioning, setHistoryPublishModeTransitioning] = useState(false);
   const [mediaStatusFilter, setMediaStatusFilter] = useState<HistoryFilterKey>("all");
   const [mediaMonthFilter, setMediaMonthFilter] = useState<string>("all");
   const [mediaYearFilter, setMediaYearFilter] = useState<string>("all");
@@ -1738,6 +2215,12 @@ function App() {
   const storyEditorMeasureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const mediaSectionRef = useRef<HTMLElement | null>(null);
   const historySectionRef = useRef<HTMLElement | null>(null);
+  const historyPublishedSectionRef = useRef<HTMLDivElement | null>(null);
+  const historyDraftSectionRef = useRef<HTMLDivElement | null>(null);
+  const historyDraftLoadMoreRef = useRef<HTMLDivElement | null>(null);
+  const historyCalendarLoadMoreRef = useRef<HTMLDivElement | null>(null);
+  const historyCalendarLoadKeyRef = useRef("");
+  const historyCalendarCelebrationTimeoutRef = useRef<number | null>(null);
   const avisosSectionRef = useRef<HTMLElement | null>(null);
   const lastUnreadAvisosCountRef = useRef(0);
   const noticesBellDesktopRef = useRef<HTMLDivElement | null>(null);
@@ -1749,6 +2232,8 @@ function App() {
   const supportedTimeZones = useMemo(() => listSupportedTimeZones(), []);
   const effectiveUserTimeZone = normalizeTimeZone(authUser?.timeZone || DEFAULT_USER_TIME_ZONE);
   const nowReferenceDate = useMemo(() => new Date(nowTickMs), [nowTickMs]);
+  const historyBulkPublishMode = historyBulkAction === "SET_PUBLISHED";
+  const historyBulkDraftMode = historyBulkAction === "SET_DRAFT";
   const isPastScheduledAtForUser = (dateIso: string) =>
     isPastScheduledAt(dateIso, effectiveUserTimeZone, nowReferenceDate);
   const instagramForcedLocationId = (dashboard.instagramForcedLocationId || "").trim();
@@ -1786,14 +2271,63 @@ function App() {
     () => billingPlans.filter((plan) => plan.isActive && !plan.isTrial),
     [billingPlans],
   );
+  const resolvedCurrentBillingPlan = useMemo(() => {
+    if (isRootUser) {
+      return null;
+    }
+
+    const canReusePaidPlanReference =
+      billingMe?.billingModel === "STRIPE_SUBSCRIPTION" ||
+      billingMe?.billingModel === "PIX_MANUAL" ||
+      billingMe?.billingModel === "MANUAL";
+
+    if (!canReusePaidPlanReference) {
+      return null;
+    }
+
+    if (billingMe?.plan?.id) {
+      return availablePaidPlans.find((plan) => plan.id === billingMe.plan?.id) ?? null;
+    }
+
+    const authPlanCode = (authUser?.billingPlanCode || "").trim();
+    if (authPlanCode) {
+      const byCode = availablePaidPlans.find((plan) => plan.code === authPlanCode);
+      if (byCode) {
+        return byCode;
+      }
+    }
+
+    const authPlanName = (authUser?.billingPlanName || "").trim().toLowerCase();
+    if (authPlanName) {
+      return availablePaidPlans.find((plan) => plan.name.trim().toLowerCase() === authPlanName) ?? null;
+    }
+
+    return null;
+  }, [
+    isRootUser,
+    billingMe?.billingModel,
+    billingMe?.plan?.id,
+    authUser?.billingPlanCode,
+    authUser?.billingPlanName,
+    availablePaidPlans,
+  ]);
+  const activeCheckoutPlanId = resolvedCurrentBillingPlan?.id ?? "";
+  const activeCheckoutPlan = resolvedCurrentBillingPlan;
+  const isBlockedBilling = !isRootUser && Boolean(billingMe?.isBlocked);
+  const checkoutTargetPlans = useMemo(
+    () => availablePaidPlans.filter((plan) => plan.id !== activeCheckoutPlanId),
+    [availablePaidPlans, activeCheckoutPlanId],
+  );
+  const canRecoverBlockedPlanCheckout =
+    isBlockedBilling &&
+    Boolean(activeCheckoutPlanId) &&
+    billingMe?.billingModel === "STRIPE_SUBSCRIPTION" &&
+    (billingMe?.cycle === "MONTHLY" || billingMe?.cycle === "YEARLY");
   const rootAssignablePlans = useMemo(() => billingPlans.filter((plan) => plan.isActive), [billingPlans]);
   const selectedCheckoutPlan = checkoutPlanId
     ? availablePaidPlans.find((plan) => plan.id === checkoutPlanId) ?? null
     : null;
-  const isCheckoutSelectionReady =
-    Boolean(selectedCheckoutPlan) &&
-    (checkoutBillingModel === "STRIPE_SUBSCRIPTION" || checkoutBillingModel === "PIX_MANUAL") &&
-    (checkoutCycle === "MONTHLY" || checkoutCycle === "YEARLY");
+  const isCheckoutSelectionReady = Boolean(selectedCheckoutPlan) && (checkoutCycle === "MONTHLY" || checkoutCycle === "YEARLY");
   const checkoutSelectedPriceCents =
     selectedCheckoutPlan && (checkoutCycle === "MONTHLY" || checkoutCycle === "YEARLY")
       ? checkoutCycle === "YEARLY"
@@ -1801,6 +2335,19 @@ function App() {
         : selectedCheckoutPlan.monthlyPriceCents
       : null;
   const checkoutSelectedPriceLabel = formatPriceFromCents(checkoutSelectedPriceCents);
+  const blockedCheckoutPriceCents =
+    activeCheckoutPlan && (billingMe?.cycle === "MONTHLY" || billingMe?.cycle === "YEARLY")
+      ? billingMe.cycle === "YEARLY"
+        ? activeCheckoutPlan.yearlyPriceCents
+        : activeCheckoutPlan.monthlyPriceCents
+      : null;
+  const blockedCheckoutPriceLabel = formatPriceFromCents(blockedCheckoutPriceCents);
+  const blockedCheckoutBillingModel = "STRIPE_SUBSCRIPTION";
+  const blockedCheckoutCycle =
+    billingMe?.cycle === "YEARLY" || billingMe?.cycle === "MONTHLY"
+      ? billingMe.cycle
+      : (activeCheckoutPlan?.yearlyPriceCents ? "YEARLY" : activeCheckoutPlan?.monthlyPriceCents ? "MONTHLY" : null);
+  const canStartBlockedCheckout = Boolean(activeCheckoutPlanId && blockedCheckoutCycle);
   const selectedBillingDiscountUser = selectedBillingDiscountUserId
     ? billingDiscountUsers.find((user) => user.id === selectedBillingDiscountUserId) ?? null
     : null;
@@ -1838,8 +2385,19 @@ function App() {
     planInfo === "Plano ativado com sucesso.";
   const isTransientAvisosInfo = isPositiveAvisosInfo;
   const isTransientNoticeAdminInfo = isPositiveNoticeAdminInfo;
+  const hasExpiredTrialContext =
+    (Boolean(authUser?.billingTrialEndsAt) &&
+      (authUser?.billingStatus === "EXPIRED" || authUser?.billingStatus === "PAYMENT_REQUIRED") &&
+      (authUser?.billingPlanCode === "FREE_TRIAL" ||
+        authUser?.billingPlanCode === null ||
+        authUser?.billingPlanCode === undefined)) ||
+    (Boolean(authUser?.billingIsBlocked) &&
+      (authUser?.billingStatus === "EXPIRED" || authUser?.billingStatus === "PAYMENT_REQUIRED") &&
+      !authUser?.billingPlanCode);
   const billingWarningMessage = authUser?.billingIsBlocked
-    ? (authUser.billingBlockMessage || "Conta bloqueada por pagamento pendente. Renove para continuar.")
+    ? hasExpiredTrialContext
+      ? "Seu período de teste expirou. Ative um plano para continuar usando o painel."
+      : (authUser.billingBlockMessage || "Conta bloqueada por pagamento pendente. Renove para continuar.")
     : "";
   const requiresMediaUpload = publicationType !== "" && publicationType !== "whatsapp_status_texto";
   const supportsMultiMediaUpload = publicationType === "instagram_post" || publicationType === "instagram_story";
@@ -2309,15 +2867,17 @@ function App() {
       return;
     }
 
-    if (availablePaidPlans.length === 0) {
+    if (checkoutTargetPlans.length === 0) {
       setCheckoutPlanId("");
       return;
     }
 
     setCheckoutPlanId((current) =>
-      current && availablePaidPlans.some((plan) => plan.id === current) ? current : "",
+      current && checkoutTargetPlans.some((plan) => plan.id === current)
+        ? current
+        : checkoutTargetPlans[0]?.id ?? "",
     );
-  }, [isRootUser, availablePaidPlans]);
+  }, [isRootUser, checkoutTargetPlans]);
 
   useEffect(() => {
     if (!authUser || isRootUser) {
@@ -2600,7 +3160,6 @@ function App() {
       { key: "instagram_reel", label: "Instagram Reels", network: "instagram" as const, count: 0 },
       { key: "instagram_story", label: "Instagram Stories", network: "instagram" as const, count: 0 },
       { key: "whatsapp_status_midia", label: "WhatsApp Status Mídia", network: "whatsapp" as const, count: 0 },
-      { key: "whatsapp_status_texto", label: "WhatsApp Status Texto", network: "whatsapp" as const, count: 0 },
     ];
     const distributionMap = new Map(distributionSeed.map((entry) => [entry.key, { ...entry }]));
     const activeCompanies = new Set<string>();
@@ -2783,6 +3342,126 @@ function App() {
     nowTickMs,
   ]);
 
+  const historyCalendarSearchFilteredJobs = useMemo(() => {
+    return historyCalendarJobs
+      .filter((job) => job.publicationState === "PUBLISHED" && Boolean(job.dataPostagem))
+      .sort((left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime());
+  }, [historyCalendarJobs]);
+
+  const historyCalendarLoadKey = useMemo(
+    () =>
+      [
+        historyCalendarYear,
+        historyCalendarMonth,
+        historySearchQuery.trim().toLocaleLowerCase("pt-BR"),
+        effectiveUserTimeZone,
+      ].join(":"),
+    [effectiveUserTimeZone, historyCalendarMonth, historyCalendarYear, historySearchQuery],
+  );
+
+  const historyCalendarYearOptions = useMemo(() => {
+    const currentYear = getYearMonthInTimeZone(nowReferenceDate, effectiveUserTimeZone).year;
+    const jobYears = historyCalendarSearchFilteredJobs.map((job) => getYearMonthInTimeZone(new Date(job.dataPostagem), effectiveUserTimeZone).year);
+    const minYear = Math.min(currentYear - 1, ...jobYears);
+    const maxYear = Math.max(currentYear + 2, ...jobYears);
+    const years: number[] = [];
+    for (let year = minYear; year <= maxYear; year += 1) {
+      years.push(year);
+    }
+    return years;
+  }, [effectiveUserTimeZone, historyCalendarSearchFilteredJobs, nowReferenceDate]);
+
+  const historyCalendarMonthLabel = useMemo(
+    () => formatHistoryCalendarMonthLabel(historyCalendarYear, historyCalendarMonth),
+    [historyCalendarMonth, historyCalendarYear],
+  );
+
+  const historyCalendarTodayKey = useMemo(
+    () => buildCalendarDayKey(
+      getYearMonthInTimeZone(nowReferenceDate, effectiveUserTimeZone).year,
+      getYearMonthInTimeZone(nowReferenceDate, effectiveUserTimeZone).month,
+      Number.parseInt(getTimeZoneDateParts(nowReferenceDate, effectiveUserTimeZone).day ?? "1", 10),
+    ),
+    [effectiveUserTimeZone, nowReferenceDate],
+  );
+
+  const historyCalendarCells = useMemo(() => {
+    const jobsByDay = new Map<string, Job[]>();
+
+    for (const job of historyCalendarSearchFilteredJobs) {
+      const dayKey = toDateLocal(job.dataPostagem, effectiveUserTimeZone);
+      if (!dayKey) {
+        continue;
+      }
+      const current = jobsByDay.get(dayKey) ?? [];
+      current.push(job);
+      jobsByDay.set(dayKey, current);
+    }
+
+    for (const [dayKey, items] of jobsByDay) {
+      items.sort((left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime());
+      jobsByDay.set(dayKey, items);
+    }
+
+    const currentMonthTotalDays = getDaysInMonth(historyCalendarYear, historyCalendarMonth);
+
+    return Array.from({ length: currentMonthTotalDays }, (_, index) => {
+      const year = historyCalendarYear;
+      const month = historyCalendarMonth;
+      const day = index + 1;
+      const dayKey = buildCalendarDayKey(year, month, day);
+      const weekdayLabel = HISTORY_CALENDAR_WEEKDAY_LABELS[getCalendarWeekdayIndex(year, month, day)] ?? "";
+
+      return {
+        dayKey,
+        year,
+        month,
+        day,
+        weekdayLabel,
+        inCurrentMonth: true,
+        isToday: dayKey === historyCalendarTodayKey,
+        isPast: dayKey < historyCalendarTodayKey,
+        isFuture: dayKey > historyCalendarTodayKey,
+        hasUpcomingJobs: dayKey > historyCalendarTodayKey && (jobsByDay.get(dayKey)?.length ?? 0) > 0,
+        jobs: jobsByDay.get(dayKey) ?? [],
+      };
+    });
+  }, [
+    effectiveUserTimeZone,
+    historyCalendarMonth,
+    historyCalendarSearchFilteredJobs,
+    historyCalendarTodayKey,
+    historyCalendarYear,
+  ]);
+
+  const historyCalendarVisibleJobsCount = historyCalendarMonthTotalJobs;
+
+  const historyCalendarWeeks = useMemo(() => {
+    const weeks: HistoryCalendarCell[][] = [];
+    for (let index = 0; index < historyCalendarCells.length; index += 7) {
+      weeks.push(historyCalendarCells.slice(index, index + 7));
+    }
+    return weeks;
+  }, [historyCalendarCells]);
+
+  const historyCalendarRenderedCells = useMemo(
+    () =>
+      historyCalendarWeeks
+        .slice(0, Math.min(historyCalendarVisibleWeekCount, historyCalendarWeeks.length))
+        .flat(),
+    [historyCalendarVisibleWeekCount, historyCalendarWeeks],
+  );
+
+  const historyCalendarHasMoreWeeks = historyCalendarPage < historyCalendarTotalPages;
+
+  const historyCalendarSensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: {
+        distance: 8,
+      },
+    }),
+  );
+
   const mediaFilteredItems = useMemo(() => {
     const statusFilteredMedia = (() => {
       switch (mediaStatusFilter) {
@@ -2828,9 +3507,26 @@ function App() {
   );
 
   const historyBulkSelectedJobIdsSet = useMemo(() => new Set(historyBulkSelectedJobIds), [historyBulkSelectedJobIds]);
+  const historyLoadedSelectionIds = useMemo(
+    () => new Set([...historyCalendarJobs, ...historyDraftJobs].map((job) => job.id)),
+    [historyCalendarJobs, historyDraftJobs],
+  );
   const historyBulkSelectedJobs = useMemo(
-    () => jobs.filter((job) => historyBulkSelectedJobIdsSet.has(job.id)),
-    [jobs, historyBulkSelectedJobIdsSet],
+    () =>
+      [...historyCalendarJobs, ...historyDraftJobs].filter((job, index, items) => {
+        if (!historyBulkSelectedJobIdsSet.has(job.id)) {
+          return false;
+        }
+        return items.findIndex((candidate) => candidate.id === job.id) === index;
+      }),
+    [historyCalendarJobs, historyDraftJobs, historyBulkSelectedJobIdsSet],
+  );
+  const historyDraggingJob = useMemo(
+    () =>
+      historyCalendarJobs.find((job) => job.id === historyDraggingJobId) ??
+      historyDraftJobs.find((job) => job.id === historyDraggingJobId) ??
+      null,
+    [historyCalendarJobs, historyDraftJobs, historyDraggingJobId],
   );
 
   const paginatedMediaItems = useMemo(
@@ -2875,6 +3571,21 @@ function App() {
 
   async function loadAll(options?: { withSkeleton?: boolean }): Promise<void> {
     const withSkeleton = options?.withSkeleton ?? true;
+    if (activeView === "history") {
+      await Promise.all([
+        reloadHistoryCalendarLoadedPages({
+          withSkeleton,
+          targetPage: Math.max(1, historyCalendarVisibleWeekCount || historyCalendarPage || 1),
+        }),
+        historyDraftsRequested || historyBulkPublishMode
+          ? reloadHistoryDraftLoadedPages({
+              targetPage: Math.max(1, historyDraftPage || 1),
+            })
+          : Promise.resolve(),
+      ]);
+      return;
+    }
+
     if (withSkeleton) {
       startContentLoading();
     }
@@ -2907,6 +3618,210 @@ function App() {
       }
 
       setError(loadError instanceof Error ? loadError.message : "Falha ao carregar dados.");
+    } finally {
+      if (withSkeleton) {
+        finishContentLoading();
+      }
+    }
+  }
+
+  async function fetchHistoryCalendarPage(page: number): Promise<HistoryCalendarPageResponse> {
+    const params = new URLSearchParams();
+    params.set("year", String(historyCalendarYear));
+    params.set("month", String(historyCalendarMonth));
+    params.set("page", String(page));
+    params.set("pageSize", "1");
+    params.set("timeZone", effectiveUserTimeZone);
+    if (historySearchQuery.trim()) {
+      params.set("query", historySearchQuery.trim());
+    }
+
+    return api.get<HistoryCalendarPageResponse>(`/jobs/calendar?${params.toString()}`);
+  }
+
+  async function loadHistoryDraftPage(
+    page: number,
+    options?: {
+      reset?: boolean;
+    },
+  ): Promise<void> {
+    const reset = options?.reset ?? false;
+
+    try {
+      const params = new URLSearchParams();
+      params.set("page", String(page));
+      params.set("pageSize", "12");
+      if (historySearchQuery.trim()) {
+        params.set("query", historySearchQuery.trim());
+      }
+
+      const result = await api.get<HistoryDraftPageResponse>(`/jobs/history-drafts?${params.toString()}`);
+
+      setHistoryDraftPage(result.page);
+      setHistoryDraftTotalPages(result.totalPages);
+      setHistoryDraftTotal(result.total);
+      setHistoryDraftJobs((current) => {
+        const merged = reset
+          ? result.items
+          : [...current, ...result.items.filter((job) => current.every((existingJob) => existingJob.id !== job.id))];
+        return merged.slice().sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
+      });
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "Falha ao carregar rascunhos.");
+    }
+  }
+
+  async function reloadHistoryDraftLoadedPages(options?: {
+    targetPage?: number;
+  }): Promise<void> {
+    const requestedPage = Math.max(1, options?.targetPage ?? historyDraftPage ?? 1);
+
+    try {
+      const params = new URLSearchParams();
+      params.set("page", "1");
+      params.set("pageSize", "12");
+      if (historySearchQuery.trim()) {
+        params.set("query", historySearchQuery.trim());
+      }
+
+      const firstPage = await api.get<HistoryDraftPageResponse>(`/jobs/history-drafts?${params.toString()}`);
+      const finalPage = Math.min(requestedPage, firstPage.totalPages);
+      const pages: HistoryDraftPageResponse[] = [firstPage];
+
+      for (let currentPage = 2; currentPage <= finalPage; currentPage += 1) {
+        const nextParams = new URLSearchParams();
+        nextParams.set("page", String(currentPage));
+        nextParams.set("pageSize", "12");
+        if (historySearchQuery.trim()) {
+          nextParams.set("query", historySearchQuery.trim());
+        }
+        const nextPage = await api.get<HistoryDraftPageResponse>(`/jobs/history-drafts?${nextParams.toString()}`);
+        pages.push(nextPage);
+      }
+
+      const mergedDrafts = pages
+        .flatMap((pageResponse) => pageResponse.items)
+        .filter((job, index, items) => items.findIndex((candidate) => candidate.id === job.id) === index)
+        .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
+
+      setHistoryDraftJobs(mergedDrafts);
+      setHistoryDraftPage(finalPage);
+      setHistoryDraftTotalPages(firstPage.totalPages);
+      setHistoryDraftTotal(firstPage.total);
+      setError("");
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "Falha ao carregar rascunhos.");
+    }
+  }
+
+  async function loadHistoryCalendarPage(
+    page: number,
+    options?: {
+      reset?: boolean;
+      withSkeleton?: boolean;
+    },
+  ): Promise<void> {
+    const reset = options?.reset ?? false;
+    const withSkeleton = options?.withSkeleton ?? false;
+
+    if (withSkeleton) {
+      startContentLoading();
+    }
+
+    try {
+      const requestKey = historyCalendarLoadKey;
+
+      const [calendarData, companiesData, connectionsData] = await Promise.all([
+        fetchHistoryCalendarPage(page),
+        reset ? api.get<Company[]>("/companies") : Promise.resolve<Company[] | null>(null),
+        reset ? api.get<SocialConnection[]>("/connections") : Promise.resolve<SocialConnection[] | null>(null),
+      ]);
+
+      if (requestKey !== historyCalendarLoadKeyRef.current) {
+        return;
+      }
+
+      if (companiesData) {
+        setCompanies(companiesData);
+      }
+      if (connectionsData) {
+        setConnections((current) => mergeConnectionsWithCachedRuntimeData(current, connectionsData));
+      }
+
+      setHistoryCalendarPage(calendarData.page);
+      setHistoryCalendarVisibleWeekCount(calendarData.page);
+      setHistoryCalendarTotalPages(calendarData.totalPages);
+      setHistoryCalendarMonthTotalJobs(calendarData.totalJobs);
+      setHistoryCalendarJobs((current) => {
+        const nextJobs = reset
+          ? calendarData.items
+          : [
+              ...current,
+              ...calendarData.items.filter((job) => current.every((existingJob) => existingJob.id !== job.id)),
+            ];
+        return nextJobs
+          .slice()
+          .sort((left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime());
+      });
+      setError("");
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "Falha ao carregar calendário do histórico.");
+    } finally {
+      if (withSkeleton) {
+        finishContentLoading();
+      }
+    }
+  }
+
+  async function reloadHistoryCalendarLoadedPages(options?: {
+    withSkeleton?: boolean;
+    targetPage?: number;
+  }): Promise<void> {
+    const withSkeleton = options?.withSkeleton ?? false;
+    const requestedPage = Math.max(1, options?.targetPage ?? historyCalendarVisibleWeekCount ?? historyCalendarPage ?? 1);
+
+    if (withSkeleton) {
+      startContentLoading();
+    }
+
+    try {
+      const requestKey = historyCalendarLoadKey;
+      const [companiesData, connectionsData, firstPage] = await Promise.all([
+        api.get<Company[]>("/companies"),
+        api.get<SocialConnection[]>("/connections"),
+        fetchHistoryCalendarPage(1),
+      ]);
+
+      if (requestKey !== historyCalendarLoadKeyRef.current) {
+        return;
+      }
+
+      const finalPage = Math.min(requestedPage, firstPage.totalPages);
+      const pages: HistoryCalendarPageResponse[] = [firstPage];
+
+      for (let currentPage = 2; currentPage <= finalPage; currentPage += 1) {
+        const nextPage = await fetchHistoryCalendarPage(currentPage);
+        if (requestKey !== historyCalendarLoadKeyRef.current) {
+          return;
+        }
+        pages.push(nextPage);
+      }
+
+      const mergedJobs = pages
+        .flatMap((pageResponse) => pageResponse.items)
+        .filter((job, index, items) => items.findIndex((candidate) => candidate.id === job.id) === index)
+        .sort((left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime());
+
+      setCompanies(companiesData);
+      setConnections((current) => mergeConnectionsWithCachedRuntimeData(current, connectionsData));
+      setHistoryCalendarJobs(mergedJobs);
+      setHistoryCalendarPage(finalPage);
+      setHistoryCalendarVisibleWeekCount(finalPage);
+      setHistoryCalendarTotalPages(firstPage.totalPages);
+      setHistoryCalendarMonthTotalJobs(firstPage.totalJobs);
+      setError("");
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "Falha ao carregar calendário do histórico.");
     } finally {
       if (withSkeleton) {
         finishContentLoading();
@@ -3126,6 +4041,14 @@ function App() {
 
   async function refreshLiveData(): Promise<void> {
     try {
+      if (activeView === "history") {
+        await reloadHistoryCalendarLoadedPages({
+          withSkeleton: false,
+          targetPage: Math.max(1, historyCalendarVisibleWeekCount || historyCalendarPage || 1),
+        });
+        return;
+      }
+
       const companyFilter = selectedCompanyId ? `?companyId=${selectedCompanyId}` : "";
       const logsPromise =
         isRootUser && activeView === "logs"
@@ -3220,7 +4143,8 @@ function App() {
       activeView === "profile" ||
       activeView === "plan" ||
       activeView === "planConfig" ||
-      activeView === "beeUpAdmin"
+      activeView === "beeUpAdmin" ||
+      activeView === "history"
     ) {
       return;
     }
@@ -3284,7 +4208,13 @@ function App() {
   }, [activeView, authChecked, authUser, isRootUser]);
 
   useEffect(() => {
-    if (!authUser || activeView === "agents" || activeView === "notices" || activeView === "beeUpAdmin") {
+    if (
+      !authUser ||
+      activeView === "agents" ||
+      activeView === "history" ||
+      activeView === "notices" ||
+      activeView === "beeUpAdmin"
+    ) {
       return;
     }
 
@@ -3652,6 +4582,28 @@ function App() {
       return;
     }
 
+    const handleResize = () => {
+      setIsDesktopViewport(window.innerWidth > 1180);
+    };
+
+    handleResize();
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    window.localStorage.setItem(DESKTOP_SIDEBAR_EXPANDED_STORAGE_KEY, String(desktopSidebarExpanded));
+  }, [desktopSidebarExpanded]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
     const handlePopState = () => {
       const nextView = initialViewFromLocation();
       const nextHistoryFilter = parseHistoryFilterKey(readSearchParam(HISTORY_FILTER_QUERY_PARAM));
@@ -3721,6 +4673,227 @@ function App() {
   }, [historyFilter, historyMonthFilter, historySearchQuery, historyYearFilter, selectedCompanyId]);
 
   useEffect(() => {
+    setHistoryCalendarDayPages({});
+    setHistoryInlineTimeJobId(null);
+    setHistoryInlineTimeValue("");
+    setHistoryDraggingJobId(null);
+  }, [historyCalendarMonth, historyCalendarYear, historySearchQuery]);
+
+  useEffect(() => {
+    setHistoryDraftJobs([]);
+    setHistoryDraftPage(0);
+    setHistoryDraftTotalPages(1);
+    setHistoryDraftTotal(0);
+    setHistoryDraftLoading(false);
+    setHistoryDraftLoadingMore(false);
+    setHistoryDraftsRequested(false);
+    setHistoryPendingDraftPlacementJobId(null);
+    setHistoryPendingDraftPlacementOriginalJob(null);
+  }, [activeView, historySearchQuery]);
+
+  useEffect(() => {
+    historyCalendarLoadKeyRef.current = historyCalendarLoadKey;
+  }, [historyCalendarLoadKey]);
+
+  useEffect(() => {
+    setHistoryCalendarLoadingNextWeek(false);
+  }, [activeView, historyCalendarLoadKey]);
+
+  useEffect(() => {
+    return () => {
+      if (historyCalendarCelebrationTimeoutRef.current) {
+        window.clearTimeout(historyCalendarCelebrationTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!authUser || activeView !== "history") {
+      return;
+    }
+
+    setHistoryCalendarJobs([]);
+    setHistoryCalendarPage(0);
+    setHistoryCalendarVisibleWeekCount(0);
+    setHistoryCalendarTotalPages(1);
+    setHistoryCalendarMonthTotalJobs(0);
+    void loadHistoryCalendarPage(1, { reset: true, withSkeleton: true });
+  }, [activeView, authUser, historyCalendarLoadKey]);
+
+  useEffect(() => {
+    if (
+      activeView !== "history" ||
+      historyDraftsRequested ||
+      contentLoading ||
+      typeof window === "undefined"
+    ) {
+      return;
+    }
+
+    const sectionNode = historyDraftSectionRef.current;
+    if (!sectionNode) {
+      return;
+    }
+    const scrollContainer = sectionNode.closest(".main-shell");
+
+    let frameId = 0;
+
+    const checkDraftSectionVisibility = () => {
+      const rect = sectionNode.getBoundingClientRect();
+      const viewportHeight =
+        scrollContainer instanceof HTMLElement
+          ? scrollContainer.getBoundingClientRect().height
+          : window.innerHeight || document.documentElement.clientHeight || 0;
+      if (rect.top <= viewportHeight + 240) {
+        setHistoryDraftsRequested(true);
+      }
+    };
+
+    const scheduleVisibilityCheck = () => {
+      window.cancelAnimationFrame(frameId);
+      frameId = window.requestAnimationFrame(checkDraftSectionVisibility);
+    };
+
+    scheduleVisibilityCheck();
+    if (scrollContainer instanceof HTMLElement) {
+      scrollContainer.addEventListener("scroll", scheduleVisibilityCheck, { passive: true });
+    }
+    window.addEventListener("scroll", scheduleVisibilityCheck, { passive: true });
+    window.addEventListener("resize", scheduleVisibilityCheck);
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      if (scrollContainer instanceof HTMLElement) {
+        scrollContainer.removeEventListener("scroll", scheduleVisibilityCheck);
+      }
+      window.removeEventListener("scroll", scheduleVisibilityCheck);
+      window.removeEventListener("resize", scheduleVisibilityCheck);
+    };
+  }, [activeView, contentLoading, historyDraftsRequested]);
+
+  useEffect(() => {
+    if (activeView !== "history" || !historyDraftsRequested || historyDraftLoading) {
+      return;
+    }
+
+    setHistoryDraftLoading(true);
+    void loadHistoryDraftPage(1, { reset: true }).finally(() => {
+      setHistoryDraftLoading(false);
+    });
+  }, [activeView, historyDraftsRequested, historySearchQuery]);
+
+  useEffect(() => {
+    if (
+      activeView !== "history" ||
+      !historyDraftsRequested ||
+      historyDraftLoading ||
+      historyDraftLoadingMore ||
+      historyDraftPage >= historyDraftTotalPages ||
+      typeof window === "undefined" ||
+      typeof window.IntersectionObserver === "undefined"
+    ) {
+      return;
+    }
+
+    const triggerNode = historyDraftLoadMoreRef.current;
+    if (!triggerNode) {
+      return;
+    }
+
+    const observer = new window.IntersectionObserver(
+      (entries) => {
+        const [entry] = entries;
+        if (!entry?.isIntersecting) {
+          return;
+        }
+
+        observer.disconnect();
+        setHistoryDraftLoadingMore(true);
+        void loadHistoryDraftPage(historyDraftPage + 1).finally(() => {
+          setHistoryDraftLoadingMore(false);
+        });
+      },
+      {
+        root: null,
+        rootMargin: "220px 0px",
+        threshold: 0.01,
+      },
+    );
+
+    observer.observe(triggerNode);
+    return () => observer.disconnect();
+  }, [activeView, historyDraftLoading, historyDraftLoadingMore, historyDraftPage, historyDraftTotalPages, historyDraftsRequested]);
+
+  useEffect(() => {
+    if (
+      activeView !== "history" ||
+      contentLoading ||
+      historyCalendarLoadingNextWeek ||
+      !historyCalendarHasMoreWeeks ||
+      typeof window === "undefined" ||
+      typeof window.IntersectionObserver === "undefined"
+    ) {
+      return;
+    }
+
+    const triggerNode = historyCalendarLoadMoreRef.current;
+    if (!triggerNode) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const observer = new window.IntersectionObserver(
+      (entries) => {
+        const [entry] = entries;
+        if (!entry?.isIntersecting) {
+          return;
+        }
+
+        observer.disconnect();
+        setHistoryCalendarLoadingNextWeek(true);
+        void (async () => {
+          if (cancelled) {
+            return;
+          }
+
+          await loadHistoryCalendarPage(historyCalendarPage + 1, { reset: false, withSkeleton: false });
+
+          if (!cancelled) {
+            setHistoryCalendarLoadingNextWeek(false);
+          }
+        })();
+      },
+      {
+        root: null,
+        rootMargin: "180px 0px",
+        threshold: 0.01,
+      },
+    );
+
+    observer.observe(triggerNode);
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+      setHistoryCalendarLoadingNextWeek(false);
+    };
+  }, [
+    activeView,
+    contentLoading,
+    historyCalendarHasMoreWeeks,
+    historyCalendarLoadingNextWeek,
+    historyCalendarPage,
+  ]);
+
+  useEffect(() => {
+    if (activeView !== "history" || !selectedCompanyId) {
+      return;
+    }
+
+    setSelectedCompanyId("");
+  }, [activeView, selectedCompanyId]);
+
+  useEffect(() => {
     setMediaPage(1);
   }, [mediaStatusFilter, mediaMonthFilter, mediaYearFilter, selectedCompanyId]);
 
@@ -3733,13 +4906,52 @@ function App() {
   }, [historyBulkAction]);
 
   useEffect(() => {
+    if (activeView !== "history" || !historyBulkPublishMode || typeof window === "undefined") {
+      setHistoryPublishModeTransitioning(false);
+      return;
+    }
+
+    setHistoryBulkSelectedJobIds([]);
+    setHistoryDraftsRequested(true);
+    setHistoryPublishModeTransitioning(true);
+
+    const scrollTimeout = window.setTimeout(() => {
+      historyDraftSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 40);
+    const transitionTimeout = window.setTimeout(() => {
+      setHistoryPublishModeTransitioning(false);
+    }, 260);
+
+    return () => {
+      window.clearTimeout(scrollTimeout);
+      window.clearTimeout(transitionTimeout);
+    };
+  }, [activeView, historyBulkPublishMode]);
+
+  useEffect(() => {
+    if (activeView !== "history" || !historyBulkDraftMode || typeof window === "undefined") {
+      return;
+    }
+
+    setHistoryBulkSelectedJobIds([]);
+
+    const scrollTimeout = window.setTimeout(() => {
+      historyPublishedSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 40);
+
+    return () => {
+      window.clearTimeout(scrollTimeout);
+    };
+  }, [activeView, historyBulkDraftMode]);
+
+  useEffect(() => {
     if (historyBulkSelectedJobIds.length === 0) {
       return;
     }
 
-    const availableIds = new Set(jobs.map((job) => job.id));
+    const availableIds = activeView === "history" ? historyLoadedSelectionIds : new Set(jobs.map((job) => job.id));
     setHistoryBulkSelectedJobIds((current) => current.filter((jobId) => availableIds.has(jobId)));
-  }, [jobs, historyBulkSelectedJobIds.length]);
+  }, [activeView, historyLoadedSelectionIds, jobs, historyBulkSelectedJobIds.length]);
 
   useEffect(() => {
     setHistoryPage((current) => Math.min(Math.max(current, 1), historyTotalPages));
@@ -5428,6 +6640,472 @@ function App() {
     });
   }
 
+  function navigateHistoryCalendarMonth(delta: number) {
+    const nextMonth = shiftCalendarMonth(historyCalendarYear, historyCalendarMonth, delta);
+    setHistoryCalendarYear(nextMonth.year);
+    setHistoryCalendarMonth(nextMonth.month);
+  }
+
+  function setHistoryCalendarDayPage(dayKey: string, nextPage: number, totalJobs: number) {
+    const totalPages = Math.max(1, Math.ceil(totalJobs / HISTORY_CALENDAR_DAY_PAGE_SIZE));
+    setHistoryCalendarDayPages((current) => ({
+      ...current,
+      [dayKey]: clampNumber(nextPage, 0, totalPages - 1),
+    }));
+  }
+
+  function focusHistoryCalendarJobPage(dayKey: string, jobId: string, calendarJobs: Job[]) {
+    const dayJobs = calendarJobs
+      .filter((item) => toDateLocal(item.dataPostagem, effectiveUserTimeZone) === dayKey)
+      .sort((left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime());
+    const targetIndex = dayJobs.findIndex((item) => item.id === jobId);
+    if (targetIndex < 0) {
+      return;
+    }
+
+    const nextPage = Math.floor(targetIndex / HISTORY_CALENDAR_DAY_PAGE_SIZE);
+    setHistoryCalendarDayPages((current) => ({
+      ...current,
+      [dayKey]: nextPage,
+    }));
+  }
+
+  function scrollHistorySectionIntoView(section: "published" | "drafts") {
+    const targetRef = section === "published" ? historyPublishedSectionRef : historyDraftSectionRef;
+    if (section === "drafts") {
+      setHistoryDraftsRequested(true);
+    }
+    targetRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function startHistoryInlineTimeEdit(job: Job) {
+    const jobDayKey = toDateLocal(job.dataPostagem, effectiveUserTimeZone);
+    if (jobDayKey && isCalendarDayInPast(jobDayKey, historyCalendarTodayKey)) {
+      return;
+    }
+
+    setHistoryInlineTimeJobId(job.id);
+    setHistoryInlineTimeValue(toTimeLocal(job.dataPostagem, effectiveUserTimeZone) || getCurrentTimeValue(effectiveUserTimeZone, nowReferenceDate));
+  }
+
+  function cancelHistoryInlineTimeEdit() {
+    if (historyPendingDraftPlacementJobId) {
+      const originalDraftJob = historyPendingDraftPlacementOriginalJob;
+      if (originalDraftJob) {
+        const restoredDraft = {
+          ...originalDraftJob,
+          publicationState: "DRAFT" as PublicationState,
+        };
+        setHistoryCalendarJobs((current) =>
+          current.filter((job) => job.id !== historyPendingDraftPlacementJobId),
+        );
+        setHistoryDraftJobs((current) =>
+          [restoredDraft, ...current.filter((job) => job.id !== restoredDraft.id)].sort(
+            (left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime(),
+          ),
+        );
+        setHistoryDraftTotal((current) => current + 1);
+        setJobs((current) => current.map((job) => (job.id === restoredDraft.id ? restoredDraft : job)));
+      }
+      setHistoryPendingDraftPlacementJobId(null);
+      setHistoryPendingDraftPlacementOriginalJob(null);
+    }
+
+    if (historyPendingCalendarPlacementJobId) {
+      const originalCalendarJob = historyPendingCalendarPlacementOriginalJob;
+      if (originalCalendarJob) {
+        const restoredCalendarJobs = historyCalendarJobs
+          .map((job) => (job.id === historyPendingCalendarPlacementJobId ? originalCalendarJob : job))
+          .sort((left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime());
+        setHistoryCalendarJobs(restoredCalendarJobs);
+        setJobs((current) => current.map((job) => (job.id === originalCalendarJob.id ? originalCalendarJob : job)));
+      }
+      if (historyPendingCalendarPlacementOriginalDayPages) {
+        setHistoryCalendarDayPages(historyPendingCalendarPlacementOriginalDayPages);
+      }
+      setHistoryPendingCalendarPlacementJobId(null);
+      setHistoryPendingCalendarPlacementOriginalJob(null);
+      setHistoryPendingCalendarPlacementOriginalDayPages(null);
+    }
+
+    setHistoryInlineTimeJobId(null);
+    setHistoryInlineTimeValue("");
+  }
+
+  function clearHistoryInlineTimeEdit() {
+    setHistoryInlineTimeJobId(null);
+    setHistoryInlineTimeValue("");
+  }
+
+  function triggerHistoryCalendarCelebration(dayKey: string) {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    if (historyCalendarCelebrationTimeoutRef.current) {
+      window.clearTimeout(historyCalendarCelebrationTimeoutRef.current);
+    }
+
+    setHistoryCalendarCelebration({
+      dayKey,
+      token: Date.now(),
+    });
+
+    historyCalendarCelebrationTimeoutRef.current = window.setTimeout(() => {
+      setHistoryCalendarCelebration(null);
+      historyCalendarCelebrationTimeoutRef.current = null;
+    }, 3600);
+  }
+
+  async function updateHistoryCalendarJobSchedule(
+    job: Job,
+    nextDate: string,
+    nextTime: string,
+    options?: {
+      feedbackMode?: "banner" | "alert";
+    },
+  ) {
+    const feedbackMode = options?.feedbackMode ?? "banner";
+    const normalizedTime = nextTime.trim();
+    if (!normalizedTime) {
+      const message = "Preencha o horário da postagem.";
+      if (feedbackMode === "alert") {
+        window.alert(message);
+      } else {
+        setError(message);
+      }
+      return;
+    }
+
+    const scheduledAtIso = toIsoFromTimeZoneDateTime(nextDate, normalizedTime, effectiveUserTimeZone);
+    if (!scheduledAtIso) {
+      const message = "Data ou horário inválido para reagendar a postagem.";
+      if (feedbackMode === "alert") {
+        window.alert(message);
+      } else {
+        setError(message);
+      }
+      return;
+    }
+
+    if (isPastScheduledAt(scheduledAtIso, effectiveUserTimeZone, nowReferenceDate)) {
+      const message = "Escolha um horário futuro para a postagem.";
+      if (feedbackMode === "alert") {
+        window.alert(message);
+      } else {
+        setError(message);
+      }
+      return;
+    }
+
+    const isPendingDraftPlacement = historyPendingDraftPlacementJobId === job.id;
+    const isPendingCalendarPlacement = historyPendingCalendarPlacementJobId === job.id;
+    const currentDate = toDateLocal(job.dataPostagem, effectiveUserTimeZone);
+    const currentTime = toTimeLocal(job.dataPostagem, effectiveUserTimeZone);
+    if (!isPendingDraftPlacement && !isPendingCalendarPlacement && currentDate === nextDate && currentTime === normalizedTime) {
+      cancelHistoryInlineTimeEdit();
+      return;
+    }
+
+    const payload = buildHistoryBulkUpdatePayload(job, {
+      publicationState: "PUBLISHED",
+      dataPostagem: scheduledAtIso,
+    });
+
+    if (!payload.socialConnectionId) {
+      const message = "Essa postagem está sem conta vinculada para reagendamento.";
+      if (feedbackMode === "alert") {
+        window.alert(message);
+      } else {
+        setError(message);
+      }
+      return;
+    }
+
+    const optimisticUpdateEnabled = feedbackMode === "alert";
+    const previousHistoryCalendarJobs = historyCalendarJobs;
+    const previousHistoryDraftJobs = historyDraftJobs;
+    const previousHistoryCalendarDayPages = historyCalendarDayPages;
+    const previousJobs = jobs;
+    const optimisticJobPatch = {
+      dataPostagem: scheduledAtIso,
+      publicationState: "PUBLISHED" as PublicationState,
+      socialConnectionId: payload.socialConnectionId,
+      companyId: payload.companyId,
+    };
+
+    if (optimisticUpdateEnabled) {
+      const optimisticCalendarJobs = previousHistoryCalendarJobs
+        .map((item) => (item.id === job.id ? { ...item, ...optimisticJobPatch } : item))
+        .sort((left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime());
+      const optimisticJobs = previousJobs
+        .map((item) => (item.id === job.id ? { ...item, ...optimisticJobPatch } : item))
+        .sort((left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime());
+
+      setHistoryCalendarJobs(optimisticCalendarJobs);
+      setJobs(optimisticJobs);
+      focusHistoryCalendarJobPage(nextDate, job.id, optimisticCalendarJobs);
+    }
+
+    setHistoryInlineSavingJobId(job.id);
+    setError("");
+    if (feedbackMode === "banner") {
+      setHistoryInfo("Atualizando agendamento no calendário...");
+    }
+
+    try {
+      await api.putJson(`/jobs/${job.id}`, payload);
+      if (feedbackMode === "banner") {
+        setHistoryInfo("");
+      } else {
+        setHistoryInfo("");
+        window.alert("Agendamento atualizado com sucesso.");
+        triggerHistoryCalendarCelebration(nextDate);
+      }
+      if (isPendingDraftPlacement) {
+        setHistoryDraftJobs((current) => current.filter((item) => item.id !== job.id));
+        setHistoryPendingDraftPlacementJobId(null);
+        setHistoryPendingDraftPlacementOriginalJob(null);
+      }
+      if (isPendingCalendarPlacement) {
+        setHistoryPendingCalendarPlacementJobId(null);
+        setHistoryPendingCalendarPlacementOriginalJob(null);
+        setHistoryPendingCalendarPlacementOriginalDayPages(null);
+      }
+      clearHistoryInlineTimeEdit();
+      setHistoryDraggingJobId(null);
+      if (feedbackMode === "banner") {
+        await loadAll({ withSkeleton: false });
+      } else {
+        void loadAll({ withSkeleton: false });
+      }
+    } catch (scheduleError) {
+      if (optimisticUpdateEnabled) {
+        setHistoryCalendarJobs(previousHistoryCalendarJobs);
+        setHistoryCalendarDayPages(previousHistoryCalendarDayPages);
+        if (historyPendingDraftPlacementJobId === job.id) {
+          const restoredDraft = {
+            ...(historyPendingDraftPlacementOriginalJob ?? job),
+            publicationState: "DRAFT" as PublicationState,
+          };
+          setHistoryDraftJobs((current) =>
+            [restoredDraft, ...current.filter((item) => item.id !== restoredDraft.id)].sort(
+              (left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime(),
+            ),
+          );
+          setHistoryDraftTotal((current) => current + 1);
+          setHistoryPendingDraftPlacementJobId(null);
+          setHistoryPendingDraftPlacementOriginalJob(null);
+        } else {
+          setHistoryDraftJobs(previousHistoryDraftJobs);
+        }
+        if (historyPendingCalendarPlacementJobId === job.id) {
+          const restoredJob = historyPendingCalendarPlacementOriginalJob ?? job;
+          setHistoryCalendarJobs((current) =>
+            current
+              .map((item) => (item.id === restoredJob.id ? restoredJob : item))
+              .sort((left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime()),
+          );
+          if (historyPendingCalendarPlacementOriginalDayPages) {
+            setHistoryCalendarDayPages(historyPendingCalendarPlacementOriginalDayPages);
+          }
+          setHistoryPendingCalendarPlacementJobId(null);
+          setHistoryPendingCalendarPlacementOriginalJob(null);
+          setHistoryPendingCalendarPlacementOriginalDayPages(null);
+        }
+        setJobs(previousJobs);
+      }
+      setHistoryInfo("");
+      const message = scheduleError instanceof Error ? scheduleError.message : "Falha ao atualizar o agendamento.";
+      if (feedbackMode === "alert") {
+        window.alert(message);
+      } else {
+        setError(message);
+      }
+    } finally {
+      setHistoryInlineSavingJobId(null);
+    }
+  }
+
+  async function moveHistoryJobToDraft(
+    job: Job,
+    options?: {
+      feedbackMode?: "banner" | "alert";
+    },
+  ) {
+    const feedbackMode = options?.feedbackMode ?? "banner";
+    const payload = buildHistoryBulkUpdatePayload(job, {
+      publicationState: "DRAFT",
+      dataPostagem: null,
+    });
+
+    const previousHistoryCalendarJobs = historyCalendarJobs;
+    const previousHistoryDraftJobs = historyDraftJobs;
+    const previousJobs = jobs;
+    const optimisticDraftJob = {
+      ...job,
+      publicationState: "DRAFT" as PublicationState,
+    };
+
+    setHistoryCalendarJobs((current) => current.filter((item) => item.id !== job.id));
+    setHistoryDraftJobs((current) =>
+      [...current.filter((item) => item.id !== job.id), optimisticDraftJob],
+    );
+    setHistoryDraftTotal((current) => current + 1);
+    setHistoryDraftsRequested(true);
+    setJobs((current) =>
+      current.map((item) =>
+        item.id === job.id ? { ...item, publicationState: "DRAFT" as PublicationState } : item,
+      ),
+    );
+
+    try {
+      await api.putJson(`/jobs/${job.id}`, payload);
+      if (feedbackMode === "alert") {
+        window.alert("Postagem movida para rascunhos com sucesso.");
+      } else {
+        setHistoryInfo("");
+      }
+    } catch (moveError) {
+      setHistoryCalendarJobs(previousHistoryCalendarJobs);
+      setHistoryDraftJobs(previousHistoryDraftJobs);
+      setHistoryDraftTotal((current) => Math.max(0, current - 1));
+      setJobs(previousJobs);
+      const message = moveError instanceof Error ? moveError.message : "Falha ao mover a postagem para rascunhos.";
+      if (feedbackMode === "alert") {
+        window.alert(message);
+      } else {
+        setError(message);
+      }
+    }
+  }
+
+  function handleHistoryCalendarDragStart(event: DragStartEvent) {
+    const activeJobId = event.active.data.current?.jobId;
+    if (typeof activeJobId === "string") {
+      setHistoryDraggingJobId(activeJobId);
+    }
+  }
+
+  async function handleHistoryCalendarDragEnd(event: DragEndEvent) {
+    const draggedJobId = event.active.data.current?.jobId;
+    const targetDayKey = event.over?.data.current?.dayKey;
+    const dropType = event.over?.data.current?.type;
+    setHistoryDraggingJobId(null);
+
+    if (typeof draggedJobId !== "string") {
+      return;
+    }
+
+    const draggedJob =
+      historyCalendarJobs.find((job) => job.id === draggedJobId) ??
+      historyDraftJobs.find((job) => job.id === draggedJobId) ??
+      jobs.find((job) => job.id === draggedJobId);
+    if (!draggedJob) {
+      return;
+    }
+
+    if (dropType === "history-draft-dropzone") {
+      if (draggedJob.publicationState === "DRAFT") {
+        return;
+      }
+      await moveHistoryJobToDraft(draggedJob, { feedbackMode: "alert" });
+      return;
+    }
+
+    if (typeof targetDayKey !== "string") {
+      return;
+    }
+
+    if (isCalendarDayInPast(targetDayKey, historyCalendarTodayKey)) {
+      window.alert("Não é possível mover a postagem para uma data passada.");
+      return;
+    }
+
+    const currentDate = toDateLocal(draggedJob.dataPostagem, effectiveUserTimeZone);
+    const currentTime = toTimeLocal(draggedJob.dataPostagem, effectiveUserTimeZone) || getCurrentTimeValue(effectiveUserTimeZone, nowReferenceDate);
+
+    if (draggedJob.publicationState !== "DRAFT" && currentDate === targetDayKey) {
+      return;
+    }
+
+    if (draggedJob.publicationState === "DRAFT") {
+      const defaultTime = getCurrentTimeValue(effectiveUserTimeZone, nowReferenceDate);
+      const optimisticScheduledAt =
+        toIsoFromTimeZoneDateTime(targetDayKey, defaultTime, effectiveUserTimeZone) ?? draggedJob.dataPostagem;
+      const optimisticDraftJob = {
+        ...draggedJob,
+        publicationState: "PUBLISHED" as PublicationState,
+        dataPostagem: optimisticScheduledAt,
+        status: "PENDING",
+      };
+
+      setHistoryDraftJobs((current) => current.filter((job) => job.id !== draggedJob.id));
+      setHistoryDraftTotal((current) => Math.max(0, current - 1));
+      const optimisticCalendarJobs = [...historyCalendarJobs.filter((job) => job.id !== draggedJob.id), optimisticDraftJob].sort(
+        (left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime(),
+      );
+      setHistoryCalendarJobs(optimisticCalendarJobs);
+      focusHistoryCalendarJobPage(targetDayKey, draggedJob.id, optimisticCalendarJobs);
+      setJobs((current) =>
+        current.map((job) =>
+          job.id === draggedJob.id
+            ? {
+                ...job,
+                publicationState: "PUBLISHED" as PublicationState,
+                dataPostagem: optimisticDraftJob.dataPostagem,
+                status: "PENDING",
+              }
+            : job,
+        ),
+      );
+      setHistoryPendingDraftPlacementJobId(draggedJob.id);
+      setHistoryPendingDraftPlacementOriginalJob(draggedJob);
+      setHistoryInlineTimeJobId(draggedJob.id);
+      setHistoryInlineTimeValue(defaultTime);
+      window.alert("Próximo passo: defina um horário para a postagem.");
+      return;
+    }
+
+    const inheritedScheduledAtIso = toIsoFromTimeZoneDateTime(targetDayKey, currentTime, effectiveUserTimeZone);
+    const requiresManualTimeSelection =
+      targetDayKey === historyCalendarTodayKey &&
+      inheritedScheduledAtIso !== null &&
+      isPastScheduledAt(inheritedScheduledAtIso, effectiveUserTimeZone, nowReferenceDate);
+
+    if (requiresManualTimeSelection) {
+      const suggestedTime = getFutureTimeValue(effectiveUserTimeZone, nowReferenceDate, 5);
+      const optimisticScheduledAt =
+        toIsoFromTimeZoneDateTime(targetDayKey, suggestedTime, effectiveUserTimeZone) ?? draggedJob.dataPostagem;
+      const optimisticCalendarJob = {
+        ...draggedJob,
+        dataPostagem: optimisticScheduledAt,
+      };
+      const optimisticCalendarJobs = historyCalendarJobs
+        .map((job) => (job.id === draggedJob.id ? optimisticCalendarJob : job))
+        .sort((left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime());
+
+      setHistoryCalendarJobs(optimisticCalendarJobs);
+      focusHistoryCalendarJobPage(targetDayKey, draggedJob.id, optimisticCalendarJobs);
+      setJobs((current) =>
+        current.map((job) => (job.id === draggedJob.id ? { ...job, dataPostagem: optimisticScheduledAt } : job)),
+      );
+      setHistoryPendingCalendarPlacementJobId(draggedJob.id);
+      setHistoryPendingCalendarPlacementOriginalJob(draggedJob);
+      setHistoryPendingCalendarPlacementOriginalDayPages(historyCalendarDayPages);
+      setHistoryInlineTimeJobId(draggedJob.id);
+      setHistoryInlineTimeValue(suggestedTime);
+      window.alert("Próximo passo: defina um horário futuro para a postagem.");
+      return;
+    }
+
+    await updateHistoryCalendarJobSchedule(draggedJob, targetDayKey, currentTime, { feedbackMode: "alert" });
+  }
+
+  function handleHistoryCalendarDragCancel() {
+    setHistoryDraggingJobId(null);
+  }
+
   function cancelHistoryBulkAction() {
     setHistoryBulkSelectedJobIds([]);
     setHistoryBulkAction("");
@@ -5440,7 +7118,7 @@ function App() {
     job: Job,
     options: {
       publicationState?: PublicationState;
-      dataPostagem?: string;
+      dataPostagem?: string | null;
       companyId?: string;
     },
   ) {
@@ -5450,16 +7128,23 @@ function App() {
 
     const targetCompanyId = options.companyId ?? job.companyId;
     let targetSocialConnectionId = job.socialConnectionId ?? "";
+    const platform = publicationTypeNetwork(job.publicationType);
 
     if (options.companyId && targetCompanyId !== job.companyId) {
       const currentConnection = connections.find((connection) => connection.id === job.socialConnectionId);
       if (!currentConnection || currentConnection.companyId !== targetCompanyId) {
-        const platform = publicationTypeNetwork(job.publicationType);
         const fallbackConnection = connections.find(
           (connection) => connection.companyId === targetCompanyId && connection.platform === platform,
         );
         targetSocialConnectionId = fallbackConnection?.id ?? "";
       }
+    }
+
+    if (!targetSocialConnectionId) {
+      const fallbackConnection = connections.find(
+        (connection) => connection.companyId === targetCompanyId && connection.platform === platform,
+      );
+      targetSocialConnectionId = fallbackConnection?.id ?? "";
     }
 
     return {
@@ -5479,7 +7164,7 @@ function App() {
       locationId: job.locationId ?? "",
       publicationType: job.publicationType,
       publicationState: options.publicationState ?? job.publicationState,
-      dataPostagem: options.dataPostagem ?? job.dataPostagem,
+      dataPostagem: options.dataPostagem === undefined ? job.dataPostagem : options.dataPostagem,
     };
   }
 
@@ -5580,8 +7265,11 @@ function App() {
           ? `Edição em massa aplicada em ${successCount} postagem(s).`
           : `Edição em massa parcial: ${successCount} sucesso(s), ${failedCount} falha(s).`,
       );
-      setHistoryBulkSelectedJobIds([]);
       await loadAll();
+      cancelHistoryBulkAction();
+      if (failedCount === 0) {
+        setError("");
+      }
     } catch (bulkError) {
       setHistoryInfo("");
       setError(bulkError instanceof Error ? bulkError.message : "Falha ao aplicar edição em massa.");
@@ -5778,28 +7466,8 @@ function App() {
         if (!resolvedStripePrices.stripeYearlyPriceId) {
           missingPriceKinds.push("assinatura anual");
         }
-        if (!resolvedStripePrices.stripePixMonthlyPriceId) {
-          missingPriceKinds.push("PIX mensal");
-        }
-        if (!resolvedStripePrices.stripePixYearlyPriceId) {
-          missingPriceKinds.push("PIX anual");
-        }
         if (missingPriceKinds.length > 0) {
           throw new Error(`Produto Stripe sem preços obrigatórios: ${missingPriceKinds.join(", ")}.`);
-        }
-
-        const hasCycleMismatch =
-          resolvedStripePrices.stripeMonthlyPriceCents !== null &&
-          resolvedStripePrices.stripeYearlyPriceCents !== null &&
-          resolvedStripePrices.stripePixMonthlyPriceCents !== null &&
-          resolvedStripePrices.stripePixYearlyPriceCents !== null &&
-          (resolvedStripePrices.stripeMonthlyPriceCents !== resolvedStripePrices.stripePixMonthlyPriceCents ||
-            resolvedStripePrices.stripeYearlyPriceCents !== resolvedStripePrices.stripePixYearlyPriceCents);
-
-        if (hasCycleMismatch) {
-          throw new Error(
-            "Os preços da assinatura e do PIX devem ser iguais por ciclo (mensal com mensal, anual com anual).",
-          );
         }
       }
 
@@ -5905,30 +7573,20 @@ function App() {
     }
   }
 
-  async function startStripeCheckout(event: FormEvent) {
-    event.preventDefault();
-    if (!checkoutPlanId) {
-      setError("Selecione um plano para iniciar o checkout.");
-      return;
-    }
-    if (checkoutBillingModel !== "STRIPE_SUBSCRIPTION" && checkoutBillingModel !== "PIX_MANUAL") {
-      setError("Selecione um modo de cobrança para iniciar o checkout.");
-      return;
-    }
-    if (checkoutCycle !== "MONTHLY" && checkoutCycle !== "YEARLY") {
-      setError("Selecione um ciclo para iniciar o checkout.");
-      return;
-    }
-
+  async function startStripeCheckoutRequest(input: {
+    planId: string;
+    billingModel: "STRIPE_SUBSCRIPTION";
+    cycle: "MONTHLY" | "YEARLY";
+  }) {
     setStartingCheckout(true);
     setError("");
     setPlanInfo("");
 
     try {
       const result = await api.postJson<{ sessionId: string; url: string | null }>("/billing/checkout/start", {
-        planId: checkoutPlanId,
-        billingModel: checkoutBillingModel,
-        cycle: checkoutCycle,
+        planId: input.planId,
+        billingModel: input.billingModel,
+        cycle: input.cycle,
       });
 
       if (!result.url) {
@@ -5940,6 +7598,24 @@ function App() {
       setError(checkoutError instanceof Error ? checkoutError.message : "Falha ao iniciar checkout Stripe.");
       setStartingCheckout(false);
     }
+  }
+
+  async function startStripeCheckout(event: FormEvent) {
+    event.preventDefault();
+    if (!checkoutPlanId) {
+      setError("Selecione um plano para iniciar o checkout.");
+      return;
+    }
+    if (checkoutCycle !== "MONTHLY" && checkoutCycle !== "YEARLY") {
+      setError("Selecione um ciclo para iniciar o checkout.");
+      return;
+    }
+
+    await startStripeCheckoutRequest({
+      planId: checkoutPlanId,
+      billingModel: "STRIPE_SUBSCRIPTION",
+      cycle: checkoutCycle,
+    });
   }
 
   async function cancelStripeSubscription() {
@@ -6656,11 +8332,6 @@ function App() {
                   </span>
                   <h2>Crescimento</h2>
                 </div>
-                <small className="field-hint">
-                  {dashboardTrendFocus === "all"
-                    ? "Linha diária com publicações, falhas e agendamentos no período."
-                    : `Linha diária focada em ${dashboardTrendFocusLabel(dashboardTrendFocus).toLocaleLowerCase("pt-BR")}.`}
-                </small>
               </div>
               <div className="dashboard-chart-filters">
                 <label className="dashboard-chart-filter">
@@ -6753,7 +8424,6 @@ function App() {
                   </span>
                   <h2>Distribuição</h2>
                 </div>
-                <small className="field-hint">Volume por formato dentro do filtro atual.</small>
               </div>
             </div>
 
@@ -7103,11 +8773,22 @@ function App() {
       billingMe?.plan?.id && billingPlans.length > 0
         ? billingPlans.find((plan) => plan.id === billingMe.plan?.id) ?? null
         : null;
+    const billingMeHasExpiredTrialContext =
+      (Boolean(billingMe?.trialEndsAt) &&
+        (billingMe?.status === "EXPIRED" || billingMe?.status === "PAYMENT_REQUIRED") &&
+        (billingMe?.billingModel === "TRIAL" || billingMe?.billingModel === "NONE")) ||
+      ((billingMe?.status === "EXPIRED" || billingMe?.status === "PAYMENT_REQUIRED") &&
+        billingMe?.billingModel === "NONE" &&
+        !billingMe?.plan);
     const activeBillingAmountCents = resolveBillingPlanAmountCents(activeBillingPlan, billingMe?.cycle ?? null);
     const activeBillingAmountLabel =
       billingMe?.plan?.isTrial || billingMe?.billingModel === "TRIAL"
         ? "Grátis"
         : formatPriceFromCents(activeBillingAmountCents);
+    const billingSummaryMessage =
+      billingMeHasExpiredTrialContext
+        ? "Seu período de teste expirou. Escolha um plano para continuar usando o painel."
+        : billingMe?.blockMessage;
     if (billingLoading) {
       return renderPlanSkeleton();
     }
@@ -7142,7 +8823,7 @@ function App() {
                       </button>
                     ) : null}
                   </div>
-                  {billingMe.blockMessage ? <span>{billingMe.blockMessage}</span> : null}
+                  {billingSummaryMessage ? <span>{billingSummaryMessage}</span> : null}
                   {billingMe.trialEndsAt ? (
                     <span>{`Trial até ${formatDate(billingMe.trialEndsAt, effectiveUserTimeZone)}`}</span>
                   ) : null}
@@ -7195,6 +8876,50 @@ function App() {
                     </small>
                   </form>
                 </div>
+              ) : canRecoverBlockedPlanCheckout ? (
+                <div id={BILLING_PLAN_CHECKOUT_ANCHOR_ID} className="row-card billing-row-card">
+                  <div className="form-stack">
+                    <strong>Ativar assinatura</strong>
+                    <small className="field-hint">
+                      {activeCheckoutPlan
+                        ? `Plano pendente: ${activeCheckoutPlan.name}${activeCheckoutPlan.code ? ` (${activeCheckoutPlan.code})` : ""}.`
+                        : "Sua conta está bloqueada e precisa regularizar a assinatura para continuar."}
+                    </small>
+                    {(billingMe?.billingModel === "STRIPE_SUBSCRIPTION" || billingMe?.billingModel === "PIX_MANUAL") ? (
+                      <small className="field-hint">
+                        {`Cobrança: ${billingModelDisplayLabel(billingMe.billingModel)}${billingMe.cycle ? ` • ${billingMe.cycle === "YEARLY" ? "Anual" : "Mensal"}` : ""}`}
+                      </small>
+                    ) : canStartBlockedCheckout ? (
+                      <small className="field-hint">
+                        {`Cobrança: ${billingModelDisplayLabel(blockedCheckoutBillingModel)}${blockedCheckoutCycle ? ` • ${blockedCheckoutCycle === "YEARLY" ? "Anual" : "Mensal"}` : ""}`}
+                      </small>
+                    ) : null}
+                    {activeCheckoutPlan ? (
+                      <strong className="checkout-price-preview">{`Valor: ${blockedCheckoutPriceLabel}`}</strong>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="stripe-pay-button"
+                      disabled={startingCheckout || !canStartBlockedCheckout}
+                      onClick={() =>
+                        void startStripeCheckoutRequest({
+                          planId: activeCheckoutPlanId,
+                          billingModel: blockedCheckoutBillingModel,
+                          cycle: blockedCheckoutCycle === "YEARLY" ? "YEARLY" : "MONTHLY",
+                        })
+                      }
+                    >
+                      {startingCheckout
+                        ? "Abrindo checkout..."
+                        : "Ativar assinatura"}
+                    </button>
+                    <small className="field-hint">
+                      {canStartBlockedCheckout
+                        ? "Primeiro quite a assinatura pendente. Depois da regularização, a troca de plano volta a ficar disponível."
+                        : "Esta conta bloqueada está sem dados suficientes para reativação automática. Precisamos conferir o plano salvo dessa assinatura."}
+                    </small>
+                  </div>
+                </div>
               ) : (
                 <div id={BILLING_PLAN_CHECKOUT_ANCHOR_ID} className="row-card billing-row-card">
                   <form onSubmit={startStripeCheckout} className="form-stack">
@@ -7205,36 +8930,24 @@ function App() {
                         value={checkoutPlanId}
                         onChange={(event) => setCheckoutPlanId(event.target.value)}
                         required
-                        disabled={availablePaidPlans.length === 0}
+                        disabled={availablePaidPlans.length === 0 || checkoutTargetPlans.length === 0}
                       >
-                        <option value="">Selecione um plano</option>
+                        <option value="">
+                          {checkoutTargetPlans.length === 0 ? "Nenhum upgrade disponível" : "Selecione um plano"}
+                        </option>
                         {availablePaidPlans.map((plan) => (
-                          <option key={plan.id} value={plan.id}>
-                            {`${plan.name} (${plan.code})`}
+                          <option key={plan.id} value={plan.id} disabled={plan.id === activeCheckoutPlanId}>
+                            {`${plan.name} (${plan.code})${plan.id === activeCheckoutPlanId ? " - plano atual" : ""}`}
                           </option>
                         ))}
                       </select>
                     </label>
-                    <label className="field-label">
-                      <span>Modo de cobrança</span>
-                      <select
-                        value={checkoutBillingModel}
-                        onChange={(event) =>
-                          setCheckoutBillingModel(
-                            event.target.value === "PIX_MANUAL"
-                              ? "PIX_MANUAL"
-                              : event.target.value === "STRIPE_SUBSCRIPTION"
-                                ? "STRIPE_SUBSCRIPTION"
-                                : "",
-                          )
-                        }
-                        required
-                      >
-                        <option value="">Selecione um modo de cobrança</option>
-                        <option value="STRIPE_SUBSCRIPTION">Assinatura recorrente</option>
-                        <option value="PIX_MANUAL">PIX avulso</option>
-                      </select>
-                    </label>
+                    <small className="field-hint">
+                      {billingMe.plan?.name
+                        ? `Plano atual: ${billingMe.plan.name}${billingMe.plan.code ? ` (${billingMe.plan.code})` : ""}.`
+                        : "Sua conta ainda não tem um plano ativo."}
+                    </small>
+                    <small className="field-hint">Cobrança via Stripe: assinatura recorrente.</small>
                     <label className="field-label">
                       <span>Ciclo</span>
                       <select
@@ -7249,20 +8962,29 @@ function App() {
                         <option value="YEARLY">Anual</option>
                       </select>
                     </label>
-                    {isCheckoutSelectionReady ? (
-                      <>
-                        <strong className="checkout-price-preview">{`Valor: ${checkoutSelectedPriceLabel}`}</strong>
-                        <button
-                          type="submit"
-                          className="stripe-pay-button"
-                          disabled={startingCheckout || availablePaidPlans.length === 0}
-                        >
-                          {startingCheckout ? "Abrindo checkout..." : "Pagar com Stripe"}
-                        </button>
-                      </>
-                    ) : null}
+                    <strong className="checkout-price-preview">
+                      {isCheckoutSelectionReady
+                        ? `Valor: ${checkoutSelectedPriceLabel}`
+                        : checkoutTargetPlans.length === 0
+                          ? "Nenhum plano diferente disponível para troca no momento."
+                          : "Selecione plano, cobrança e ciclo para continuar."}
+                    </strong>
+                    <button
+                      type="submit"
+                      className="stripe-pay-button"
+                      disabled={
+                        startingCheckout ||
+                        availablePaidPlans.length === 0 ||
+                        checkoutTargetPlans.length === 0 ||
+                        !isCheckoutSelectionReady
+                      }
+                    >
+                      {startingCheckout ? "Abrindo checkout..." : "Pagar com Stripe"}
+                    </button>
                     <small className="field-hint">
-                      O link abre no Checkout oficial do Stripe e volta automaticamente para esta tela.
+                      {isBlockedBilling
+                        ? "Sua conta está sem um plano pago ativo. Escolha um plano para reativar o acesso."
+                        : "O link abre no Checkout oficial do Stripe e volta automaticamente para esta tela."}
                     </small>
                   </form>
                 </div>
@@ -7498,26 +9220,8 @@ function App() {
                     readOnly
                   />
                 </label>
-                <label className="field-label">
-                  <span>Price PIX mensal (auto)</span>
-                  <input
-                    value={resolvedStripePriceIdsForSelectedProduct?.stripePixMonthlyPriceId ?? ""}
-                    placeholder="Definido automaticamente pelo produto"
-                    disabled
-                    readOnly
-                  />
-                </label>
-                <label className="field-label">
-                  <span>Price PIX anual (auto)</span>
-                  <input
-                    value={resolvedStripePriceIdsForSelectedProduct?.stripePixYearlyPriceId ?? ""}
-                    placeholder="Definido automaticamente pelo produto"
-                    disabled
-                    readOnly
-                  />
-                </label>
                 <small className="field-hint">
-                  Ao selecionar o produto Stripe, os preços são vinculados automaticamente e não podem ser editados.
+                  Ao selecionar o produto Stripe, os preços recorrentes mensal e anual são vinculados automaticamente e não podem ser editados.
                 </small>
               </>
             ) : null}
@@ -8960,12 +10664,6 @@ function App() {
         <div className="section-head">
           {renderSectionTitleWithIcon("history", "Histórico", "timeline")}
         </div>
-        <div className="history-filters-grid">
-          {renderCompanyFilter("Filtrar perfil")}
-          {renderHistoryFilter()}
-          {renderHistoryMonthFilter()}
-          {renderHistoryYearFilter()}
-        </div>
         <form onSubmit={applyHistoryBulkEdit} className="history-bulk-shell">
           <div className="history-bulk-top">
             <label className="field-label history-bulk-search-field">
@@ -8978,7 +10676,7 @@ function App() {
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
                       event.preventDefault();
-                      setHistoryPage(1);
+                      setHistoryCalendarDayPages({});
                     }
                   }}
                   placeholder="Título ou legenda"
@@ -8988,7 +10686,7 @@ function App() {
                 <button
                   type="button"
                   className="ghost-button history-search-submit-button"
-                  onClick={() => setHistoryPage(1)}
+                  onClick={() => setHistoryCalendarDayPages({})}
                   disabled={historyBulkApplying}
                 >
                   Buscar
@@ -9081,10 +10779,67 @@ function App() {
             ) : null}
           </div>
         </form>
-        <div className="history-filters-meta">
-          <span className="count-pill">{historyFilteredJobs.length} registros</span>
-          <span className="count-pill">{`${historyBulkSelectedJobIds.length} selecionado(s)`}</span>
-        </div>
+        {!historyBulkPublishMode ? (
+          <>
+            <div className="history-calendar-toolbar">
+              <div className="history-calendar-toolbar-left">
+                <span className="count-pill">{`Horário: ${formatHistoryCalendarTimeZoneLabel(effectiveUserTimeZone)}`}</span>
+                <span className="count-pill">{`${historyCalendarVisibleJobsCount} agendamento(s) no mês`}</span>
+                <span className="count-pill">{`${historyBulkSelectedJobIds.length} selecionado(s)`}</span>
+              </div>
+              <div className="history-calendar-toolbar-right">
+                <button
+                  type="button"
+                  className="ghost-button history-calendar-nav-button"
+                  onClick={() => navigateHistoryCalendarMonth(-1)}
+                  aria-label="Mês anterior"
+                >
+                  <FiChevronLeft />
+                </button>
+                <div className="history-calendar-toolbar-period">
+                  <strong>{historyCalendarMonthLabel}</strong>
+                  <select
+                    value={historyCalendarYear}
+                    onChange={(event) => setHistoryCalendarYear(Number(event.target.value))}
+                    disabled={historyBulkApplying}
+                  >
+                    {historyCalendarYearOptions.map((year) => (
+                      <option key={year} value={year}>
+                        {year}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <button
+                  type="button"
+                  className="ghost-button history-calendar-nav-button"
+                  onClick={() => navigateHistoryCalendarMonth(1)}
+                  aria-label="Próximo mês"
+                >
+                  <FiChevronRight />
+                </button>
+              </div>
+            </div>
+            <div className="history-anchor-tabs" role="tablist" aria-label="Seções do histórico">
+              <button
+                type="button"
+                className="history-anchor-tab"
+                onClick={() => scrollHistorySectionIntoView("published")}
+              >
+                Publicados
+              </button>
+              {!historyBulkDraftMode ? (
+                <button
+                  type="button"
+                  className="history-anchor-tab"
+                  onClick={() => scrollHistorySectionIntoView("drafts")}
+                >
+                  Rascunhos
+                </button>
+              ) : null}
+            </div>
+          </>
+        ) : null}
         {historyInfo ? (
           <div
             className={`info-banner${isPositiveHistoryInfo ? " info-banner-success" : ""}${isTransientHistoryInfo ? " info-banner-transient" : ""}`}
@@ -9092,108 +10847,244 @@ function App() {
             {historyInfo}
           </div>
         ) : null}
-        {renderNumericPagination("history-top", historyPage, historyTotalPages, setHistoryPage, historySectionRef)}
-        <div className="table-list">
-          {paginatedHistoryJobs.map((job) => (
-            <div key={job.id} className="row-card history-row-card">
-              {(() => {
-                const storySequenceFailureMeta = parseStorySequenceFailureMeta(job.lastError);
-                const canRescheduleFailedInstagramMedia =
-                  job.publicationState !== "DRAFT" &&
-                  job.status === "FAILED" &&
-                  isInstagramPublication(job.publicationType);
-                const hasPartialStoryFailure =
-                  job.publicationType === "instagram_story" &&
-                  storySequenceFailureMeta !== null &&
-                  storySequenceFailureMeta.publishedCount > 0 &&
-                  storySequenceFailureMeta.publishedCount < storySequenceFailureMeta.total;
-
-                return (
-            <>
-              <div>
-                {historyBulkAction ? (
-                  <label className="history-bulk-item-check">
-                    <input
-                      type="checkbox"
-                      checked={historyBulkSelectedJobIdsSet.has(job.id)}
-                      onChange={() => toggleHistoryBulkJobSelection(job.id)}
-                      disabled={historyBulkApplying}
-                    />
-                    <span>Selecionar</span>
-                  </label>
-                ) : null}
-                <strong>{resolveJobDisplayTitle(job)}</strong>
-                <div className="meta-pill-row">
-                  {renderPublicationTypePill(job.publicationType)}
-                  <span className="unit-pill">{`Perfil: ${companyNameMap[job.companyId] || "Perfil removido"}`}</span>
+        <DndContext
+          sensors={historyCalendarSensors}
+          collisionDetection={pointerWithin}
+          onDragStart={handleHistoryCalendarDragStart}
+          onDragEnd={(event) => void handleHistoryCalendarDragEnd(event)}
+          onDragCancel={handleHistoryCalendarDragCancel}
+        >
+          <div className="history-anchor-sections">
+            {historyBulkPublishMode ? (
+              historyPublishModeTransitioning ? (
+                <div className="history-bulk-publish-placeholder skeleton-shell" aria-hidden="true">
+                  <span className="skeleton-line history-bulk-publish-placeholder-kicker" />
+                  <span className="skeleton-line history-bulk-publish-placeholder-bar" />
+                  <div className="history-bulk-publish-placeholder-grid">
+                    {Array.from({ length: 7 }, (_, index) => (
+                      <div key={`history-publish-placeholder-${index}`} className="history-bulk-publish-placeholder-cell">
+                        <span className="skeleton-line history-bulk-publish-placeholder-line" />
+                        <span className="skeleton-line history-bulk-publish-placeholder-card" />
+                      </div>
+                    ))}
+                  </div>
                 </div>
-                {job.locationName ? <span>Localização: {job.locationName}</span> : null}
-                <span>{formatJobScheduledAt(job, effectiveUserTimeZone)}</span>
+              ) : null
+            ) : (
+              <div ref={historyPublishedSectionRef} className="history-anchor-section" id="history-published-section">
+                <div className="history-anchor-section-head">
+                  <strong>Publicados</strong>
+                  <span className="count-pill">{`${historyCalendarVisibleJobsCount} no calendário`}</span>
+                </div>
+                <div className={`history-calendar-shell${historyDraggingJobId ? " history-calendar-shell-dragging" : ""}`}>
+                  {contentLoading ? (
+                    renderHistoryCalendarGridSkeleton(HISTORY_CALENDAR_SKELETON_CELL_COUNT)
+                  ) : (
+                    <>
+                      <div className="history-calendar-grid">
+                        {historyCalendarRenderedCells.map((cell) => {
+                          const totalPages = Math.max(1, Math.ceil(cell.jobs.length / HISTORY_CALENDAR_DAY_PAGE_SIZE));
+                          const currentPage = clampNumber(historyCalendarDayPages[cell.dayKey] ?? 0, 0, totalPages - 1);
+                          const visibleJobs = cell.jobs.slice(
+                            currentPage * HISTORY_CALENDAR_DAY_PAGE_SIZE,
+                            (currentPage + 1) * HISTORY_CALENDAR_DAY_PAGE_SIZE,
+                          );
+
+                          return (
+                            <HistoryCalendarDayDropZone
+                              key={cell.dayKey}
+                              cell={cell}
+                              disabled={Boolean(historyBulkAction)}
+                              overlay={
+                                historyCalendarCelebration?.dayKey === cell.dayKey ? (
+                                  <div
+                                    key={historyCalendarCelebration.token}
+                                    className="history-calendar-day-confetti"
+                                    aria-hidden="true"
+                                  >
+                                    <img src={confettiGif} alt="" />
+                                  </div>
+                                ) : null
+                              }
+                              footer={
+                                totalPages > 1 ? (
+                                  <div className="history-calendar-day-pager">
+                                    <button
+                                      type="button"
+                                      className="ghost-button history-calendar-day-pager-button"
+                                      onClick={() => setHistoryCalendarDayPage(cell.dayKey, currentPage - 1, cell.jobs.length)}
+                                      disabled={currentPage === 0}
+                                      aria-label="Postagens anteriores do dia"
+                                    >
+                                      <FiChevronLeft />
+                                    </button>
+                                    <span>{`${currentPage + 1}/${totalPages}`}</span>
+                                    <button
+                                      type="button"
+                                      className="ghost-button history-calendar-day-pager-button"
+                                      onClick={() => setHistoryCalendarDayPage(cell.dayKey, currentPage + 1, cell.jobs.length)}
+                                      disabled={currentPage >= totalPages - 1}
+                                      aria-label="Próximas postagens do dia"
+                                    >
+                                      <FiChevronRight />
+                                    </button>
+                                  </div>
+                                ) : null
+                              }
+                            >
+                              {visibleJobs.length === 0 ? (
+                                <div className="history-calendar-day-empty">
+                                  {cell.inCurrentMonth ? "Sem agendamentos" : "Sem itens"}
+                                </div>
+                              ) : (
+                                visibleJobs.map((job) => (
+                                  <HistoryCalendarDraggableCard
+                                    key={job.id}
+                                    job={job}
+                                    companyLabel={companyNameMap[job.companyId] || "Perfil removido"}
+                                    timeLabel={toTimeLocal(job.dataPostagem, effectiveUserTimeZone)}
+                                    canEditTime={!isCalendarDayInPast(toDateLocal(job.dataPostagem, effectiveUserTimeZone), historyCalendarTodayKey)}
+                                    bulkSelectionEnabled={Boolean(historyBulkAction)}
+                                    isSelected={historyBulkSelectedJobIdsSet.has(job.id)}
+                                    isSaving={historyInlineSavingJobId === job.id}
+                                    isEditingTime={historyInlineTimeJobId === job.id}
+                                    timeValue={historyInlineTimeValue}
+                                    onToggleSelection={toggleHistoryBulkJobSelection}
+                                    onStartTimeEdit={startHistoryInlineTimeEdit}
+                                    onTimeValueChange={setHistoryInlineTimeValue}
+                                    onSaveTime={(targetJob, nextTime) =>
+                                      void updateHistoryCalendarJobSchedule(
+                                        targetJob,
+                                        toDateLocal(targetJob.dataPostagem, effectiveUserTimeZone),
+                                        nextTime,
+                                        {
+                                          feedbackMode:
+                                            historyPendingDraftPlacementJobId === targetJob.id ||
+                                            historyPendingCalendarPlacementJobId === targetJob.id
+                                              ? "alert"
+                                              : "banner",
+                                        },
+                                      )
+                                    }
+                                    onCancelTimeEdit={cancelHistoryInlineTimeEdit}
+                                  />
+                                ))
+                              )}
+                            </HistoryCalendarDayDropZone>
+                          );
+                        })}
+                      </div>
+                      {historyCalendarLoadingNextWeek ? (
+                        <div className="history-calendar-loading-row" aria-hidden="true">
+                          {renderHistoryCalendarGridSkeleton(HISTORY_CALENDAR_SKELETON_CELL_COUNT)}
+                        </div>
+                      ) : null}
+                      {historyCalendarHasMoreWeeks ? <div ref={historyCalendarLoadMoreRef} className="history-calendar-load-trigger" /> : null}
+                    </>
+                  )}
+                </div>
               </div>
-              <div className="inline-actions">
-                <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
-                {canToggleJobSchedule(job, isPastScheduledAtForUser) ? (
-                  <button
-                    type="button"
-                    className={job.status === "CANCELED" ? "activate-button" : "ghost-button"}
-                    onClick={() => void toggleJobSchedule(job)}
-                    disabled={togglingScheduleJobId === job.id}
-                  >
-                    {togglingScheduleJobId === job.id
-                      ? "Salvando..."
-                      : job.status === "CANCELED"
-                        ? "Ativar agendamento"
-                        : "Cancelar agendamento"}
-                  </button>
-                ) : null}
-                {job.filePath ? (
-                  <a href={`${api.baseUrl}${job.filePath}`} target="_blank" rel="noreferrer" className="link-chip">
-                    Midia
-                  </a>
-                ) : (
-                  <span className="text-chip">Sem midia</span>
-                )}
-                {canRescheduleFailedInstagramMedia ? (
-                  <button
-                    type="button"
-                    className="activate-button"
-                    onClick={() => void rescheduleFailedMedia(job)}
-                    disabled={reschedulingFailedMediaJobId === job.id}
-                  >
-                    {reschedulingFailedMediaJobId === job.id
-                      ? "Reagendando..."
-                      : hasPartialStoryFailure
-                        ? "Reagendar restantes +20 min"
-                        : "Reagendar mídia +20 min"}
-                  </button>
-                ) : null}
-                {job.publicationState !== "DRAFT" &&
-                !canRescheduleFailedInstagramMedia &&
-                (job.status === "FAILED" || job.status === "WAITING_LOGIN" || job.status === "SENT_UNCONFIRMED") ? (
-                  <button
-                    type="button"
-                    className="ghost-button"
-                    onClick={() => retryJob(job.id)}
-                    disabled={retryingJobId === job.id}
-                  >
-                    {retryingJobId === job.id ? "Tentando..." : "Tentar de novo"}
-                  </button>
-                ) : null}
-                <button type="button" className="ghost-button" onClick={() => startEditJob(job)}>
-                  Editar
-                </button>
-                <button type="button" className="danger-button" onClick={() => deleteJob(job.id)}>
-                  Excluir
-                </button>
+            )}
+
+            {!historyBulkDraftMode ? (
+              <div ref={historyDraftSectionRef} className="history-anchor-section history-draft-section" id="history-draft-section">
+                <div className="history-anchor-section-head">
+                  <strong>Rascunhos</strong>
+                  <span className="count-pill">{`${historyDraftTotal} na fila`}</span>
+                </div>
+                <HistoryDraftDropZone disabled={Boolean(historyBulkAction)}>
+                  {historyDraftLoading ? (
+                    <div className="history-draft-grid">
+                      {Array.from({ length: 6 }, (_, index) => (
+                        <div key={`draft-skeleton-${index}`} className="history-draft-card-skeleton" aria-hidden="true" />
+                      ))}
+                    </div>
+                  ) : historyDraftJobs.length > 0 ? (
+                    <>
+                      <div className="history-draft-grid">
+                        {historyDraftJobs.map((job) => (
+                          <HistoryCalendarDraggableCard
+                            key={job.id}
+                            job={job}
+                            companyLabel={companyNameMap[job.companyId] || "Perfil removido"}
+                            timeLabel=""
+                            canEditTime={false}
+                            bulkSelectionEnabled={Boolean(historyBulkAction)}
+                            isSelected={historyBulkSelectedJobIdsSet.has(job.id)}
+                            isSaving={historyInlineSavingJobId === job.id}
+                            isEditingTime={historyInlineTimeJobId === job.id}
+                            timeValue={historyInlineTimeValue}
+                            onToggleSelection={toggleHistoryBulkJobSelection}
+                            onStartTimeEdit={startHistoryInlineTimeEdit}
+                            onTimeValueChange={setHistoryInlineTimeValue}
+                            onSaveTime={(targetJob, nextTime) =>
+                              void updateHistoryCalendarJobSchedule(
+                                targetJob,
+                                toDateLocal(targetJob.dataPostagem, effectiveUserTimeZone) || historyCalendarTodayKey,
+                                nextTime,
+                                {
+                                  feedbackMode:
+                                    historyPendingDraftPlacementJobId === targetJob.id ||
+                                    historyPendingCalendarPlacementJobId === targetJob.id
+                                      ? "alert"
+                                      : "banner",
+                                },
+                              )
+                            }
+                            onCancelTimeEdit={cancelHistoryInlineTimeEdit}
+                            showTimeRow={false}
+                            muted
+                          />
+                        ))}
+                      </div>
+                      {historyDraftLoadingMore ? (
+                        <div className="history-draft-grid history-draft-grid-loading" aria-hidden="true">
+                          {Array.from({ length: 3 }, (_, index) => (
+                            <div key={`draft-skeleton-more-${index}`} className="history-draft-card-skeleton" />
+                          ))}
+                        </div>
+                      ) : null}
+                      {historyDraftPage < historyDraftTotalPages ? (
+                        <div ref={historyDraftLoadMoreRef} className="history-calendar-load-trigger" />
+                      ) : null}
+                    </>
+                  ) : !historyDraftsRequested ? (
+                    <div className="history-draft-grid">
+                      {Array.from({ length: 3 }, (_, index) => (
+                        <div key={`draft-placeholder-${index}`} className="history-draft-card-skeleton" aria-hidden="true" />
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="empty-state history-calendar-empty-state">Nenhum rascunho encontrado.</div>
+                  )}
+                </HistoryDraftDropZone>
               </div>
-            </>
-                );
-              })()}
-            </div>
-          ))}
-          {historyFilteredJobs.length === 0 ? <div className="empty-state">Nenhum job encontrado neste filtro.</div> : null}
-        </div>
-        {renderNumericPagination("history-bottom", historyPage, historyTotalPages, setHistoryPage, historySectionRef)}
+            ) : null}
+          </div>
+          <DragOverlay>
+            {historyDraggingJob ? (
+              <HistoryCalendarDraggableCard
+                job={historyDraggingJob}
+                companyLabel={companyNameMap[historyDraggingJob.companyId] || "Perfil removido"}
+                timeLabel={toTimeLocal(historyDraggingJob.dataPostagem, effectiveUserTimeZone)}
+                canEditTime={!isCalendarDayInPast(toDateLocal(historyDraggingJob.dataPostagem, effectiveUserTimeZone), historyCalendarTodayKey)}
+                bulkSelectionEnabled={false}
+                isSelected={false}
+                isSaving={false}
+                isEditingTime={false}
+                timeValue=""
+                onToggleSelection={() => undefined}
+                onStartTimeEdit={() => undefined}
+                onTimeValueChange={() => undefined}
+                onSaveTime={() => undefined}
+                onCancelTimeEdit={() => undefined}
+                showTimeRow={historyDraggingJob.publicationState !== "DRAFT"}
+                muted={historyDraggingJob.publicationState === "DRAFT"}
+                staticPreview
+              />
+            ) : null}
+          </DragOverlay>
+        </DndContext>
       </section>
     );
   }
@@ -9521,16 +11412,47 @@ function App() {
     );
   }
 
+  function renderHistoryCalendarGridSkeleton(count = HISTORY_CALENDAR_SKELETON_CELL_COUNT) {
+    return (
+      <div className="history-calendar-grid history-calendar-grid-skeleton" aria-hidden="true">
+        {Array.from({ length: count }, (_, index) => (
+          <article key={`history-calendar-skeleton-${index}`} className="history-calendar-day history-calendar-day-skeleton">
+            <div className="history-calendar-day-head">
+              <span className="skeleton-line history-calendar-skeleton-weekday" />
+              <span className="skeleton-line history-calendar-skeleton-day" />
+            </div>
+            <div className="history-calendar-day-body">
+              <span className="skeleton-line history-calendar-skeleton-card" />
+              <span className="skeleton-line history-calendar-skeleton-card" />
+            </div>
+          </article>
+        ))}
+      </div>
+    );
+  }
+
   function renderHistorySkeleton() {
     return (
       <section className="panel-card view-stack skeleton-shell" aria-busy="true">
         {renderSkeletonSectionHead()}
-        <div className="history-filters-grid" aria-hidden="true">
-          {Array.from({ length: 4 }, (_, index) => (
-            <span key={`history-filter-skeleton-${index}`} className="skeleton-line skeleton-line-filter" />
-          ))}
+        <div className="history-bulk-shell" aria-hidden="true">
+          <div className="history-bulk-top">
+            <span className="skeleton-line skeleton-line-input" />
+            <span className="skeleton-line skeleton-line-input" />
+          </div>
+          <div className="history-calendar-toolbar">
+            <div className="history-calendar-toolbar-left">
+              <span className="skeleton-line skeleton-line-chip" />
+              <span className="skeleton-line skeleton-line-chip" />
+            </div>
+            <div className="history-calendar-toolbar-right">
+              <span className="skeleton-line skeleton-line-button" />
+              <span className="skeleton-line skeleton-line-input" />
+              <span className="skeleton-line skeleton-line-button" />
+            </div>
+          </div>
         </div>
-        {renderSkeletonRows(4)}
+        <div className="history-calendar-shell">{renderHistoryCalendarGridSkeleton(HISTORY_CALENDAR_SKELETON_CELL_COUNT)}</div>
       </section>
     );
   }
@@ -9702,7 +11624,7 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${isDesktopViewport && desktopSidebarExpanded ? "sidebar-desktop-expanded" : ""}`}>
       <button
         type="button"
         className={`sidebar-overlay ${sidebarOpen ? "sidebar-overlay-visible" : ""}`}
@@ -9718,6 +11640,15 @@ function App() {
           onClick={() => setSidebarOpen(false)}
         >
           <span className="sidebar-close-icon" aria-hidden="true">×</span>
+        </button>
+        <button
+          type="button"
+          className="sidebar-collapse-toggle"
+          aria-label={desktopSidebarExpanded ? "Recolher menu" : "Expandir menu"}
+          title={desktopSidebarExpanded ? "Recolher menu" : "Expandir menu"}
+          onClick={() => setDesktopSidebarExpanded((current) => !current)}
+        >
+          {desktopSidebarExpanded ? <FiChevronLeft aria-hidden="true" /> : <FiChevronRight aria-hidden="true" />}
         </button>
         <nav className="nav-list">
           {visibleNavItems.map((item) => (
@@ -9995,7 +11926,7 @@ function App() {
                         />
                       </label>
                       <small className="field-hint">
-                        Aplica nas próximas cobranças (assinatura ou PIX avulso) e permanece ativo até você desativar.
+                        Aplica nas próximas cobranças de assinatura e permanece ativo até você desativar.
                       </small>
                       <button type="submit" disabled={savingBillingDiscountUserId === selectedBillingDiscountUser.id}>
                         {savingBillingDiscountUserId === selectedBillingDiscountUser.id ? "Salvando..." : "Salvar desconto"}

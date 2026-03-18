@@ -123,7 +123,6 @@ const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
 const STRIPE_WEBHOOK_PATH = "/billing/stripe/webhook";
 const STRIPE_CHECKOUT_SUCCESS_URL = (process.env.STRIPE_CHECKOUT_SUCCESS_URL || "").trim();
 const STRIPE_CHECKOUT_CANCEL_URL = (process.env.STRIPE_CHECKOUT_CANCEL_URL || "").trim();
-const STRIPE_PIX_CHECKOUT_EXPIRES_HOURS = parseEnvPositiveInt(process.env.STRIPE_PIX_CHECKOUT_EXPIRES_HOURS, 24);
 const BILLING_SETTING_AUTO_TRIAL_ENABLED = "billing.autoTrialEnabled";
 const BILLING_SETTING_AUTO_TRIAL_DAYS = "billing.autoTrialDays";
 const BILLING_SETTING_ROOT_DISPLAY_PLAN_ID = "billing.rootDisplayPlanId";
@@ -197,6 +196,61 @@ function normalizeUserTimeZone(value: string | null | undefined): string {
   }
 
   return isValidIanaTimeZone(normalized) ? normalized : DEFAULT_USER_TIME_ZONE;
+}
+
+function getTimeZoneOffsetMinutes(date: Date, timeZone: string): number {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    timeZoneName: "longOffset",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const timeZoneName = formatter.formatToParts(date).find((part) => part.type === "timeZoneName")?.value || "GMT+00:00";
+  const match = timeZoneName.match(/^GMT([+-])(\d{2}):?(\d{2})$/);
+  if (!match) {
+    return 0;
+  }
+
+  const sign = match[1] === "-" ? -1 : 1;
+  const hours = Number.parseInt(match[2] || "0", 10);
+  const minutes = Number.parseInt(match[3] || "0", 10);
+  return sign * (hours * 60 + minutes);
+}
+
+function zonedDateTimeToUtc(input: {
+  year: number;
+  month: number;
+  day: number;
+  hour?: number;
+  minute?: number;
+  second?: number;
+  timeZone: string;
+}): Date {
+  const hour = input.hour ?? 0;
+  const minute = input.minute ?? 0;
+  const second = input.second ?? 0;
+  const utcGuess = new Date(Date.UTC(input.year, input.month - 1, input.day, hour, minute, second));
+  const offsetMinutes = getTimeZoneOffsetMinutes(utcGuess, input.timeZone);
+  return new Date(utcGuess.getTime() - offsetMinutes * 60_000);
+}
+
+function shiftCalendarDate(input: { year: number; month: number; day: number }, deltaDays: number) {
+  const cursor = new Date(Date.UTC(input.year, input.month - 1, input.day));
+  cursor.setUTCDate(cursor.getUTCDate() + deltaDays);
+  return {
+    year: cursor.getUTCFullYear(),
+    month: cursor.getUTCMonth() + 1,
+    day: cursor.getUTCDate(),
+  };
+}
+
+function getDaysInMonthForCalendar(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
 }
 
 function formatMegabytes(bytes: number): string {
@@ -691,7 +745,6 @@ const createJobSchema = z.object({
     "instagram_reel",
     "instagram_post",
     "whatsapp_status_midia",
-    "whatsapp_status_texto",
   ]),
   publicationState: publicationStateSchema.optional().default("PUBLISHED"),
   dataPostagem: z.string().datetime().optional().nullable(),
@@ -717,7 +770,6 @@ const updateJobSchema = z.object({
     "instagram_reel",
     "instagram_post",
     "whatsapp_status_midia",
-    "whatsapp_status_texto",
   ]),
   publicationState: publicationStateSchema.optional(),
   dataPostagem: z.string().datetime().optional().nullable(),
@@ -727,9 +779,26 @@ const deleteUploadQuerySchema = z.object({
   filePath: z.string().trim().min(1),
 });
 
+const jobsCalendarQuerySchema = z.object({
+  companyId: z.string().trim().min(1).optional(),
+  year: z.coerce.number().int().min(2020).max(2100),
+  month: z.coerce.number().int().min(1).max(12),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(4).default(1),
+  query: z.string().trim().max(120).optional(),
+  timeZone: z.string().trim().min(1).max(80).optional().nullable(),
+});
+
 const avisoPaginationQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(50).default(10),
+});
+
+const historyDraftsQuerySchema = z.object({
+  companyId: z.string().trim().min(1).optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(24).default(12),
+  query: z.string().trim().max(120).optional(),
 });
 
 const avisoRecentQuerySchema = z.object({
@@ -774,7 +843,7 @@ const assignUserPlanSchema = z.object({
 
 const startStripeCheckoutSchema = z.object({
   planId: z.string().trim().min(1),
-  billingModel: z.enum(["STRIPE_SUBSCRIPTION", "PIX_MANUAL"]),
+  billingModel: z.enum(["STRIPE_SUBSCRIPTION"]),
   cycle: z.enum(["MONTHLY", "YEARLY"]),
 });
 
@@ -1370,6 +1439,43 @@ function isRootUser(request: Request & { adminUser?: AdminUserAuth }): boolean {
   return request.adminUser?.username === "root";
 }
 
+function serializeJobForClient(job: Prisma.JobGetPayload<Record<string, never>>) {
+  const locationMetadata = decodeInstagramLocationStorage(job.locationName);
+  const mediaBundle = decodeJobMediaBundleStorage(job.filePath);
+
+  return {
+    id: job.id,
+    companyId: job.companyId,
+    socialConnectionId: job.socialConnectionId,
+    filePath: mediaBundle.files[0] ?? job.filePath,
+    filePaths: mediaBundle.files,
+    fileCaptions: mediaBundle.captions,
+    sequential: mediaBundle.sequential,
+    title: job.title,
+    caption: job.caption,
+    firstComment: job.firstComment,
+    whatsappBackgroundColor: job.whatsappBackgroundColor ?? null,
+    whatsappRelinkEnabled: Boolean(job.whatsappRelinkEnabled),
+    whatsappRelinkConnectionIds: parseStoredWhatsappRelinkConnectionIds(job.whatsappRelinkConnectionIds),
+    instagramPermalink: job.instagramPermalink ?? null,
+    locationName: locationMetadata.locationName,
+    locationId: locationMetadata.locationId,
+    publicationType: normalizePublicationType(job),
+    publicationState: normalizePublicationState(job.publicationState),
+    postStory: job.postStory,
+    postReel: job.postReel,
+    postWhatsapp: job.postWhatsapp,
+    modoWhatsapp: job.modoWhatsapp,
+    dataPostagem: job.dataPostagem,
+    status: job.status,
+    tentativas: job.tentativas,
+    createdAt: job.criadoEm,
+    startedAt: job.startedAt,
+    completedAt: job.completedAt,
+    lastError: job.lastError,
+  };
+}
+
 function companyVisibilityWhere(
   request: Request & { adminUser?: AdminUserAuth },
   companyId?: string,
@@ -1399,6 +1505,9 @@ function jobVisibilityWhere(
     companyId: companyId ?? undefined,
     status: status ?? undefined,
     createdByUserId: isRootUser(request) ? undefined : request.adminUser?.id,
+    NOT: {
+      publicationType: "whatsapp_status_texto",
+    },
   };
 }
 
@@ -1884,6 +1993,13 @@ const EMPTY_STRIPE_PLAN_PRICE_IDS: ResolvedStripePlanPriceIds = {
   stripePixYearlyPriceCents: null,
 };
 
+let stripePixAvailabilityCache:
+  | {
+      value: boolean;
+      expiresAtMs: number;
+    }
+  | null = null;
+
 function normalizeStripeSearchText(value: string): string {
   return value
     .normalize("NFD")
@@ -1999,6 +2115,27 @@ async function resolveStripePlanPriceIdsFromProduct(stripeProductId: string): Pr
   return resolveStripePlanPriceIdsFromPriceList(pricesResponse.data);
 }
 
+async function resolveStripePixAvailability(): Promise<boolean> {
+  if (!STRIPE_SECRET_KEY) {
+    return false;
+  }
+
+  const now = Date.now();
+  if (stripePixAvailabilityCache && stripePixAvailabilityCache.expiresAtMs > now) {
+    return stripePixAvailabilityCache.value;
+  }
+
+  const stripe = ensureStripeClient();
+  const account = await stripe.accounts.retrieve();
+  const pixCapability = account.capabilities?.pix_payments;
+  const value = pixCapability === "active";
+  stripePixAvailabilityCache = {
+    value,
+    expiresAtMs: now + 5 * 60 * 1000,
+  };
+  return value;
+}
+
 function listMissingRequiredStripePriceKinds(priceIds: ResolvedStripePlanPriceIds): string[] {
   const missing: string[] = [];
   if (!priceIds.stripeMonthlyPriceId) {
@@ -2007,29 +2144,7 @@ function listMissingRequiredStripePriceKinds(priceIds: ResolvedStripePlanPriceId
   if (!priceIds.stripeYearlyPriceId) {
     missing.push("assinatura anual");
   }
-  if (!priceIds.stripePixMonthlyPriceId) {
-    missing.push("PIX mensal");
-  }
-  if (!priceIds.stripePixYearlyPriceId) {
-    missing.push("PIX anual");
-  }
   return missing;
-}
-
-function hasStripeCyclePriceMismatch(priceIds: ResolvedStripePlanPriceIds): boolean {
-  if (
-    priceIds.stripeMonthlyPriceCents === null ||
-    priceIds.stripeYearlyPriceCents === null ||
-    priceIds.stripePixMonthlyPriceCents === null ||
-    priceIds.stripePixYearlyPriceCents === null
-  ) {
-    return false;
-  }
-
-  return (
-    priceIds.stripeMonthlyPriceCents !== priceIds.stripePixMonthlyPriceCents ||
-    priceIds.stripeYearlyPriceCents !== priceIds.stripePixYearlyPriceCents
-  );
 }
 
 type BillingSettingsSnapshot = {
@@ -2247,9 +2362,26 @@ function currentMonthBounds(now: Date): { start: Date; end: Date } {
   return { start, end };
 }
 
-function computeBillingBlockMessage(status: string, planName: string | null): string | null {
+function computeBillingBlockMessage(
+  status: string,
+  planName: string | null,
+  options?: {
+    billingModel?: string | null;
+    trialEndsAt?: Date | null;
+    now?: Date;
+  },
+): string | null {
+  const now = options?.now ?? new Date();
+  const trialExpired =
+    Boolean(options?.trialEndsAt) && (options?.trialEndsAt?.getTime() ?? 0) <= now.getTime();
+  const cameFromTrial =
+    options?.billingModel === "TRIAL" || (options?.billingModel === "NONE" && trialExpired);
+
   if (status === "ACTIVE" || status === "TRIALING") {
     return null;
+  }
+  if (cameFromTrial) {
+    return "Seu período de teste expirou. Ative um plano para continuar usando o painel.";
   }
   if (status === "PAYMENT_REQUIRED") {
     return "Sua conta está sem plano ativo. Renove para continuar usando o painel.";
@@ -2330,12 +2462,51 @@ async function resolveUserBillingAccess(userId: string): Promise<BillingAccessSn
     };
   }
 
+  let resolvedPlan = subscription.plan;
+  const subscriptionStripePriceId = trimNullable(subscription.stripePriceId);
+  if (!resolvedPlan && subscriptionStripePriceId) {
+    const fallbackPlan = await prisma.plan.findFirst({
+      where: {
+        isActive: true,
+        OR: [
+          { stripeMonthlyPriceId: subscriptionStripePriceId },
+          { stripeYearlyPriceId: subscriptionStripePriceId },
+          { stripePixMonthlyPriceId: subscriptionStripePriceId },
+          { stripePixYearlyPriceId: subscriptionStripePriceId },
+        ],
+      },
+      select: {
+        id: true,
+        code: true,
+        name: true,
+        isTrial: true,
+        maxProfiles: true,
+        maxConnections: true,
+        maxMonthlyPublications: true,
+        isActive: true,
+      },
+    });
+
+    if (fallbackPlan) {
+      resolvedPlan = fallbackPlan;
+      if (!subscription.planId) {
+        await prisma.userPlanSubscription.update({
+          where: { id: subscription.id },
+          data: {
+            planId: fallbackPlan.id,
+          },
+        });
+      }
+    }
+  }
+
   let status = subscription.status;
   const trialExpired = subscription.trialEndsAt ? subscription.trialEndsAt.getTime() <= now.getTime() : false;
   const endsAtExpired = subscription.endsAt ? subscription.endsAt.getTime() <= now.getTime() : false;
-  const planIsActive = subscription.plan?.isActive ?? false;
+  const planIsActive = resolvedPlan?.isActive ?? false;
+  const effectivePlanId = subscription.planId ?? resolvedPlan?.id ?? null;
 
-  if ((trialExpired && subscription.billingModel === "TRIAL") || endsAtExpired || !planIsActive || !subscription.planId) {
+  if ((trialExpired && subscription.billingModel === "TRIAL") || endsAtExpired || !planIsActive || !effectivePlanId) {
     status = "EXPIRED";
     if (subscription.status !== "EXPIRED") {
       await prisma.userPlanSubscription.update({
@@ -2349,7 +2520,8 @@ async function resolveUserBillingAccess(userId: string): Promise<BillingAccessSn
   }
 
   const isBlocked = status !== "ACTIVE" && status !== "TRIALING";
-  const planName = subscription.plan?.name ?? null;
+  const exposedPlan = subscription.billingModel === "NONE" ? null : resolvedPlan;
+  const planName = exposedPlan?.name ?? null;
 
   return {
     status,
@@ -2357,15 +2529,15 @@ async function resolveUserBillingAccess(userId: string): Promise<BillingAccessSn
     cycle: subscription.cycle,
     stripeSubscriptionId: trimNullable(subscription.stripeSubscriptionId),
     stripeCancelAtPeriodEnd: Boolean(subscription.endsAt && subscription.billingModel === "STRIPE_SUBSCRIPTION"),
-    plan: subscription.plan
+    plan: exposedPlan
       ? {
-          id: subscription.plan.id,
-          code: subscription.plan.code,
-          name: subscription.plan.name,
-          isTrial: subscription.plan.isTrial,
-          maxProfiles: subscription.plan.maxProfiles,
-          maxConnections: subscription.plan.maxConnections,
-          maxMonthlyPublications: subscription.plan.maxMonthlyPublications,
+          id: exposedPlan.id,
+          code: exposedPlan.code,
+          name: exposedPlan.name,
+          isTrial: exposedPlan.isTrial,
+          maxProfiles: exposedPlan.maxProfiles,
+          maxConnections: exposedPlan.maxConnections,
+          maxMonthlyPublications: exposedPlan.maxMonthlyPublications,
         }
       : null,
     usage: {
@@ -2374,7 +2546,13 @@ async function resolveUserBillingAccess(userId: string): Promise<BillingAccessSn
       postsUsedThisMonth,
     },
     isBlocked,
-    blockMessage: isBlocked ? computeBillingBlockMessage(status, planName) : null,
+    blockMessage: isBlocked
+      ? computeBillingBlockMessage(status, planName, {
+          billingModel: subscription.billingModel,
+          trialEndsAt: subscription.trialEndsAt,
+          now,
+        })
+      : null,
     startsAt: subscription.startsAt,
     endsAt: subscription.endsAt,
     trialEndsAt: subscription.trialEndsAt,
@@ -5238,7 +5416,7 @@ function startServerWhatsappJobWorker(): void {
       const candidateJobs = await prisma.job.findMany({
         where: {
           publicationType: {
-            in: ["whatsapp_status_midia", "whatsapp_status_texto"],
+            in: ["whatsapp_status_midia"],
           },
           publicationState: "PUBLISHED",
           status: {
@@ -6566,6 +6744,127 @@ app.get("/jobs/instagram-location-suggestions", async (request, response) => {
   });
 });
 
+app.get("/jobs/calendar", async (request, response) => {
+  const payload = jobsCalendarQuerySchema.parse(request.query);
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  const timeZone = normalizeUserTimeZone(payload.timeZone ?? authRequest.adminUser?.timeZone ?? DEFAULT_USER_TIME_ZONE);
+  const totalDays = getDaysInMonthForCalendar(payload.year, payload.month);
+  const totalPages = Math.max(1, Math.ceil(totalDays / (payload.pageSize * 7)));
+  const page = Math.min(payload.page, totalPages);
+  const weekStartDay = (page - 1) * payload.pageSize * 7 + 1;
+  const weekEndDay = Math.min(totalDays, weekStartDay + payload.pageSize * 7 - 1);
+  const monthRangeStart = zonedDateTimeToUtc({
+    year: payload.year,
+    month: payload.month,
+    day: 1,
+    timeZone,
+  });
+  const monthRangeEnd = zonedDateTimeToUtc({
+    ...shiftCalendarDate({ year: payload.year, month: payload.month, day: totalDays }, 1),
+    timeZone,
+  });
+  const pageRangeStart = zonedDateTimeToUtc({
+    year: payload.year,
+    month: payload.month,
+    day: weekStartDay,
+    timeZone,
+  });
+  const pageRangeEnd = zonedDateTimeToUtc({
+    ...shiftCalendarDate({ year: payload.year, month: payload.month, day: weekEndDay }, 1),
+    timeZone,
+  });
+  const normalizedQuery = (payload.query || "").trim();
+  const baseWhere = {
+    ...jobVisibilityWhere(authRequest, payload.companyId),
+    publicationState: "PUBLISHED",
+  } satisfies Prisma.JobWhereInput;
+  const searchWhere = normalizedQuery
+    ? ({
+        OR: [
+          { title: { contains: normalizedQuery, mode: "insensitive" } },
+          { caption: { contains: normalizedQuery, mode: "insensitive" } },
+        ],
+      } satisfies Prisma.JobWhereInput)
+    : {};
+  const monthWhere = {
+    ...baseWhere,
+    ...searchWhere,
+    dataPostagem: {
+      gte: monthRangeStart,
+      lt: monthRangeEnd,
+    },
+  } satisfies Prisma.JobWhereInput;
+  const pageWhere = {
+    ...baseWhere,
+    ...searchWhere,
+    dataPostagem: {
+      gte: pageRangeStart,
+      lt: pageRangeEnd,
+    },
+  } satisfies Prisma.JobWhereInput;
+
+  const [jobs, totalJobs] = await Promise.all([
+    prisma.job.findMany({
+      where: pageWhere,
+      orderBy: [{ dataPostagem: "asc" }, { criadoEm: "asc" }],
+    }),
+    prisma.job.count({
+      where: monthWhere,
+    }),
+  ]);
+
+  response.json({
+    year: payload.year,
+    month: payload.month,
+    page,
+    pageSize: payload.pageSize,
+    totalPages,
+    totalDays,
+    totalJobs,
+    items: jobs.map(serializeJobForClient),
+  });
+});
+
+app.get("/jobs/history-drafts", async (request, response) => {
+  const payload = historyDraftsQuerySchema.parse(request.query);
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  const normalizedQuery = (payload.query || "").trim();
+  const baseWhere = {
+    ...jobVisibilityWhere(authRequest, payload.companyId),
+    publicationState: "DRAFT",
+  } satisfies Prisma.JobWhereInput;
+  const searchWhere = normalizedQuery
+    ? ({
+        OR: [
+          { title: { contains: normalizedQuery, mode: "insensitive" } },
+          { caption: { contains: normalizedQuery, mode: "insensitive" } },
+        ],
+      } satisfies Prisma.JobWhereInput)
+    : {};
+  const where = {
+    ...baseWhere,
+    ...searchWhere,
+  } satisfies Prisma.JobWhereInput;
+
+  const total = await prisma.job.count({ where });
+  const totalPages = Math.max(1, Math.ceil(total / payload.pageSize));
+  const page = Math.min(payload.page, totalPages);
+  const items = await prisma.job.findMany({
+    where,
+    orderBy: [{ criadoEm: "desc" }],
+    skip: (page - 1) * payload.pageSize,
+    take: payload.pageSize,
+  });
+
+  response.json({
+    page,
+    pageSize: payload.pageSize,
+    total,
+    totalPages,
+    items: items.map(serializeJobForClient),
+  });
+});
+
 app.get("/jobs", async (request, response) => {
   const companyId = typeof request.query.companyId === "string" ? request.query.companyId : undefined;
   const status = typeof request.query.status === "string" ? request.query.status : undefined;
@@ -6577,41 +6876,7 @@ app.get("/jobs", async (request, response) => {
   });
 
   response.json(
-    jobs.map((job) => {
-      const locationMetadata = decodeInstagramLocationStorage(job.locationName);
-      const mediaBundle = decodeJobMediaBundleStorage(job.filePath);
-      return {
-        id: job.id,
-        companyId: job.companyId,
-        socialConnectionId: job.socialConnectionId,
-        filePath: mediaBundle.files[0] ?? job.filePath,
-        filePaths: mediaBundle.files,
-        fileCaptions: mediaBundle.captions,
-        sequential: mediaBundle.sequential,
-        title: job.title,
-        caption: job.caption,
-        firstComment: job.firstComment,
-        whatsappBackgroundColor: job.whatsappBackgroundColor ?? null,
-        whatsappRelinkEnabled: Boolean(job.whatsappRelinkEnabled),
-        whatsappRelinkConnectionIds: parseStoredWhatsappRelinkConnectionIds(job.whatsappRelinkConnectionIds),
-        instagramPermalink: job.instagramPermalink ?? null,
-        locationName: locationMetadata.locationName,
-        locationId: locationMetadata.locationId,
-        publicationType: normalizePublicationType(job),
-        publicationState: normalizePublicationState(job.publicationState),
-        postStory: job.postStory,
-        postReel: job.postReel,
-        postWhatsapp: job.postWhatsapp,
-        modoWhatsapp: job.modoWhatsapp,
-        dataPostagem: job.dataPostagem,
-        status: job.status,
-        tentativas: job.tentativas,
-        createdAt: job.criadoEm,
-        startedAt: job.startedAt,
-        completedAt: job.completedAt,
-        lastError: job.lastError,
-      };
-    }),
+    jobs.map(serializeJobForClient),
   );
 });
 
@@ -6666,9 +6931,7 @@ app.post("/jobs", async (request, response) => {
   });
   const whatsappBackgroundColor = normalizeWhatsappBackgroundColor(
     payload.whatsappBackgroundColor,
-    payload.publicationType === "whatsapp_status_texto" ||
-      payload.publicationType === "whatsapp_status_midia" ||
-      relinkOptions.enabled,
+    payload.publicationType === "whatsapp_status_midia" || relinkOptions.enabled,
   );
   const normalizedTitle = normalizeJobTitle(payload.title);
   let scheduledAt = new Date();
@@ -6773,9 +7036,7 @@ app.put("/jobs/:id", async (request, response) => {
   });
   const whatsappBackgroundColor = normalizeWhatsappBackgroundColor(
     payload.whatsappBackgroundColor ?? existingJob.whatsappBackgroundColor,
-    payload.publicationType === "whatsapp_status_texto" ||
-      payload.publicationType === "whatsapp_status_midia" ||
-      relinkOptions.enabled,
+    payload.publicationType === "whatsapp_status_midia" || relinkOptions.enabled,
   );
 
   const nextPublicationState = normalizePublicationState(payload.publicationState ?? existingJob.publicationState);
@@ -7203,6 +7464,7 @@ app.get("/billing/me", async (request, response) => {
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
   const userId = authRequest.adminUser!.id;
   const monthBounds = currentMonthBounds(new Date());
+  const stripePixAvailable = await resolveStripePixAvailability().catch(() => false);
 
   if (isRootUser(authRequest)) {
     const bestPlan = await getRootDisplayPlanForDisplay();
@@ -7239,6 +7501,7 @@ app.get("/billing/me", async (request, response) => {
       },
       canCancelStripeSubscription: false,
       stripeCancelAtPeriodEnd: false,
+      stripePixAvailable,
     });
     return;
   }
@@ -7258,6 +7521,7 @@ app.get("/billing/me", async (request, response) => {
     canCancelStripeSubscription:
       billing.billingModel === "STRIPE_SUBSCRIPTION" && !billing.stripeCancelAtPeriodEnd,
     stripeCancelAtPeriodEnd: billing.stripeCancelAtPeriodEnd,
+    stripePixAvailable,
   });
 });
 
@@ -7387,6 +7651,7 @@ app.get("/billing/stripe/catalog", async (request, response) => {
         defaultPriceId: typeof item.default_price === "string" ? item.default_price : null,
       })),
       resolvedByProduct,
+      pixAvailable: await resolveStripePixAvailability().catch(() => false),
     });
   } catch (error) {
     response.status(400).json({
@@ -7410,7 +7675,8 @@ app.post("/billing/checkout/start", async (request, response) => {
   }
 
   const stripe = ensureStripeClient();
-  const [plan, currentSubscription, userBillingSettings] = await Promise.all([
+  const [currentBilling, plan, currentSubscription, userBillingSettings] = await Promise.all([
+    resolveUserBillingAccess(user.id),
     prisma.plan.findUnique({
       where: { id: payload.planId },
       select: {
@@ -7437,6 +7703,26 @@ app.post("/billing/checkout/start", async (request, response) => {
       },
     }),
   ]);
+
+  const hasBlockedPlanToRecover =
+    currentBilling.isBlocked &&
+    currentBilling.plan &&
+    currentBilling.billingModel === "STRIPE_SUBSCRIPTION" &&
+    (currentBilling.cycle === "MONTHLY" || currentBilling.cycle === "YEARLY");
+
+  const blockedCurrentPlan = hasBlockedPlanToRecover ? currentBilling.plan : null;
+
+  if (
+    blockedCurrentPlan &&
+    (payload.planId !== blockedCurrentPlan.id ||
+      payload.billingModel !== currentBilling.billingModel ||
+      payload.cycle !== currentBilling.cycle)
+  ) {
+    response.status(409).json({
+      error: `Quite primeiro o plano atual (${blockedCurrentPlan.name}) antes de trocar de plano ou cobrança.`,
+    });
+    return;
+  }
 
   if (!plan) {
     response.status(404).json({ error: "Plano não encontrado." });
@@ -7482,30 +7768,16 @@ app.post("/billing/checkout/start", async (request, response) => {
       });
       return;
     }
-
-    if (hasStripeCyclePriceMismatch(resolvedPlanStripePrices)) {
-      response.status(409).json({
-        error:
-          "Os preços da assinatura e do PIX devem ser iguais por ciclo (mensal com mensal, anual com anual).",
-      });
-      return;
-    }
   }
 
-  const isSubscriptionMode = payload.billingModel === "STRIPE_SUBSCRIPTION";
-  const selectedPriceId = isSubscriptionMode
-    ? payload.cycle === "MONTHLY"
+  const selectedPriceId =
+    payload.cycle === "MONTHLY"
       ? trimNullable(resolvedPlanStripePrices.stripeMonthlyPriceId)
-      : trimNullable(resolvedPlanStripePrices.stripeYearlyPriceId)
-    : payload.cycle === "MONTHLY"
-      ? trimNullable(resolvedPlanStripePrices.stripePixMonthlyPriceId)
-      : trimNullable(resolvedPlanStripePrices.stripePixYearlyPriceId);
+      : trimNullable(resolvedPlanStripePrices.stripeYearlyPriceId);
 
   if (!selectedPriceId) {
     response.status(409).json({
-      error: isSubscriptionMode
-        ? "Este plano ainda não possui Price ID de assinatura para o ciclo selecionado."
-        : "Este plano ainda não possui Price ID de PIX avulso para o ciclo selecionado.",
+      error: "Este plano ainda não possui Price ID de assinatura para o ciclo selecionado.",
     });
     return;
   }
@@ -7567,20 +7839,15 @@ app.post("/billing/checkout/start", async (request, response) => {
         })
       : null;
 
-  const expiresHours = Math.max(1, Math.min(24, STRIPE_PIX_CHECKOUT_EXPIRES_HOURS));
-  const expiresAtSeconds = Math.floor(Date.now() / 1000) + expiresHours * 60 * 60;
   const session = await stripe.checkout.sessions.create({
-    mode: isSubscriptionMode ? "subscription" : "payment",
+    mode: "subscription",
     customer: stripeCustomerId,
     success_url: buildStripeCheckoutSuccessUrl(),
     cancel_url: buildStripeCheckoutCancelUrl(),
     line_items: [{ price: selectedPriceId, quantity: 1 }],
-    payment_method_types: isSubscriptionMode ? undefined : ["pix"],
-    expires_at: isSubscriptionMode ? undefined : expiresAtSeconds,
-    allow_promotion_codes: isSubscriptionMode ? true : undefined,
+    allow_promotion_codes: true,
     metadata,
-    subscription_data: isSubscriptionMode ? { metadata } : undefined,
-    payment_intent_data: isSubscriptionMode ? undefined : { metadata },
+    subscription_data: { metadata },
     discounts: discountCouponId ? [{ coupon: discountCouponId }] : undefined,
     client_reference_id: user.id,
   });
@@ -7795,14 +8062,6 @@ app.post("/billing/plans", async (request, response) => {
       });
       return;
     }
-
-    if (hasStripeCyclePriceMismatch(resolvedStripePriceIds)) {
-      response.status(409).json({
-        error:
-          "Os preços da assinatura e do PIX devem ser iguais por ciclo (mensal com mensal, anual com anual).",
-      });
-      return;
-    }
   }
 
   const plan = await prisma.plan.create({
@@ -7908,14 +8167,6 @@ app.put("/billing/plans/:id", async (request, response) => {
     if (missingPriceKinds.length > 0) {
       response.status(409).json({
         error: `Produto Stripe sem preços obrigatórios: ${missingPriceKinds.join(", ")}.`,
-      });
-      return;
-    }
-
-    if (hasStripeCyclePriceMismatch(nextStripePriceIds)) {
-      response.status(409).json({
-        error:
-          "Os preços da assinatura e do PIX devem ser iguais por ciclo (mensal com mensal, anual com anual).",
       });
       return;
     }
