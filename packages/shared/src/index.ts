@@ -13,6 +13,8 @@ export type PublicationType =
   | "instagram_story"
   | "instagram_reel"
   | "instagram_post"
+  | "facebook_post"
+  | "threads_post"
   | "whatsapp_status_midia"
   | "whatsapp_status_texto";
 

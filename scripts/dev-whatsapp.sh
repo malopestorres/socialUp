@@ -8,6 +8,7 @@ PG_BIN="/Applications/Postgres.app/Contents/Versions/17/bin"
 PG_DATA_DIR="${EVOLUTION_PG_DATA_DIR:-$HOME/.evolution-postgres/data}"
 PG_LOG_DIR="${EVOLUTION_PG_LOG_DIR:-$HOME/.evolution-postgres/logs}"
 PG_LOG_FILE="$PG_LOG_DIR/postgres.log"
+PG_PORT="${EVOLUTION_PG_PORT:-5433}"
 
 if [ ! -d "$EVOLUTION_DIR" ]; then
   echo "services/evolution-api nao encontrado. Clone/configure a Evolution API primeiro."
@@ -38,8 +39,8 @@ if [ ! -f "$PG_DATA_DIR/PG_VERSION" ]; then
 fi
 
 if ! "$PG_BIN/pg_ctl" -D "$PG_DATA_DIR" status >/dev/null 2>&1; then
-  echo "Iniciando PostgreSQL local na porta 5432..."
-  "$PG_BIN/pg_ctl" -D "$PG_DATA_DIR" -l "$PG_LOG_FILE" -o "-p 5432" start
+  echo "Iniciando PostgreSQL local na porta $PG_PORT..."
+  "$PG_BIN/pg_ctl" -D "$PG_DATA_DIR" -l "$PG_LOG_FILE" -o "-p $PG_PORT" start
 fi
 
 cd "$EVOLUTION_DIR"

@@ -40,6 +40,8 @@ type QrOverlayState = {
   qrGeneratedAt: Date | null;
   workerLastSeenAt: Date | null;
   qrMessage: string | null;
+  whatsappOwnerJid: string | null;
+  whatsappProfileName: string | null;
 };
 
 type EvolutionConnectionStateResponse = {
@@ -177,6 +179,8 @@ function getOrCreateQrOverlay(connectionId: string): QrOverlayState {
     qrGeneratedAt: null,
     workerLastSeenAt: null,
     qrMessage: null,
+    whatsappOwnerJid: null,
+    whatsappProfileName: null,
   };
   qrOverlayByConnectionId.set(connectionId, created);
   return created;
@@ -694,11 +698,27 @@ async function syncQrState(connectionId: string, credentials: EvolutionCredentia
   const normalizedState = normalizeState(state);
 
   if (normalizedState === "open") {
+    let ownerJid: string | null = null;
+    let profileName: string | null = null;
+    try {
+      const instance = await fetchInstanceRecord(credentials);
+      ownerJid = typeof instance?.ownerJid === "string" && instance.ownerJid.trim().length > 0
+        ? instance.ownerJid.trim()
+        : null;
+      profileName = typeof instance?.profileName === "string" && instance.profileName.trim().length > 0
+        ? instance.profileName.trim()
+        : null;
+    } catch {
+      // Mantém conectado mesmo se o metadata fetch falhar.
+    }
+
     setQrOverlay(connectionId, {
       qrStatus: "CONNECTED",
       qrImageDataUrl: null,
       qrMessage: "Conta WhatsApp conectada com sucesso.",
       qrGeneratedAt: null,
+      whatsappOwnerJid: ownerJid,
+      whatsappProfileName: profileName,
     });
     await markConnectionConnected(connectionId);
     return "STOP";
@@ -998,6 +1018,8 @@ export function getWhatsappConnectionOverlay(connectionId: string): Partial<Reco
     qrGeneratedAt: state.qrGeneratedAt,
     workerLastSeenAt: state.workerLastSeenAt,
     qrMessage: state.qrMessage,
+    whatsappOwnerJid: state.whatsappOwnerJid,
+    whatsappProfileName: state.whatsappProfileName,
   };
 }
 
@@ -1027,7 +1049,7 @@ export async function requestWhatsappQr(connectionId: string, forceRegenerate: b
     qrStatus: "PREPARING",
     qrImageDataUrl: null,
     qrGeneratedAt: null,
-    qrMessage: "Preparando QR Code da Evolution API...",
+    qrMessage: "Preparando QR Code do WhatsApp...",
   });
 
   await ensureInstanceExists(credentials);
@@ -1146,7 +1168,7 @@ export async function executeWhatsappJobWithEvolutionApi(
       `contactsTotal=${statusRecipients.contactsTotal}; ` +
       `droppedGroups=${statusRecipients.contactsRejectedGroups}; ` +
       `droppedLid=${statusRecipients.contactsRejectedLid}; ` +
-      `droppedInvalid=${statusRecipients.contactsRejectedInvalid}) via Evolution API.`,
+      `droppedInvalid=${statusRecipients.contactsRejectedInvalid}) via WhatsApp.`,
   });
 
   const route = `/message/sendStatus/${encodeURIComponent(credentials.instanceName)}`;

@@ -530,11 +530,12 @@ export async function resolveInstagramConnectionRuntimeMetadata(input: {
   loginIdentifier: string | null;
   secretCipher: string | null;
 }): Promise<{ instagramUserId: string | null; instagramUsername: string | null }> {
-  const fallbackUserIdRaw = input.loginIdentifier?.trim() || "";
-  const fallbackUserId = /^\d+$/.test(fallbackUserIdRaw) ? fallbackUserIdRaw : null;
+  const fallbackIdentifier = input.loginIdentifier?.trim() || "";
+  const fallbackUserId = /^\d+$/.test(fallbackIdentifier) ? fallbackIdentifier : null;
+  const fallbackUsername = fallbackUserId ? null : fallbackIdentifier || null;
   const fallback = {
     instagramUserId: fallbackUserId,
-    instagramUsername: null,
+    instagramUsername: fallbackUsername,
   };
 
   const accessToken = decodeSecret(input.secretCipher)?.trim() || "";
@@ -554,6 +555,27 @@ export async function resolveInstagramConnectionRuntimeMetadata(input: {
   } catch {
     return fallback;
   }
+}
+
+async function resolveInstagramPublishingUserId(connection: {
+  loginIdentifier: string | null;
+  secretCipher: string | null;
+}): Promise<string> {
+  const rawIdentifier = connection.loginIdentifier?.trim() || "";
+  if (/^\d+$/.test(rawIdentifier)) {
+    return rawIdentifier;
+  }
+
+  const metadata = await resolveInstagramConnectionRuntimeMetadata({
+    loginIdentifier: connection.loginIdentifier,
+    secretCipher: connection.secretCipher,
+  });
+  const instagramUserId = metadata.instagramUserId?.trim() || "";
+  if (!instagramUserId || !/^\d+$/.test(instagramUserId)) {
+    throw new Error("LOGIN_REQUIRED_INSTAGRAM");
+  }
+
+  return instagramUserId;
 }
 
 function selectInstagramAccount(
@@ -1096,6 +1118,7 @@ export async function exchangeInstagramOAuthCodeForConnection(input: {
 
   let effectiveToken = shortLivedToken;
   let effectiveExpiresIn = typeof shortToken.expires_in === "number" ? shortToken.expires_in : null;
+  const longTokenExchangeErrors: string[] = [];
 
   if (INSTAGRAM_OAUTH_FLOW === "facebook_login") {
     try {
@@ -1124,7 +1147,10 @@ export async function exchangeInstagramOAuthCodeForConnection(input: {
         effectiveToken = longToken.access_token.trim();
         effectiveExpiresIn = typeof longToken.expires_in === "number" ? longToken.expires_in : effectiveExpiresIn;
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.message) {
+        longTokenExchangeErrors.push(error.message);
+      }
       // Compat fallback: alguns apps antigos ainda aceitam o caminho de exchange via Graph/Facebook.
       try {
         const fallbackLongToken = await graphRequest<FacebookOAuthTokenResponse>("/oauth/access_token", {
@@ -1140,14 +1166,22 @@ export async function exchangeInstagramOAuthCodeForConnection(input: {
           effectiveExpiresIn =
             typeof fallbackLongToken.expires_in === "number" ? fallbackLongToken.expires_in : effectiveExpiresIn;
         }
-      } catch {
+      } catch (fallbackError) {
+        if (fallbackError instanceof Error && fallbackError.message) {
+          longTokenExchangeErrors.push(fallbackError.message);
+        }
         // Se ambos falharem, mantém o token atual; o refresh worker tentará renovar novamente.
       }
     }
   }
 
   if (INSTAGRAM_OAUTH_FLOW !== "facebook_login" && effectiveToken === shortLivedToken) {
-    throw new Error("INSTAGRAM_GRAPH_OAUTH_LONG_TOKEN_EXCHANGE_FAILED");
+    const exchangeDetail = longTokenExchangeErrors.find((entry) => entry.trim().length > 0) || null;
+    throw new Error(
+      exchangeDetail
+        ? `INSTAGRAM_GRAPH_OAUTH_LONG_TOKEN_EXCHANGE_FAILED:${exchangeDetail}`
+        : "INSTAGRAM_GRAPH_OAUTH_LONG_TOKEN_EXCHANGE_FAILED",
+    );
   }
 
   const candidates: InstagramAccountCandidate[] = [];
@@ -1381,10 +1415,7 @@ export async function executeInstagramCarouselJobWithGraphApi(
     throw new Error("LOGIN_REQUIRED_INSTAGRAM");
   }
 
-  const instagramUserId = connection.loginIdentifier?.trim() || "";
-  if (!instagramUserId || !/^\d+$/.test(instagramUserId)) {
-    throw new Error("LOGIN_REQUIRED_INSTAGRAM");
-  }
+  const instagramUserId = await resolveInstagramPublishingUserId(connection);
 
   const normalizedMediaUrls = mediaUrls.map((entry) => entry.trim()).filter((entry) => /^https?:\/\//i.test(entry));
   if (normalizedMediaUrls.length < 2) {
@@ -1528,10 +1559,7 @@ export async function executeInstagramJobWithGraphApi(
     throw new Error("LOGIN_REQUIRED_INSTAGRAM");
   }
 
-  const instagramUserId = connection.loginIdentifier?.trim() || "";
-  if (!instagramUserId || !/^\d+$/.test(instagramUserId)) {
-    throw new Error("LOGIN_REQUIRED_INSTAGRAM");
-  }
+  const instagramUserId = await resolveInstagramPublishingUserId(connection);
 
   const normalizedMediaUrl = mediaUrl.trim();
   if (!/^https?:\/\//i.test(normalizedMediaUrl)) {
