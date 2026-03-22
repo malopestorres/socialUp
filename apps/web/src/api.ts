@@ -1,6 +1,56 @@
-const API_URL = "http://localhost:4000";
+function resolveApiUrl(): string {
+  if (typeof window === "undefined") {
+    return "http://localhost:4000";
+  }
+
+  const hostname = window.location.hostname.trim().toLowerCase();
+  if (hostname === "localhost" || hostname === "127.0.0.1") {
+    return "http://localhost:4000";
+  }
+
+  if (hostname.endsWith("socialup.space")) {
+    return "https://api.socialup.space";
+  }
+
+  return "http://localhost:4000";
+}
+
+const API_URL = resolveApiUrl();
 const PERSISTENT_SESSION_STORAGE_KEY = "socialup-admin-session";
 const TEMPORARY_SESSION_STORAGE_KEY = "socialup-admin-session-temporary";
+const POPUP_SESSION_HANDOFF_STORAGE_KEY = "socialup-admin-session-popup-handoff";
+const POPUP_SESSION_HANDOFF_MAX_AGE_MS = 10 * 60 * 1000;
+
+function getPopupSessionHandoffToken(): string {
+  if (typeof window === "undefined") {
+    return "";
+  }
+
+  const raw = window.localStorage.getItem(POPUP_SESSION_HANDOFF_STORAGE_KEY);
+  if (!raw) {
+    return "";
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as { token?: string; createdAtMs?: number };
+    const token = typeof parsed.token === "string" ? parsed.token.trim() : "";
+    const createdAtMs = typeof parsed.createdAtMs === "number" ? parsed.createdAtMs : 0;
+    if (!token || !Number.isFinite(createdAtMs) || createdAtMs <= 0) {
+      window.localStorage.removeItem(POPUP_SESSION_HANDOFF_STORAGE_KEY);
+      return "";
+    }
+
+    if (Date.now() - createdAtMs > POPUP_SESSION_HANDOFF_MAX_AGE_MS) {
+      window.localStorage.removeItem(POPUP_SESSION_HANDOFF_STORAGE_KEY);
+      return "";
+    }
+
+    return token;
+  } catch {
+    window.localStorage.removeItem(POPUP_SESSION_HANDOFF_STORAGE_KEY);
+    return "";
+  }
+}
 
 function getSessionToken(): string {
   if (typeof window === "undefined") {
@@ -10,6 +60,7 @@ function getSessionToken(): string {
   return (
     window.localStorage.getItem(PERSISTENT_SESSION_STORAGE_KEY) ??
     window.sessionStorage.getItem(TEMPORARY_SESSION_STORAGE_KEY) ??
+    getPopupSessionHandoffToken() ??
     ""
   );
 }
@@ -95,6 +146,7 @@ export const api = {
       if (remember) {
         window.localStorage.setItem(PERSISTENT_SESSION_STORAGE_KEY, token);
         window.sessionStorage.removeItem(TEMPORARY_SESSION_STORAGE_KEY);
+        window.localStorage.removeItem(POPUP_SESSION_HANDOFF_STORAGE_KEY);
       } else {
         window.sessionStorage.setItem(TEMPORARY_SESSION_STORAGE_KEY, token);
         window.localStorage.removeItem(PERSISTENT_SESSION_STORAGE_KEY);
@@ -104,6 +156,26 @@ export const api = {
 
     window.localStorage.removeItem(PERSISTENT_SESSION_STORAGE_KEY);
     window.sessionStorage.removeItem(TEMPORARY_SESSION_STORAGE_KEY);
+    window.localStorage.removeItem(POPUP_SESSION_HANDOFF_STORAGE_KEY);
+  },
+  setPopupSessionHandoffToken(token: string): void {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const normalizedToken = token.trim();
+    if (!normalizedToken) {
+      window.localStorage.removeItem(POPUP_SESSION_HANDOFF_STORAGE_KEY);
+      return;
+    }
+
+    window.localStorage.setItem(
+      POPUP_SESSION_HANDOFF_STORAGE_KEY,
+      JSON.stringify({
+        token: normalizedToken,
+        createdAtMs: Date.now(),
+      }),
+    );
   },
   getSessionToken,
   sessionStorageKey: PERSISTENT_SESSION_STORAGE_KEY,

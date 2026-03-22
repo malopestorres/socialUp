@@ -1,6 +1,6 @@
 import amqp, { type Channel, type ChannelModel, type ConsumeMessage } from "amqplib";
 
-export type JobExecutionPlatform = "instagram" | "whatsapp";
+export type JobExecutionPlatform = "instagram" | "facebook" | "threads" | "whatsapp";
 
 export type JobExecutionQueueMessage = {
   jobId: string;
@@ -169,7 +169,7 @@ function parseQueueMessage(raw: ConsumeMessage): JobExecutionQueueMessage | null
     if (!jobId) {
       return null;
     }
-    if (platform !== "instagram" && platform !== "whatsapp") {
+    if (platform !== "instagram" && platform !== "facebook" && platform !== "threads" && platform !== "whatsapp") {
       return null;
     }
     return {
