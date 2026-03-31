@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import QRCode from "qrcode";
@@ -111,7 +112,7 @@ type EvolutionRequestOptions = {
 const EVOLUTION_API_BASE_URL = normalizeBaseUrl(process.env.EVOLUTION_API_BASE_URL || "http://localhost:8080");
 const EVOLUTION_API_KEY = (process.env.EVOLUTION_API_KEY || "").trim();
 const EVOLUTION_API_TIMEOUT_MS = parsePositiveInt(process.env.EVOLUTION_API_TIMEOUT_MS, 45_000);
-const EVOLUTION_QR_POLL_INTERVAL_MS = parsePositiveInt(process.env.EVOLUTION_QR_POLL_INTERVAL_MS, 4_000);
+const EVOLUTION_QR_POLL_INTERVAL_MS = parsePositiveInt(process.env.EVOLUTION_QR_POLL_INTERVAL_MS, 800);
 const EVOLUTION_INSTANCE_INTEGRATION = (process.env.EVOLUTION_INSTANCE_INTEGRATION || "WHATSAPP-BAILEYS").trim();
 const EVOLUTION_STATUS_TEXT_BACKGROUND = process.env.EVOLUTION_STATUS_TEXT_BACKGROUND?.trim() || "#202C33";
 const EVOLUTION_STATUS_TEXT_FONT = parseStatusTextFont(process.env.EVOLUTION_STATUS_TEXT_FONT, 1);
@@ -129,6 +130,19 @@ const HARD_CODED_INSTANCE_API_KEY = (process.env.EVOLUTION_HARD_CODED_INSTANCE_A
 
 const qrOverlayByConnectionId = new Map<string, QrOverlayState>();
 const qrPollersByConnectionId = new Map<string, NodeJS.Timeout>();
+
+function buildAutoWhatsappInstanceName(connectionId: string): string {
+  const normalized = connectionId.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+  const suffix = normalized.slice(0, 20) || "default";
+  return `socialup_wa_${suffix}`;
+}
+
+export function buildFreshWhatsappInstanceName(seed: string): string {
+  const normalized = seed.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+  const prefix = normalized.slice(0, 12) || "default";
+  const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
+  return `socialup_wa_${prefix}_${suffix}`;
+}
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value ?? "", 10);
@@ -243,12 +257,8 @@ function getConnectionCredentials(connection: ConnectionIdentity): EvolutionCred
     };
   }
 
-  const instanceName = connection.loginIdentifier?.trim() ?? "";
+  const instanceName = connection.loginIdentifier?.trim() || buildAutoWhatsappInstanceName(connection.id);
   const apiKey = decodeSecret(connection.secretCipher) ?? EVOLUTION_API_KEY;
-
-  if (!instanceName) {
-    throw new Error("WHATSAPP_EVOLUTION_INSTANCE_NAME_MISSING");
-  }
 
   if (!apiKey) {
     throw new Error("WHATSAPP_EVOLUTION_API_KEY_MISSING");
@@ -599,6 +609,55 @@ async function logoutInstance(credentials: EvolutionCredentials): Promise<void> 
   });
 }
 
+async function deleteInstance(credentials: EvolutionCredentials): Promise<void> {
+  await evolutionRequest(credentials, `/instance/delete/${encodeURIComponent(credentials.instanceName)}`, {
+    method: "DELETE",
+  });
+}
+
+async function waitForInstanceDeletion(
+  credentials: EvolutionCredentials,
+  timeoutMs: number = 15_000,
+): Promise<void> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const existing = await fetchInstanceRecord(credentials);
+      if (!existing) {
+        return;
+      }
+    } catch (error) {
+      if (errorHasHttpStatus(error, 404)) {
+        return;
+      }
+      throw error;
+    }
+
+    await delay(1_000);
+  }
+
+  throw new Error("WHATSAPP_INSTANCE_DELETE_PENDING");
+}
+
+async function waitForLogoutToInvalidateCurrentSession(
+  credentials: EvolutionCredentials,
+  timeoutMs: number = 15_000,
+): Promise<void> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const state = normalizeState(await getEffectiveConnectionState(credentials));
+    if (!state || state === "close" || state === "closed" || state === "connecting") {
+      return;
+    }
+
+    await delay(1_000);
+  }
+
+  throw new Error("WHATSAPP_INSTANCE_LOGOUT_PENDING");
+}
+
 function formatStateMessage(state: string | null): string {
   const normalized = normalizeState(state);
   switch (normalized) {
@@ -693,11 +752,19 @@ async function appendWhatsappDiagnosticLog(input: {
   });
 }
 
-async function syncQrState(connectionId: string, credentials: EvolutionCredentials): Promise<"CONTINUE" | "STOP"> {
+async function syncQrState(
+  connectionId: string,
+  credentials: EvolutionCredentials,
+  allowExistingConnectedSession: boolean,
+): Promise<"CONTINUE" | "STOP"> {
   const state = await getEffectiveConnectionState(credentials);
   const normalizedState = normalizeState(state);
 
   if (normalizedState === "open") {
+    if (!allowExistingConnectedSession) {
+      throw new Error("WHATSAPP_INSTANCE_REUSE_BLOCKED");
+    }
+
     let ownerJid: string | null = null;
     let profileName: string | null = null;
     try {
@@ -724,7 +791,49 @@ async function syncQrState(connectionId: string, credentials: EvolutionCredentia
     return "STOP";
   }
 
-  const connect = await connectInstance(credentials);
+  let connect: EvolutionConnectResponse;
+  try {
+    connect = await connectInstance(credentials);
+  } catch (error) {
+    const retryState = normalizeState(await getEffectiveConnectionState(credentials).catch(() => null));
+
+    if (retryState === "open") {
+      let ownerJid: string | null = null;
+      let profileName: string | null = null;
+      try {
+        const instance = await fetchInstanceRecord(credentials);
+        ownerJid = typeof instance?.ownerJid === "string" && instance.ownerJid.trim().length > 0
+          ? instance.ownerJid.trim()
+          : null;
+        profileName = typeof instance?.profileName === "string" && instance.profileName.trim().length > 0
+          ? instance.profileName.trim()
+          : null;
+      } catch {
+        // melhor esforço
+      }
+
+      setQrOverlay(connectionId, {
+        qrStatus: "CONNECTED",
+        qrImageDataUrl: null,
+        qrMessage: "Conta WhatsApp conectada com sucesso.",
+        qrGeneratedAt: null,
+        whatsappOwnerJid: ownerJid,
+        whatsappProfileName: profileName,
+      });
+      await markConnectionConnected(connectionId);
+      return "STOP";
+    }
+
+    if (retryState === "connecting") {
+      setQrOverlay(connectionId, {
+        qrStatus: "PREPARING",
+        qrMessage: "Conectando o WhatsApp. Aguarde alguns segundos...",
+      });
+      return "CONTINUE";
+    }
+
+    throw error;
+  }
   const qrCodeContent = connect.code?.trim() || "";
   const qrBase64 = connect.base64?.trim() || "";
   const pairingCode = connect.pairingCode?.trim() || "";
@@ -1026,9 +1135,28 @@ export function getWhatsappConnectionOverlay(connectionId: string): Partial<Reco
 export async function requestWhatsappQr(connectionId: string, forceRegenerate: boolean): Promise<void> {
   clearQrPoller(connectionId);
 
-  const connection = await getConnectionIdentity(connectionId);
+  let connection = await getConnectionIdentity(connectionId);
   if (!connection || connection.platform !== "whatsapp") {
     throw new Error("WHATSAPP_CONNECTION_NOT_FOUND");
+  }
+
+  if (forceRegenerate && !isWhatsappEvolutionHardcodedEnabled()) {
+    const nextInstanceName = buildFreshWhatsappInstanceName(connection.id);
+    await prisma.socialConnection.update({
+      where: { id: connection.id },
+      data: {
+        loginIdentifier: nextInstanceName,
+        authStatus: "AUTH_IN_PROGRESS",
+        authLaunchUrl: "https://web.whatsapp.com/",
+        lastAuthAt: null,
+        lastSeenAt: new Date(),
+      },
+    });
+
+    connection = {
+      ...connection,
+      loginIdentifier: nextInstanceName,
+    };
   }
 
   let credentials: EvolutionCredentials;
@@ -1056,10 +1184,20 @@ export async function requestWhatsappQr(connectionId: string, forceRegenerate: b
 
   if (forceRegenerate) {
     try {
-      await logoutInstance(credentials);
-    } catch {
-      // Some providers return conflict errors when there is no active session.
+      await deleteInstance(credentials);
+      await waitForInstanceDeletion(credentials);
+    } catch (error) {
+      if (!errorHasHttpStatus(error, 400) && !errorHasHttpStatus(error, 404)) {
+        try {
+          await logoutInstance(credentials);
+          await waitForLogoutToInvalidateCurrentSession(credentials);
+        } catch (logoutError) {
+          throw logoutError;
+        }
+      }
     }
+
+    await ensureInstanceExists(credentials);
   }
 
   let running = false;
@@ -1075,7 +1213,7 @@ export async function requestWhatsappQr(connectionId: string, forceRegenerate: b
         clearQrPoller(connectionId);
         return;
       }
-      const outcome = await syncQrState(connectionId, credentials);
+      const outcome = await syncQrState(connectionId, credentials, !forceRegenerate);
       if (outcome === "STOP") {
         clearQrPoller(connectionId);
       }
@@ -1133,6 +1271,18 @@ export async function disconnectWhatsappConnection(connectionId: string): Promis
       await logoutInstance(credentials);
     } catch {
       // Ignore logout failures while disconnecting.
+    }
+
+    if (!isWhatsappEvolutionHardcodedEnabled()) {
+      await prisma.socialConnection.updateMany({
+        where: { id: connectionId, platform: "whatsapp" },
+        data: {
+          loginIdentifier: buildFreshWhatsappInstanceName(connectionId),
+          authLaunchUrl: null,
+          lastAuthAt: null,
+          lastSeenAt: null,
+        },
+      });
     }
   }
 

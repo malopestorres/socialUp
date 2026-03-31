@@ -50,14 +50,17 @@ import {
   createPostForMeSocialPost,
   disconnectPostForMeSocialAccount,
   isPostForMeManagedPlatform,
+  listPostForMeSocialAccountFeed,
   listPostForMeSocialAccounts,
   listPostForMeSocialPostResults,
   listPostForMeSocialPosts,
   type PostForMePlacement,
   type PostForMePlatform,
+  type PostForMeSocialAccountFeedRecord,
   type PostForMeSocialAccountRecord,
   type PostForMeSocialPostResultRecord,
 } from "./post-for-me.js";
+import { META_LOCATION_CATALOG, type MetaLocationCatalogEntry } from "./meta-location-catalog.js";
 import { prisma } from "./prisma.js";
 import { createRandomToken, verifyPassword, hashPassword } from "./security.js";
 import {
@@ -84,9 +87,10 @@ const OAUTH_PUBLIC_BASE_URL = (process.env.PUBLIC_OAUTH_BASE_URL || INSTAGRAM_GR
 const INSTAGRAM_IMAGE_MAX_SIZE_BYTES = 8 * 1024 * 1024;
 const INSTAGRAM_POST_ASPECT_RATIO_MIN = 4 / 5;
 const INSTAGRAM_POST_ASPECT_RATIO_MAX = 1.91;
-const INSTAGRAM_LOCATION_STORAGE_PREFIX = "__IGLOC__";
+const META_LOCATION_STORAGE_PREFIX = "__IGLOC__";
 const JOB_MEDIA_BUNDLE_STORAGE_PREFIX = "__JOB_MEDIA_BUNDLE__";
 const INSTAGRAM_MULTI_MEDIA_MAX_FILES = 10;
+const THREADS_MULTI_MEDIA_MAX_FILES = 20;
 const INSTAGRAM_FORCED_LOCATION_ID_RAW = (process.env.INSTAGRAM_FORCED_LOCATION_ID || "").trim();
 const INSTAGRAM_FORCED_LOCATION_ID = /^\d+$/.test(INSTAGRAM_FORCED_LOCATION_ID_RAW)
   ? INSTAGRAM_FORCED_LOCATION_ID_RAW
@@ -116,6 +120,13 @@ const FAILED_MEDIA_RESCHEDULE_DELAY_MS = parseEnvPositiveInt(
   process.env.FAILED_MEDIA_RESCHEDULE_DELAY_MS,
   20 * 60 * 1000,
 );
+const IMMUTABLE_PUBLICATION_HISTORY_STATUSES = new Set([
+  "COMPLETED",
+  "SENT_UNCONFIRMED",
+  "FAILED",
+  "WAITING_LOGIN",
+  "CANCELED",
+]);
 const INSTAGRAM_OAUTH_FLOW_RUNTIME = (process.env.INSTAGRAM_OAUTH_FLOW || "instagram_login").trim().toLowerCase();
 const INSTAGRAM_DEFAULT_PROACTIVE_TOKEN_REFRESH_COOLDOWN_MS =
   INSTAGRAM_OAUTH_FLOW_RUNTIME === "instagram_login" ? 26 * 60 * 60 * 1000 : 30 * 60 * 1000;
@@ -146,20 +157,25 @@ const POST_FOR_ME_WHATSAPP_RELINK_LOCK_MS = parseEnvPositiveInt(
 );
 const POST_FOR_ME_WHATSAPP_RELINK_MAX_WAIT_MS = parseEnvPositiveInt(
   process.env.POST_FOR_ME_WHATSAPP_RELINK_MAX_WAIT_MS,
-  20_000,
+  45_000,
 );
 const POST_FOR_ME_WHATSAPP_RELINK_POLL_INTERVAL_MS = parseEnvPositiveInt(
   process.env.POST_FOR_ME_WHATSAPP_RELINK_POLL_INTERVAL_MS,
-  3_000,
+  1_500,
 );
 const POST_FOR_ME_WHATSAPP_RELINK_WORKER_INTERVAL_MS = parseEnvPositiveInt(
   process.env.POST_FOR_ME_WHATSAPP_RELINK_WORKER_INTERVAL_MS,
-  20_000,
+  2_000,
 );
 const POST_FOR_ME_WHATSAPP_RELINK_BATCH_SIZE = parseEnvPositiveInt(
   process.env.POST_FOR_ME_WHATSAPP_RELINK_BATCH_SIZE,
   10,
 );
+const POST_FOR_ME_AMBIGUOUS_FAILURE_MAX_WAIT_MS = parseEnvPositiveInt(
+  process.env.POST_FOR_ME_AMBIGUOUS_FAILURE_MAX_WAIT_MS,
+  90_000,
+);
+const POST_FOR_ME_REQUIRED_CAPTION_FALLBACK = "\u2060";
 const JOB_DISPATCH_INTERVAL_MS = parseEnvPositiveInt(process.env.JOB_DISPATCH_INTERVAL_MS, 10_000);
 const JOB_DISPATCH_BATCH_SIZE = parseEnvPositiveInt(process.env.JOB_DISPATCH_BATCH_SIZE, 10);
 const JOB_CONSUMER_CONNECTION_LOCK_MS = parseEnvPositiveInt(process.env.JOB_CONSUMER_CONNECTION_LOCK_MS, 15 * 60 * 1000);
@@ -242,6 +258,10 @@ function parseEnvBoolean(value: string | undefined, fallback: boolean): boolean 
   return fallback;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
 function isValidIanaTimeZone(value: string): boolean {
   try {
     new Intl.DateTimeFormat("en-US", { timeZone: value }).format(new Date());
@@ -313,6 +333,51 @@ function shiftCalendarDate(input: { year: number; month: number; day: number }, 
 
 function getDaysInMonthForCalendar(year: number, month: number): number {
   return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+function resolveScheduledAtFromPayload(input: {
+  dataPostagem?: string | null;
+  scheduledDateLocal?: string | null;
+  scheduledTimeLocal?: string | null;
+  timeZone?: string | null;
+  fallbackTimeZone?: string | null;
+}): Date | null {
+  const scheduledDateLocal = (input.scheduledDateLocal || "").trim();
+  const scheduledTimeLocal = (input.scheduledTimeLocal || "").trim();
+
+  if (scheduledDateLocal && scheduledTimeLocal) {
+    const [yearRaw, monthRaw, dayRaw] = scheduledDateLocal.split("-").map((part) => Number.parseInt(part, 10));
+    const [hourRaw, minuteRaw] = scheduledTimeLocal.split(":").map((part) => Number.parseInt(part, 10));
+
+    if (
+      !Number.isFinite(yearRaw) ||
+      !Number.isFinite(monthRaw) ||
+      !Number.isFinite(dayRaw) ||
+      !Number.isFinite(hourRaw) ||
+      !Number.isFinite(minuteRaw)
+    ) {
+      return null;
+    }
+
+    const timeZone = normalizeUserTimeZone(input.timeZone ?? input.fallbackTimeZone ?? DEFAULT_USER_TIME_ZONE);
+    const resolved = zonedDateTimeToUtc({
+      year: yearRaw,
+      month: monthRaw,
+      day: dayRaw,
+      hour: hourRaw,
+      minute: minuteRaw,
+      timeZone,
+    });
+
+    return Number.isNaN(resolved.getTime()) ? null : resolved;
+  }
+
+  if (!input.dataPostagem) {
+    return null;
+  }
+
+  const scheduledAt = new Date(input.dataPostagem);
+  return Number.isNaN(scheduledAt.getTime()) ? null : scheduledAt;
 }
 
 function formatMegabytes(bytes: number): string {
@@ -553,7 +618,7 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutCod
   }
 }
 
-function encodeInstagramLocationStorage(locationName: string | null, locationId: string | null): string | null {
+function encodeMetaLocationStorage(locationName: string | null, locationId: string | null): string | null {
   const normalizedName = locationName?.trim() || "";
   if (!normalizedName) {
     return null;
@@ -564,10 +629,10 @@ function encodeInstagramLocationStorage(locationName: string | null, locationId:
     return normalizedName;
   }
 
-  return `${INSTAGRAM_LOCATION_STORAGE_PREFIX}${normalizedId}::${normalizedName}`;
+  return `${META_LOCATION_STORAGE_PREFIX}${normalizedId}::${normalizedName}`;
 }
 
-function decodeInstagramLocationStorage(input: string | null | undefined): { locationName: string | null; locationId: string | null } {
+function decodeMetaLocationStorage(input: string | null | undefined): { locationName: string | null; locationId: string | null } {
   const raw = input?.trim() || "";
   if (!raw) {
     return {
@@ -576,14 +641,14 @@ function decodeInstagramLocationStorage(input: string | null | undefined): { loc
     };
   }
 
-  if (!raw.startsWith(INSTAGRAM_LOCATION_STORAGE_PREFIX)) {
+  if (!raw.startsWith(META_LOCATION_STORAGE_PREFIX)) {
     return {
       locationName: raw,
       locationId: null,
     };
   }
 
-  const encoded = raw.slice(INSTAGRAM_LOCATION_STORAGE_PREFIX.length);
+  const encoded = raw.slice(META_LOCATION_STORAGE_PREFIX.length);
   const separatorIndex = encoded.indexOf("::");
   if (separatorIndex <= 0) {
     return {
@@ -595,7 +660,7 @@ function decodeInstagramLocationStorage(input: string | null | undefined): { loc
   const locationId = encoded.slice(0, separatorIndex).trim();
   const locationName = encoded.slice(separatorIndex + 2).trim();
 
-  if (!/^\d+$/.test(locationId) || !locationName) {
+  if (!locationId || !locationName) {
     return {
       locationName: raw,
       locationId: null,
@@ -608,12 +673,69 @@ function decodeInstagramLocationStorage(input: string | null | undefined): { loc
   };
 }
 
+function encodeInstagramLocationStorage(locationName: string | null, locationId: string | null): string | null {
+  return encodeMetaLocationStorage(locationName, locationId);
+}
+
+function decodeInstagramLocationStorage(input: string | null | undefined): { locationName: string | null; locationId: string | null } {
+  return decodeMetaLocationStorage(input);
+}
+
 function normalizeSearchText(value: string): string {
   return value
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .trim();
+}
+
+function metaLocationTypeLabel(type: MetaLocationCatalogEntry["type"]): string {
+  return type === "state" ? "Estado" : "Local";
+}
+
+function buildMetaLocationSuggestionSubtitle(entry: MetaLocationCatalogEntry): string {
+  if (entry.type === "state" && entry.stateCode) {
+    return `Estado · ${entry.stateCode}`;
+  }
+  return metaLocationTypeLabel(entry.type);
+}
+
+function searchMetaLocationCatalog(query: string, limit: number): Array<{
+  id: string;
+  name: string;
+  subtitle: string;
+  type: MetaLocationCatalogEntry["type"];
+}> {
+  const normalizedQuery = normalizeSearchText(query);
+  if (normalizedQuery.length < 2) {
+    return [];
+  }
+
+  const scored = META_LOCATION_CATALOG.map((entry) => {
+    const haystack = normalizeSearchText(
+      [entry.name, entry.stateCode ?? "", metaLocationTypeLabel(entry.type)].join(" "),
+    );
+    if (!haystack.includes(normalizedQuery)) {
+      return null;
+    }
+
+    const startsWith = haystack.startsWith(normalizedQuery) ? 0 : 1;
+    const typeWeight = entry.type === "state" ? 0 : 1;
+
+    return {
+      entry,
+      score: `${startsWith}:${typeWeight}:${haystack.length.toString().padStart(4, "0")}:${entry.name}`,
+    };
+  }).filter((item): item is { entry: MetaLocationCatalogEntry; score: string } => Boolean(item));
+
+  scored.sort((left, right) => left.score.localeCompare(right.score));
+
+  return scored.slice(0, limit).map(({ entry }) => ({
+    id: entry.id,
+    name: entry.name,
+    subtitle: buildMetaLocationSuggestionSubtitle(entry),
+    type: entry.type,
+  }));
 }
 
 function sanitizeUploadedFilename(originalName: string): string {
@@ -772,12 +894,12 @@ const workspaceInviteQuerySchema = z.object({
   key: z.string().trim().min(1),
 });
 
-const socialPlatformSchema = z.enum(["instagram", "facebook", "threads", "whatsapp"]);
+const socialPlatformSchema = z.enum(["instagram", "facebook", "threads", "tiktok", "x", "whatsapp"]);
 
 const createConnectionSchema = z.object({
   companyId: z.string().trim().min(1, "Workspace é obrigatório."),
   platform: socialPlatformSchema,
-  displayName: z.string().min(2).max(80),
+  displayName: z.string().min(2).max(80).optional().nullable(),
   loginIdentifier: z.string().trim().max(160).optional().nullable(),
   secret: z.string().trim().max(255).optional().nullable(),
 });
@@ -827,6 +949,8 @@ const updateProfileSchema = z.object({
 });
 
 const publicationStateSchema = z.enum(["PUBLISHED", "DRAFT"]);
+const localDateStringSchema = z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/);
+const localTimeStringSchema = z.string().trim().regex(/^\d{2}:\d{2}$/);
 
 const createJobSchema = z.object({
   companyId: z.string().min(1),
@@ -850,10 +974,15 @@ const createJobSchema = z.object({
     "instagram_post",
     "facebook_post",
     "threads_post",
+    "tiktok_post",
+    "x_post",
     "whatsapp_status_midia",
   ]),
   publicationState: publicationStateSchema.optional().default("PUBLISHED"),
   dataPostagem: z.string().datetime().optional().nullable(),
+  scheduledDateLocal: localDateStringSchema.optional().nullable(),
+  scheduledTimeLocal: localTimeStringSchema.optional().nullable(),
+  timeZone: z.string().trim().min(1).max(80).optional().nullable(),
 });
 
 const updateJobSchema = z.object({
@@ -878,10 +1007,15 @@ const updateJobSchema = z.object({
     "instagram_post",
     "facebook_post",
     "threads_post",
+    "tiktok_post",
+    "x_post",
     "whatsapp_status_midia",
   ]),
   publicationState: publicationStateSchema.optional(),
   dataPostagem: z.string().datetime().optional().nullable(),
+  scheduledDateLocal: localDateStringSchema.optional().nullable(),
+  scheduledTimeLocal: localTimeStringSchema.optional().nullable(),
+  timeZone: z.string().trim().min(1).max(80).optional().nullable(),
 });
 
 const deleteUploadQuerySchema = z.object({
@@ -995,6 +1129,8 @@ function deriveLegacyJobFields(publicationType: PublicationType): {
     case "instagram_post":
     case "facebook_post":
     case "threads_post":
+    case "tiktok_post":
+    case "x_post":
       return { postStory: false, postReel: false, postWhatsapp: false, modoWhatsapp: "midia" };
     case "whatsapp_status_midia":
       return { postStory: false, postReel: false, postWhatsapp: true, modoWhatsapp: "midia" };
@@ -1016,6 +1152,8 @@ function normalizePublicationType(job: {
     job.publicationType === "instagram_post" ||
     job.publicationType === "facebook_post" ||
     job.publicationType === "threads_post" ||
+    job.publicationType === "tiktok_post" ||
+    job.publicationType === "x_post" ||
     job.publicationType === "whatsapp_status_midia" ||
     job.publicationType === "whatsapp_status_texto"
   ) {
@@ -1067,6 +1205,14 @@ function validateSingleFilePathForPublication(publicationType: PublicationType, 
         ? "Facebook aceita imagem (JPG/PNG) ou vídeo (MP4/MOV/M4V/WEBM)."
         : "Threads aceita imagem (JPG/PNG) ou vídeo (MP4/MOV/M4V/WEBM).",
     );
+  }
+
+  if (publicationType === "tiktok_post" && !/\.(mp4|mov|m4v|webm)$/.test(normalizedPath)) {
+    throw createFilePathValidationError("TikTok aceita apenas vídeo (MP4/MOV/M4V/WEBM).");
+  }
+
+  if (publicationType === "x_post" && !/\.(jpg|jpeg|png|mp4|mov|m4v|webm)$/.test(normalizedPath)) {
+    throw createFilePathValidationError("X aceita imagem (JPG/PNG) ou vídeo (MP4/MOV/M4V/WEBM).");
   }
 
   const isInstagramImageUpload =
@@ -1123,7 +1269,10 @@ function ensureFilePathForPublication(
     return filePath ?? "";
   }
 
-  const allowsMediaOptional = publicationType === "facebook_post" || publicationType === "threads_post";
+  const allowsMediaOptional =
+    publicationType === "facebook_post" ||
+    publicationType === "threads_post" ||
+    publicationType === "x_post";
 
   const sourceFiles = (Array.isArray(filePaths) && filePaths.length > 0
     ? filePaths
@@ -1165,6 +1314,18 @@ function ensureFilePathForPublication(
     throw createFilePathValidationError(`Você pode enviar até ${INSTAGRAM_MULTI_MEDIA_MAX_FILES} mídias por agendamento.`);
   }
 
+  if (publicationType === "threads_post" && uniqueFiles.length > THREADS_MULTI_MEDIA_MAX_FILES) {
+    throw createFilePathValidationError(`Você pode enviar até ${THREADS_MULTI_MEDIA_MAX_FILES} mídias por agendamento no Threads.`);
+  }
+
+  if (publicationType === "tiktok_post" && uniqueFiles.length > 1) {
+    throw createFilePathValidationError("TikTok aceita apenas um vídeo por agendamento.");
+  }
+
+  if (publicationType === "x_post" && uniqueFiles.length > 4) {
+    throw createFilePathValidationError("X aceita até 4 mídias por agendamento.");
+  }
+
   const normalizedSequential = sequential === true;
   if ((publicationType === "instagram_post" || publicationType === "instagram_story") && uniqueFiles.length > 1 && !normalizedSequential) {
     throw createFilePathValidationError(
@@ -1198,6 +1359,17 @@ function isProviderManagedMetaPublication(publicationType: PublicationType): boo
     publicationType === "instagram_reel" ||
     publicationType === "instagram_story" ||
     publicationType === "facebook_post" ||
+    publicationType === "threads_post" ||
+    publicationType === "tiktok_post" ||
+    publicationType === "x_post"
+  );
+}
+
+function isMetaLocationSupportedPublication(publicationType: PublicationType): boolean {
+  return (
+    publicationType === "instagram_post" ||
+    publicationType === "instagram_reel" ||
+    publicationType === "facebook_post" ||
     publicationType === "threads_post"
   );
 }
@@ -1206,12 +1378,16 @@ function isInstagramLocationSupportedPublication(publicationType: PublicationTyp
   return publicationType === "instagram_post" || publicationType === "instagram_reel";
 }
 
-function platformForPublication(publicationType: PublicationType): "instagram" | "facebook" | "threads" | "whatsapp" {
+function platformForPublication(publicationType: PublicationType): "instagram" | "facebook" | "threads" | "tiktok" | "x" | "whatsapp" {
   switch (publicationType) {
     case "facebook_post":
       return "facebook";
     case "threads_post":
       return "threads";
+    case "tiktok_post":
+      return "tiktok";
+    case "x_post":
+      return "x";
     case "whatsapp_status_midia":
     case "whatsapp_status_texto":
       return "whatsapp";
@@ -1235,10 +1411,14 @@ function publicationExecutionPriority(publicationType: PublicationType): number 
       return 4;
     case "threads_post":
       return 5;
-    case "whatsapp_status_texto":
+    case "tiktok_post":
       return 6;
-    case "whatsapp_status_midia":
+    case "x_post":
       return 7;
+    case "whatsapp_status_texto":
+      return 8;
+    case "whatsapp_status_midia":
+      return 9;
   }
 }
 
@@ -1254,6 +1434,10 @@ function publicationTypeDisplayLabel(publicationType: PublicationType): string {
       return "Facebook Post";
     case "threads_post":
       return "Threads Post";
+    case "tiktok_post":
+      return "TikTok";
+    case "x_post":
+      return "X";
     case "whatsapp_status_midia":
       return "WhatsApp Status (midia)";
     case "whatsapp_status_texto":
@@ -1325,7 +1509,7 @@ function normalizeWhatsappBackgroundColor(
   return DEFAULT_WHATSAPP_BACKGROUND_COLOR;
 }
 
-function ensureInstagramMetadata(
+function ensureMetaPublicationMetadata(
   publicationType: PublicationType,
   caption?: string | null,
   fileCaptions?: Array<string | null | undefined> | null,
@@ -1354,8 +1538,18 @@ function ensureInstagramMetadata(
       ? normalizedLocation || INSTAGRAM_FORCED_LOCATION_NAME || `Local #${effectiveLocationId}`
       : normalizedLocation;
 
-  if (isInstagramPublication(publicationType)) {
-    if (effectiveLocationId && !/^\d+$/.test(effectiveLocationId)) {
+  if (isMetaLocationSupportedPublication(publicationType)) {
+    if (effectiveLocationName && !effectiveLocationId) {
+      throw new z.ZodError([
+        {
+          code: "custom",
+          path: ["locationName"],
+          message: "Selecione uma localização válida da lista para preencher o ID automaticamente.",
+        },
+      ]);
+    }
+
+    if (effectiveLocationId?.includes("::")) {
       throw new z.ZodError([
         {
           code: "custom",
@@ -1368,7 +1562,10 @@ function ensureInstagramMetadata(
 
   return {
     caption: publicationType === "instagram_story" ? null : effectiveCaption,
-    locationName: encodeInstagramLocationStorage(effectiveLocationName, effectiveLocationId),
+    locationName: encodeMetaLocationStorage(
+      effectiveLocationName || (effectiveLocationId ? `Local #${effectiveLocationId}` : null),
+      effectiveLocationId,
+    ),
   };
 }
 
@@ -1401,7 +1598,9 @@ function normalizeHashtags(publicationType: PublicationType, value?: Array<strin
     publicationType === "instagram_post" ||
     publicationType === "instagram_reel" ||
     publicationType === "facebook_post" ||
-    publicationType === "threads_post";
+    publicationType === "threads_post" ||
+    publicationType === "tiktok_post" ||
+    publicationType === "x_post";
   if (!supportsHashtags) {
     return [];
   }
@@ -1420,6 +1619,24 @@ function appendHashtagsToCaption(caption: string | null, hashtags: string[]): st
 
   const normalizedCaption = caption?.trim() || "";
   const hashtagBlock = hashtags.map((tag) => `#${tag}`).join(" ");
+
+  if (!normalizedCaption) {
+    return hashtagBlock;
+  }
+
+  return `${normalizedCaption}\n\n${hashtagBlock}`;
+}
+
+function appendThreadsHashtagsOnNewLine(caption: string | null, hashtags: string[]): string | null {
+  if (hashtags.length === 0) {
+    return caption;
+  }
+
+  const normalizedCaption = caption?.trim() || "";
+  const [firstTag, ...remainingTags] = hashtags;
+  const hashtagBlock = [`##${firstTag}`]
+    .concat(remainingTags.map((tag) => `#${tag}`))
+    .join(" ");
 
   if (!normalizedCaption) {
     return hashtagBlock;
@@ -1447,15 +1664,38 @@ function resolveStoredJobCaptionForPublication(job: {
     publicationType !== "instagram_post" &&
     publicationType !== "instagram_reel" &&
     publicationType !== "facebook_post" &&
-    publicationType !== "threads_post"
+    publicationType !== "threads_post" &&
+    publicationType !== "tiktok_post" &&
+    publicationType !== "x_post"
   ) {
     return job.caption;
   }
 
-  return appendHashtagsToCaption(job.caption, parseStoredJobHashtags(job.hashtags));
+  const hashtags = parseStoredJobHashtags(job.hashtags);
+  if (publicationType === "threads_post") {
+    return appendThreadsHashtagsOnNewLine(job.caption, hashtags);
+  }
+
+  return appendHashtagsToCaption(job.caption, hashtags);
 }
 
-function resolvePostForMePlacementForMetaPublication(publicationType: PublicationType): PostForMePlacement {
+function resolvePostForMeCaptionForPublication(job: {
+  caption: string | null;
+  hashtags?: unknown;
+  publicationType?: string | null;
+  postStory?: boolean;
+  postReel?: boolean;
+  postWhatsapp?: boolean;
+}): string {
+  const resolvedCaption = resolveStoredJobCaptionForPublication(job)?.trim() || "";
+  if (resolvedCaption) {
+    return resolvedCaption;
+  }
+
+  return POST_FOR_ME_REQUIRED_CAPTION_FALLBACK;
+}
+
+function resolvePostForMePlacementForMetaPublication(publicationType: PublicationType): PostForMePlacement | undefined {
   switch (publicationType) {
     case "instagram_reel":
       return "reels";
@@ -1464,8 +1704,9 @@ function resolvePostForMePlacementForMetaPublication(publicationType: Publicatio
     case "instagram_post":
     case "facebook_post":
     case "threads_post":
-    default:
       return "timeline";
+    default:
+      return undefined;
   }
 }
 
@@ -1484,32 +1725,54 @@ function isPostForMeLoginRequiredErrorMessage(message: string): boolean {
   );
 }
 
-function supportsInstagramWhatsappRelink(publicationType: PublicationType): boolean {
+function supportsWhatsappRelink(publicationType: PublicationType): boolean {
   return (
     publicationType === "instagram_post" ||
     publicationType === "instagram_reel" ||
-    publicationType === "instagram_story"
+    publicationType === "instagram_story" ||
+    publicationType === "threads_post" ||
+    publicationType === "x_post" ||
+    publicationType === "tiktok_post"
   );
 }
 
-function supportsInstagramWhatsappRelinkForJobMedia(
+function resolveWhatsappRelinkMediaFiles(encodedFilePath: string): string[] {
+  const mediaBundle = decodeJobMediaBundleStorage(encodedFilePath);
+  return mediaBundle.files.length > 0
+    ? mediaBundle.files
+    : (encodedFilePath?.trim() ? [encodedFilePath.trim()] : []);
+}
+
+function resolveWhatsappRelinkMediaValidationMessage(
+  publicationType: PublicationType,
+  encodedFilePath: string,
+): string | null {
+  if (!supportsWhatsappRelink(publicationType)) {
+    return "Relink no WhatsApp indisponível para este tipo de publicação.";
+  }
+
+  const mediaFiles = resolveWhatsappRelinkMediaFiles(encodedFilePath);
+
+  if (publicationType === "instagram_story" && mediaFiles.length > 1) {
+    return "Relink no WhatsApp para stories funciona apenas com 1 mídia por vez.";
+  }
+
+  if ((publicationType === "threads_post" || publicationType === "x_post") && mediaFiles.length === 0) {
+    return `Relink no WhatsApp para ${publicationType === "threads_post" ? "Threads" : "X"} exige ao menos 1 mídia publicada.`;
+  }
+
+  if (publicationType === "tiktok_post" && mediaFiles.length === 0) {
+    return "Relink no WhatsApp para TikTok exige 1 vídeo publicado.";
+  }
+
+  return null;
+}
+
+function supportsWhatsappRelinkForJobMedia(
   publicationType: PublicationType,
   encodedFilePath: string,
 ): boolean {
-  if (!supportsInstagramWhatsappRelink(publicationType)) {
-    return false;
-  }
-
-  if (publicationType !== "instagram_story") {
-    return true;
-  }
-
-  const mediaBundle = decodeJobMediaBundleStorage(encodedFilePath);
-  const mediaFiles = mediaBundle.files.length > 0
-    ? mediaBundle.files
-    : (encodedFilePath?.trim() ? [encodedFilePath.trim()] : []);
-
-  return mediaFiles.length <= 1;
+  return resolveWhatsappRelinkMediaValidationMessage(publicationType, encodedFilePath) === null;
 }
 
 function normalizeWhatsappRelinkConnectionIds(value?: string[] | null): string[] {
@@ -1559,7 +1822,7 @@ async function resolveWhatsappRelinkOptions(input: {
   enabledValue?: boolean | null;
   connectionIdsValue?: string[] | null;
 }): Promise<{ enabled: boolean; connectionIds: string[] }> {
-  if (!supportsInstagramWhatsappRelink(input.publicationType)) {
+  if (!supportsWhatsappRelink(input.publicationType)) {
     return {
       enabled: false,
       connectionIds: [],
@@ -1574,12 +1837,14 @@ async function resolveWhatsappRelinkOptions(input: {
     };
   }
 
-  if (!supportsInstagramWhatsappRelinkForJobMedia(input.publicationType, input.encodedFilePath)) {
+  if (!supportsWhatsappRelinkForJobMedia(input.publicationType, input.encodedFilePath)) {
     throw new z.ZodError([
       {
         code: "custom",
         path: ["whatsappRelinkEnabled"],
-        message: "Relink no WhatsApp para stories funciona apenas com 1 mídia por vez.",
+        message:
+          resolveWhatsappRelinkMediaValidationMessage(input.publicationType, input.encodedFilePath) ||
+          "Relink no WhatsApp indisponível para esta publicação.",
       },
     ]);
   }
@@ -1695,7 +1960,7 @@ async function ensureMatchingConnection(input: {
   }
 }
 
-async function resolveAutomaticInstagramLocation(input: {
+async function resolveAutomaticMetaLocation(input: {
   publicationType: PublicationType;
   socialConnectionId: string;
   locationName?: string | null;
@@ -1704,14 +1969,14 @@ async function resolveAutomaticInstagramLocation(input: {
   const normalizedLocationName = input.locationName?.trim() || null;
   const normalizedLocationId = input.locationId?.trim() || null;
 
-  if (!isInstagramPublication(input.publicationType)) {
+  if (!isProviderManagedMetaPublication(input.publicationType)) {
     return {
       locationName: normalizedLocationName,
       locationId: normalizedLocationId,
     };
   }
 
-  if (!isInstagramLocationSupportedPublication(input.publicationType)) {
+  if (!isMetaLocationSupportedPublication(input.publicationType)) {
     return {
       locationName: null,
       locationId: null,
@@ -3573,8 +3838,84 @@ function buildPostForMeJobExternalId(jobId: string): string {
   return `socialup:job:${jobId}`;
 }
 
-function defaultAuthLaunchUrlForPlatform(platform: "instagram" | "facebook" | "threads" | "whatsapp"): string | null {
+function defaultAuthLaunchUrlForPlatform(platform: "instagram" | "facebook" | "threads" | "tiktok" | "x" | "whatsapp"): string | null {
   return platform === "whatsapp" ? "https://web.whatsapp.com/" : null;
+}
+
+function defaultConnectionDisplayNameForPlatform(platform: string): string {
+  if (platform === "instagram") {
+    return "Conta Instagram";
+  }
+  if (platform === "facebook") {
+    return "Conta Facebook";
+  }
+  if (platform === "threads") {
+    return "Conta Threads";
+  }
+  if (platform === "tiktok") {
+    return "Conta TikTok";
+  }
+  if (platform === "x") {
+    return "Conta X";
+  }
+  if (platform === "whatsapp") {
+    return "Conta WhatsApp";
+  }
+  return "Conta conectada";
+}
+
+function buildAutoWhatsappInstanceName(connectionId: string): string {
+  const suffix = createHash("sha1").update(connectionId).digest("hex").slice(0, 20);
+  return `socialup_wa_${suffix}`;
+}
+
+function humanizeWhatsappQrErrorMessage(message: string): string {
+  const normalized = message.trim();
+  if (!normalized) {
+    return "Falha ao iniciar a geração do QR do WhatsApp.";
+  }
+
+  if (normalized.includes("WHATSAPP_EVOLUTION_API_KEY_MISSING")) {
+    return "A integração do WhatsApp não está configurada no backend. Revise a chave da Evolution API.";
+  }
+
+  if (normalized.includes("WHATSAPP_EVOLUTION_API_HTTP_401:")) {
+    return "A Evolution API recusou a autenticação. Revise a chave configurada no backend e na Evolution.";
+  }
+
+  if (normalized.includes("WHATSAPP_EVOLUTION_API_HTTP_403:")) {
+    return "A Evolution API bloqueou esta operação. Revise as permissões e a configuração da instância.";
+  }
+
+  if (normalized.includes("WHATSAPP_EVOLUTION_API_HTTP_404:")) {
+    return "A instância do WhatsApp não foi encontrada na Evolution. Tente gerar o QR novamente.";
+  }
+
+  if (normalized.includes("WHATSAPP_EVOLUTION_API_HTTP_409:")) {
+    return "A instância do WhatsApp está em conflito de sessão. Tente gerar um novo QR.";
+  }
+
+  if (normalized.includes("LOGIN_REQUIRED_WHATSAPP")) {
+    return "A conta do WhatsApp precisa ser autenticada para continuar.";
+  }
+
+  if (normalized.includes("WHATSAPP_INSTANCE_STARTING")) {
+    return "A instância do WhatsApp está iniciando. Aguarde alguns segundos e tente novamente.";
+  }
+
+  if (normalized.includes("WHATSAPP_INSTANCE_LOGOUT_PENDING")) {
+    return "A sessão anterior do WhatsApp ainda não foi encerrada na Evolution. Aguarde alguns segundos e tente gerar um novo QR.";
+  }
+
+  if (normalized.includes("WHATSAPP_INSTANCE_DELETE_PENDING")) {
+    return "A Evolution ainda está removendo a sessão anterior do WhatsApp. Aguarde alguns segundos e tente novamente.";
+  }
+
+  if (normalized.includes("WHATSAPP_INSTANCE_REUSE_BLOCKED")) {
+    return "A Evolution ainda está reaproveitando a sessão anterior do WhatsApp. O novo QR só será liberado quando essa sessão for encerrada.";
+  }
+
+  return normalized;
 }
 
 function encodeSecret(secret?: string | null): string | null {
@@ -4084,7 +4425,7 @@ function resolvePostForMeAccountLoginIdentifier(
     return null;
   }
 
-  if (platform === "instagram" || platform === "threads") {
+  if (platform === "instagram" || platform === "threads" || platform === "tiktok" || platform === "x") {
     return normalizedUsername.replace(/^@+/, "");
   }
 
@@ -4352,6 +4693,21 @@ async function syncConnectionRuntimeState(connection: {
     return connection;
   }
 
+  const now = new Date();
+  const overlay = getWhatsappConnectionOverlay(connection.id) as {
+    qrStatus?: unknown;
+    workerLastSeenAt?: unknown;
+  };
+  const overlayQrStatus = typeof overlay.qrStatus === "string" ? overlay.qrStatus : null;
+  const overlayWorkerLastSeenAt =
+    overlay.workerLastSeenAt instanceof Date ? overlay.workerLastSeenAt : null;
+  const hasRecentConnectedOverlay =
+    overlayQrStatus === "CONNECTED" &&
+    overlayWorkerLastSeenAt !== null &&
+    now.getTime() - overlayWorkerLastSeenAt.getTime() < 2 * 60 * 1000;
+  const hasRecentLastAuthAt =
+    connection.lastAuthAt instanceof Date && now.getTime() - connection.lastAuthAt.getTime() < 2 * 60 * 1000;
+
   let runtimeAuthStatus: "CONNECTED" | "AUTH_IN_PROGRESS" | "AUTH_REQUIRED" | null = null;
   try {
     runtimeAuthStatus = await withTimeout(
@@ -4374,7 +4730,18 @@ async function syncConnectionRuntimeState(connection: {
     return connection;
   }
 
-  const now = new Date();
+  if (connection.authStatus === "AUTH_REQUIRED") {
+    return connection;
+  }
+
+  if (
+    connection.authStatus === "CONNECTED" &&
+    runtimeAuthStatus !== "CONNECTED" &&
+    (hasRecentConnectedOverlay || hasRecentLastAuthAt)
+  ) {
+    return connection;
+  }
+
   const updatedConnection = await prisma.socialConnection.update({
     where: { id: connection.id },
     data: {
@@ -4395,6 +4762,36 @@ async function syncConnectionRuntimeState(connection: {
   });
 
   return updatedConnection;
+}
+
+async function waitForWhatsappRuntimeConnected(input: {
+  id: string;
+  companyId: string;
+  displayName: string;
+  platform: string;
+  loginIdentifier: string | null;
+  secretCipher?: string | null;
+}, timeoutMs: number = 8_000, delayMs: number = 1_000): Promise<boolean> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const runtimeAuthStatus = await resolveWhatsappConnectionRuntimeAuthStatus({
+      id: input.id,
+      companyId: input.companyId,
+      displayName: input.displayName,
+      platform: input.platform,
+      loginIdentifier: input.loginIdentifier,
+      secretCipher: input.secretCipher ?? null,
+    }).catch(() => null);
+
+    if (runtimeAuthStatus === "CONNECTED") {
+      return true;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+
+  return false;
 }
 
 function mapAviso(aviso: {
@@ -4565,6 +4962,98 @@ async function appendJobAvisoSafely(
   }
 }
 
+function resolveWhatsappOwnerNumberFromJid(ownerJid: string | null | undefined): string | null {
+  const raw = ownerJid?.trim() || "";
+  if (!raw) {
+    return null;
+  }
+
+  const base = raw.split("@")[0]?.trim() || "";
+  if (!base) {
+    return null;
+  }
+
+  const digits = base.replace(/\D+/g, "");
+  return digits || base;
+}
+
+async function resolveWhatsappConnectionNoticeLabel(connection: {
+  id: string;
+  companyId: string;
+  displayName: string;
+  platform: string;
+  loginIdentifier: string | null;
+  secretCipher: string | null;
+}): Promise<string> {
+  try {
+    const metadata = await resolveWhatsappConnectionRuntimeMetadata({
+      id: connection.id,
+      companyId: connection.companyId,
+      displayName: connection.displayName,
+      platform: connection.platform,
+      loginIdentifier: connection.loginIdentifier,
+      secretCipher: connection.secretCipher,
+    });
+
+    const ownerNumber = resolveWhatsappOwnerNumberFromJid(metadata.ownerJid);
+    if (ownerNumber) {
+      return ownerNumber;
+    }
+
+    const profileName = metadata.profileName?.trim() || "";
+    if (profileName) {
+      return profileName;
+    }
+  } catch {
+    // Melhor esforço: cai no nome visual da conta.
+  }
+
+  return connection.displayName.trim() || "conta do WhatsApp";
+}
+
+async function appendWhatsappRelinkChildAviso(
+  parentJobId: string,
+  connection: {
+    id: string;
+    companyId: string;
+    displayName: string;
+    platform: string;
+    loginIdentifier: string | null;
+    secretCipher: string | null;
+  },
+  input: {
+    title: string;
+    kind: string;
+    messageForAccount: (accountLabel: string) => string;
+  },
+): Promise<void> {
+  const parentJob = await prisma.job.findUnique({
+    where: { id: parentJobId },
+    select: {
+      id: true,
+      createdByUserId: true,
+      title: true,
+      caption: true,
+      publicationType: true,
+      postStory: true,
+      postReel: true,
+      postWhatsapp: true,
+      modoWhatsapp: true,
+    },
+  });
+
+  if (!parentJob?.createdByUserId) {
+    return;
+  }
+
+  const accountLabel = await resolveWhatsappConnectionNoticeLabel(connection);
+  await appendJobAvisoSafely(parentJob, {
+    title: input.title,
+    kind: input.kind,
+    message: input.messageForAccount(accountLabel),
+  });
+}
+
 async function failJobDueToConnectionUnavailable(
   job: {
     id: string;
@@ -4613,6 +5102,67 @@ async function failJobDueToConnectionUnavailable(
     kind: "JOB_FAILED",
     message: input.message,
   });
+}
+
+async function failJobDueToUnhandledConsumerCrash(
+  queueMessage: JobExecutionQueueMessage,
+  job:
+    | {
+        id: string;
+        companyId: string;
+        createdByUserId: string | null;
+        title?: string | null;
+        caption: string | null;
+        publicationType?: string | null;
+        postStory?: boolean;
+        postReel?: boolean;
+        postWhatsapp?: boolean;
+        modoWhatsapp?: string | null;
+      }
+    | null,
+  error: unknown,
+): Promise<"ack" | "requeue"> {
+  console.error("RabbitMQ consumer handler failed", error);
+
+  if (!job) {
+    return "requeue";
+  }
+
+  const rawMessage = error instanceof Error ? error.message : "Erro inesperado no consumidor RabbitMQ.";
+  const update = await prisma.job.updateMany({
+    where: {
+      id: job.id,
+      status: {
+        in: ["PENDING", "WAITING_LOGIN", "RUNNING", "SENT_UNCONFIRMED"],
+      },
+    },
+    data: {
+      status: "FAILED",
+      completedAt: new Date(),
+      lastError: rawMessage,
+    },
+  });
+
+  if (update.count === 0) {
+    return "ack";
+  }
+
+  await appendLog({
+    companyId: job.companyId,
+    level: "ERROR",
+    errorCode: "RABBITMQ_CONSUMER_UNHANDLED_ERROR",
+    message:
+      `Job ${job.id} falhou por erro inesperado no consumidor RabbitMQ (${queueMessage.platform}). ` +
+      `Erro: ${rawMessage}`,
+  });
+
+  await appendJobAvisoSafely(job, {
+    title: "Falha no agendamento",
+    kind: "JOB_FAILED",
+    message: summarizeFailureMessageForAviso(normalizePublicationType(job), rawMessage),
+  });
+
+  return "ack";
 }
 
 function normalizeAutomationErrorCode(message: string): string {
@@ -4679,6 +5229,14 @@ function summarizeFailureMessageForAviso(publicationType: PublicationType, rawMe
     return "Falha ao publicar no WhatsApp Status. Tente novamente.";
   }
 
+  if (publicationType === "tiktok_post") {
+    return "Falha ao publicar no TikTok. Revise o vídeo e tente novamente.";
+  }
+
+  if (publicationType === "x_post") {
+    return "Falha ao publicar no X. Revise o texto, a mídia e tente novamente.";
+  }
+
   return "Falha ao executar o agendamento. Tente novamente.";
 }
 
@@ -4742,6 +5300,138 @@ function connectionExecutionLockKey(connectionId: string): string {
 
 function postForMeWhatsappRelinkLockKey(jobId: string): string {
   return `job:postforme:whatsapp-relink:${jobId}`;
+}
+
+const WHATSAPP_RELINK_PARENT_MARKER_PREFIX = "__wa_relink_parent__:";
+const POST_FOR_ME_INSTAGRAM_CONFIRMED_MARKER_PREFIX = "__pfm_instagram_confirmed__:";
+
+function buildWhatsappRelinkParentMarker(parentJobId: string): string {
+  return `${WHATSAPP_RELINK_PARENT_MARKER_PREFIX}${parentJobId}`;
+}
+
+function parseWhatsappRelinkParentMarker(value: string | null | undefined): string | null {
+  const normalized = value?.trim() || "";
+  if (!normalized.startsWith(WHATSAPP_RELINK_PARENT_MARKER_PREFIX)) {
+    return null;
+  }
+
+  const parentJobId = normalized.slice(WHATSAPP_RELINK_PARENT_MARKER_PREFIX.length).trim();
+  return parentJobId || null;
+}
+
+function hasPostForMeInstagramConfirmedMarker(value: string | null | undefined): boolean {
+  return (value?.trim() || "").startsWith(POST_FOR_ME_INSTAGRAM_CONFIRMED_MARKER_PREFIX);
+}
+
+function buildPostForMeInstagramConfirmedMarker(nowMs: number): string {
+  return `${POST_FOR_ME_INSTAGRAM_CONFIRMED_MARKER_PREFIX}${nowMs}`;
+}
+
+function parsePostForMeInstagramConfirmedMarkerMs(value: string | null | undefined): number | null {
+  const normalized = value?.trim() || "";
+  if (!normalized.startsWith(POST_FOR_ME_INSTAGRAM_CONFIRMED_MARKER_PREFIX)) {
+    return null;
+  }
+
+  const raw = normalized.slice(POST_FOR_ME_INSTAGRAM_CONFIRMED_MARKER_PREFIX.length).trim();
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function isOfficialMetaPermalink(url: string | null | undefined): boolean {
+  const normalized = url?.trim() || "";
+  if (!normalized) {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(normalized);
+    const hostname = parsed.hostname.toLowerCase();
+    return (
+      hostname === "instagram.com" ||
+      hostname === "www.instagram.com" ||
+      hostname === "instagr.am" ||
+      hostname === "threads.net" ||
+      hostname === "www.threads.net" ||
+      hostname === "x.com" ||
+      hostname === "www.x.com" ||
+      hostname === "twitter.com" ||
+      hostname === "www.twitter.com" ||
+      hostname === "tiktok.com" ||
+      hostname === "www.tiktok.com" ||
+      hostname === "m.tiktok.com" ||
+      hostname === "vm.tiktok.com"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function postForMePublishedAvisoTitleForPublicationType(publicationType: PublicationType): string {
+  switch (publicationType) {
+    case "threads_post":
+      return "Threads publicado";
+    case "facebook_post":
+      return "Facebook publicado";
+    case "tiktok_post":
+      return "TikTok publicado";
+    case "x_post":
+      return "X publicado";
+    case "instagram_post":
+    case "instagram_reel":
+    case "instagram_story":
+    default:
+      return "Instagram publicado";
+  }
+}
+
+async function appendMetaPublishedAvisoOnce(job: {
+  id: string;
+  createdByUserId: string | null;
+  title?: string | null;
+  caption: string | null;
+  publicationType?: string | null;
+  postStory?: boolean;
+  postReel?: boolean;
+  postWhatsapp?: boolean;
+  modoWhatsapp?: string | null;
+  lastError?: string | null;
+}): Promise<boolean> {
+  const marker = buildPostForMeInstagramConfirmedMarker(Date.now());
+
+  const update = await prisma.job.updateMany({
+    where: {
+      id: job.id,
+      status: "RUNNING",
+      OR: [
+        {
+          lastError: null,
+        },
+        {
+          NOT: {
+            lastError: {
+              startsWith: POST_FOR_ME_INSTAGRAM_CONFIRMED_MARKER_PREFIX,
+            },
+          },
+        },
+      ],
+    },
+    data: {
+      lastError: marker,
+    },
+  });
+
+  if (update.count === 0) {
+    return false;
+  }
+
+  await appendJobAvisoSafely(job, {
+    title: postForMePublishedAvisoTitleForPublicationType(normalizePublicationType(job)),
+    kind: "JOB_SENT",
+    message: "Publicacao concluida com sucesso.",
+  });
+
+  return true;
 }
 
 async function enqueueJobForExecution(input: {
@@ -4970,13 +5660,21 @@ function sharePreviewFrameConfigForPublicationType(publicationType: string | nul
         accentStart: "#fb7185",
         accentEnd: "#f59e0b",
       };
-    case "tiktok_video":
+    case "tiktok_post":
       return {
-        label: "TikTok Video",
+        label: "TikTok",
         frameWidth: 292,
         frameHeight: 520,
         accentStart: "#0f172a",
         accentEnd: "#111827",
+      };
+    case "x_post":
+      return {
+        label: "X",
+        frameWidth: 360,
+        frameHeight: 450,
+        accentStart: "#1f2937",
+        accentEnd: "#0f172a",
       };
     case "instagram_post":
     default:
@@ -5149,6 +5847,76 @@ function renderInstagramShareLandingPage(input: {
 </html>`;
 }
 
+function renderInstagramSharePendingPage(input: {
+  shareUrl: string;
+  previewTitle: string;
+  previewDescription: string;
+  previewImageUrl: string | null;
+}): string {
+  const shareUrl = escapeHtml(input.shareUrl);
+  const previewTitle = escapeHtml(input.previewTitle);
+  const previewDescription = escapeHtml(input.previewDescription);
+  const previewImageUrl = input.previewImageUrl ? escapeHtml(input.previewImageUrl) : null;
+
+  return `<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${previewTitle}</title>
+    <meta name="description" content="${previewDescription}" />
+    <meta property="og:type" content="website" />
+    <meta property="og:locale" content="pt_BR" />
+    <meta property="og:title" content="${previewTitle}" />
+    <meta property="og:description" content="${previewDescription}" />
+    <meta property="og:url" content="${shareUrl}" />
+    <meta property="og:site_name" content="Compartilhamento" />
+    ${previewImageUrl ? `<meta property="og:image" content="${previewImageUrl}" />
+    <meta property="og:image:secure_url" content="${previewImageUrl}" />
+    <meta property="og:image:alt" content="${previewTitle}" />` : ""}
+    <meta name="twitter:card" content="${previewImageUrl ? "summary_large_image" : "summary"}" />
+    <meta name="twitter:title" content="${previewTitle}" />
+    <meta name="twitter:description" content="${previewDescription}" />
+    ${previewImageUrl ? `<meta name="twitter:image" content="${previewImageUrl}" />` : ""}
+    <meta http-equiv="refresh" content="4; url=${shareUrl}" />
+    <style>
+      :root { color-scheme: light; }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        background: linear-gradient(180deg, #fafafa 0%, #f3f4f6 100%);
+        color: #111827;
+        font: 400 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      main {
+        width: min(100%, 440px);
+        background: rgba(255, 255, 255, 0.98);
+        border: 1px solid #e5e7eb;
+        border-radius: 20px;
+        padding: 28px 24px;
+        text-align: center;
+        box-shadow: 0 24px 48px rgba(15, 23, 42, 0.08);
+      }
+      h1 { margin: 0 0 8px; font-size: 1.05rem; font-weight: 600; }
+      p { margin: 0; color: #4b5563; }
+      a { color: #111827; font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>${previewTitle}</h1>
+      <p>Esta publicação do Instagram ainda está sendo finalizada.</p>
+      <p style="margin-top: 10px;">Vamos tentar abrir novamente em alguns segundos.</p>
+      <p style="margin-top: 14px;"><a href="${shareUrl}">Atualizar agora</a></p>
+    </main>
+  </body>
+</html>`;
+}
+
 function appendStorySequenceCacheBuster(mediaUrl: string, jobId: string, index: number, fileName: string): string {
   const targetUrl = new URL(mediaUrl);
   targetUrl.searchParams.set("_su_story_job", jobId);
@@ -5266,7 +6034,7 @@ function buildWhatsappRelinkMediaCaption(input: {
     return "";
   }
 
-  if (input.publicationType === "instagram_story") {
+  if (input.publicationType === "instagram_story" || input.publicationType === "tiktok_post") {
     return normalizedPermalink;
   }
 
@@ -5312,8 +6080,8 @@ async function dispatchWhatsappRelinkJobsForInstagramPublication(input: {
 }): Promise<boolean> {
   const publicationType = normalizePublicationType(input.job);
   if (
-    !supportsInstagramWhatsappRelink(publicationType) ||
-    !supportsInstagramWhatsappRelinkForJobMedia(publicationType, input.job.filePath)
+    !supportsWhatsappRelink(publicationType) ||
+    !supportsWhatsappRelinkForJobMedia(publicationType, input.job.filePath)
   ) {
     return false;
   }
@@ -5387,8 +6155,8 @@ async function dispatchWhatsappRelinkJobsForInstagramPermalink(input: {
 }): Promise<boolean> {
   const publicationType = normalizePublicationType(input.job);
   if (
-    !supportsInstagramWhatsappRelink(publicationType) ||
-    !supportsInstagramWhatsappRelinkForJobMedia(publicationType, input.job.filePath)
+    !supportsWhatsappRelink(publicationType) ||
+    !supportsWhatsappRelinkForJobMedia(publicationType, input.job.filePath)
   ) {
     return false;
   }
@@ -5469,25 +6237,34 @@ async function dispatchWhatsappRelinkJobsForInstagramPermalink(input: {
     caption: input.job.caption,
     permalink,
   });
+  const relinkParentMarker = buildWhatsappRelinkParentMarker(input.job.id);
+  const relinkOriginLabel =
+    publicationType === "threads_post"
+      ? "Relink Threads"
+      : publicationType === "x_post"
+        ? "Relink X"
+        : publicationType === "tiktok_post"
+          ? "Relink TikTok"
+          : "Relink Instagram";
   const now = new Date();
   for (const whatsappConnection of targetConnectionsInOrder) {
     await prisma.job.create({
       data: {
-      companyId: whatsappConnection.companyId,
-      createdByUserId: input.job.createdByUserId,
-      socialConnectionId: whatsappConnection.id,
+        companyId: whatsappConnection.companyId,
+        createdByUserId: input.job.createdByUserId,
+        socialConnectionId: whatsappConnection.id,
         filePath: relinkSourceFilePath,
-        title: input.job.title ? `${input.job.title} (Relink)` : "Relink Instagram",
+        title: input.job.title ? `${input.job.title} (Relink)` : relinkOriginLabel,
         caption: relinkText,
         firstComment: null,
-        locationName: null,
+        locationName: relinkParentMarker,
         whatsappBackgroundColor: null,
         publicationType: "whatsapp_status_midia",
         publicationState: "PUBLISHED",
         postStory: false,
         postReel: false,
         postWhatsapp: true,
-        modoWhatsapp: "texto",
+        modoWhatsapp: "midia",
         dataPostagem: now,
       },
     });
@@ -5497,7 +6274,7 @@ async function dispatchWhatsappRelinkJobsForInstagramPermalink(input: {
     where: { id: input.job.id },
     data: {
       whatsappRelinkDispatchedAt: now,
-      instagramPermalink: permalink,
+      instagramPermalink: isOfficialMetaPermalink(permalink) ? permalink : undefined,
     },
   });
 
@@ -5512,11 +6289,147 @@ async function dispatchWhatsappRelinkJobsForInstagramPermalink(input: {
   return true;
 }
 
+async function finalizeWhatsappRelinkParentJob(
+  parentJob: {
+    id: string;
+    createdByUserId: string | null;
+    title?: string | null;
+    caption: string | null;
+    publicationType?: string | null;
+    postStory?: boolean;
+    postReel?: boolean;
+    postWhatsapp?: boolean;
+    modoWhatsapp?: string | null;
+  },
+  input: {
+    status: "COMPLETED" | "FAILED";
+    title: string;
+    kind: string;
+    message: string;
+    lastError: string | null;
+    emitAviso?: boolean;
+  },
+): Promise<boolean> {
+  const update = await prisma.job.updateMany({
+    where: {
+      id: parentJob.id,
+      completedAt: null,
+    },
+    data: {
+      status: input.status,
+      completedAt: new Date(),
+      lastError: input.lastError,
+    },
+  });
+
+  if (update.count === 0) {
+    return false;
+  }
+
+  if (input.emitAviso !== false) {
+    await appendJobAvisoSafely(parentJob, {
+      title: input.title,
+      kind: input.kind,
+      message: input.message,
+    });
+  }
+  return true;
+}
+
+async function syncWhatsappRelinkParentJobOutcome(parentJobId: string): Promise<boolean> {
+  const parentJob = await prisma.job.findUnique({
+    where: { id: parentJobId },
+    select: {
+      id: true,
+      createdByUserId: true,
+      title: true,
+      caption: true,
+      publicationType: true,
+      postStory: true,
+      postReel: true,
+      postWhatsapp: true,
+      modoWhatsapp: true,
+      whatsappRelinkEnabled: true,
+      whatsappRelinkConnectionIds: true,
+      whatsappRelinkDispatchedAt: true,
+      completedAt: true,
+    },
+  });
+
+  if (!parentJob || !parentJob.whatsappRelinkEnabled || !parentJob.whatsappRelinkDispatchedAt) {
+    return false;
+  }
+
+  const configuredConnectionIds = parseStoredWhatsappRelinkConnectionIds(parentJob.whatsappRelinkConnectionIds);
+  if (configuredConnectionIds.length === 0) {
+    return false;
+  }
+
+  const childJobs = await prisma.job.findMany({
+    where: {
+      locationName: buildWhatsappRelinkParentMarker(parentJobId),
+      publicationState: "PUBLISHED",
+    },
+    select: {
+      id: true,
+      status: true,
+      lastError: true,
+    },
+  });
+
+  if (childJobs.length < configuredConnectionIds.length) {
+    return false;
+  }
+
+  const allResolved = childJobs.every((job) =>
+    job.status === "COMPLETED" || job.status === "FAILED" || job.status === "WAITING_LOGIN" || job.status === "CANCELED",
+  );
+  if (!allResolved) {
+    return false;
+  }
+
+  const hasCompletedChild = childJobs.some((job) => job.status === "COMPLETED");
+  const failedChildJob = childJobs.find((job) =>
+    job.status === "FAILED" || job.status === "WAITING_LOGIN" || job.status === "CANCELED",
+  );
+  if (failedChildJob) {
+    return finalizeWhatsappRelinkParentJob(parentJob, {
+      status: "COMPLETED",
+      title: "Relink concluído",
+      kind: "JOB_SENT",
+      message: hasCompletedChild
+        ? `O relink foi concluído para parte das contas de WhatsApp.`
+        : `O relink foi encerrado com pendências nas contas de WhatsApp.`,
+      lastError: failedChildJob.lastError?.trim() || "WHATSAPP_RELINK_INCOMPLETE",
+      emitAviso: false,
+    });
+  }
+
+  const allCompleted = childJobs.every((job) => job.status === "COMPLETED");
+  if (!allCompleted) {
+    return false;
+  }
+
+  return finalizeWhatsappRelinkParentJob(parentJob, {
+    status: "COMPLETED",
+    title: "Relink postado no WhatsApp",
+    kind: "JOB_SENT",
+    message: `A publicação foi repostada em ${configuredConnectionIds.length} conta(s) de WhatsApp.`,
+    lastError: null,
+    emitAviso: false,
+  });
+}
+
 function extractPostForMePlatformUrlFromResults(
   results: PostForMeSocialPostResultRecord[],
   platform: PostForMePlatform,
 ): string | null {
   for (const result of results) {
+    const platformDataUrl = result.platformDataUrl?.trim() || "";
+    if (platformDataUrl) {
+      return platformDataUrl;
+    }
+
     for (const platformPost of result.platformPosts) {
       if (platformPost.platform !== platform) {
         continue;
@@ -5532,14 +6445,208 @@ function extractPostForMePlatformUrlFromResults(
   return null;
 }
 
+function collectPostForMeUrlCandidates(record: Record<string, unknown> | null | undefined): string[] {
+  if (!record) {
+    return [];
+  }
+
+  const platformDataRecord =
+    record.platform_data && typeof record.platform_data === "object" && !Array.isArray(record.platform_data)
+      ? (record.platform_data as Record<string, unknown>)
+      : null;
+
+  const candidates = [
+    record.platform_url,
+    record.platformUrl,
+    record.url,
+    record.permalink,
+    record.short_url,
+    record.shortUrl,
+    record.share_url,
+    record.shareUrl,
+    record.link,
+    record.post_url,
+    record.postUrl,
+    platformDataRecord?.url,
+    platformDataRecord?.platform_url,
+    platformDataRecord?.platformUrl,
+    platformDataRecord?.permalink,
+    platformDataRecord?.share_url,
+    platformDataRecord?.shareUrl,
+    platformDataRecord?.link,
+    asRecord(record.details)?.url,
+    asRecord(record.details)?.platform_url,
+    asRecord(record.details)?.platformUrl,
+    asRecord(record.details)?.permalink,
+    asRecord(record.details)?.share_url,
+    asRecord(record.details)?.shareUrl,
+    asRecord(record.details)?.link,
+  ];
+
+  const normalized = candidates
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter((value) => /^https?:\/\//i.test(value));
+
+  return Array.from(new Set(normalized));
+}
+
+function collectPostForMeCaptionCandidates(record: Record<string, unknown> | null | undefined): string[] {
+  if (!record) {
+    return [];
+  }
+
+  const platformDataRecord =
+    record.platform_data && typeof record.platform_data === "object" && !Array.isArray(record.platform_data)
+      ? (record.platform_data as Record<string, unknown>)
+      : null;
+  const detailsRecord =
+    record.details && typeof record.details === "object" && !Array.isArray(record.details)
+      ? (record.details as Record<string, unknown>)
+      : null;
+
+  const candidates = [
+    record.caption,
+    record.text,
+    record.body,
+    record.content,
+    platformDataRecord?.caption,
+    platformDataRecord?.text,
+    platformDataRecord?.body,
+    platformDataRecord?.content,
+    detailsRecord?.caption,
+    detailsRecord?.text,
+    detailsRecord?.body,
+    detailsRecord?.content,
+  ];
+
+  const normalized = candidates
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter((value) => value.length > 0);
+
+  return Array.from(new Set(normalized));
+}
+
+function extractPostForMeSocialAccountIdFromProviderPost(record: Record<string, unknown> | null | undefined): string | null {
+  if (!record) {
+    return null;
+  }
+
+  const socialAccounts = Array.isArray(record.social_accounts) ? record.social_accounts : [];
+  for (const entry of socialAccounts) {
+    const entryRecord = asRecord(entry);
+    const id = typeof entryRecord?.id === "string" ? entryRecord.id.trim() : "";
+    if (id) {
+      return id;
+    }
+  }
+
+  return null;
+}
+
+function extractPostForMePlatformUrlFromAccountFeed(
+  records: PostForMeSocialAccountFeedRecord[],
+  platform: PostForMePlatform,
+): string | null {
+  for (const record of records) {
+    if (record.platform !== platform) {
+      continue;
+    }
+
+    const platformUrl = record.platformUrl?.trim() || "";
+    if (platformUrl) {
+      return platformUrl;
+    }
+  }
+
+  return null;
+}
+
+function isPostForMeProcessedApplicationLimitFalseNegative(input: {
+  postStatus: string | null;
+  providerError: string | null;
+  hasFailedResult: boolean;
+  hasSuccessfulResult: boolean;
+}): boolean {
+  if (!isPostForMeSocialPostProcessed(input.postStatus)) {
+    return false;
+  }
+
+  if (input.hasSuccessfulResult || !input.hasFailedResult) {
+    return false;
+  }
+
+  const normalizedError = input.providerError?.trim().toLowerCase() || "";
+  if (!normalizedError) {
+    return false;
+  }
+
+  return normalizedError.includes("application request limit reached");
+}
+
+function isPostForMeProcessedTikTokFalseNegative(input: {
+  platform: PostForMePlatform;
+  postStatus: string | null;
+  providerError: string | null;
+  hasFailedResult: boolean;
+  hasSuccessfulResult: boolean;
+  providerPlatformPostId: string | null;
+  platformUrl: string | null;
+}): boolean {
+  if (input.platform !== "tiktok" || input.hasSuccessfulResult || !input.hasFailedResult) {
+    return false;
+  }
+
+  const normalizedError = input.providerError?.trim().toLowerCase() || "";
+  if (!normalizedError.startsWith("failed to post to tiktok")) {
+    return false;
+  }
+
+  return (
+    Boolean(input.providerPlatformPostId?.trim()) ||
+    Boolean(input.platformUrl?.trim()) ||
+    isPostForMeSocialPostProcessed(input.postStatus)
+  );
+}
+
+function shouldDeferPostForMeAmbiguousFailure(input: {
+  platform: PostForMePlatform;
+  providerError: string | null;
+  startedAt: Date | null;
+  createdAt: Date | null;
+}): boolean {
+  if (input.platform !== "tiktok") {
+    return false;
+  }
+
+  const normalizedError = input.providerError?.trim().toLowerCase() || "";
+  if (!normalizedError.startsWith("failed to post to tiktok")) {
+    return false;
+  }
+
+  const referenceTimeMs = input.startedAt?.getTime() ?? input.createdAt?.getTime() ?? null;
+  if (!referenceTimeMs) {
+    return false;
+  }
+
+  return Date.now() - referenceTimeMs < POST_FOR_ME_AMBIGUOUS_FAILURE_MAX_WAIT_MS;
+}
+
 async function resolvePostForMeManagedMetaJobState(input: {
   jobId: string;
   platform: PostForMePlatform;
 }): Promise<{
   postStatus: string | null;
   providerPostId: string | null;
+  providerPlatformPostId: string | null;
   platformUrl: string | null;
-  hasResult: boolean;
+  platformUrlSource: "social-post" | "social-post-result" | "social-account-feed" | null;
+  hasAnyResult: boolean;
+  hasSuccessfulResult: boolean;
+  hasFailedResult: boolean;
+  providerError: string | null;
+  debugUrlCandidates: string[];
+  debugCaptionCandidates: string[];
+  resultsCount: number;
 }> {
   const providerExternalId = buildPostForMeJobExternalId(input.jobId);
   const providerPosts = await listPostForMeSocialPosts({
@@ -5549,40 +6656,175 @@ async function resolvePostForMeManagedMetaJobState(input: {
   });
 
   for (const providerPost of providerPosts) {
+    const providerPostPlatformData =
+      providerPost.raw.platform_data &&
+      typeof providerPost.raw.platform_data === "object" &&
+      !Array.isArray(providerPost.raw.platform_data)
+        ? (providerPost.raw.platform_data as Record<string, unknown>)
+        : null;
     const directPlatformUrl =
       (providerPost.raw.platform_url && typeof providerPost.raw.platform_url === "string"
         ? providerPost.raw.platform_url
         : null) ||
       (providerPost.raw.url && typeof providerPost.raw.url === "string" ? providerPost.raw.url : null) ||
-      (providerPost.raw.permalink && typeof providerPost.raw.permalink === "string" ? providerPost.raw.permalink : null);
+      (providerPost.raw.permalink && typeof providerPost.raw.permalink === "string" ? providerPost.raw.permalink : null) ||
+      (providerPostPlatformData?.url && typeof providerPostPlatformData.url === "string"
+        ? providerPostPlatformData.url
+        : null) ||
+      (providerPostPlatformData?.platform_url && typeof providerPostPlatformData.platform_url === "string"
+        ? providerPostPlatformData.platform_url
+        : null) ||
+      (providerPostPlatformData?.permalink && typeof providerPostPlatformData.permalink === "string"
+        ? providerPostPlatformData.permalink
+        : null);
     const results = await listPostForMeSocialPostResults({
       postId: providerPost.id,
       platform: input.platform,
       limit: 20,
     });
+    const providerSocialAccountId =
+      results.map((result) => result.socialAccountId?.trim() || "").find(Boolean) ||
+      extractPostForMeSocialAccountIdFromProviderPost(providerPost.raw);
+    let accountFeedRecords: PostForMeSocialAccountFeedRecord[] = [];
+    if (providerSocialAccountId) {
+      try {
+        accountFeedRecords = await listPostForMeSocialAccountFeed({
+          socialAccountId: providerSocialAccountId,
+          socialPostId: providerPost.id,
+          limit: 10,
+        });
+      } catch {
+        accountFeedRecords = [];
+      }
+    }
+    const feedPlatformUrl = extractPostForMePlatformUrlFromAccountFeed(accountFeedRecords, input.platform);
+    const feedPlatformPostId =
+      accountFeedRecords.map((record) => record.id?.trim() || "").find(Boolean) || null;
+    const providerPlatformPostId =
+      results.map((result) => result.platformDataId?.trim() || "").find(Boolean) ||
+      results
+        .flatMap((result) => result.platformPosts.map((platformPost) => platformPost.id?.trim() || ""))
+        .find(Boolean) ||
+      feedPlatformPostId ||
+      null;
+    const resultPlatformUrl = extractPostForMePlatformUrlFromResults(results, input.platform);
+    const normalizedDirectPlatformUrl = directPlatformUrl?.trim() || "";
+    const normalizedResultPlatformUrl = resultPlatformUrl?.trim() || "";
+    const normalizedFeedPlatformUrl = feedPlatformUrl?.trim() || "";
+    const resolvedPlatformUrl =
+      normalizedDirectPlatformUrl || normalizedResultPlatformUrl || normalizedFeedPlatformUrl || null;
+    const platformUrlSource = normalizedDirectPlatformUrl
+      ? "social-post"
+      : normalizedResultPlatformUrl
+        ? "social-post-result"
+        : normalizedFeedPlatformUrl
+          ? "social-account-feed"
+          : null;
+    const hasSuccessfulResult = results.some((result) => result.success === true);
+    const hasFailedResult = results.some((result) => result.success === false || Boolean(result.error?.trim()));
+    const providerError = results.map((result) => result.error?.trim() || "").find(Boolean) || null;
+    const debugUrlCandidates = Array.from(
+      new Set([
+        ...collectPostForMeUrlCandidates(providerPost.raw),
+        ...results.flatMap((result) => collectPostForMeUrlCandidates(result.raw)),
+        ...results.flatMap((result) =>
+          result.platformPosts
+            .filter((platformPost) => platformPost.platform === input.platform)
+            .flatMap((platformPost) => collectPostForMeUrlCandidates(platformPost.raw)),
+        ),
+        ...accountFeedRecords.flatMap((record) => collectPostForMeUrlCandidates(record.raw)),
+      ]),
+    );
+    const debugCaptionCandidates = Array.from(
+      new Set([
+        ...collectPostForMeCaptionCandidates(providerPost.raw),
+        ...results.flatMap((result) => collectPostForMeCaptionCandidates(result.raw)),
+        ...results.flatMap((result) =>
+          result.platformPosts
+            .filter((platformPost) => platformPost.platform === input.platform)
+            .flatMap((platformPost) => collectPostForMeCaptionCandidates(platformPost.raw)),
+        ),
+        ...accountFeedRecords.map((record) => record.caption?.trim() || "").filter(Boolean),
+        ...accountFeedRecords.flatMap((record) => collectPostForMeCaptionCandidates(record.raw)),
+      ]),
+    );
 
     return {
       postStatus: providerPost.status,
       providerPostId: providerPost.id,
-      platformUrl: directPlatformUrl?.trim() || extractPostForMePlatformUrlFromResults(results, input.platform),
-      hasResult: results.length > 0,
+      providerPlatformPostId,
+      platformUrl: resolvedPlatformUrl,
+      platformUrlSource,
+      hasAnyResult: results.length > 0,
+      hasSuccessfulResult,
+      hasFailedResult,
+      providerError,
+      debugUrlCandidates,
+      debugCaptionCandidates,
+      resultsCount: results.length,
     };
   }
 
   return {
     postStatus: null,
     providerPostId: null,
+    providerPlatformPostId: null,
     platformUrl: null,
-    hasResult: false,
+    platformUrlSource: null,
+    hasAnyResult: false,
+    hasSuccessfulResult: false,
+    hasFailedResult: false,
+    providerError: null,
+    debugUrlCandidates: [],
+    debugCaptionCandidates: [],
+    resultsCount: 0,
   };
 }
 
-async function resolvePostForMeInstagramPermalinkForJob(jobId: string): Promise<string | null> {
+async function resolvePostForMeMetaPermalinkForJob(
+  jobId: string,
+  platform: PostForMePlatform,
+): Promise<string | null> {
   const state = await resolvePostForMeManagedMetaJobState({
     jobId,
-    platform: "instagram",
+    platform,
   });
   return state.platformUrl;
+}
+
+async function resolveMetaRelinkTargetUrl(job: {
+  id: string;
+  publicationType?: string | null;
+  instagramPermalink: string | null;
+}): Promise<string | null> {
+  const directPermalink = job.instagramPermalink?.trim() || "";
+  if (directPermalink) {
+    return directPermalink;
+  }
+
+  const publicationType = normalizePublicationType(job);
+  const providerPlatform: PostForMePlatform | null =
+    publicationType === "threads_post"
+      ? "threads"
+      : publicationType === "x_post"
+        ? "x"
+        : publicationType === "tiktok_post"
+          ? "tiktok"
+          : publicationType === "instagram_post" ||
+              publicationType === "instagram_reel" ||
+              publicationType === "instagram_story"
+            ? "instagram"
+            : null;
+  if (!providerPlatform) {
+    return null;
+  }
+
+  const providerPermalink = (await resolvePostForMeMetaPermalinkForJob(job.id, providerPlatform))?.trim() || "";
+  if (providerPermalink) {
+    return providerPermalink;
+  }
+
+  return null;
 }
 
 function isPostForMeSocialPostProcessed(status: string | null | undefined): boolean {
@@ -5590,7 +6832,219 @@ function isPostForMeSocialPostProcessed(status: string | null | undefined): bool
   return normalized === "processed" || normalized === "published" || normalized === "completed";
 }
 
-async function tryDispatchPostForMeWhatsappRelinkForInstagramJob(job: {
+function postForMePlatformNoticeLabel(platform: "instagram" | "facebook" | "threads" | "tiktok" | "x"): string {
+  switch (platform) {
+    case "instagram":
+      return "Instagram";
+    case "facebook":
+      return "Facebook";
+    case "threads":
+      return "Threads";
+    case "tiktok":
+      return "TikTok";
+    case "x":
+      return "X";
+  }
+}
+
+function socialPlatformNoticeLabel(platform: "instagram" | "facebook" | "threads" | "tiktok" | "x" | "whatsapp"): string {
+  return platform === "whatsapp" ? "WhatsApp" : postForMePlatformNoticeLabel(platform);
+}
+
+function supportsPostForMeCaptionDebug(platform: "instagram" | "facebook" | "threads" | "tiktok" | "x"): boolean {
+  return platform === "instagram" || platform === "threads";
+}
+
+function supportsPostForMeUrlDebug(platform: "instagram" | "facebook" | "threads" | "tiktok" | "x"): boolean {
+  return platform === "tiktok";
+}
+
+async function tryRecoverPostForMeManagedMetaJobAfterConnectionLoss(job: {
+  id: string;
+  companyId: string;
+  createdByUserId: string | null;
+  criadoEm: Date | null;
+  startedAt: Date | null;
+  title?: string | null;
+  caption: string | null;
+  lastError?: string | null;
+  publicationType?: string | null;
+  postStory?: boolean;
+  postReel?: boolean;
+  postWhatsapp?: boolean;
+  modoWhatsapp?: string | null;
+  whatsappRelinkEnabled?: boolean;
+  whatsappRelinkConnectionIds?: unknown;
+}, platform: "instagram" | "facebook" | "threads" | "tiktok" | "x"): Promise<boolean> {
+  let providerState: Awaited<ReturnType<typeof resolvePostForMeManagedMetaJobState>>;
+  try {
+    providerState = await resolvePostForMeManagedMetaJobState({
+      jobId: job.id,
+      platform,
+    });
+  } catch (error) {
+    await appendLog({
+      companyId: job.companyId,
+      level: "WARN",
+      errorCode: "POST_FOR_ME_META_RECOVERY_FAILED",
+      message:
+        `Job ${job.id} não conseguiu consultar o Post for Me após perda de conexão: ` +
+        `${error instanceof Error ? error.message : "erro desconhecido"}`,
+    });
+    return false;
+  }
+
+  const providerAccepted = Boolean(providerState.providerPostId);
+  const providerFalseNegativeProcessed =
+    platform === "instagram" &&
+    isPostForMeProcessedApplicationLimitFalseNegative({
+      postStatus: providerState.postStatus,
+      providerError: providerState.providerError,
+      hasFailedResult: providerState.hasFailedResult,
+      hasSuccessfulResult: providerState.hasSuccessfulResult,
+    });
+  const providerTikTokFalseNegativeProcessed = isPostForMeProcessedTikTokFalseNegative({
+    platform,
+    postStatus: providerState.postStatus,
+    providerError: providerState.providerError,
+    hasFailedResult: providerState.hasFailedResult,
+    hasSuccessfulResult: providerState.hasSuccessfulResult,
+    providerPlatformPostId: providerState.providerPlatformPostId,
+    platformUrl: providerState.platformUrl,
+  });
+  const providerProcessed =
+    providerFalseNegativeProcessed ||
+    providerTikTokFalseNegativeProcessed ||
+    providerState.hasSuccessfulResult ||
+    (isPostForMeSocialPostProcessed(providerState.postStatus) && !providerState.hasAnyResult);
+  const providerFailed =
+    providerState.hasFailedResult &&
+    !providerFalseNegativeProcessed &&
+    !providerTikTokFalseNegativeProcessed;
+
+  if (!providerAccepted && !providerProcessed && !providerFailed) {
+    return false;
+  }
+
+  if (providerFailed) {
+    if (shouldDeferPostForMeAmbiguousFailure({
+      platform,
+      providerError: providerState.providerError,
+      startedAt: job.startedAt,
+      createdAt: job.criadoEm,
+    })) {
+      await prisma.job.updateMany({
+        where: {
+          id: job.id,
+          status: {
+            in: ["PENDING", "WAITING_LOGIN", "RUNNING", "SENT_UNCONFIRMED"],
+          },
+        },
+        data: {
+          status: "RUNNING",
+          completedAt: null,
+          lastError: `Aguardando confirmação final do ${postForMePlatformNoticeLabel(platform)}.`,
+        },
+      });
+      return true;
+    }
+
+    const failureMessage = providerState.providerError || "O Post for Me retornou erro ao concluir a publicação.";
+    const update = await prisma.job.updateMany({
+      where: {
+        id: job.id,
+        status: {
+          in: ["PENDING", "WAITING_LOGIN", "RUNNING", "SENT_UNCONFIRMED"],
+        },
+      },
+      data: {
+        status: "FAILED",
+        completedAt: new Date(),
+        lastError: failureMessage,
+      },
+    });
+
+    if (update.count > 0) {
+      await appendLog({
+        companyId: job.companyId,
+        level: "ERROR",
+        errorCode: "POST_FOR_ME_META_RECOVERED_FAILED",
+        message:
+          `Job ${job.id} retornou falha real no Post for Me. ` +
+          `platform=${platform} providerPostId=${providerState.providerPostId ?? "indisponivel"} ` +
+          `platformUrlSource=${providerState.platformUrlSource ?? "indisponivel"} ` +
+          `error=${failureMessage}.`,
+      });
+
+      await appendJobAvisoSafely(job, {
+        title: "Falha no agendamento",
+        kind: "JOB_FAILED",
+        message: failureMessage,
+      });
+    }
+
+    return true;
+  }
+
+  const relinkTargetCount =
+    (platform === "instagram" || platform === "threads" || platform === "tiktok" || platform === "x") &&
+      job.whatsappRelinkEnabled
+      ? parseStoredWhatsappRelinkConnectionIds(job.whatsappRelinkConnectionIds).length
+      : 0;
+  const shouldHoldForWhatsappRelink =
+    (platform === "instagram" || platform === "threads" || platform === "tiktok" || platform === "x") &&
+    relinkTargetCount > 0;
+  const recoveredStatus = providerProcessed && !shouldHoldForWhatsappRelink ? "COMPLETED" : "RUNNING";
+  const update = await prisma.job.updateMany({
+    where: {
+      id: job.id,
+      status: {
+        in: ["PENDING", "WAITING_LOGIN", "RUNNING"],
+      },
+    },
+    data: {
+      status: recoveredStatus,
+      completedAt: providerProcessed && !shouldHoldForWhatsappRelink ? new Date() : null,
+      lastError: null,
+      instagramPermalink:
+        (platform === "instagram" || platform === "threads" || platform === "tiktok" || platform === "x") &&
+          providerState.platformUrl?.trim()
+          ? providerState.platformUrl.trim()
+          : undefined,
+    },
+  });
+
+  if (update.count === 0) {
+    return true;
+  }
+
+  await appendLog({
+    companyId: job.companyId,
+    level: providerProcessed ? "INFO" : "WARN",
+    errorCode: providerProcessed ? "POST_FOR_ME_META_RECOVERED_COMPLETED" : "POST_FOR_ME_META_RECOVERED_PENDING",
+    message:
+      `Job ${job.id} foi recuperado pelo Post for Me após perda de conexão. ` +
+      `platform=${platform} providerPostId=${providerState.providerPostId ?? "indisponivel"} ` +
+      `platformUrlSource=${providerState.platformUrlSource ?? "indisponivel"} ` +
+      `status=${providerState.postStatus ?? "desconhecido"}.`,
+  });
+
+  if (providerProcessed) {
+    if (shouldHoldForWhatsappRelink) {
+      await appendMetaPublishedAvisoOnce(job);
+    } else {
+      await appendJobAvisoSafely(job, {
+        title: `${postForMePlatformNoticeLabel(platform)} publicado`,
+        kind: "JOB_SENT",
+        message: "Publicacao concluida com sucesso.",
+      });
+    }
+  }
+
+  return true;
+}
+
+async function tryDispatchPostForMeWhatsappRelinkForMetaJob(job: {
   id: string;
   companyId: string;
   createdByUserId: string | null;
@@ -5608,7 +7062,7 @@ async function tryDispatchPostForMeWhatsappRelinkForInstagramJob(job: {
     return false;
   }
 
-  const permalink = (job.instagramPermalink?.trim() || "") || (await resolvePostForMeInstagramPermalinkForJob(job.id));
+  const permalink = await resolveMetaRelinkTargetUrl(job);
   if (!permalink) {
     return false;
   }
@@ -5619,7 +7073,7 @@ async function tryDispatchPostForMeWhatsappRelinkForInstagramJob(job: {
   });
 }
 
-async function waitForPostForMeWhatsappRelinkForInstagramJob(job: {
+async function waitForPostForMeWhatsappRelinkForMetaJob(job: {
   id: string;
   companyId: string;
   createdByUserId: string | null;
@@ -5639,7 +7093,7 @@ async function waitForPostForMeWhatsappRelinkForInstagramJob(job: {
 
   const deadlineAt = Date.now() + POST_FOR_ME_WHATSAPP_RELINK_MAX_WAIT_MS;
   while (Date.now() <= deadlineAt) {
-    if (await tryDispatchPostForMeWhatsappRelinkForInstagramJob(job)) {
+    if (await tryDispatchPostForMeWhatsappRelinkForMetaJob(job)) {
       return true;
     }
 
@@ -5851,6 +7305,7 @@ async function executePostForMeManagedMetaRunningJob(job: {
   title?: string | null;
   filePath: string;
   caption: string | null;
+  lastError?: string | null;
   hashtags?: unknown;
   firstComment: string | null;
   locationName: string | null;
@@ -5864,7 +7319,7 @@ async function executePostForMeManagedMetaRunningJob(job: {
   instagramPermalink: string | null;
 }, connection: {
   id: string;
-  platform: "instagram" | "facebook" | "threads";
+  platform: "instagram" | "facebook" | "threads" | "tiktok" | "x";
   displayName: string;
   loginIdentifier: string | null;
   provider?: string | null;
@@ -5898,12 +7353,32 @@ async function executePostForMeManagedMetaRunningJob(job: {
       `pfm-${publicationType}-${index + 1}`,
     ),
   );
-  const locationMetadata = connection.platform === "instagram"
-    ? decodeInstagramLocationStorage(job.locationName)
-    : { locationId: null as string | null };
+  const locationMetadata = isMetaLocationSupportedPublication(publicationType)
+    ? decodeMetaLocationStorage(job.locationName)
+    : { locationName: null as string | null, locationId: null as string | null };
+
+  const relinkTargetCount =
+    connection.platform === "instagram" ||
+      connection.platform === "threads" ||
+      connection.platform === "tiktok" ||
+      connection.platform === "x"
+      ? parseStoredWhatsappRelinkConnectionIds(job.whatsappRelinkConnectionIds).length
+      : 0;
+  const resolvedProviderCaption = resolvePostForMeCaptionForPublication(job);
+
+  if (supportsPostForMeCaptionDebug(connection.platform)) {
+    await appendLog({
+      companyId: job.companyId,
+      level: "INFO",
+      errorCode: "POST_FOR_ME_META_FINAL_CAPTION_DEBUG",
+      message:
+        `Job ${job.id} enviará caption final ao ${postForMePlatformNoticeLabel(connection.platform)}: ${JSON.stringify(resolvedProviderCaption)}. ` +
+        `mediaCount=${mediaFiles.length}.`,
+    });
+  }
 
   const socialPost = await createPostForMeSocialPost({
-    caption: resolveStoredJobCaptionForPublication(job),
+    caption: resolvedProviderCaption,
     socialAccountIds: [socialAccountId],
     mediaUrls,
     platform: connection.platform,
@@ -5913,28 +7388,50 @@ async function executePostForMeManagedMetaRunningJob(job: {
   });
 
   const normalizedProviderStatus = socialPost.status?.trim().toLowerCase() || "submitted";
-  const isProcessed =
-    normalizedProviderStatus === "processed" ||
-    normalizedProviderStatus === "published" ||
-    normalizedProviderStatus === "completed";
-
   await prisma.job.update({
     where: { id: job.id },
     data: {
-      status: isProcessed ? "COMPLETED" : "SENT_UNCONFIRMED",
-      completedAt: new Date(),
+      status: "RUNNING",
+      completedAt: null,
       lastError: null,
     },
   });
 
   await appendLog({
     companyId: job.companyId,
-    level: isProcessed ? "INFO" : "WARN",
-    errorCode: isProcessed ? "POST_FOR_ME_SOCIAL_POST_COMPLETED" : "POST_FOR_ME_SOCIAL_POST_SUBMITTED",
+    level: "INFO",
+    errorCode: "POST_FOR_ME_SOCIAL_POST_SUBMITTED",
     message:
       `Job ${job.id} enviado ao Post for Me para ${connection.platform}. ` +
       `providerPostId=${socialPost.id} status=${normalizedProviderStatus}.`,
   });
+
+  if (supportsPostForMeCaptionDebug(connection.platform)) {
+    const providerSubmitCaption =
+      typeof socialPost.raw.caption === "string" && socialPost.raw.caption.trim().length > 0
+        ? socialPost.raw.caption.trim()
+        : null;
+    await appendLog({
+      companyId: job.companyId,
+      level: "INFO",
+      errorCode: "POST_FOR_ME_META_PROVIDER_SUBMIT_DEBUG",
+      message:
+        `Job ${job.id} recebeu resposta inicial do Post for Me para ${postForMePlatformNoticeLabel(connection.platform)} com ` +
+        `submitCaption=${JSON.stringify(providerSubmitCaption)} mediaCount=${mediaFiles.length}.`,
+    });
+  }
+
+  if (supportsPostForMeUrlDebug(connection.platform)) {
+    const submitUrlCandidates = collectPostForMeUrlCandidates(socialPost.raw).join(" | ") || "none";
+    await appendLog({
+      companyId: job.companyId,
+      level: "INFO",
+      errorCode: "POST_FOR_ME_META_PROVIDER_URL_DEBUG",
+      message:
+        `Job ${job.id} recebeu resposta inicial do Post for Me para ${postForMePlatformNoticeLabel(connection.platform)} com ` +
+        `submitUrlCandidates=${submitUrlCandidates}.`,
+    });
+  }
 
   if (connection.platform === "instagram" && job.firstComment?.trim()) {
     await appendLog({
@@ -5946,40 +7443,22 @@ async function executePostForMeManagedMetaRunningJob(job: {
     });
   }
 
-  if (connection.platform === "instagram" && job.whatsappRelinkEnabled) {
-    const relinkLock = await acquireDistributedLock(
-      postForMeWhatsappRelinkLockKey(job.id),
-      POST_FOR_ME_WHATSAPP_RELINK_LOCK_MS,
-    );
-    if (relinkLock) {
-      try {
-        const relinkDispatched = await waitForPostForMeWhatsappRelinkForInstagramJob(job);
-        if (!relinkDispatched) {
-          await appendLog({
-            companyId: job.companyId,
-            level: "INFO",
-            errorCode: "POST_FOR_ME_WHATSAPP_RELINK_PENDING",
-            message:
-              `Job ${job.id} segue aguardando o resultado final do Post for Me para gerar o relink no WhatsApp.`,
-          });
-        }
-      } finally {
-        await relinkLock.release();
-      }
-    }
+  if (
+    (connection.platform === "instagram" ||
+      connection.platform === "threads" ||
+      connection.platform === "tiktok" ||
+      connection.platform === "x") &&
+    job.whatsappRelinkEnabled &&
+    relinkTargetCount > 0
+  ) {
+    await appendLog({
+      companyId: job.companyId,
+      level: "INFO",
+      errorCode: "POST_FOR_ME_WHATSAPP_RELINK_PENDING",
+      message:
+        `Job ${job.id} aguarda confirmação final do Post for Me para disparar relink em ${relinkTargetCount} conta(s) de WhatsApp.`,
+    });
   }
-
-  await appendJobAvisoSafely(job, isProcessed
-    ? {
-        title: "Postagem enviada",
-        kind: "JOB_SENT",
-        message: "Publicacao concluida com sucesso.",
-      }
-    : {
-        title: "Postagem enviada sem confirmação",
-        kind: "JOB_SENT_UNCONFIRMED",
-        message: "A API aceitou o envio, mas o provedor ainda está concluindo a publicação.",
-      });
 }
 
 function isSequentialStoryJob(input: {
@@ -6595,7 +8074,15 @@ function startServerInstagramJobWorker(): void {
       const candidateJobs = await prisma.job.findMany({
         where: {
           publicationType: {
-            in: ["instagram_post", "instagram_reel", "instagram_story", "facebook_post", "threads_post"],
+            in: [
+              "instagram_post",
+              "instagram_reel",
+              "instagram_story",
+              "facebook_post",
+              "threads_post",
+              "tiktok_post",
+              "x_post",
+            ],
           },
           publicationState: "PUBLISHED",
           status: {
@@ -6618,6 +8105,16 @@ function startServerInstagramJobWorker(): void {
         }
 
         if (!job.socialConnectionId) {
+          if (
+            (expectedPlatform === "instagram" ||
+              expectedPlatform === "facebook" ||
+              expectedPlatform === "threads" ||
+              expectedPlatform === "tiktok" ||
+              expectedPlatform === "x") &&
+            (await tryRecoverPostForMeManagedMetaJobAfterConnectionLoss(job, expectedPlatform))
+          ) {
+            continue;
+          }
           await failJobDueToConnectionUnavailable(job, {
             errorCode: "SOCIAL_CONNECTION_MISSING",
             message: "Conta social removida deste agendamento. Edite o agendamento e selecione uma conta conectada.",
@@ -6642,6 +8139,16 @@ function startServerInstagramJobWorker(): void {
         });
 
         if (!connection) {
+          if (
+            (expectedPlatform === "instagram" ||
+              expectedPlatform === "facebook" ||
+              expectedPlatform === "threads" ||
+              expectedPlatform === "tiktok" ||
+              expectedPlatform === "x") &&
+            (await tryRecoverPostForMeManagedMetaJobAfterConnectionLoss(job, expectedPlatform))
+          ) {
+            continue;
+          }
           await failJobDueToConnectionUnavailable(job, {
             errorCode: "SOCIAL_CONNECTION_NOT_FOUND",
             message:
@@ -6655,12 +8162,7 @@ function startServerInstagramJobWorker(): void {
         const hasNativeExecutionAccess = !isPostForMeProviderConnection(connection) && Boolean(connection.secretCipher);
 
         if (connection.authStatus !== "CONNECTED" || (!hasProviderExecutionAccess && !hasNativeExecutionAccess)) {
-          const platformLabel =
-            expectedPlatform === "facebook"
-              ? "Facebook"
-              : expectedPlatform === "threads"
-                ? "Threads"
-                : "Instagram";
+          const platformLabel = socialPlatformNoticeLabel(expectedPlatform);
           if (job.status === "PENDING") {
             await prisma.job.update({
               where: { id: job.id },
@@ -6853,15 +8355,17 @@ function startPostForMeMetaPostSyncWorker(): void {
         where: {
           publicationState: "PUBLISHED",
           status: {
-            in: ["COMPLETED", "SENT_UNCONFIRMED"],
+            in: ["RUNNING", "COMPLETED", "SENT_UNCONFIRMED"],
           },
           OR: [
             {
-              status: "SENT_UNCONFIRMED",
+              status: {
+                in: ["RUNNING", "SENT_UNCONFIRMED"],
+              },
             },
             {
               publicationType: {
-                in: ["instagram_post", "instagram_reel", "instagram_story"],
+                in: ["instagram_post", "instagram_reel", "instagram_story", "threads_post", "tiktok_post", "x_post"],
               },
               whatsappRelinkEnabled: true,
               whatsappRelinkDispatchedAt: null,
@@ -6871,7 +8375,7 @@ function startPostForMeMetaPostSyncWorker(): void {
             is: {
               provider: "POST_FOR_ME",
               platform: {
-                in: ["instagram", "facebook", "threads"],
+                in: ["instagram", "facebook", "threads", "tiktok", "x"],
               },
             },
           },
@@ -6892,6 +8396,20 @@ function startPostForMeMetaPostSyncWorker(): void {
         if (!isPostForMeManagedPlatform(providerPlatform)) {
           continue;
         }
+        const relinkTargetCount =
+          (providerPlatform === "instagram" ||
+            providerPlatform === "threads" ||
+            providerPlatform === "tiktok" ||
+            providerPlatform === "x")
+            ? parseStoredWhatsappRelinkConnectionIds(job.whatsappRelinkConnectionIds).length
+            : 0;
+        const shouldHoldForWhatsappRelink =
+          (providerPlatform === "instagram" ||
+            providerPlatform === "threads" ||
+            providerPlatform === "tiktok" ||
+            providerPlatform === "x") &&
+          job.whatsappRelinkEnabled &&
+          relinkTargetCount > 0;
 
         const relinkLock = await acquireDistributedLock(
           postForMeWhatsappRelinkLockKey(job.id),
@@ -6902,44 +8420,267 @@ function startPostForMeMetaPostSyncWorker(): void {
         }
 
         try {
+          if (shouldHoldForWhatsappRelink && job.whatsappRelinkDispatchedAt) {
+            await syncWhatsappRelinkParentJobOutcome(job.id);
+            continue;
+          }
+
           const providerState = await resolvePostForMeManagedMetaJobState({
             jobId: job.id,
             platform: providerPlatform,
           });
+          const providerFalseNegativeProcessed =
+            providerPlatform === "instagram" &&
+            isPostForMeProcessedApplicationLimitFalseNegative({
+              postStatus: providerState.postStatus,
+              providerError: providerState.providerError,
+              hasFailedResult: providerState.hasFailedResult,
+              hasSuccessfulResult: providerState.hasSuccessfulResult,
+            });
+          const providerTikTokFalseNegativeProcessed = isPostForMeProcessedTikTokFalseNegative({
+            platform: providerPlatform,
+            postStatus: providerState.postStatus,
+            providerError: providerState.providerError,
+            hasFailedResult: providerState.hasFailedResult,
+            hasSuccessfulResult: providerState.hasSuccessfulResult,
+            providerPlatformPostId: providerState.providerPlatformPostId,
+            platformUrl: providerState.platformUrl,
+          });
+          const providerConfirmed =
+            providerFalseNegativeProcessed ||
+            providerTikTokFalseNegativeProcessed ||
+            providerState.hasSuccessfulResult ||
+            (isPostForMeSocialPostProcessed(providerState.postStatus) && !providerState.hasAnyResult);
+          const providerFailed =
+            providerState.hasFailedResult &&
+            !providerFalseNegativeProcessed &&
+            !providerTikTokFalseNegativeProcessed;
 
-          if (
-            job.status === "SENT_UNCONFIRMED" &&
-            (providerState.hasResult || isPostForMeSocialPostProcessed(providerState.postStatus))
-          ) {
-            await prisma.job.update({
-              where: { id: job.id },
+          if (providerFalseNegativeProcessed) {
+            await appendLog({
+              companyId: job.companyId,
+              level: "WARN",
+              errorCode: "POST_FOR_ME_FALSE_NEGATIVE_PROCESSED",
+              message:
+                `Job ${job.id} recebeu erro contraditório do Post for Me após processamento no Instagram. ` +
+                `providerPostId=${providerState.providerPostId ?? "indisponivel"} ` +
+                `providerPlatformPostId=${providerState.providerPlatformPostId ?? "indisponivel"} ` +
+                `platformUrlSource=${providerState.platformUrlSource ?? "indisponivel"} ` +
+                `error=${providerState.providerError ?? "indisponivel"}.`,
+            });
+          }
+
+          if (providerFailed) {
+            if (shouldDeferPostForMeAmbiguousFailure({
+              platform: providerPlatform,
+              providerError: providerState.providerError,
+              startedAt: job.startedAt,
+              createdAt: job.criadoEm,
+            })) {
+              await prisma.job.updateMany({
+                where: {
+                  id: job.id,
+                  status: {
+                    in: ["RUNNING", "SENT_UNCONFIRMED"],
+                  },
+                },
+                data: {
+                  status: "RUNNING",
+                  completedAt: null,
+                  lastError: `Aguardando confirmação final do ${postForMePlatformNoticeLabel(providerPlatform)}.`,
+                },
+              });
+              continue;
+            }
+
+            const failureMessage = providerState.providerError || "O Post for Me retornou erro ao concluir a publicação.";
+            const update = await prisma.job.updateMany({
+              where: {
+                id: job.id,
+                status: {
+                  in: ["RUNNING", "SENT_UNCONFIRMED"],
+                },
+              },
+              data: {
+                status: "FAILED",
+                completedAt: new Date(),
+                lastError: failureMessage,
+              },
+            });
+
+            if (update.count > 0) {
+              await appendLog({
+                companyId: job.companyId,
+                level: "ERROR",
+                errorCode: "POST_FOR_ME_SOCIAL_POST_FAILED",
+                message:
+                  `Job ${job.id} retornou falha real no Post for Me para ${providerPlatform}. ` +
+                  `providerPostId=${providerState.providerPostId ?? "indisponivel"} ` +
+                  `providerPlatformPostId=${providerState.providerPlatformPostId ?? "indisponivel"} ` +
+                  `platformUrlSource=${providerState.platformUrlSource ?? "indisponivel"} ` +
+                  `error=${failureMessage}.`,
+              });
+
+              if (supportsPostForMeCaptionDebug(providerPlatform)) {
+                const debugCaptions = providerState.debugCaptionCandidates.join(" | ") || "none";
+                await appendLog({
+                  companyId: job.companyId,
+                  level: "INFO",
+                  errorCode: "POST_FOR_ME_META_PROVIDER_RESPONSE_DEBUG",
+                  message:
+                    `Job ${job.id} recebeu retorno do Post for Me para ${postForMePlatformNoticeLabel(providerPlatform)} com ` +
+                    `captionCandidates=${debugCaptions}.`,
+                });
+              }
+
+              await appendJobAvisoSafely(job, {
+                title: "Falha no agendamento",
+                kind: "JOB_FAILED",
+                message: failureMessage,
+              });
+            }
+            continue;
+          }
+
+          if (!shouldHoldForWhatsappRelink && (job.status === "RUNNING" || job.status === "SENT_UNCONFIRMED") && providerConfirmed) {
+            const update = await prisma.job.updateMany({
+              where: {
+                id: job.id,
+                status: {
+                  in: ["RUNNING", "SENT_UNCONFIRMED"],
+                },
+              },
               data: {
                 status: "COMPLETED",
                 completedAt: job.completedAt ?? new Date(),
                 lastError: null,
+                instagramPermalink:
+                  (providerPlatform === "instagram" ||
+                    providerPlatform === "threads" ||
+                    providerPlatform === "tiktok" ||
+                    providerPlatform === "x") &&
+                    providerState.platformUrl?.trim()
+                    ? providerState.platformUrl.trim()
+                    : undefined,
               },
             });
 
-            await appendLog({
-              companyId: job.companyId,
-              level: "INFO",
-              errorCode: "POST_FOR_ME_SOCIAL_POST_CONFIRMED",
-              message:
-                `Job ${job.id} foi confirmado pelo Post for Me para ${providerPlatform}. ` +
-                `providerPostId=${providerState.providerPostId ?? "indisponivel"} status=${providerState.postStatus ?? "desconhecido"}.`,
-            });
+            if (update.count > 0) {
+              await appendLog({
+                companyId: job.companyId,
+                level: "INFO",
+                errorCode: "POST_FOR_ME_SOCIAL_POST_CONFIRMED",
+                message:
+                  `Job ${job.id} foi confirmado pelo Post for Me para ${providerPlatform}. ` +
+                  `providerPostId=${providerState.providerPostId ?? "indisponivel"} ` +
+                  `providerPlatformPostId=${providerState.providerPlatformPostId ?? "indisponivel"} ` +
+                  `platformUrlSource=${providerState.platformUrlSource ?? "indisponivel"} ` +
+                  `status=${providerState.postStatus ?? "desconhecido"}.`,
+              });
+
+              if (supportsPostForMeCaptionDebug(providerPlatform)) {
+                const debugCaptions = providerState.debugCaptionCandidates.join(" | ") || "none";
+                await appendLog({
+                  companyId: job.companyId,
+                  level: "INFO",
+                  errorCode: "POST_FOR_ME_META_PROVIDER_RESPONSE_DEBUG",
+                  message:
+                    `Job ${job.id} confirmou no ${postForMePlatformNoticeLabel(providerPlatform)} com ` +
+                    `captionCandidates=${debugCaptions}.`,
+                });
+              }
+
+              if (supportsPostForMeUrlDebug(providerPlatform)) {
+                const debugUrls = providerState.debugUrlCandidates.join(" | ") || "none";
+                await appendLog({
+                  companyId: job.companyId,
+                  level: "INFO",
+                  errorCode: "POST_FOR_ME_META_PROVIDER_URL_DEBUG",
+                  message:
+                    `Job ${job.id} confirmou no ${postForMePlatformNoticeLabel(providerPlatform)} com ` +
+                    `providerPlatformPostId=${providerState.providerPlatformPostId ?? "indisponivel"} ` +
+                    `platformUrlSource=${providerState.platformUrlSource ?? "indisponivel"} ` +
+                    `urlCandidates=${debugUrls}.`,
+                });
+              }
+
+              await appendJobAvisoSafely(job, {
+                title: `${postForMePlatformNoticeLabel(providerPlatform)} publicado`,
+                kind: "JOB_SENT",
+                message: "Publicacao concluida com sucesso.",
+              });
+            }
           }
 
-          if (
-            providerPlatform === "instagram" &&
-            job.whatsappRelinkEnabled &&
-            !job.whatsappRelinkDispatchedAt
-          ) {
-            const resolvedPermalink = providerState.platformUrl?.trim() || job.instagramPermalink?.trim() || "";
+          if (shouldHoldForWhatsappRelink && providerConfirmed) {
+            await prisma.job.updateMany({
+              where: {
+                id: job.id,
+                status: {
+                  in: ["RUNNING", "SENT_UNCONFIRMED"],
+                },
+              },
+              data: {
+                status: "RUNNING",
+                completedAt: null,
+                instagramPermalink:
+                  providerState.platformUrl?.trim()
+                    ? providerState.platformUrl.trim()
+                    : undefined,
+              },
+            });
+
+            await appendMetaPublishedAvisoOnce(job);
+          }
+
+          if (shouldHoldForWhatsappRelink && !job.whatsappRelinkDispatchedAt) {
+            const resolvedPermalink =
+              providerState.platformUrl?.trim() ||
+              job.instagramPermalink?.trim() ||
+              "";
             if (resolvedPermalink) {
-              await dispatchWhatsappRelinkJobsForInstagramPermalink({
+              const relinkDispatched = await dispatchWhatsappRelinkJobsForInstagramPermalink({
                 job,
                 permalink: resolvedPermalink,
+              });
+              if (!relinkDispatched && providerConfirmed) {
+                await finalizeWhatsappRelinkParentJob(job, {
+                  status: "FAILED",
+                  title: "Relink falhou no WhatsApp",
+                  kind: "JOB_FAILED",
+                  message: `O relink para ${relinkTargetCount} conta(s) de WhatsApp não pôde ser iniciado.`,
+                  lastError: "Não foi possível iniciar o relink para o WhatsApp.",
+                });
+              }
+            } else if (providerConfirmed) {
+              const instagramConfirmedAtMs = parsePostForMeInstagramConfirmedMarkerMs(job.lastError);
+              const relinkUrlWaitTimedOut =
+                instagramConfirmedAtMs !== null && Date.now() - instagramConfirmedAtMs >= POST_FOR_ME_WHATSAPP_RELINK_MAX_WAIT_MS;
+
+              if (relinkUrlWaitTimedOut) {
+                await finalizeWhatsappRelinkParentJob(job, {
+                  status: "FAILED",
+                  title: "Relink falhou no WhatsApp",
+                  kind: "JOB_FAILED",
+                  message:
+                    `A publicação em ${postForMePlatformNoticeLabel(providerPlatform)} foi concluída, mas a URL oficial não ficou disponível a tempo para enviar o relink ao WhatsApp.`,
+                  lastError: `A URL oficial da publicação em ${postForMePlatformNoticeLabel(providerPlatform)} não ficou disponível a tempo para o relink.`,
+                });
+                continue;
+              }
+
+              const debugCandidates = providerState.debugUrlCandidates.join(" | ") || "none";
+              await appendLog({
+                companyId: job.companyId,
+                level: "INFO",
+                errorCode: "POST_FOR_ME_WHATSAPP_RELINK_URL_PENDING",
+                message:
+                  `Job ${job.id} foi confirmado em ${postForMePlatformNoticeLabel(providerPlatform)}, mas ainda aguarda URL final para disparar o relink no WhatsApp. ` +
+                  `providerPostId=${providerState.providerPostId ?? "indisponivel"} ` +
+                  `providerPlatformPostId=${providerState.providerPlatformPostId ?? "indisponivel"} ` +
+                  `platformUrlSource=${providerState.platformUrlSource ?? "indisponivel"} ` +
+                  `resultsCount=${providerState.resultsCount} ` +
+                  `urlCandidates=${debugCandidates}.`,
               });
             }
           }
@@ -6971,6 +8712,7 @@ async function executeWhatsappRunningJob(job: {
   id: string;
   companyId: string;
   caption: string | null;
+  locationName: string | null;
   publicationType: string;
   postStory: boolean;
   postReel: boolean;
@@ -6992,6 +8734,9 @@ async function executeWhatsappRunningJob(job: {
   createdAt: Date;
   updatedAt: Date;
 }): Promise<void> {
+  const relinkParentJobId = parseWhatsappRelinkParentMarker(job.locationName);
+  const isWhatsappRelinkChild = Boolean(relinkParentJobId);
+
   try {
     await appendLog({
       companyId: job.companyId,
@@ -7020,11 +8765,56 @@ async function executeWhatsappRunningJob(job: {
           `remoteJid=${delivery.remoteJid ?? "status@broadcast"} messageId=${delivery.messageId ?? "indisponivel"}`,
       });
 
+      if (relinkParentJobId) {
+        await appendWhatsappRelinkChildAviso(relinkParentJobId, connection, {
+          title: "Relink postado no WhatsApp",
+          kind: "JOB_SENT",
+          messageForAccount: (accountLabel) => `O relink foi postado no WhatsApp ${accountLabel}.`,
+        });
+        await syncWhatsappRelinkParentJobOutcome(relinkParentJobId);
+        return;
+      }
+
       await appendJobAvisoSafely(job, {
         title: "Postagem enviada",
         kind: "JOB_SENT",
         message: "Publicacao concluida com sucesso.",
       });
+      return;
+    }
+
+    if (isWhatsappRelinkChild) {
+      await prisma.job.update({
+        where: { id: job.id },
+        data: {
+          status: delivery.messageId ? "COMPLETED" : "FAILED",
+          completedAt: new Date(),
+          lastError: delivery.messageId ? null : "O WhatsApp não confirmou a publicação do relink.",
+        },
+      });
+
+      await appendLog({
+        companyId: job.companyId,
+        level: delivery.messageId ? "WARN" : "ERROR",
+        errorCode: delivery.messageId ? "WHATSAPP_RELINK_ACCEPTED_WITHOUT_CONFIRMATION" : "WHATSAPP_RELINK_NOT_CONFIRMED",
+        message:
+          delivery.messageId
+            ? `Job ${job.id} teve o relink aceito pelo WhatsApp sem confirmação final explícita. ` +
+              `remoteJid=${delivery.remoteJid ?? "status@broadcast"} messageId=${delivery.messageId}`
+            : `Job ${job.id} não recebeu confirmação final do WhatsApp para o relink. ` +
+              `remoteJid=${delivery.remoteJid ?? "status@broadcast"} messageId=${delivery.messageId ?? "indisponivel"}`,
+      });
+
+      if (relinkParentJobId) {
+        if (delivery.messageId) {
+          await appendWhatsappRelinkChildAviso(relinkParentJobId, connection, {
+            title: "Relink postado no WhatsApp",
+            kind: "JOB_SENT",
+            messageForAccount: (accountLabel) => `O relink foi postado no WhatsApp ${accountLabel}.`,
+          });
+        }
+        await syncWhatsappRelinkParentJobOutcome(relinkParentJobId);
+      }
       return;
     }
 
@@ -7080,6 +8870,19 @@ async function executeWhatsappRunningJob(job: {
       message: `Job ${job.id} falhou no consumidor RabbitMQ do WhatsApp: ${message}`,
     });
 
+    if (relinkParentJobId) {
+      if (waitingLogin) {
+        await appendWhatsappRelinkChildAviso(relinkParentJobId, connection, {
+          title: "Aguardando autenticação",
+          kind: "JOB_WAITING_LOGIN",
+          messageForAccount: (accountLabel) =>
+            `A conta ${accountLabel} do WhatsApp precisa ser autenticada novamente para receber o relink.`,
+        });
+      }
+      await syncWhatsappRelinkParentJobOutcome(relinkParentJobId);
+      return;
+    }
+
     await appendJobAvisoSafely(
       job,
       waitingLogin
@@ -7100,47 +8903,162 @@ async function executeWhatsappRunningJob(job: {
 async function processQueuedJobMessage(
   queueMessage: JobExecutionQueueMessage,
 ): Promise<"ack" | "requeue"> {
-  const job = await prisma.job.findUnique({
-    where: { id: queueMessage.jobId },
-  });
+  let job:
+    | {
+        id: string;
+        companyId: string;
+        createdByUserId: string | null;
+        socialConnectionId: string | null;
+        filePath: string;
+        title: string | null;
+        caption: string | null;
+        firstComment: string | null;
+        hashtags: unknown;
+        locationName: string | null;
+        whatsappBackgroundColor: string | null;
+        whatsappRelinkEnabled: boolean;
+        whatsappRelinkConnectionIds: unknown;
+        whatsappRelinkDispatchedAt: Date | null;
+        instagramPermalink: string | null;
+        publicationType: string;
+        postStory: boolean;
+        postReel: boolean;
+        postWhatsapp: boolean;
+        modoWhatsapp: string;
+        dataPostagem: Date;
+        publicationState: string;
+        status: string;
+        tentativas: number;
+        criadoEm: Date;
+        startedAt: Date | null;
+        completedAt: Date | null;
+        lastError: string | null;
+      }
+    | null = null;
 
-  if (!job) {
-    return "ack";
-  }
-
-  if (normalizePublicationState(job.publicationState) !== "PUBLISHED") {
-    return "ack";
-  }
-
-  if (job.status !== "RUNNING") {
-    return "ack";
-  }
-
-  const billingBlockedMessage = await resolveJobBillingBlockMessage(job);
-  if (billingBlockedMessage) {
-    await failJobDueToBillingBlocked(job, billingBlockedMessage);
-    return "ack";
-  }
-
-  const expectedPlatform = platformForPublication(normalizePublicationType(job));
-  if (expectedPlatform !== queueMessage.platform) {
-    return "ack";
-  }
-
-  if (!job.socialConnectionId) {
-    await failJobDueToConnectionUnavailable(job, {
-      errorCode: "SOCIAL_CONNECTION_MISSING",
-      message: "Conta social removida deste agendamento. Edite o agendamento e selecione uma conta conectada.",
+  try {
+    job = await prisma.job.findUnique({
+      where: { id: queueMessage.jobId },
     });
-    return "ack";
-  }
 
-  if (queueMessage.platform !== "whatsapp") {
+    if (!job) {
+      return "ack";
+    }
+
+    if (normalizePublicationState(job.publicationState) !== "PUBLISHED") {
+      return "ack";
+    }
+
+    if (job.status !== "RUNNING") {
+      return "ack";
+    }
+
+    const billingBlockedMessage = await resolveJobBillingBlockMessage(job);
+    if (billingBlockedMessage) {
+      await failJobDueToBillingBlocked(job, billingBlockedMessage);
+      return "ack";
+    }
+
+    const expectedPlatform = platformForPublication(normalizePublicationType(job));
+    if (expectedPlatform !== queueMessage.platform) {
+      return "ack";
+    }
+
+    if (!job.socialConnectionId) {
+      if (
+        (queueMessage.platform === "instagram" ||
+          queueMessage.platform === "facebook" ||
+          queueMessage.platform === "threads" ||
+          queueMessage.platform === "tiktok" ||
+          queueMessage.platform === "x") &&
+        (await tryRecoverPostForMeManagedMetaJobAfterConnectionLoss(job, queueMessage.platform))
+      ) {
+        return "ack";
+      }
+      await failJobDueToConnectionUnavailable(job, {
+        errorCode: "SOCIAL_CONNECTION_MISSING",
+        message: "Conta social removida deste agendamento. Edite o agendamento e selecione uma conta conectada.",
+      });
+      return "ack";
+    }
+
+    if (queueMessage.platform !== "whatsapp") {
+      const connection = await prisma.socialConnection.findFirst({
+        where: {
+          id: job.socialConnectionId,
+          companyId: job.companyId,
+          platform: queueMessage.platform,
+        },
+      });
+
+      if (!connection) {
+        if (
+          (queueMessage.platform === "instagram" ||
+            queueMessage.platform === "facebook" ||
+            queueMessage.platform === "threads" ||
+            queueMessage.platform === "tiktok" ||
+            queueMessage.platform === "x") &&
+          (await tryRecoverPostForMeManagedMetaJobAfterConnectionLoss(job, queueMessage.platform))
+        ) {
+          return "ack";
+        }
+        await failJobDueToConnectionUnavailable(job, {
+          errorCode: "SOCIAL_CONNECTION_NOT_FOUND",
+          message:
+            "Conta social deste agendamento não está mais disponível. Edite o agendamento e selecione outra conta conectada.",
+        });
+        return "ack";
+      }
+
+      const connectionLock = await acquireDistributedLock(
+        connectionExecutionLockKey(connection.id),
+        JOB_CONSUMER_CONNECTION_LOCK_MS,
+      );
+      if (!connectionLock) {
+        return "requeue";
+      }
+
+      try {
+        const hasProviderExecutionAccess =
+          isPostForMeProviderConnection(connection) && Boolean(connection.providerAccountId?.trim());
+        const hasNativeExecutionAccess = !isPostForMeProviderConnection(connection) && Boolean(connection.secretCipher);
+
+        if (connection.authStatus !== "CONNECTED" || (!hasProviderExecutionAccess && !hasNativeExecutionAccess)) {
+          const platformLabel = socialPlatformNoticeLabel(queueMessage.platform);
+          await prisma.job.update({
+            where: { id: job.id },
+            data: {
+              status: "WAITING_LOGIN",
+              lastError: `Aguardando autenticação do ${platformLabel}.`,
+            },
+          });
+
+          await appendJobAvisoSafely(job, {
+            title: "Aguardando autenticação",
+            kind: "JOB_WAITING_LOGIN",
+            message: `A conta do ${platformLabel} precisa ser autenticada para continuar.`,
+          });
+          return "ack";
+        }
+
+        if (queueMessage.platform === "instagram") {
+          await executeInstagramRunningJob(job, connection);
+        } else {
+          await executePostForMeManagedMetaRunningJob(job, connection as typeof connection & {
+            platform: "facebook" | "threads" | "tiktok" | "x";
+          });
+        }
+        return "ack";
+      } finally {
+        await connectionLock.release();
+      }
+    }
+
     const connection = await prisma.socialConnection.findFirst({
       where: {
         id: job.socialConnectionId,
         companyId: job.companyId,
-        platform: queueMessage.platform,
+        platform: "whatsapp",
       },
     });
 
@@ -7162,93 +9080,30 @@ async function processQueuedJobMessage(
     }
 
     try {
-      const hasProviderExecutionAccess =
-        isPostForMeProviderConnection(connection) && Boolean(connection.providerAccountId?.trim());
-      const hasNativeExecutionAccess = !isPostForMeProviderConnection(connection) && Boolean(connection.secretCipher);
-
-      if (connection.authStatus !== "CONNECTED" || (!hasProviderExecutionAccess && !hasNativeExecutionAccess)) {
-        const platformLabel =
-          queueMessage.platform === "facebook"
-            ? "Facebook"
-            : queueMessage.platform === "threads"
-              ? "Threads"
-              : "Instagram";
+      if (connection.authStatus !== "CONNECTED") {
         await prisma.job.update({
           where: { id: job.id },
           data: {
             status: "WAITING_LOGIN",
-            lastError: `Aguardando autenticação do ${platformLabel}.`,
+            lastError: "Aguardando autenticação do WhatsApp.",
           },
         });
 
         await appendJobAvisoSafely(job, {
           title: "Aguardando autenticação",
           kind: "JOB_WAITING_LOGIN",
-          message: `A conta do ${platformLabel} precisa ser autenticada para continuar.`,
+          message: "A conta do WhatsApp precisa ser autenticada para continuar.",
         });
         return "ack";
       }
 
-      if (queueMessage.platform === "instagram") {
-        await executeInstagramRunningJob(job, connection);
-      } else {
-        await executePostForMeManagedMetaRunningJob(job, connection as typeof connection & {
-          platform: "facebook" | "threads";
-        });
-      }
+      await executeWhatsappRunningJob(job, connection);
       return "ack";
     } finally {
       await connectionLock.release();
     }
-  }
-
-  const connection = await prisma.socialConnection.findFirst({
-    where: {
-      id: job.socialConnectionId,
-      companyId: job.companyId,
-      platform: "whatsapp",
-    },
-  });
-
-  if (!connection) {
-    await failJobDueToConnectionUnavailable(job, {
-      errorCode: "SOCIAL_CONNECTION_NOT_FOUND",
-      message:
-        "Conta social deste agendamento não está mais disponível. Edite o agendamento e selecione outra conta conectada.",
-    });
-    return "ack";
-  }
-
-  const connectionLock = await acquireDistributedLock(
-    connectionExecutionLockKey(connection.id),
-    JOB_CONSUMER_CONNECTION_LOCK_MS,
-  );
-  if (!connectionLock) {
-    return "requeue";
-  }
-
-  try {
-    if (connection.authStatus !== "CONNECTED") {
-      await prisma.job.update({
-        where: { id: job.id },
-        data: {
-          status: "WAITING_LOGIN",
-          lastError: "Aguardando autenticação do WhatsApp.",
-        },
-      });
-
-      await appendJobAvisoSafely(job, {
-        title: "Aguardando autenticação",
-        kind: "JOB_WAITING_LOGIN",
-        message: "A conta do WhatsApp precisa ser autenticada para continuar.",
-      });
-      return "ack";
-    }
-
-    await executeWhatsappRunningJob(job, connection);
-    return "ack";
-  } finally {
-    await connectionLock.release();
+  } catch (error) {
+    return await failJobDueToUnhandledConsumerCrash(queueMessage, job, error);
   }
 }
 
@@ -8143,7 +9998,7 @@ app.get("/share/instagram/:jobId", async (request, response) => {
     },
   });
 
-  if (!job || !job.instagramPermalink || !isInstagramPublication(normalizePublicationType(job))) {
+  if (!job || !isInstagramPublication(normalizePublicationType(job))) {
     response.status(404).type("html").send("Compartilhamento não encontrado.");
     return;
   }
@@ -8157,6 +10012,18 @@ app.get("/share/instagram/:jobId", async (request, response) => {
   const previewImageUrl = buildInstagramSharePreviewCardUrl(job.id);
 
   response.setHeader("Cache-Control", "public, max-age=300");
+  if (!job.instagramPermalink) {
+    response.type("html").send(
+      renderInstagramSharePendingPage({
+        shareUrl,
+        previewTitle,
+        previewDescription,
+        previewImageUrl,
+      }),
+    );
+    return;
+  }
+
   response.type("html").send(
     renderInstagramShareLandingPage({
       shareUrl,
@@ -8372,6 +10239,12 @@ app.get("/connections/:id/instagram-location-candidates", async (request, respon
   }
 });
 
+app.get("/jobs/meta-location-suggestions", async (request, response) => {
+  const query = typeof request.query.q === "string" ? request.query.q : "";
+  const suggestions = searchMetaLocationCatalog(query, 10);
+  response.json(suggestions);
+});
+
 app.post("/connections", async (request, response) => {
   const payload = createConnectionSchema.parse(request.body);
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
@@ -8395,6 +10268,8 @@ app.post("/connections", async (request, response) => {
     return;
   }
 
+  const resolvedDisplayName = payload.displayName?.trim() || defaultConnectionDisplayNameForPlatform(payload.platform);
+
   if (company.status !== "ACTIVE") {
     response.status(409).json({ error: "Este workspace está inativo e não aceita novas conexões." });
     return;
@@ -8404,18 +10279,6 @@ app.post("/connections", async (request, response) => {
   if (billingAccess && billingAccess.plan && billingAccess.usage.connectionsUsed >= billingAccess.plan.maxConnections) {
     response.status(409).json({
       error: `Seu plano atingiu o limite de ${billingAccess.plan.maxConnections} conta(s) conectada(s).`,
-    });
-    return;
-  }
-
-  if (
-    payload.platform === "whatsapp" &&
-    !isWhatsappEvolutionHardcodedEnabled() &&
-    !loginIdentifier
-  ) {
-    response.status(400).json({
-      error:
-        "Para WhatsApp, informe o nome da instância. A chave pode ficar no backend (EVOLUTION_API_KEY) ou no campo segredo desta conta.",
     });
     return;
   }
@@ -8439,14 +10302,18 @@ app.post("/connections", async (request, response) => {
 
   const launchUrl = defaultAuthLaunchUrlForPlatform(payload.platform);
   const isPostForMeConnection = isPostForMeManagedPlatform(payload.platform);
+  const resolvedLoginIdentifier =
+    payload.platform === "whatsapp" && !isWhatsappEvolutionHardcodedEnabled()
+      ? loginIdentifier || buildAutoWhatsappInstanceName(`${payload.companyId}:${payload.platform}:${Date.now()}`)
+      : loginIdentifier;
   const createdConnection = await prisma.socialConnection.create({
     data: {
       companyId: payload.companyId,
       createdByUserId: authRequest.adminUser!.id,
       platform: payload.platform,
       provider: isPostForMeConnection ? "POST_FOR_ME" : "NATIVE",
-      displayName: payload.displayName,
-      loginIdentifier,
+      displayName: resolvedDisplayName,
+      loginIdentifier: resolvedLoginIdentifier,
       secretCipher,
       authStatus: "AUTH_REQUIRED",
       automationMode: "VISUAL",
@@ -8468,7 +10335,7 @@ app.post("/connections", async (request, response) => {
   await appendLog({
     companyId: payload.companyId,
     level: "INFO",
-    message: `Conta ${payload.displayName} (${payload.platform}) criada e pronta para autenticação.`,
+    message: `Conta ${resolvedDisplayName} (${payload.platform}) criada e pronta para autenticação.`,
   });
 
   response.status(201).json(mapConnection(connection));
@@ -8494,24 +10361,16 @@ app.put("/connections/:id", async (request, response) => {
     payload.loginIdentifier !== undefined ? payload.loginIdentifier?.trim() || null : existingConnection.loginIdentifier;
   const nextSecretCipher =
     payload.secret !== undefined ? encodeSecret(payload.secret) : existingConnection.secretCipher;
-
-  if (
-    existingConnection.platform === "whatsapp" &&
-    !isWhatsappEvolutionHardcodedEnabled() &&
-    !nextLoginIdentifier
-  ) {
-    response.status(400).json({
-      error:
-        "Para WhatsApp, mantenha preenchido o nome da instância. A chave pode ficar no backend (EVOLUTION_API_KEY) ou no campo segredo desta conta.",
-    });
-    return;
-  }
+  const resolvedNextLoginIdentifier =
+    existingConnection.platform === "whatsapp" && !isWhatsappEvolutionHardcodedEnabled()
+      ? nextLoginIdentifier || buildAutoWhatsappInstanceName(existingConnection.id)
+      : nextLoginIdentifier;
 
   const connection = await prisma.socialConnection.update({
     where: { id: request.params.id },
     data: {
       displayName: payload.displayName,
-      loginIdentifier: nextLoginIdentifier,
+      loginIdentifier: resolvedNextLoginIdentifier,
       secretCipher: nextSecretCipher,
       tokenExpiresAt: payload.secret !== undefined ? null : existingConnection.tokenExpiresAt,
     },
@@ -8633,8 +10492,9 @@ app.post("/connections/:id/open-visual-auth", async (request, response) => {
     try {
       await requestWhatsappQr(updatedConnection.id, false);
     } catch (error) {
-      const message =
-        error instanceof Error && error.message ? error.message : "Falha ao iniciar a geracao do QR do WhatsApp.";
+      const message = humanizeWhatsappQrErrorMessage(
+        error instanceof Error && error.message ? error.message : "Falha ao iniciar a geracao do QR do WhatsApp.",
+      );
 
       await appendLog({
         companyId: updatedConnection.companyId,
@@ -8808,8 +10668,9 @@ app.post("/connections/:id/regenerate-qr", async (request, response) => {
   try {
     await requestWhatsappQr(updatedConnection.id, true);
   } catch (error) {
-    const message =
-      error instanceof Error && error.message ? error.message : "Falha ao gerar um novo QR do WhatsApp.";
+    const message = humanizeWhatsappQrErrorMessage(
+      error instanceof Error && error.message ? error.message : "Falha ao gerar um novo QR do WhatsApp.",
+    );
 
     await appendLog({
       companyId: updatedConnection.companyId,
@@ -8866,6 +10727,45 @@ app.post("/connections/:id/dismiss-qr", async (request, response) => {
     return;
   }
 
+  let runtimeAuthStatus = await resolveWhatsappConnectionRuntimeAuthStatus({
+    id: connection.id,
+    companyId: connection.companyId,
+    displayName: connection.displayName,
+    platform: connection.platform,
+    loginIdentifier: connection.loginIdentifier,
+    secretCipher: connection.secretCipher ?? null,
+  }).catch(() => null);
+
+  if (runtimeAuthStatus !== "CONNECTED") {
+    const becameConnected = await waitForWhatsappRuntimeConnected(connection, 5_000, 500);
+    if (becameConnected) {
+      runtimeAuthStatus = "CONNECTED";
+    }
+  }
+
+  if (runtimeAuthStatus === "CONNECTED") {
+    const updatedConnection = await prisma.socialConnection.update({
+      where: { id: request.params.id },
+      data: {
+        authStatus: "CONNECTED",
+        authLaunchUrl: null,
+        lastAuthAt: connection.lastAuthAt ?? new Date(),
+        lastSeenAt: new Date(),
+      },
+    });
+
+    await dismissWhatsappQr(updatedConnection.id);
+
+    await appendLog({
+      companyId: updatedConnection.companyId,
+      level: "INFO",
+      message: `Conta ${updatedConnection.displayName} conectada ao fechar o modal de QR.`,
+    });
+
+    response.json(mapConnection(updatedConnection));
+    return;
+  }
+
   const updatedConnection = await prisma.socialConnection.update({
     where: { id: request.params.id },
     data: {
@@ -8880,6 +10780,37 @@ app.post("/connections/:id/dismiss-qr", async (request, response) => {
     companyId: updatedConnection.companyId,
     level: "WARN",
     message: `Fluxo de QR fechado para a conta ${updatedConnection.displayName}.`,
+  });
+
+  response.json(mapConnection(updatedConnection));
+});
+
+app.post("/connections/:id/cancel-auth", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  const connection = await findConnectionWithWorkspaceContext(request.params.id);
+
+  if (!connection) {
+    response.status(404).json({ error: "Conexao nao encontrada." });
+    return;
+  }
+
+  const workspace = connection.company as WorkspacePermissionContext;
+  if (!canCurrentUserConnectWorkspaceAccounts(authRequest, workspace)) {
+    response.status(403).json({ error: "Você não pode alterar esta conta." });
+    return;
+  }
+
+  const updatedConnection = await prisma.socialConnection.update({
+    where: { id: request.params.id },
+    data: {
+      authStatus: "AUTH_REQUIRED",
+      authLaunchUrl: null,
+      lastSeenAt: null,
+      providerStatus:
+        isPostForMeManagedPlatform(connection.platform) && connection.providerStatus === "auth_in_progress"
+          ? "disconnected"
+          : connection.providerStatus,
+    },
   });
 
   response.json(mapConnection(updatedConnection));
@@ -8931,10 +10862,12 @@ app.post("/connections/:id/disconnect", async (request, response) => {
       tokenExpiresAt: isLegacyMetaOAuthPlatform(connection.platform) || isPostForMeManagedPlatform(connection.platform)
         ? null
         : connection.tokenExpiresAt,
-      lastAuthAt: isLegacyMetaOAuthPlatform(connection.platform) || isPostForMeManagedPlatform(connection.platform)
+      lastAuthAt:
+        connection.platform === "whatsapp" || isLegacyMetaOAuthPlatform(connection.platform) || isPostForMeManagedPlatform(connection.platform)
         ? null
         : connection.lastAuthAt,
-      authLaunchUrl: isLegacyMetaOAuthPlatform(connection.platform) || isPostForMeManagedPlatform(connection.platform)
+      authLaunchUrl:
+        connection.platform === "whatsapp" || isLegacyMetaOAuthPlatform(connection.platform) || isPostForMeManagedPlatform(connection.platform)
         ? null
         : connection.authLaunchUrl,
       lastSeenAt: null,
@@ -9735,14 +11668,14 @@ app.post("/jobs", async (request, response) => {
     payload.fileCaptions,
     payload.sequential,
   );
-  const resolvedLocation = await resolveAutomaticInstagramLocation({
+  const resolvedLocation = await resolveAutomaticMetaLocation({
     publicationType: payload.publicationType,
     socialConnectionId: payload.socialConnectionId,
     locationName: payload.locationName,
     locationId: payload.locationId,
   });
   const hashtags = normalizeHashtags(payload.publicationType, payload.hashtags);
-  const metadata = ensureInstagramMetadata(
+  const metadata = ensureMetaPublicationMetadata(
     payload.publicationType,
     payload.caption,
     payload.fileCaptions,
@@ -9762,13 +11695,19 @@ app.post("/jobs", async (request, response) => {
     payload.publicationType === "whatsapp_status_midia" || relinkOptions.enabled,
   );
   const normalizedTitle = normalizeJobTitle(payload.title);
-  if (!payload.dataPostagem) {
+  if (!payload.dataPostagem && !(payload.scheduledDateLocal && payload.scheduledTimeLocal)) {
     response.status(400).json({ error: "Data e horário são obrigatórios para salvar a postagem." });
     return;
   }
 
-  const scheduledAt = new Date(payload.dataPostagem);
-  if (Number.isNaN(scheduledAt.getTime())) {
+  const scheduledAt = resolveScheduledAtFromPayload({
+    dataPostagem: payload.dataPostagem,
+    scheduledDateLocal: payload.scheduledDateLocal,
+    scheduledTimeLocal: payload.scheduledTimeLocal,
+    timeZone: payload.timeZone,
+    fallbackTimeZone: authRequest.adminUser?.timeZone,
+  });
+  if (!scheduledAt) {
     response.status(400).json({ error: "Data/hora inválida." });
     return;
   }
@@ -9825,14 +11764,14 @@ app.put("/jobs/:id", async (request, response) => {
     payload.fileCaptions,
     payload.sequential,
   );
-  const resolvedLocation = await resolveAutomaticInstagramLocation({
+  const resolvedLocation = await resolveAutomaticMetaLocation({
     publicationType: payload.publicationType,
     socialConnectionId: payload.socialConnectionId,
     locationName: payload.locationName,
     locationId: payload.locationId,
   });
   const hashtags = normalizeHashtags(payload.publicationType, payload.hashtags);
-  const metadata = ensureInstagramMetadata(
+  const metadata = ensureMetaPublicationMetadata(
     payload.publicationType,
     payload.caption,
     payload.fileCaptions,
@@ -9874,7 +11813,11 @@ app.put("/jobs/:id", async (request, response) => {
 
   const nextPublicationState = normalizePublicationState(payload.publicationState ?? existingJob.publicationState);
   const previousPublicationState = normalizePublicationState(existingJob.publicationState);
-  const willConsumeMonthlyQuota = previousPublicationState !== "PUBLISHED" && nextPublicationState === "PUBLISHED";
+  const shouldCreateNewJobVersion =
+    previousPublicationState === "PUBLISHED" && IMMUTABLE_PUBLICATION_HISTORY_STATUSES.has(existingJob.status);
+  const willConsumeMonthlyQuota =
+    nextPublicationState === "PUBLISHED" &&
+    (shouldCreateNewJobVersion || previousPublicationState !== "PUBLISHED");
 
   if (!isRootUser(authRequest) && willConsumeMonthlyQuota) {
     const billingAccess = isRootUser(authRequest) ? null : await ensureWorkspaceOwnerBillingWritableAccess(workspace);
@@ -9890,55 +11833,74 @@ app.put("/jobs/:id", async (request, response) => {
     }
   }
 
-  if (!payload.dataPostagem) {
+  if (!payload.dataPostagem && !(payload.scheduledDateLocal && payload.scheduledTimeLocal)) {
     response.status(400).json({ error: "Data e horário são obrigatórios para salvar a postagem." });
     return;
   }
 
-  const scheduledAt = new Date(payload.dataPostagem);
-  if (Number.isNaN(scheduledAt.getTime())) {
+  const scheduledAt = resolveScheduledAtFromPayload({
+    dataPostagem: payload.dataPostagem,
+    scheduledDateLocal: payload.scheduledDateLocal,
+    scheduledTimeLocal: payload.scheduledTimeLocal,
+    timeZone: payload.timeZone,
+    fallbackTimeZone: authRequest.adminUser?.timeZone,
+  });
+  if (!scheduledAt) {
     response.status(400).json({ error: "Data/hora inválida." });
     return;
   }
 
-  const job = await prisma.job.update({
-    where: { id: request.params.id },
-    data: {
-      companyId: payload.companyId,
-      socialConnectionId: payload.socialConnectionId,
-      filePath,
-      title: normalizedTitle,
-      caption: metadata.caption,
-      firstComment,
-      hashtags: hashtags.length > 0 ? hashtags : Prisma.JsonNull,
-      whatsappBackgroundColor,
-      whatsappRelinkEnabled: relinkOptions.enabled,
-      whatsappRelinkConnectionIds: relinkOptions.enabled ? relinkOptions.connectionIds : Prisma.DbNull,
-      whatsappRelinkDispatchedAt: null,
-      instagramPermalink: null,
-      locationName: metadata.locationName,
-      publicationType: payload.publicationType,
-      publicationState: nextPublicationState,
-      postStory: legacyFields.postStory,
-      postReel: legacyFields.postReel,
-      postWhatsapp: legacyFields.postWhatsapp,
-      modoWhatsapp: legacyFields.modoWhatsapp,
-      dataPostagem: scheduledAt,
-      status: "PENDING",
-      tentativas: 0,
-      startedAt: null,
-      completedAt: null,
-      lastError: null,
-    },
-  });
+  const nextJobData = {
+    companyId: payload.companyId,
+    socialConnectionId: payload.socialConnectionId,
+    filePath,
+    title: normalizedTitle,
+    caption: metadata.caption,
+    firstComment,
+    hashtags: hashtags.length > 0 ? hashtags : Prisma.JsonNull,
+    whatsappBackgroundColor,
+    whatsappRelinkEnabled: relinkOptions.enabled,
+    whatsappRelinkConnectionIds: relinkOptions.enabled ? relinkOptions.connectionIds : Prisma.DbNull,
+    whatsappRelinkDispatchedAt: null,
+    instagramPermalink: null,
+    locationName: metadata.locationName,
+    publicationType: payload.publicationType,
+    publicationState: nextPublicationState,
+    postStory: legacyFields.postStory,
+    postReel: legacyFields.postReel,
+    postWhatsapp: legacyFields.postWhatsapp,
+    modoWhatsapp: legacyFields.modoWhatsapp,
+    dataPostagem: scheduledAt,
+    status: "PENDING" as const,
+    tentativas: 0,
+    startedAt: null,
+    completedAt: null,
+    lastError: null,
+  };
+
+  const job = shouldCreateNewJobVersion
+    ? await prisma.job.create({
+        data: {
+          createdByUserId: authRequest.adminUser?.id ?? existingJob.createdByUserId ?? null,
+          ...nextJobData,
+        },
+      })
+    : await prisma.job.update({
+        where: { id: request.params.id },
+        data: nextJobData,
+      });
 
   await appendLog({
     companyId: payload.companyId,
     level: "INFO",
     message:
       nextPublicationState === "DRAFT"
-        ? `Job ${job.id} foi editado e salvo como rascunho para ${job.dataPostagem.toISOString()} (execução suspensa até publicação).`
-        : `Job ${job.id} foi editado e reagendado para ${job.dataPostagem.toISOString()}.`,
+        ? shouldCreateNewJobVersion
+          ? `Job ${existingJob.id} foi preservado no histórico e gerou o rascunho ${job.id} para ${job.dataPostagem.toISOString()}.`
+          : `Job ${job.id} foi editado e salvo como rascunho para ${job.dataPostagem.toISOString()} (execução suspensa até publicação).`
+        : shouldCreateNewJobVersion
+          ? `Job ${existingJob.id} foi preservado no histórico e gerou o novo agendamento ${job.id} para ${job.dataPostagem.toISOString()}.`
+          : `Job ${job.id} foi editado e reagendado para ${job.dataPostagem.toISOString()}.`,
   });
 
   response.json(job);
@@ -9963,22 +11925,41 @@ app.post("/jobs/:id/retry", async (request, response) => {
     return;
   }
 
-  const job = await prisma.job.update({
-    where: { id: request.params.id },
+  const job = await prisma.job.create({
     data: {
+      companyId: existingJob.companyId,
+      createdByUserId: authRequest.adminUser?.id ?? existingJob.createdByUserId ?? null,
+      socialConnectionId: existingJob.socialConnectionId,
+      filePath: existingJob.filePath,
+      title: existingJob.title,
+      caption: existingJob.caption,
+      firstComment: existingJob.firstComment,
+      hashtags: existingJob.hashtags ?? Prisma.JsonNull,
+      whatsappBackgroundColor: existingJob.whatsappBackgroundColor,
+      whatsappRelinkEnabled: existingJob.whatsappRelinkEnabled,
+      whatsappRelinkConnectionIds: existingJob.whatsappRelinkConnectionIds ?? Prisma.DbNull,
+      whatsappRelinkDispatchedAt: null,
+      instagramPermalink: null,
+      locationName: existingJob.locationName,
+      publicationType: existingJob.publicationType,
+      publicationState: existingJob.publicationState,
+      postStory: existingJob.postStory,
+      postReel: existingJob.postReel,
+      postWhatsapp: existingJob.postWhatsapp,
+      modoWhatsapp: existingJob.modoWhatsapp,
+      dataPostagem: new Date(),
       status: "PENDING",
       tentativas: 0,
       startedAt: null,
       completedAt: null,
       lastError: null,
-      dataPostagem: new Date(),
     },
   });
 
   await appendLog({
     companyId: existingJob.companyId,
     level: "INFO",
-    message: `Job ${job.id} foi reenfileirado manualmente para tentativa imediata.`,
+    message: `Job ${existingJob.id} foi preservado no histórico e gerou o novo job ${job.id} para tentativa imediata.`,
   });
 
   response.json(job);
@@ -10267,10 +12248,31 @@ app.post("/jobs/:id/activate", async (request, response) => {
   }
 
   const willRunImmediately = existingJob.dataPostagem.getTime() <= Date.now();
-  const job = await prisma.job.update({
-    where: { id: request.params.id },
+  const job = await prisma.job.create({
     data: {
+      companyId: existingJob.companyId,
+      createdByUserId: authRequest.adminUser?.id ?? existingJob.createdByUserId ?? null,
+      socialConnectionId: existingJob.socialConnectionId,
+      filePath: existingJob.filePath,
+      title: existingJob.title,
+      caption: existingJob.caption,
+      firstComment: existingJob.firstComment,
+      hashtags: existingJob.hashtags ?? Prisma.JsonNull,
+      whatsappBackgroundColor: existingJob.whatsappBackgroundColor,
+      whatsappRelinkEnabled: existingJob.whatsappRelinkEnabled,
+      whatsappRelinkConnectionIds: existingJob.whatsappRelinkConnectionIds ?? Prisma.DbNull,
+      whatsappRelinkDispatchedAt: null,
+      instagramPermalink: null,
+      locationName: existingJob.locationName,
+      publicationType: existingJob.publicationType,
+      publicationState: existingJob.publicationState,
+      postStory: existingJob.postStory,
+      postReel: existingJob.postReel,
+      postWhatsapp: existingJob.postWhatsapp,
+      modoWhatsapp: existingJob.modoWhatsapp,
+      dataPostagem: existingJob.dataPostagem,
       status: "PENDING",
+      tentativas: 0,
       startedAt: null,
       completedAt: null,
       lastError: null,
@@ -10281,8 +12283,8 @@ app.post("/jobs/:id/activate", async (request, response) => {
     companyId: existingJob.companyId,
     level: "INFO",
     message: willRunImmediately
-      ? `Job ${job.id} foi reativado e esta com data no passado; sera executado imediatamente.`
-      : `Job ${job.id} foi reativado para execucao em ${job.dataPostagem.toISOString()}.`,
+      ? `Job ${existingJob.id} foi preservado no histórico e gerou o novo job ${job.id}, que será executado imediatamente.`
+      : `Job ${existingJob.id} foi preservado no histórico e gerou o novo job ${job.id} para execução em ${job.dataPostagem.toISOString()}.`,
   });
 
   response.json(job);

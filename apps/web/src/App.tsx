@@ -63,12 +63,13 @@ import {
   FiSun,
   FiTrendingUp,
 } from "react-icons/fi";
-import { FaFacebookF, FaInstagram, FaThreads, FaWhatsapp } from "react-icons/fa6";
+import { FaFacebookF, FaInstagram, FaThreads, FaTiktok, FaWhatsapp, FaXTwitter } from "react-icons/fa6";
 import { api } from "./api";
 import appLogo from "./assets/logo.svg";
 import appLogoAlternative from "./assets/logo-alternativo.svg";
 import confettiGif from "./assets/confetti.gif";
 import { BeeUpDrawer, BeeUpKnowledgeAdmin, type BeeUpOpenViewKey } from "./bee-up";
+import { searchLocalMetaLocationSuggestions, type MetaLocationSuggestion } from "./meta-location-catalog";
 
 type ViewKey =
   | "dashboard"
@@ -93,7 +94,7 @@ type PublicationState = "PUBLISHED" | "DRAFT";
 type SchedulerPublicationState = PublicationState | "";
 type StoryEditorToolMode = "MOVE" | "DRAW";
 type DashboardTrendRange = "7" | "30" | "90";
-type DashboardTrendNetwork = "all" | "instagram" | "whatsapp";
+type DashboardTrendNetwork = "all" | "instagram" | "facebook" | "threads" | "tiktok" | "x" | "whatsapp";
 type DashboardTrendFocus = "all" | "published" | "failed" | "scheduled";
 type AgentWorkspaceFilter = "all" | string;
 type AgentPlatformFilter = "all" | SocialConnection["platform"];
@@ -169,7 +170,7 @@ type Company = {
 type SocialConnection = {
   id: string;
   companyId: string;
-  platform: "instagram" | "facebook" | "threads" | "whatsapp";
+  platform: "instagram" | "facebook" | "threads" | "tiktok" | "x" | "whatsapp";
   provider?: string | null;
   providerAccountId?: string | null;
   providerExternalId?: string | null;
@@ -224,6 +225,8 @@ type Job = {
     | "instagram_post"
     | "facebook_post"
     | "threads_post"
+    | "tiktok_post"
+    | "x_post"
     | "whatsapp_status_midia"
     | "whatsapp_status_texto";
   publicationState: PublicationState;
@@ -245,6 +248,12 @@ type SchedulerProfileTarget = {
   accountLabel: string;
   accountMeta: string | null;
 };
+
+const WHATSAPP_RELINK_PARENT_MARKER_PREFIX = "__wa_relink_parent__:";
+
+function isWhatsappRelinkChildJob(job: Pick<Job, "locationName">): boolean {
+  return typeof job.locationName === "string" && job.locationName.startsWith(WHATSAPP_RELINK_PARENT_MARKER_PREFIX);
+}
 
 type HistoryCalendarPageResponse = {
   year: number;
@@ -280,7 +289,7 @@ const schedulerPublicationTypeChoices: Array<{
   value: Exclude<SchedulerPublicationType, "">;
   label: string;
   note: string;
-  network: "instagram" | "facebook" | "threads" | "whatsapp";
+  network: "instagram" | "facebook" | "threads" | "tiktok" | "x" | "whatsapp";
   icon: IconType;
 }> = [
   {
@@ -317,6 +326,20 @@ const schedulerPublicationTypeChoices: Array<{
     note: "Threads",
     network: "threads",
     icon: FaThreads,
+  },
+  {
+    value: "tiktok_post",
+    label: "TikTok",
+    note: "TikTok",
+    network: "tiktok",
+    icon: FaTiktok,
+  },
+  {
+    value: "x_post",
+    label: "X",
+    note: "X",
+    network: "x",
+    icon: FaXTwitter,
   },
   {
     value: "whatsapp_status_midia",
@@ -571,6 +594,8 @@ const navItems: Array<{ key: ViewKey; label: string; eyebrow?: string; icon: Ico
   { key: "logs", label: "Logs", icon: FiFileText },
 ];
 
+const DASHBOARD_CALENDAR_WEEKDAY_LABELS = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sab", "Dom"];
+
 const viewHeadingIconByView: Partial<Record<ViewKey, IconType>> = {
   dashboard: FiHome,
   profile: FiUser,
@@ -607,6 +632,18 @@ const connectionPlatformOptions: ConnectionPlatformOption[] = [
     description: "Textos e conversas",
   },
   {
+    platform: "tiktok",
+    label: "TikTok",
+    icon: FaTiktok,
+    description: "Vídeos",
+  },
+  {
+    platform: "x",
+    label: "X",
+    icon: FaXTwitter,
+    description: "Posts e mídia",
+  },
+  {
     platform: "whatsapp",
     label: "WhatsApp",
     icon: FaWhatsapp,
@@ -627,6 +664,7 @@ const POST_FOR_ME_COMPLETION_STORAGE_KEY = "socialup.postForMeConnectionComplete
 const POST_FOR_ME_PENDING_SYNC_MAX_AGE_MS = 10 * 60 * 1000;
 const POST_FOR_ME_POPUP_WINDOW_NAME = "socialup-postforme-auth";
 const PUBLICATION_TEMPLATE_STORAGE_KEY = "socialup.publicationTemplates";
+const HISTORY_COLLAPSED_SECTIONS_COOKIE = "socialup.historyCollapsedSections";
 const STRIPE_CHECKOUT_RESULT_QUERY_PARAM = "stripeCheckout";
 const STRIPE_CHECKOUT_SESSION_ID_QUERY_PARAM = "session_id";
 const BILLING_PLAN_CHECKOUT_ANCHOR_ID = "billing-plan-checkout";
@@ -636,6 +674,8 @@ const NOTICE_PAGE_SIZE = 10;
 const BILLING_USER_DISCOUNT_PAGE_SIZE = 8;
 const INSTAGRAM_IMAGE_MAX_SIZE_BYTES = 8 * 1024 * 1024;
 const INSTAGRAM_MULTI_MEDIA_MAX_FILES = 10;
+const THREADS_MULTI_MEDIA_MAX_FILES = 20;
+const X_MULTI_MEDIA_MAX_FILES = 4;
 const INSTAGRAM_POST_ASPECT_RATIO_MIN = 4 / 5;
 const INSTAGRAM_POST_ASPECT_RATIO_MAX = 1.91;
 const STORY_EDITOR_CANVAS_WIDTH = 1080;
@@ -698,6 +738,14 @@ const WORKSPACE_PRESET_COLORS = [
   "#334155",
 ] as const;
 const HISTORY_CALENDAR_DAY_PAGE_SIZE = 1;
+const CONNECTION_PLATFORM_ORDER: Record<SocialConnection["platform"], number> = {
+  instagram: 0,
+  facebook: 1,
+  threads: 2,
+  tiktok: 3,
+  x: 4,
+  whatsapp: 5,
+};
 const HISTORY_CALENDAR_SKELETON_CELL_COUNT = 7;
 const HISTORY_CALENDAR_WEEKDAY_LABELS = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"];
 const EDIT_PUBLISHED_RESCHEDULE_CONFIRM_STATUSES = new Set([
@@ -718,7 +766,7 @@ const VIEW_ROUTE_MAP: Record<ViewKey, string> = {
   agents: "/conectar-contas",
   scheduler: "/agendar",
   media: "/midias",
-  history: "/historico",
+  history: "/publicacoes",
   logs: "/logs",
   notices: "/avisos",
   noticeAdmin: "/avisos/cadastrar",
@@ -931,6 +979,9 @@ function viewFromPathname(pathname: string): ViewKey | null {
   const normalizedPath = normalizePath(pathname);
   if (normalizedPath === "/unidades" || normalizedPath === "/empresa" || normalizedPath === "/perfis") {
     return "companies";
+  }
+  if (normalizedPath === "/historico") {
+    return "history";
   }
   if (normalizedPath === "/plano") {
     return "plan";
@@ -1269,6 +1320,29 @@ function toIsoFromTimeZoneDateTime(
   return result.toISOString();
 }
 
+function buildScheduledPayload(
+  dateValue: string,
+  timeValue: string,
+  timeZone: string,
+): {
+  dataPostagem: string;
+  scheduledDateLocal: string;
+  scheduledTimeLocal: string;
+  timeZone: string;
+} | null {
+  const iso = toIsoFromTimeZoneDateTime(dateValue, timeValue, timeZone);
+  if (!iso) {
+    return null;
+  }
+
+  return {
+    dataPostagem: iso,
+    scheduledDateLocal: dateValue,
+    scheduledTimeLocal: timeValue,
+    timeZone: normalizeTimeZone(timeZone),
+  };
+}
+
 function parseInstagramOauthWindowMessage(data: unknown): InstagramOauthWindowMessage | null {
   if (!data || typeof data !== "object") {
     return null;
@@ -1527,6 +1601,52 @@ function getFutureTimeValue(
   return getCurrentTimeValue(timeZone, new Date(referenceDate.getTime() + offsetMinutes * 60_000));
 }
 
+function readCookieValue(name: string): string | null {
+  if (typeof document === "undefined") {
+    return null;
+  }
+
+  const cookieName = `${encodeURIComponent(name)}=`;
+  const cookies = document.cookie ? document.cookie.split("; ") : [];
+  for (const cookie of cookies) {
+    if (cookie.startsWith(cookieName)) {
+      return decodeURIComponent(cookie.slice(cookieName.length));
+    }
+  }
+
+  return null;
+}
+
+function writeCookieValue(name: string, value: string, maxAgeSeconds = 60 * 60 * 24 * 365): void {
+  if (typeof document === "undefined") {
+    return;
+  }
+
+  document.cookie = `${encodeURIComponent(name)}=${encodeURIComponent(value)}; path=/; max-age=${maxAgeSeconds}; SameSite=Lax`;
+}
+
+function readHistoryCollapsedSectionsCookie(): Record<string, boolean> {
+  const raw = readCookieValue(HISTORY_COLLAPSED_SECTIONS_COOKIE);
+  if (!raw) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+
+    return Object.fromEntries(
+      Object.entries(parsed).filter(
+        (entry): entry is [string, boolean] => typeof entry[0] === "string" && typeof entry[1] === "boolean",
+      ),
+    );
+  } catch {
+    return {};
+  }
+}
+
 function isVideoPath(filePath: string): boolean {
   return /\.(mp4|mov|webm|m4v)$/i.test(filePath);
 }
@@ -1543,8 +1663,49 @@ function isSupportedMediaPath(filePath: string): boolean {
   return isVideoPath(filePath) || isImagePath(filePath);
 }
 
+const JOB_MEDIA_BUNDLE_STORAGE_PREFIX = "__JOB_MEDIA_BUNDLE__";
+
+function decodeJobMediaPaths(job: Pick<Job, "filePath" | "filePaths">): string[] {
+  const explicitPaths = (job.filePaths ?? [])
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+
+  if (explicitPaths.length > 0) {
+    return Array.from(new Set(explicitPaths));
+  }
+
+  const raw = (job.filePath ?? "").trim();
+  if (!raw) {
+    return [];
+  }
+
+  if (!raw.startsWith(JOB_MEDIA_BUNDLE_STORAGE_PREFIX)) {
+    return [raw];
+  }
+
+  const encodedPayload = raw.slice(JOB_MEDIA_BUNDLE_STORAGE_PREFIX.length).trim();
+  if (!encodedPayload) {
+    return [];
+  }
+
+  try {
+    const binary = window.atob(encodedPayload);
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    const parsed = JSON.parse(new TextDecoder().decode(bytes)) as { files?: unknown };
+    const files = Array.isArray(parsed.files)
+      ? parsed.files
+          .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+          .filter((entry) => entry.length > 0)
+      : [];
+
+    return Array.from(new Set(files));
+  } catch {
+    return [raw];
+  }
+}
+
 function resolveJobMediaPaths(job: Pick<Job, "filePath" | "filePaths">): string[] {
-  const entries = (job.filePaths && job.filePaths.length > 0 ? job.filePaths : [job.filePath])
+  const entries = decodeJobMediaPaths(job)
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0 && (isVideoPath(entry) || isPreviewImagePath(entry)));
 
@@ -1747,6 +1908,10 @@ function schedulerMediaValidationMessage(
     return "Instagram Reel aceita apenas vídeo MP4.";
   }
 
+  if (publicationType === "tiktok_post" && !/\.(mp4|mov|m4v|webm)$/i.test(fileName)) {
+    return "TikTok aceita apenas vídeo.";
+  }
+
   if (
     typeof fileSizeBytes === "number" &&
     fileSizeBytes > INSTAGRAM_IMAGE_MAX_SIZE_BYTES &&
@@ -1754,6 +1919,52 @@ function schedulerMediaValidationMessage(
   ) {
     return `Imagem acima do limite para Instagram (${formatMegabytes(INSTAGRAM_IMAGE_MAX_SIZE_BYTES)} MB). ` +
       `Arquivo atual: ${formatMegabytes(fileSizeBytes)} MB.`;
+  }
+
+  return null;
+}
+
+function schedulerMultiMediaMaxFiles(publicationType: SchedulerPublicationType): number {
+  if (publicationType === "threads_post") {
+    return THREADS_MULTI_MEDIA_MAX_FILES;
+  }
+
+  if (publicationType === "x_post") {
+    return X_MULTI_MEDIA_MAX_FILES;
+  }
+
+  return INSTAGRAM_MULTI_MEDIA_MAX_FILES;
+}
+
+function supportsSchedulerWhatsappRelink(publicationType: SchedulerPublicationType): boolean {
+  return (
+    publicationType === "instagram_post" ||
+    publicationType === "instagram_reel" ||
+    publicationType === "instagram_story" ||
+    publicationType === "threads_post" ||
+    publicationType === "x_post" ||
+    publicationType === "tiktok_post"
+  );
+}
+
+function schedulerWhatsappRelinkValidationMessage(
+  publicationType: SchedulerPublicationType,
+  mediaCount: number,
+): string | null {
+  if (!supportsSchedulerWhatsappRelink(publicationType)) {
+    return null;
+  }
+
+  if (publicationType === "instagram_story" && mediaCount > 1) {
+    return "Relink no WhatsApp para story funciona apenas com 1 mídia por vez.";
+  }
+
+  if ((publicationType === "threads_post" || publicationType === "x_post") && mediaCount === 0) {
+    return `Relink no WhatsApp para ${publicationType === "threads_post" ? "Threads" : "X"} exige ao menos 1 mídia publicada.`;
+  }
+
+  if (publicationType === "tiktok_post" && mediaCount === 0) {
+    return "Relink no WhatsApp para TikTok exige 1 vídeo publicado.";
   }
 
   return null;
@@ -1823,6 +2034,10 @@ function publicationTypeLabel(publicationType: Job["publicationType"]): string {
       return "Facebook";
     case "threads_post":
       return "Threads";
+    case "tiktok_post":
+      return "TikTok";
+    case "x_post":
+      return "X";
     case "whatsapp_status_midia":
       return "Status";
     case "whatsapp_status_texto":
@@ -1832,7 +2047,7 @@ function publicationTypeLabel(publicationType: Job["publicationType"]): string {
 
 function publicationTypeNetwork(
   publicationType: Job["publicationType"],
-): "instagram" | "facebook" | "threads" | "whatsapp" {
+): "instagram" | "facebook" | "threads" | "tiktok" | "x" | "whatsapp" {
   if (
     publicationType === "instagram_post" ||
     publicationType === "instagram_reel" ||
@@ -1849,23 +2064,69 @@ function publicationTypeNetwork(
     return "threads";
   }
 
+  if (publicationType === "tiktok_post") {
+    return "tiktok";
+  }
+
+  if (publicationType === "x_post") {
+    return "x";
+  }
+
   return "whatsapp";
 }
 
 function socialPlatformIcon(
-  network: "instagram" | "facebook" | "threads" | "whatsapp",
+  network: "instagram" | "facebook" | "threads" | "tiktok" | "x" | "whatsapp",
 ): IconType {
   switch (network) {
     case "facebook":
       return FaFacebookF;
     case "threads":
       return FaThreads;
+    case "tiktok":
+      return FaTiktok;
+    case "x":
+      return FaXTwitter;
     case "whatsapp":
       return FaWhatsapp;
     case "instagram":
     default:
       return FaInstagram;
   }
+}
+
+function socialPlatformLabel(
+  network: "instagram" | "facebook" | "threads" | "tiktok" | "x" | "whatsapp",
+): string {
+  switch (network) {
+    case "facebook":
+      return "Facebook";
+    case "threads":
+      return "Threads";
+    case "tiktok":
+      return "TikTok";
+    case "x":
+      return "X";
+    case "whatsapp":
+      return "WhatsApp";
+    case "instagram":
+    default:
+      return "Instagram";
+  }
+}
+
+function resolveJobParticipantNetworks(
+  job: Pick<Job, "publicationType" | "whatsappRelinkEnabled" | "whatsappRelinkConnectionIds">,
+): Array<"instagram" | "facebook" | "threads" | "tiktok" | "x" | "whatsapp"> {
+  const networks: Array<"instagram" | "facebook" | "threads" | "tiktok" | "x" | "whatsapp"> = [
+    publicationTypeNetwork(job.publicationType),
+  ];
+
+  if (job.whatsappRelinkEnabled && (job.whatsappRelinkConnectionIds?.length ?? 0) > 0) {
+    networks.push("whatsapp");
+  }
+
+  return Array.from(new Set(networks));
 }
 
 function isProviderMetaPublication(publicationType: SchedulerPublicationType): boolean {
@@ -1930,23 +2191,32 @@ function buildDashboardChartPath(values: number[], width: number, height: number
 function renderPublicationTypePill(publicationType: Job["publicationType"]) {
   const network = publicationTypeNetwork(publicationType);
   const Icon = socialPlatformIcon(network);
+  const label = publicationTypeLabel(publicationType);
 
   return (
-    <span className={`publication-pill publication-pill-with-icon publication-pill-${network}`}>
+    <span
+      className={`publication-pill publication-pill-icon-only publication-pill-${network}`}
+      title={label}
+      aria-label={label}
+    >
       <Icon className={`publication-pill-icon publication-pill-icon-${network}`} aria-hidden="true" />
-      <span>{publicationTypeLabel(publicationType)}</span>
     </span>
   );
 }
 
-function renderPublicationBoardActionPreview(icon: ReactNode, label: string, toneClass: string) {
+function renderPublicationNetworkPill(
+  network: "instagram" | "facebook" | "threads" | "tiktok" | "x" | "whatsapp",
+) {
+  const Icon = socialPlatformIcon(network);
+  const label = socialPlatformLabel(network);
+
   return (
     <span
-      className={`publications-board-action-button publications-board-action-button-preview ${toneClass}`}
+      className={`publication-pill publication-pill-icon-only publication-pill-${network}`}
       title={label}
       aria-label={label}
     >
-      {icon}
+      <Icon className={`publication-pill-icon publication-pill-icon-${network}`} aria-hidden="true" />
     </span>
   );
 }
@@ -1979,7 +2249,10 @@ function matchesHistoryFilterKey(
 ): boolean {
   switch (filter) {
     case "upcoming":
-      return job.publicationState === "PUBLISHED" && !isPastScheduledAtForUser(job.dataPostagem) && job.status === "PENDING";
+      return (
+        job.publicationState === "PUBLISHED" &&
+        (job.status === "RUNNING" || (!isPastScheduledAtForUser(job.dataPostagem) && job.status === "PENDING"))
+      );
     case "canceled":
       return job.status === "CANCELED";
     case "sent":
@@ -2095,6 +2368,33 @@ function canRetryPublicationBoardJob(job: Job): boolean {
 
 function canReactivatePublicationBoardJob(job: Job): boolean {
   return job.status === "CANCELED";
+}
+
+function publicationBoardStatusChipTone(
+  job: Job,
+  isPastScheduledAtInUserTimeZone: (dateIso: string) => boolean,
+): "draft" | "scheduled" | "waiting" | "failed" | "canceled" | "published" {
+  if (matchesHistoryFilterKey(job, "draft", isPastScheduledAtInUserTimeZone)) {
+    return "draft";
+  }
+
+  if (matchesHistoryFilterKey(job, "waiting_login", isPastScheduledAtInUserTimeZone)) {
+    return "waiting";
+  }
+
+  if (matchesHistoryFilterKey(job, "failed", isPastScheduledAtInUserTimeZone)) {
+    return "failed";
+  }
+
+  if (matchesHistoryFilterKey(job, "canceled", isPastScheduledAtInUserTimeZone)) {
+    return "canceled";
+  }
+
+  if (matchesHistoryFilterKey(job, "sent", isPastScheduledAtInUserTimeZone)) {
+    return "published";
+  }
+
+  return "scheduled";
 }
 
 function historyCalendarStatusVisual(job: Job): {
@@ -2246,19 +2546,6 @@ function isPastScheduledAt(
   );
 }
 
-function connectionPlatformLabel(platform: SocialConnection["platform"]): string {
-  switch (platform) {
-    case "instagram":
-      return "Instagram";
-    case "facebook":
-      return "Facebook";
-    case "threads":
-      return "Threads";
-    default:
-      return "WhatsApp";
-  }
-}
-
 function workspaceStatusLabel(status: Company["status"]): string {
   return status === "ACTIVE" ? "Ativo" : "Inativo";
 }
@@ -2334,6 +2621,10 @@ function connectionPlatformIcon(platform: SocialConnection["platform"]): IconTyp
       return FaFacebookF;
     case "threads":
       return FaThreads;
+    case "tiktok":
+      return FaTiktok;
+    case "x":
+      return FaXTwitter;
     default:
       return FaWhatsapp;
   }
@@ -2352,8 +2643,14 @@ function resolveConnectionAvatarUrl(connection: SocialConnection): string | null
   const candidates = [
     metadata.profilePictureUrl,
     metadata.profile_picture_url,
+    metadata.profilePicUrl,
+    metadata.profile_pic_url,
+    metadata.profilePic,
+    metadata.profile_pic,
     metadata.profileImageUrl,
     metadata.profile_image_url,
+    metadata.profilePhotoUrl,
+    metadata.profile_photo_url,
     metadata.avatarUrl,
     metadata.avatar_url,
     metadata.pictureUrl,
@@ -2370,7 +2667,7 @@ function resolveConnectionAvatarUrl(connection: SocialConnection): string | null
     }
   }
 
-  const nestedSources = [metadata.profile, metadata.picture, metadata.avatar];
+  const nestedSources = [metadata.profile, metadata.picture, metadata.avatar, metadata.user, metadata.account, metadata.owner];
   for (const source of nestedSources) {
     if (!source || typeof source !== "object" || Array.isArray(source)) {
       continue;
@@ -2411,7 +2708,13 @@ function connectionStatusLabel(status: SocialConnection["authStatus"]): string {
 }
 
 function isMetaConnectionPlatform(platform: string): boolean {
-  return platform === "instagram" || platform === "facebook" || platform === "threads";
+  return (
+    platform === "instagram" ||
+    platform === "facebook" ||
+    platform === "threads" ||
+    platform === "tiktok" ||
+    platform === "x"
+  );
 }
 
 function formatConnectionTokenExpiryLabel(
@@ -2536,6 +2839,14 @@ function resolveSchedulerTargetAccountLabel(connection: SocialConnection): strin
     return connection.displayName;
   }
 
+  if (connection.platform === "tiktok" || connection.platform === "x") {
+    const username = connection.loginIdentifier?.trim() || "";
+    if (username) {
+      return username.startsWith("@") ? username : `@${username}`;
+    }
+    return connection.displayName;
+  }
+
   if (connection.platform === "facebook") {
     return connection.loginIdentifier?.trim() || connection.displayName;
   }
@@ -2554,6 +2865,10 @@ function resolveSchedulerTargetAccountMeta(connection: SocialConnection): string
 
   if (connection.platform === "facebook") {
     return null;
+  }
+
+  if (connection.platform === "tiktok" || connection.platform === "x") {
+    return connection.displayName;
   }
 
   const ownerNumber = resolveWhatsappOwnerNumber(connection.whatsappOwnerJid);
@@ -2582,6 +2897,12 @@ function isInstagramPublication(publicationType: SchedulerPublicationType): bool
     publicationType === "instagram_reel" ||
     publicationType === "instagram_story"
   );
+}
+
+function supportsMetaLocationPublication(publicationType: SchedulerPublicationType): boolean {
+  void publicationType;
+  // Temporarily disabled in the scheduler until we have a reliable source of valid Meta location page IDs.
+  return false;
 }
 
 function normalizeSchedulerHashtagValue(value: string): string | null {
@@ -2850,9 +3171,12 @@ function HistoryCalendarDraggableCard({
         </div>
       </div>
       <div className="history-calendar-card-meta">
-        <span className={`history-calendar-card-meta-item history-calendar-card-meta-item-${publicationNetwork}`}>
+        <span
+          className={`history-calendar-card-meta-item history-calendar-card-meta-item-icon-only history-calendar-card-meta-item-${publicationNetwork}`}
+          title={publicationTypeLabel(job.publicationType)}
+          aria-label={publicationTypeLabel(job.publicationType)}
+        >
           <PublicationIcon className="history-calendar-card-meta-icon" aria-hidden="true" />
-          <span>{publicationTypeLabel(job.publicationType)}</span>
         </span>
         <span className="history-calendar-card-meta-item history-calendar-card-meta-item-company">
           <FiUsers className="history-calendar-card-meta-icon" aria-hidden="true" />
@@ -3032,9 +3356,10 @@ function App() {
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [postForMeAuthLaunchingConnectionId, setPostForMeAuthLaunchingConnectionId] = useState<string | null>(null);
   const [syncingProviderConnectionId, setSyncingProviderConnectionId] = useState<string | null>(null);
+  const [dismissedAgentAuthConnectionIds, setDismissedAgentAuthConnectionIds] = useState<string[]>([]);
   const [agentWorkspaceFilter, setAgentWorkspaceFilter] = useState<AgentWorkspaceFilter>("all");
   const [agentPlatformFilter, setAgentPlatformFilter] = useState<AgentPlatformFilter>("all");
-  const [agentStatusFilter, setAgentStatusFilter] = useState<AgentConnectionStatusFilter>("connected");
+  const [agentStatusFilter, setAgentStatusFilter] = useState<AgentConnectionStatusFilter>("all");
   const [activeAgentFilterMenu, setActiveAgentFilterMenu] = useState<"workspace" | "platform" | "status" | null>(null);
   const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [profileName, setProfileName] = useState("");
@@ -3079,6 +3404,14 @@ function App() {
   const [dashboardTrendRange, setDashboardTrendRange] = useState<DashboardTrendRange>("30");
   const [dashboardTrendNetwork, setDashboardTrendNetwork] = useState<DashboardTrendNetwork>("all");
   const [dashboardTrendFocus, setDashboardTrendFocus] = useState<DashboardTrendFocus>("all");
+  const [dashboardCalendarPeriod, setDashboardCalendarPeriod] = useState(() =>
+    getYearMonthInTimeZone(new Date(), DEFAULT_USER_TIME_ZONE),
+  );
+  const [dashboardCalendarDayPages, setDashboardCalendarDayPages] = useState<Record<string, number>>({});
+  const [dashboardCalendarPopoverJobId, setDashboardCalendarPopoverJobId] = useState<string | null>(null);
+  const [dashboardCalendarEditingJobId, setDashboardCalendarEditingJobId] = useState<string | null>(null);
+  const [dashboardCalendarTimeValue, setDashboardCalendarTimeValue] = useState("");
+  const [dashboardCalendarSavingJobId, setDashboardCalendarSavingJobId] = useState<string | null>(null);
   const [companyName, setCompanyName] = useState("");
   const [companyKindInput, setCompanyKindInput] = useState<Company["kind"]>("CLIENT");
   const [companyColorInput, setCompanyColorInput] = useState(DEFAULT_WORKSPACE_COLOR);
@@ -3092,15 +3425,12 @@ function App() {
   const [activeWorkspaceDetailsCompanyId, setActiveWorkspaceDetailsCompanyId] = useState<string | null>(null);
   const [activeWorkspaceDetailsView, setActiveWorkspaceDetailsView] = useState<"members" | "invites" | null>(null);
   const [workspaceModalInfo, setWorkspaceModalInfo] = useState("");
-  const [connectionDisplayName, setConnectionDisplayName] = useState("");
-  const [connectionCompanyId, setConnectionCompanyId] = useState("");
-  const [connectionPlatform, setConnectionPlatform] = useState<SocialConnection["platform"]>("instagram");
-  const [connectionLoginIdentifier, setConnectionLoginIdentifier] = useState("");
-  const [connectionSecret, setConnectionSecret] = useState("");
-  const [connectionCreateAttempted, setConnectionCreateAttempted] = useState(false);
-  const [isCreateConnectionModalOpen, setIsCreateConnectionModalOpen] = useState(false);
+  const [workspaceModalInfoTone, setWorkspaceModalInfoTone] = useState<"success" | "error">("success");
+  const [creatingConnectionCardKey, setCreatingConnectionCardKey] = useState<string | null>(null);
   const [transientAgentError, setTransientAgentError] = useState("");
   const [activeQrConnectionId, setActiveQrConnectionId] = useState<string | null>(null);
+  const [qrModalInfo, setQrModalInfo] = useState("");
+  const [qrModalInfoTone, setQrModalInfoTone] = useState<"success" | "error">("success");
   const postForMePopupResult = readPostForMePopupResult();
   const [qrRequestingConnectionId, setQrRequestingConnectionId] = useState<string | null>(null);
   const [qrCancellingConnectionId, setQrCancellingConnectionId] = useState<string | null>(null);
@@ -3108,8 +3438,6 @@ function App() {
   const [uploadedSchedulerMedia, setUploadedSchedulerMedia] = useState<SchedulerUploadedMedia[]>([]);
   const [draggingSchedulerMediaIndex, setDraggingSchedulerMediaIndex] = useState<number | null>(null);
   const [dragOverSchedulerMediaIndex, setDragOverSchedulerMediaIndex] = useState<number | null>(null);
-  const [mediaCaptionModalIndex, setMediaCaptionModalIndex] = useState<number | null>(null);
-  const [mediaCaptionDraft, setMediaCaptionDraft] = useState("");
   const [storyEditorMediaIndex, setStoryEditorMediaIndex] = useState<number | null>(null);
   const [storyEditorLocationEnabled, setStoryEditorLocationEnabled] = useState(false);
   const [storyEditorLocationText, setStoryEditorLocationText] = useState("");
@@ -3156,6 +3484,8 @@ function App() {
   const [firstComment, setFirstComment] = useState("");
   const [hashtagsInput, setHashtagsInput] = useState("");
   const [jobHashtags, setJobHashtags] = useState<string[]>([]);
+  const [jobLocationName, setJobLocationName] = useState("");
+  const [jobLocationId, setJobLocationId] = useState("");
   const [whatsappBackgroundColor, setWhatsappBackgroundColor] = useState(DEFAULT_WHATSAPP_BACKGROUND_COLOR);
   const [whatsappRelinkEnabled, setWhatsappRelinkEnabled] = useState(false);
   const [whatsappRelinkConnectionIds, setWhatsappRelinkConnectionIds] = useState<string[]>([]);
@@ -3239,6 +3569,14 @@ function App() {
   const [historyCalendarTotalPages, setHistoryCalendarTotalPages] = useState(1);
   const [historyCalendarMonthTotalJobs, setHistoryCalendarMonthTotalJobs] = useState(0);
   const [historyCalendarLoadingNextWeek, setHistoryCalendarLoadingNextWeek] = useState(false);
+  const [historyBoardPageByFilter, setHistoryBoardPageByFilter] = useState<Record<string, number>>({});
+  const [publicationBoardPeriodByFilter, setPublicationBoardPeriodByFilter] = useState<
+    Record<string, { year: number; month: number }>
+  >({});
+  const [publicationBoardLoadingByFilter, setPublicationBoardLoadingByFilter] = useState<Record<string, boolean>>({});
+  const [historyCollapsedSections, setHistoryCollapsedSections] = useState<Record<string, boolean>>(() =>
+    readHistoryCollapsedSectionsCookie(),
+  );
   const [historyDraftJobs, setHistoryDraftJobs] = useState<Job[]>([]);
   const [historyDraftPage, setHistoryDraftPage] = useState(0);
   const [historyDraftTotalPages, setHistoryDraftTotalPages] = useState(1);
@@ -3316,6 +3654,7 @@ function App() {
   const historyDraftLoadMoreRef = useRef<HTMLDivElement | null>(null);
   const historyCalendarLoadMoreRef = useRef<HTMLDivElement | null>(null);
   const historyCalendarLoadKeyRef = useRef("");
+  const previousAgentCompanyCountRef = useRef(0);
   const historyCalendarCelebrationTimeoutRef = useRef<number | null>(null);
   const avisosSectionRef = useRef<HTMLElement | null>(null);
   const lastUnreadAvisosCountRef = useRef(0);
@@ -3499,23 +3838,30 @@ function App() {
     : "";
   const supportsMediaUpload = publicationType !== "" && publicationType !== "whatsapp_status_texto";
   const requiresMediaUpload =
-    supportsMediaUpload && publicationType !== "facebook_post" && publicationType !== "threads_post";
-  const supportsMultiMediaUpload = publicationType === "instagram_post" || publicationType === "instagram_story";
+    supportsMediaUpload &&
+    publicationType !== "facebook_post" &&
+    publicationType !== "threads_post" &&
+    publicationType !== "x_post";
+  const supportsMultiMediaUpload =
+    publicationType === "instagram_post" ||
+    publicationType === "instagram_story" ||
+    publicationType === "threads_post" ||
+    publicationType === "x_post";
   const supportsFirstComment = publicationType === "instagram_post" || publicationType === "instagram_reel";
   const supportsHashtags =
     publicationType === "instagram_post" ||
     publicationType === "instagram_reel" ||
     publicationType === "facebook_post" ||
-    publicationType === "threads_post";
-  const supportsWhatsappRelink =
-    publicationType === "instagram_post" ||
-    publicationType === "instagram_reel" ||
-    publicationType === "instagram_story";
+    publicationType === "threads_post" ||
+    publicationType === "tiktok_post" ||
+    publicationType === "x_post";
+  const supportsWhatsappRelink = supportsSchedulerWhatsappRelink(publicationType);
   const activeAppLogo = themeMode === "dark" ? appLogoAlternative : appLogo;
   const uploadedFilePath = uploadedSchedulerMedia[0]?.filePath ?? "";
   const uploadedFileName = uploadedSchedulerMedia[0]?.fileName ?? "";
   const uploadedFileSizeBytes = uploadedSchedulerMedia[0]?.fileSizeBytes ?? null;
   const uploadedMediaCount = uploadedSchedulerMedia.length;
+  const whatsappRelinkMediaMessage = schedulerWhatsappRelinkValidationMessage(publicationType, uploadedMediaCount);
   const effectiveSequentialPublishing =
     (publicationType === "instagram_post" || publicationType === "instagram_story") &&
     uploadedMediaCount > 1;
@@ -3524,7 +3870,17 @@ function App() {
   const supportsWhatsappBackgroundColor =
     publicationType === "whatsapp_status_texto" ||
     publicationType === "whatsapp_status_midia";
-  const requiresInstagramMetadata = isInstagramPublication(publicationType);
+  const supportsMetaLocation = supportsMetaLocationPublication(publicationType);
+  const hasForcedInstagramMetaLocation =
+    isInstagramForcedLocationEnabled &&
+    (publicationType === "instagram_post" || publicationType === "instagram_reel");
+  const metaLocationSuggestions = useMemo(
+    () =>
+      !supportsMetaLocation || hasForcedInstagramMetaLocation || jobLocationId
+        ? []
+        : searchLocalMetaLocationSuggestions(jobLocationName, 10),
+    [hasForcedInstagramMetaLocation, jobLocationId, jobLocationName, supportsMetaLocation],
+  );
   const supportsCaption = publicationType !== "" && publicationType !== "instagram_story";
   const captionLabel = publicationType === "whatsapp_status_texto" ? "Texto do status (aceita emojis)" : "Legenda da postagem";
   const captionPlaceholder =
@@ -3699,9 +4055,12 @@ function App() {
   );
 
   const activeQrState = activeQrConnection?.qrStatus ?? (activeQrConnectionId ? "PREPARING" : "IDLE");
+  const hasQrModalError = qrModalInfoTone === "error" && qrModalInfo.trim().length > 0;
 
   const activeQrHeading =
-    activeQrState === "CONNECTED"
+    hasQrModalError
+      ? "Falha ao gerar QR"
+      : activeQrState === "CONNECTED"
       ? "WhatsApp conectado"
       : activeQrState === "QR_EXPIRED"
         ? "QR expirado"
@@ -3710,6 +4069,10 @@ function App() {
           : activeQrState === "ERROR"
             ? "Falha ao gerar QR"
             : "Gerando QR do WhatsApp...";
+
+  const activeQrPrimaryMessage = hasQrModalError
+    ? ""
+    : (activeQrConnection?.qrMessage?.trim() || activeQrHeading);
 
   useEffect(() => {
     if (!companyInfo) {
@@ -3738,13 +4101,6 @@ function App() {
       window.clearTimeout(timer);
     };
   }, [isTransientSchedulerInfo]);
-
-  useEffect(() => {
-    if (connectionPlatform !== "instagram" || !connectionSecret) {
-      return;
-    }
-    setConnectionSecret("");
-  }, [connectionPlatform, connectionSecret]);
 
   useEffect(() => {
     if (!isTransientHistoryInfo) {
@@ -4218,12 +4574,30 @@ function App() {
     if (qrRequestingConnectionId === activeQrConnection.id) {
       return;
     }
-
-    if (activeQrConnection.authStatus === "CONNECTED") {
-      setActiveQrConnectionId(null);
-      setQrRequestingConnectionId(null);
-    }
   }, [activeQrConnection, qrRequestingConnectionId]);
+
+  useEffect(() => {
+    if (!authUser || activeView !== "agents" || !activeQrConnectionId) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const tick = () => {
+      if (cancelled || document.visibilityState !== "visible") {
+        return;
+      }
+      void loadAll({ withSkeleton: false });
+    };
+
+    void tick();
+    const intervalId = window.setInterval(tick, 500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [authUser, activeView, activeQrConnectionId]);
 
   const filteredJobs = useMemo(
     () => jobs.filter((job) => (selectedCompanyId ? job.companyId === selectedCompanyId : true)),
@@ -4236,14 +4610,25 @@ function App() {
   );
 
   useEffect(() => {
+    const previousCount = previousAgentCompanyCountRef.current;
+    previousAgentCompanyCountRef.current = companies.length;
+
     if (!companies.length) {
       setAgentWorkspaceFilter("all");
       return;
     }
 
     setAgentWorkspaceFilter((current) => {
+      if (companies.length === 1) {
+        return companies[0]?.id ?? "all";
+      }
+
+      if (previousCount <= 1) {
+        return "all";
+      }
+
       if (current === "all") {
-        return current;
+        return "all";
       }
 
       if (current && companies.some((company) => company.id === current)) {
@@ -4294,6 +4679,40 @@ function App() {
     }, {});
   }, [connections]);
 
+  const connectedConnectionCountByCompanyId = useMemo(() => {
+    return connections.reduce<Record<string, number>>((accumulator, connection) => {
+      if (connection.authStatus !== "CONNECTED") {
+        return accumulator;
+      }
+
+      accumulator[connection.companyId] = (accumulator[connection.companyId] ?? 0) + 1;
+      return accumulator;
+    }, {});
+  }, [connections]);
+
+  const totalConnectedConnections = useMemo(
+    () => connections.filter((connection) => connection.authStatus === "CONNECTED").length,
+    [connections],
+  );
+  const dismissedAgentAuthConnectionIdSet = useMemo(
+    () => new Set(dismissedAgentAuthConnectionIds),
+    [dismissedAgentAuthConnectionIds],
+  );
+
+  function resolveEffectiveAgentConnectionAuthStatus(
+    connection: SocialConnection | null | undefined,
+  ): SocialConnection["authStatus"] | null {
+    if (!connection) {
+      return null;
+    }
+
+    if (dismissedAgentAuthConnectionIdSet.has(connection.id)) {
+      return "AUTH_REQUIRED";
+    }
+
+    return connection.authStatus;
+  }
+
   const connectionByWorkspaceAndPlatform = useMemo(() => {
     return connections.reduce<Map<string, SocialConnection>>((accumulator, connection) => {
       accumulator.set(`${connection.companyId}:${connection.platform}`, connection);
@@ -4302,25 +4721,35 @@ function App() {
   }, [connections]);
 
   const agentWorkspaceFilterOptions = useMemo<AgentWorkspaceFilterOption[]>(() => {
+    const companyOptions = companies.map((company) => ({
+      value: company.id,
+      label: company.name,
+      subtitle: `${connectedConnectionCountByCompanyId[company.id] ?? 0} conta(s) conectada(s)`,
+      company,
+    }));
+
+    if (companies.length <= 1) {
+      return companyOptions;
+    }
+
     return [
       {
         value: "all" as const,
         label: "Todos os workspaces",
         subtitle:
-          companies.length > 0
-            ? `${companies.length} workspace${companies.length === 1 ? "" : "s"} disponível${companies.length === 1 ? "" : "eis"}`
-            : "Nenhum workspace disponível",
+          totalConnectedConnections > 0
+            ? `${totalConnectedConnections} conta(s) conectada(s) no total`
+            : `${companies.length} workspaces disponíveis`,
       },
-      ...companies.map((company) => ({
-        value: company.id,
-        label: company.name,
-        subtitle: `${connectionCountByCompanyId[company.id] ?? 0} conta(s)`,
-        company,
-      })),
+      ...companyOptions,
     ];
-  }, [companies, connectionCountByCompanyId]);
+  }, [companies, connectedConnectionCountByCompanyId, totalConnectedConnections]);
 
   const agentVisibleWorkspaces = useMemo(() => {
+    if (companies.length <= 1) {
+      return companies;
+    }
+
     if (agentWorkspaceFilter === "all") {
       return companies;
     }
@@ -4337,9 +4766,19 @@ function App() {
           }
 
           const connection = connectionByWorkspaceAndPlatform.get(`${company.id}:${option.platform}`) ?? null;
-          const isConnected = connection?.authStatus === "CONNECTED";
+          const effectiveAuthStatus = resolveEffectiveAgentConnectionAuthStatus(connection);
+          const isAllWorkspacesScope = agentWorkspaceFilter === "all" && companies.length > 1;
+          if (
+            isAllWorkspacesScope &&
+            (!connection || effectiveAuthStatus !== "CONNECTED")
+          ) {
+            return null;
+          }
+          const isConnected = effectiveAuthStatus === "CONNECTED";
           const matchesStatus =
-            agentStatusFilter === "all"
+            isAllWorkspacesScope
+              ? isConnected
+              : agentStatusFilter === "all"
               ? true
               : agentStatusFilter === "connected"
                 ? isConnected
@@ -4358,6 +4797,30 @@ function App() {
           };
         }),
       )
+      .sort((left, right) => {
+        if (!left || !right) {
+          return 0;
+        }
+
+        if (left.isConnected !== right.isConnected) {
+          return left.isConnected ? -1 : 1;
+        }
+
+        if (left.isConnected && right.isConnected) {
+          const leftTimestamp = left.connection?.lastAuthAt ?? left.connection?.updatedAt ?? left.connection?.createdAt ?? "";
+          const rightTimestamp = right.connection?.lastAuthAt ?? right.connection?.updatedAt ?? right.connection?.createdAt ?? "";
+          if (leftTimestamp !== rightTimestamp) {
+            return leftTimestamp.localeCompare(rightTimestamp);
+          }
+        }
+
+        const workspaceCompare = left.workspace.name.localeCompare(right.workspace.name, "pt-BR");
+        if (workspaceCompare !== 0) {
+          return workspaceCompare;
+        }
+
+        return CONNECTION_PLATFORM_ORDER[left.platform] - CONNECTION_PLATFORM_ORDER[right.platform];
+      })
       .filter(
         (
           item,
@@ -4369,7 +4832,7 @@ function App() {
           isConnected: boolean;
         } => Boolean(item),
       );
-  }, [agentPlatformFilter, agentStatusFilter, agentVisibleWorkspaces, connectionByWorkspaceAndPlatform]);
+  }, [agentPlatformFilter, agentStatusFilter, agentVisibleWorkspaces, connectionByWorkspaceAndPlatform, agentWorkspaceFilter, companies.length]);
 
   const schedulerTargetPlatform = useMemo<SocialConnection["platform"] | null>(() => {
     if (!publicationType) {
@@ -4449,6 +4912,21 @@ function App() {
     [companyNameMap, connections],
   );
 
+  const schedulerDisconnectedWhatsappConnections = useMemo(
+    () =>
+      connections
+        .filter((connection) => connection.platform === "whatsapp" && connection.authStatus !== "CONNECTED")
+        .sort((a, b) => {
+          const companyA = companyNameMap[a.companyId] || "";
+          const companyB = companyNameMap[b.companyId] || "";
+          if (companyA !== companyB) {
+            return companyA.localeCompare(companyB);
+          }
+          return a.displayName.localeCompare(b.displayName);
+        }),
+    [companyNameMap, connections],
+  );
+
   const mediaLibrary = useMemo(() => {
     const map = new Map<string, MediaEntry>();
 
@@ -4457,7 +4935,7 @@ function App() {
         continue;
       }
 
-      const mediaPaths = (job.filePaths && job.filePaths.length > 0 ? job.filePaths : [job.filePath])
+      const mediaPaths = decodeJobMediaPaths(job)
         .map((entry) => entry.trim())
         .filter((entry) => entry.length > 0 && isSupportedMediaPath(entry));
 
@@ -4511,6 +4989,10 @@ function App() {
         .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()),
     [filteredJobs],
   );
+  const publicationHistoryJobsOrderedByCreatedAtDesc = useMemo(
+    () => jobsOrderedByCreatedAtDesc.filter((job) => !isWhatsappRelinkChildJob(job)),
+    [jobsOrderedByCreatedAtDesc],
+  );
 
   const upcomingJobs = useMemo(() => {
     const eligibleUpcomingJobs = jobsOrderedByCreatedAtDesc.filter(
@@ -4534,6 +5016,99 @@ function App() {
         return leftScheduledAt - rightScheduledAt;
       });
   }, [effectiveUserTimeZone, jobsOrderedByCreatedAtDesc, nowTickMs]);
+
+  const dashboardCalendarTodayKey = useMemo(
+    () => buildCalendarDayKey(
+      getYearMonthInTimeZone(nowReferenceDate, effectiveUserTimeZone).year,
+      getYearMonthInTimeZone(nowReferenceDate, effectiveUserTimeZone).month,
+      Number.parseInt(getTimeZoneDateParts(nowReferenceDate, effectiveUserTimeZone).day ?? "1", 10),
+    ),
+    [effectiveUserTimeZone, nowReferenceDate],
+  );
+
+  const dashboardCalendarJobs = useMemo(
+    () => publicationHistoryJobsOrderedByCreatedAtDesc.filter((job) => job.publicationState === "PUBLISHED"),
+    [publicationHistoryJobsOrderedByCreatedAtDesc],
+  );
+
+  const dashboardCalendarMonthLabel = useMemo(
+    () => formatHistoryCalendarMonthLabel(dashboardCalendarPeriod.year, dashboardCalendarPeriod.month),
+    [dashboardCalendarPeriod.month, dashboardCalendarPeriod.year],
+  );
+
+  const dashboardCalendarCells = useMemo(() => {
+    const jobsByDay = new Map<string, Job[]>();
+
+    for (const job of dashboardCalendarJobs) {
+      const dayKey = toDateLocal(job.dataPostagem, effectiveUserTimeZone);
+      if (!dayKey) {
+        continue;
+      }
+
+      const current = jobsByDay.get(dayKey) ?? [];
+      current.push(job);
+      jobsByDay.set(dayKey, current);
+    }
+
+    for (const items of jobsByDay.values()) {
+      items.sort((left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime());
+    }
+
+    const { year, month } = dashboardCalendarPeriod;
+    const firstWeekdayIndex = getCalendarWeekdayIndex(year, month, 1);
+    const daysInMonth = getDaysInMonth(year, month);
+    const previousPeriod = shiftCalendarMonth(year, month, -1);
+    const previousMonthDayCount = getDaysInMonth(previousPeriod.year, previousPeriod.month);
+
+    return Array.from({ length: 42 }, (_, index) => {
+      const relativeDay = index - firstWeekdayIndex + 1;
+      let cellYear = year;
+      let cellMonth = month;
+      let cellDay = relativeDay;
+      let inCurrentMonth = true;
+
+      if (relativeDay < 1) {
+        cellYear = previousPeriod.year;
+        cellMonth = previousPeriod.month;
+        cellDay = previousMonthDayCount + relativeDay;
+        inCurrentMonth = false;
+      } else if (relativeDay > daysInMonth) {
+        const nextPeriod = shiftCalendarMonth(year, month, 1);
+        cellYear = nextPeriod.year;
+        cellMonth = nextPeriod.month;
+        cellDay = relativeDay - daysInMonth;
+        inCurrentMonth = false;
+      }
+
+      const dayKey = buildCalendarDayKey(cellYear, cellMonth, cellDay);
+      const jobs = inCurrentMonth ? jobsByDay.get(dayKey) ?? [] : [];
+
+      return {
+        key: dayKey,
+        year: cellYear,
+        month: cellMonth,
+        day: cellDay,
+        displayDay: inCurrentMonth ? cellDay : null,
+        dayKey,
+        inCurrentMonth,
+        isToday: dayKey === dashboardCalendarTodayKey,
+        jobs,
+        columnIndex: index % 7,
+      };
+    });
+  }, [dashboardCalendarJobs, dashboardCalendarPeriod, dashboardCalendarTodayKey, effectiveUserTimeZone]);
+
+  useEffect(() => {
+    if (!dashboardCalendarPopoverJobId) {
+      return;
+    }
+
+    if (!dashboardCalendarJobs.some((job) => job.id === dashboardCalendarPopoverJobId)) {
+      setDashboardCalendarPopoverJobId(null);
+      setDashboardCalendarEditingJobId(null);
+      setDashboardCalendarTimeValue("");
+    }
+  }, [dashboardCalendarJobs, dashboardCalendarPopoverJobId]);
 
   const dashboardUpcomingPages = useMemo(() => {
     const chunkSize = 2;
@@ -4600,6 +5175,8 @@ function App() {
       { key: "instagram_story", label: "Instagram Stories", network: "instagram" as const, count: 0 },
       { key: "facebook_post", label: "Facebook Posts", network: "facebook" as const, count: 0 },
       { key: "threads_post", label: "Threads Posts", network: "threads" as const, count: 0 },
+      { key: "tiktok_post", label: "TikTok Posts", network: "tiktok" as const, count: 0 },
+      { key: "x_post", label: "X Posts", network: "x" as const, count: 0 },
       { key: "whatsapp_status_midia", label: "WhatsApp Status Mídia", network: "whatsapp" as const, count: 0 },
     ];
     const distributionMap = new Map(distributionSeed.map((entry) => [entry.key, { ...entry }]));
@@ -4699,14 +5276,14 @@ function App() {
     () =>
       Array.from(
         new Set(
-          jobsOrderedByCreatedAtDesc.map((job) =>
+          publicationHistoryJobsOrderedByCreatedAtDesc.map((job) =>
             String(getYearMonthInTimeZone(new Date(job.dataPostagem), effectiveUserTimeZone).year),
           ),
         ),
       ).sort(
         (left, right) => Number(right) - Number(left),
       ),
-    [effectiveUserTimeZone, jobsOrderedByCreatedAtDesc],
+    [effectiveUserTimeZone, publicationHistoryJobsOrderedByCreatedAtDesc],
   );
 
   const activePublicationDuplicateJob = useMemo(
@@ -4759,7 +5336,7 @@ function App() {
   );
 
   const historyFilteredJobs = useMemo(() => {
-    const statusFilteredJobs = jobsOrderedByCreatedAtDesc.filter((job) =>
+    const statusFilteredJobs = publicationHistoryJobsOrderedByCreatedAtDesc.filter((job) =>
       matchesHistoryFilterKey(job, historyFilter, isPastScheduledAtForUser),
     );
 
@@ -4789,12 +5366,13 @@ function App() {
     historyMonthFilter,
     historySearchQuery,
     historyYearFilter,
-    jobsOrderedByCreatedAtDesc,
+    publicationHistoryJobsOrderedByCreatedAtDesc,
     nowTickMs,
   ]);
 
   const historyCalendarSearchFilteredJobs = useMemo(() => {
     return historyCalendarJobs
+      .filter((job) => !isWhatsappRelinkChildJob(job))
       .filter((job) => job.publicationState === "PUBLISHED" && Boolean(job.dataPostagem))
       .sort((left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime());
   }, [historyCalendarJobs]);
@@ -4959,18 +5537,18 @@ function App() {
 
   const historyBulkSelectedJobIdsSet = useMemo(() => new Set(historyBulkSelectedJobIds), [historyBulkSelectedJobIds]);
   const historyLoadedSelectionIds = useMemo(
-    () => new Set(jobsOrderedByCreatedAtDesc.map((job) => job.id)),
-    [jobsOrderedByCreatedAtDesc],
+    () => new Set(publicationHistoryJobsOrderedByCreatedAtDesc.map((job) => job.id)),
+    [publicationHistoryJobsOrderedByCreatedAtDesc],
   );
   const historyBulkSelectedJobs = useMemo(
     () =>
-      jobsOrderedByCreatedAtDesc.filter((job, index, items) => {
+      publicationHistoryJobsOrderedByCreatedAtDesc.filter((job, index, items) => {
         if (!historyBulkSelectedJobIdsSet.has(job.id)) {
           return false;
         }
         return items.findIndex((candidate) => candidate.id === job.id) === index;
       }),
-    [historyBulkSelectedJobIdsSet, jobsOrderedByCreatedAtDesc],
+    [historyBulkSelectedJobIdsSet, publicationHistoryJobsOrderedByCreatedAtDesc],
   );
   const historyDraggingJob = useMemo(
     () =>
@@ -5024,6 +5602,32 @@ function App() {
         };
       }
 
+      if (connection.platform === "whatsapp" && connection.authStatus === "AUTH_IN_PROGRESS") {
+        const nextQrStatus = connection.qrStatus ?? null;
+        const preservePreviousQrImage =
+          !connection.qrImageDataUrl &&
+          Boolean(previous.qrImageDataUrl) &&
+          (nextQrStatus === null || nextQrStatus === "PREPARING" || nextQrStatus === "WAITING_QR_SCAN");
+
+        const keepPreviousQrMessage =
+          preservePreviousQrImage &&
+          (connection.qrMessage == null ||
+            connection.qrMessage.trim().length === 0 ||
+            connection.qrMessage === "Gerando QR do WhatsApp..." ||
+            connection.qrMessage === "Preparando QR Code do WhatsApp..." ||
+            connection.qrMessage === "Conectando o WhatsApp. Aguarde alguns segundos...");
+
+        return {
+          ...connection,
+          qrStatus: preservePreviousQrImage ? "WAITING_QR_SCAN" : connection.qrStatus,
+          qrImageDataUrl: preservePreviousQrImage ? previous.qrImageDataUrl ?? null : connection.qrImageDataUrl ?? null,
+          qrGeneratedAt: preservePreviousQrImage ? previous.qrGeneratedAt ?? connection.qrGeneratedAt ?? null : connection.qrGeneratedAt ?? null,
+          qrMessage: keepPreviousQrMessage ? previous.qrMessage ?? connection.qrMessage ?? null : connection.qrMessage ?? null,
+          whatsappProfileName: connection.whatsappProfileName || previous.whatsappProfileName || null,
+          whatsappOwnerJid: connection.whatsappOwnerJid || previous.whatsappOwnerJid || null,
+        };
+      }
+
       return connection;
     });
   };
@@ -5031,17 +5635,43 @@ function App() {
   async function loadAll(options?: { withSkeleton?: boolean }): Promise<void> {
     const withSkeleton = options?.withSkeleton ?? true;
     if (activeView === "history") {
-      await Promise.all([
-        reloadHistoryCalendarLoadedPages({
-          withSkeleton,
-          targetPage: Math.max(1, historyCalendarVisibleWeekCount || historyCalendarPage || 1),
-        }),
-        historyDraftsRequested || historyBulkPublishMode
-          ? reloadHistoryDraftLoadedPages({
-              targetPage: Math.max(1, historyDraftPage || 1),
-            })
-          : Promise.resolve(),
-      ]);
+      if (withSkeleton) {
+        startContentLoading();
+      }
+
+      try {
+        const companyFilter = selectedCompanyId ? `?companyId=${selectedCompanyId}` : "";
+        const jobsPromise = api.get<Job[]>(`/jobs${companyFilter}`);
+
+        const [, jobsData] = await Promise.all([
+          reloadHistoryCalendarLoadedPages({
+            withSkeleton: false,
+            targetPage: Math.max(1, historyCalendarVisibleWeekCount || historyCalendarPage || 1),
+          }),
+          jobsPromise,
+          historyDraftsRequested || historyBulkPublishMode
+            ? reloadHistoryDraftLoadedPages({
+                targetPage: Math.max(1, historyDraftPage || 1),
+              })
+            : Promise.resolve(),
+        ]);
+
+        setJobs(jobsData);
+        setError("");
+      } catch (loadError) {
+        if (loadError instanceof Error && loadError.message.includes("Sessao invalida")) {
+          api.setSessionToken("");
+          setAuthUser(null);
+          setAuthError("Sua sessão expirou. Faça login novamente.");
+          return;
+        }
+
+        setError(loadError instanceof Error ? loadError.message : "Falha ao carregar dados.");
+      } finally {
+        if (withSkeleton) {
+          finishContentLoading();
+        }
+      }
       return;
     }
 
@@ -5747,9 +6377,10 @@ function App() {
 
     void tick();
 
+    const refreshIntervalMs = activeView === "dashboard" ? 1_000 : 5_000;
     const intervalId = window.setInterval(() => {
       void tick();
-    }, 5000);
+    }, refreshIntervalMs);
 
     const handleVisibilityChange = () => {
       void tick();
@@ -5805,7 +6436,7 @@ function App() {
 
     const intervalId = window.setInterval(() => {
       void refreshUnreadCount();
-    }, 5000);
+    }, 2000);
 
     const handleVisibilityChange = () => {
       void refreshUnreadCount();
@@ -5942,14 +6573,6 @@ function App() {
   }, [editingJobId, jobSelectedCompanyIds.length, publicationType, schedulerProfileTargets]);
 
   useEffect(() => {
-    if (publicationType !== "instagram_post" && publicationType !== "instagram_story" && uploadedSchedulerMedia.length > 1) {
-      setUploadedSchedulerMedia((current) => current.slice(0, 1));
-      setDraggingSchedulerMediaIndex(null);
-      setDragOverSchedulerMediaIndex(null);
-    }
-  }, [publicationType, uploadedSchedulerMedia.length]);
-
-  useEffect(() => {
     if (supportsFirstComment) {
       return;
     }
@@ -5991,18 +6614,6 @@ function App() {
       return filtered.length === current.length && filtered.every((id, index) => id === current[index]) ? current : filtered;
     });
   }, [canEnableWhatsappRelink, schedulerWhatsappConnections, whatsappRelinkConnectionIds.length, whatsappRelinkEnabled]);
-
-  useEffect(() => {
-    if (mediaCaptionModalIndex === null) {
-      return;
-    }
-    if (mediaCaptionModalIndex < uploadedSchedulerMedia.length) {
-      return;
-    }
-
-    setMediaCaptionModalIndex(null);
-    setMediaCaptionDraft("");
-  }, [mediaCaptionModalIndex, uploadedSchedulerMedia.length]);
 
   useEffect(() => {
     if (storyEditorMediaIndex === null) {
@@ -6230,6 +6841,38 @@ function App() {
   }, [historyCalendarMonth, historyCalendarYear, historySearchQuery]);
 
   useEffect(() => {
+    setHistoryBoardPageByFilter({});
+  }, [historyCalendarMonth, historyCalendarYear, historySearchQuery, selectedCompanyId, jobs.length]);
+
+  useEffect(() => {
+    const loadingKeys = Object.entries(publicationBoardLoadingByFilter)
+      .filter(([, value]) => value)
+      .map(([key]) => key);
+
+    if (loadingKeys.length === 0) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      setPublicationBoardLoadingByFilter((current) => {
+        const next = { ...current };
+        loadingKeys.forEach((key) => {
+          next[key] = false;
+        });
+        return next;
+      });
+    }, 260);
+
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [publicationBoardLoadingByFilter]);
+
+  useEffect(() => {
+    writeCookieValue(HISTORY_COLLAPSED_SECTIONS_COOKIE, JSON.stringify(historyCollapsedSections));
+  }, [historyCollapsedSections]);
+
+  useEffect(() => {
     setHistoryDraftJobs([]);
     setHistoryDraftPage(0);
     setHistoryDraftTotalPages(1);
@@ -6267,7 +6910,7 @@ function App() {
     setHistoryCalendarVisibleWeekCount(0);
     setHistoryCalendarTotalPages(1);
     setHistoryCalendarMonthTotalJobs(0);
-    void loadHistoryCalendarPage(1, { reset: true, withSkeleton: true });
+    void loadAll({ withSkeleton: true });
   }, [activeView, authUser, historyCalendarLoadKey]);
 
   useEffect(() => {
@@ -6531,6 +7174,8 @@ function App() {
     event.preventDefault();
     setError("");
     setCompanyInfo("");
+    setWorkspaceModalInfo("");
+    setWorkspaceModalInfoTone("success");
     setCreatingWorkspace(true);
 
     try {
@@ -6558,7 +7203,8 @@ function App() {
       await loadAll();
       window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (workspaceError) {
-      setError(
+      setWorkspaceModalInfoTone("error");
+      setWorkspaceModalInfo(
         workspaceError instanceof Error
           ? workspaceError.message
           : editingWorkspaceId
@@ -6574,6 +7220,8 @@ function App() {
     setEditingWorkspaceId(null);
     setCompanyName("");
     setCompanyColorInput(DEFAULT_WORKSPACE_COLOR);
+    setWorkspaceModalInfo("");
+    setWorkspaceModalInfoTone("success");
     if (defaultKind) {
       setCompanyKindInput(defaultKind);
     } else {
@@ -6588,6 +7236,8 @@ function App() {
     setCompanyName(company.name);
     setCompanyKindInput(company.kind);
     setCompanyColorInput(company.color?.trim() || DEFAULT_WORKSPACE_COLOR);
+    setWorkspaceModalInfo("");
+    setWorkspaceModalInfoTone("success");
     setError("");
     setIsCreateWorkspaceModalOpen(true);
   }
@@ -6598,6 +7248,8 @@ function App() {
     setCompanyName("");
     setCompanyKindInput("CLIENT");
     setCompanyColorInput(DEFAULT_WORKSPACE_COLOR);
+    setWorkspaceModalInfo("");
+    setWorkspaceModalInfoTone("success");
     setCreatingWorkspace(false);
   }
 
@@ -6629,12 +7281,14 @@ function App() {
     }));
     setError("");
     setWorkspaceModalInfo("");
+    setWorkspaceModalInfoTone("success");
     setActiveWorkspaceInviteUrl("");
     setActiveWorkspaceInviteCompanyId(company.id);
   }
 
   function closeWorkspaceInviteModal() {
     setWorkspaceModalInfo("");
+    setWorkspaceModalInfoTone("success");
     setActiveWorkspaceInviteUrl("");
     setCreatingWorkspaceInvite(false);
     setActiveWorkspaceInviteCompanyId(null);
@@ -6642,12 +7296,14 @@ function App() {
 
   function openWorkspaceDetailsModal(company: Company, view: "members" | "invites") {
     setWorkspaceModalInfo("");
+    setWorkspaceModalInfoTone("success");
     setActiveWorkspaceDetailsCompanyId(company.id);
     setActiveWorkspaceDetailsView(view);
   }
 
   function closeWorkspaceDetailsModal() {
     setWorkspaceModalInfo("");
+    setWorkspaceModalInfoTone("success");
     setActiveWorkspaceDetailsCompanyId(null);
     setActiveWorkspaceDetailsView(null);
   }
@@ -6661,6 +7317,7 @@ function App() {
       if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(inviteUrl);
         setError("");
+        setWorkspaceModalInfoTone("success");
         setWorkspaceModalInfo(successMessage);
         return;
       }
@@ -6721,54 +7378,6 @@ function App() {
     }
   }
 
-  async function createConnection(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setConnectionCreateAttempted(true);
-    const formElement = event.currentTarget;
-    if (!formElement.reportValidity()) {
-      return;
-    }
-
-    const normalizedCompanyId = connectionCompanyId.trim();
-    if (!normalizedCompanyId) {
-      setTransientAgentError("");
-      setAuthInfo("");
-      setError("Selecione o workspace para adicionar a conta.");
-      return;
-    }
-
-    if (connections.some((connection) => connection.companyId === normalizedCompanyId && connection.platform === connectionPlatform)) {
-      const duplicateMessage = "Só é permitido adicionar 1 tipo de rede social por workspace.";
-      showTransientAgentsError(duplicateMessage);
-      setConnectionCreateAttempted(false);
-      setIsCreateConnectionModalOpen(false);
-      return;
-    }
-
-    const loginIdentifierPayload = connectionPlatform === "whatsapp" ? connectionLoginIdentifier || null : null;
-    try {
-      await api.postJson("/connections", {
-        companyId: normalizedCompanyId,
-        platform: connectionPlatform,
-        displayName: connectionDisplayName,
-        loginIdentifier: loginIdentifierPayload,
-        secret: connectionSecret || null,
-      });
-      setConnectionDisplayName("");
-      setConnectionLoginIdentifier("");
-      setConnectionSecret("");
-      setConnectionCreateAttempted(false);
-      setIsCreateConnectionModalOpen(false);
-      await loadAll();
-    } catch (createError) {
-      const createConnectionErrorMessage =
-        createError instanceof Error && createError.message ? createError.message : "Não foi possível adicionar a conta.";
-      setConnectionCreateAttempted(false);
-      setIsCreateConnectionModalOpen(false);
-      showTransientAgentsError(createConnectionErrorMessage);
-    }
-  }
-
   async function syncProviderConnection(
     connectionId: string,
     options?: { silent?: boolean; source?: "manual" | "auto"; intent?: "sync" | "renew" },
@@ -6809,11 +7418,74 @@ function App() {
     }
   }
 
+  async function resetCanceledConnectionAuth(connectionId: string) {
+    setDismissedAgentAuthConnectionIds((current) => (current.includes(connectionId) ? current : [...current, connectionId]));
+    setConnections((current) =>
+      current.map((connection) =>
+        connection.id === connectionId
+          ? {
+              ...connection,
+              authStatus: "AUTH_REQUIRED",
+              authLaunchUrl: null,
+              lastSeenAt: null,
+            }
+          : connection,
+      ),
+    );
+
+    try {
+      await api.postJson(`/connections/${connectionId}/cancel-auth`, {});
+      await loadAll();
+    } catch {
+      // Mantém o reset local mesmo se a limpeza remota falhar.
+    }
+  }
+
   function showTransientAgentsError(message: string) {
     const normalizedMessage = message.trim() || "Falha ao concluir a conexão da conta.";
     setAuthInfo("");
     setTransientAgentError(normalizedMessage);
     setError(normalizedMessage);
+  }
+
+  function applyQrConnectionRuntimeState(
+    connectionId: string,
+    patch: Partial<
+      Pick<
+        SocialConnection,
+        | "authStatus"
+        | "authLaunchUrl"
+        | "lastSeenAt"
+        | "lastAuthAt"
+        | "qrStatus"
+        | "qrImageDataUrl"
+        | "qrGeneratedAt"
+        | "workerLastSeenAt"
+        | "qrMessage"
+        | "whatsappOwnerJid"
+        | "whatsappProfileName"
+      >
+    >,
+  ) {
+    setConnections((current) =>
+      current.map((connection) => (connection.id === connectionId ? { ...connection, ...patch } : connection)),
+    );
+  }
+
+  function primeWhatsappQrGeneration(connectionId: string) {
+    applyQrConnectionRuntimeState(connectionId, {
+      authStatus: "AUTH_IN_PROGRESS",
+      authLaunchUrl: null,
+      lastSeenAt: null,
+      lastAuthAt: null,
+      qrStatus: "PREPARING",
+      qrImageDataUrl: null,
+      qrGeneratedAt: null,
+      workerLastSeenAt: null,
+      qrMessage: "Gerando QR do WhatsApp...",
+      whatsappOwnerJid: null,
+      whatsappProfileName: null,
+    });
   }
 
   function applyCompletedPostForMeConnection(payload: {
@@ -6840,6 +7512,7 @@ function App() {
       }
       activePostForMeSyncConnectionIdRef.current = null;
       if ((payload.message || "").trim() === "Processo cancelado pelo usuário.") {
+        void resetCanceledConnectionAuth(normalizedConnectionId);
         setError("");
         setAuthInfo("Processo cancelado pelo usuário.");
       } else {
@@ -6946,36 +7619,55 @@ function App() {
     window.setTimeout(() => void tick(), 2_500);
   }
 
-  function openCreateConnectionModal(platform: SocialConnection["platform"], workspaceId?: string) {
-    setConnectionPlatform(platform);
-    setConnectionDisplayName("");
-    setConnectionCompanyId(workspaceId ?? creatableConnectionWorkspaces[0]?.id ?? "");
-    setConnectionLoginIdentifier("");
-    setConnectionSecret("");
-    setConnectionCreateAttempted(false);
-    setIsCreateConnectionModalOpen(true);
-    setError("");
+  async function createConnectionForWorkspace(platform: SocialConnection["platform"], workspaceId: string) {
+    const connectionCardKey = `${workspaceId}:${platform}`;
+    setCreatingConnectionCardKey(connectionCardKey);
+    setTransientAgentError("");
     setAuthInfo("");
+    setError("");
+
+    try {
+      const existingConnection = connections.find(
+        (connection) => connection.companyId === workspaceId && connection.platform === platform,
+      );
+
+      if (existingConnection) {
+        setDismissedAgentAuthConnectionIds((current) => current.filter((id) => id !== existingConnection.id));
+        await openConnectionVisualAuth(existingConnection.id, existingConnection);
+        return;
+      }
+
+      const createdConnection = await api.postJson<SocialConnection>("/connections", {
+        companyId: workspaceId,
+        platform,
+        displayName: null,
+        loginIdentifier: null,
+        secret: null,
+      });
+
+      setConnections((current) => {
+        const next = current.filter(
+          (connection) => !(connection.companyId === createdConnection.companyId && connection.platform === createdConnection.platform),
+        );
+        next.push(createdConnection);
+        return next;
+      });
+
+      await openConnectionVisualAuth(createdConnection.id, createdConnection);
+    } catch (createError) {
+      const createConnectionErrorMessage =
+        createError instanceof Error && createError.message ? createError.message : "Não foi possível adicionar a conta.";
+      showTransientAgentsError(createConnectionErrorMessage);
+    } finally {
+      setCreatingConnectionCardKey((current) => (current === connectionCardKey ? null : current));
+    }
   }
 
-  async function openConnectionVisualAuth(connectionId: string) {
-    const connection = connections.find((entry) => entry.id === connectionId);
+  async function openConnectionVisualAuth(connectionId: string, connectionOverride?: SocialConnection | null) {
+    setDismissedAgentAuthConnectionIds((current) => current.filter((id) => id !== connectionId));
+    const connection = connectionOverride ?? connections.find((entry) => entry.id === connectionId);
     const isWhatsappConnection = connection?.platform === "whatsapp";
     const isPostForMeConnection = connection?.provider === "POST_FOR_ME";
-
-    if (
-      connection &&
-      isPostForMeConnection &&
-      (connection.platform === "facebook" || connection.platform === "threads") &&
-      !window.confirm(
-        `Detectamos que ${connection.platform === "facebook" ? "o Facebook" : "o Threads"} pode reaproveitar a sessão já aberta neste navegador.\n\n` +
-          "Se você quiser conectar outra conta dessa rede, saia primeiro da conta atual no navegador.\n\n" +
-          "A conta que já está conectada no SocialUp não será desconectada.\n\n" +
-          "Deseja continuar mesmo assim?",
-      )
-    ) {
-      return;
-    }
 
     if (isPostForMeConnection) {
       if (postForMeAuthLaunchLockRef.current) {
@@ -7039,6 +7731,11 @@ function App() {
     if (isWhatsappConnection) {
       setActiveQrConnectionId(connectionId);
       setQrRequestingConnectionId(connectionId);
+      setQrModalInfo("");
+      setQrModalInfoTone("success");
+      setError("");
+      setAuthInfo("");
+      primeWhatsappQrGeneration(connectionId);
     }
 
     try {
@@ -7050,17 +7747,18 @@ function App() {
       }
 
       const result = await api.postJson<{ launchUrl?: string }>(
-        "/connections/" + connectionId + "/open-visual-auth",
+        `/connections/${connectionId}/open-visual-auth`,
         isWhatsappConnection ? {} : { returnToUrl },
       );
-      await loadAll();
       setError("");
       if (isWhatsappConnection) {
+        setQrModalInfo("");
+        setQrModalInfoTone("success");
         return;
       }
 
       if (!result.launchUrl) {
-        setError("A URL de autorização da conta Meta não foi retornada pelo backend.");
+        setError("A URL de autorização da conta não foi retornada pelo backend.");
         return;
       }
 
@@ -7080,6 +7778,7 @@ function App() {
           postForMeAuthPopupRef.current = null;
           postForMeAuthPopupConnectionIdRef.current = null;
           clearManagedPopupWatch(postForMeAuthPopupWatchIntervalRef);
+          void resetCanceledConnectionAuth(connectionId);
           setError("");
           setAuthInfo("Processo cancelado pelo usuário.");
           return;
@@ -7129,6 +7828,7 @@ function App() {
                   if (activePostForMeSyncConnectionIdRef.current === connectionId) {
                     activePostForMeSyncConnectionIdRef.current = null;
                   }
+                  void resetCanceledConnectionAuth(connectionId);
                   setError("");
                   setAuthInfo("Processo cancelado pelo usuário.");
                 })
@@ -7147,6 +7847,7 @@ function App() {
                   if (activePostForMeSyncConnectionIdRef.current === connectionId) {
                     activePostForMeSyncConnectionIdRef.current = null;
                   }
+                  void resetCanceledConnectionAuth(connectionId);
                   setError("");
                   setAuthInfo("Processo cancelado pelo usuário.");
                 });
@@ -7169,7 +7870,25 @@ function App() {
       clearManagedPopupWatch(postForMeAuthPopupWatchIntervalRef);
       postForMeAuthPopupRef.current = null;
       postForMeAuthPopupConnectionIdRef.current = null;
-      setError(error instanceof Error ? error.message : "Falha ao iniciar a autorização.");
+      const errorMessage = error instanceof Error ? error.message : "Falha ao iniciar a autorização.";
+      if (isWhatsappConnection) {
+        setError("");
+        setAuthInfo("");
+        setQrModalInfo(errorMessage);
+        setQrModalInfoTone("error");
+        applyQrConnectionRuntimeState(connectionId, {
+          authStatus: "AUTH_REQUIRED",
+          authLaunchUrl: null,
+          lastSeenAt: null,
+          qrStatus: "ERROR",
+          qrImageDataUrl: null,
+          qrGeneratedAt: null,
+          workerLastSeenAt: null,
+          qrMessage: errorMessage,
+        });
+      } else {
+        setError(errorMessage);
+      }
     } finally {
       if (isPostForMeConnection) {
         if (postForMeAuthLaunchLockRef.current === connectionId) {
@@ -7373,15 +8092,31 @@ function App() {
     }
     setActiveQrConnectionId(connectionId);
     setQrRequestingConnectionId(connectionId);
+    setQrModalInfo("");
+    setQrModalInfoTone("success");
+    setError("");
+    setAuthInfo("");
+    primeWhatsappQrGeneration(connectionId);
     try {
       await api.postJson(`/connections/${connectionId}/regenerate-qr`, {});
-      await loadAll();
       setError("");
       setAuthInfo("Novo QR solicitado com sucesso.");
     } catch (error) {
-      setActiveQrConnectionId((current) => (current === connectionId ? null : current));
+      const errorMessage = error instanceof Error ? error.message : "Falha ao gerar um novo QR do WhatsApp.";
+      setError("");
       setAuthInfo("");
-      setError(error instanceof Error ? error.message : "Falha ao gerar um novo QR do WhatsApp.");
+      setQrModalInfo(errorMessage);
+      setQrModalInfoTone("error");
+      applyQrConnectionRuntimeState(connectionId, {
+        authStatus: "AUTH_REQUIRED",
+        authLaunchUrl: null,
+        lastSeenAt: null,
+        qrStatus: "ERROR",
+        qrImageDataUrl: null,
+        qrGeneratedAt: null,
+        workerLastSeenAt: null,
+        qrMessage: errorMessage,
+      });
     } finally {
       setQrRequestingConnectionId((current) => (current === connectionId ? null : current));
     }
@@ -7391,10 +8126,15 @@ function App() {
     setQrCancellingConnectionId(connectionId);
     setActiveQrConnectionId((current) => (current === connectionId ? null : current));
     setQrRequestingConnectionId((current) => (current === connectionId ? null : current));
+    setQrModalInfo("");
+    setQrModalInfoTone("success");
     try {
-      await api.postJson(`/connections/${connectionId}/dismiss-qr`, {});
+      const result = await api.postJson<SocialConnection>(`/connections/${connectionId}/dismiss-qr`, {});
       await loadAll();
       setError("");
+      if (result.authStatus === "CONNECTED") {
+        setAuthInfo("Conta WhatsApp conectada com sucesso.");
+      }
     } finally {
       setQrCancellingConnectionId((current) => (current === connectionId ? null : current));
     }
@@ -7405,34 +8145,28 @@ function App() {
       return;
     }
 
+    setActiveQrConnectionId((current) => (current === connectionId ? null : current));
+    setQrRequestingConnectionId((current) => (current === connectionId ? null : current));
+    setQrCancellingConnectionId((current) => (current === connectionId ? null : current));
+    setQrModalInfo("");
+    setQrModalInfoTone("success");
+    applyQrConnectionRuntimeState(connectionId, {
+      authStatus: "AUTH_REQUIRED",
+      authLaunchUrl: null,
+      lastSeenAt: null,
+      lastAuthAt: null,
+      qrStatus: "IDLE",
+      qrImageDataUrl: null,
+      qrGeneratedAt: null,
+      workerLastSeenAt: null,
+      qrMessage: null,
+      whatsappOwnerJid: null,
+      whatsappProfileName: null,
+    });
     await api.postJson(`/connections/${connectionId}/disconnect`, {});
     await loadAll();
     setError("");
     setAuthInfo("Conta desconectada com sucesso.");
-  }
-
-  async function deleteConnection(connectionId: string) {
-    await api.delete(`/connections/${connectionId}`);
-    clearPendingPostForMeConnectionSync(connectionId);
-    clearCompletedPostForMeConnectionSync(connectionId);
-    clearManagedPopupWatch(postForMeAuthPopupWatchIntervalRef);
-    if (postForMeAuthPopupConnectionIdRef.current === connectionId) {
-      closeManagedPopupWindow(postForMeAuthPopupRef.current);
-      postForMeAuthPopupRef.current = null;
-      postForMeAuthPopupConnectionIdRef.current = null;
-    }
-    if (activePostForMeSyncConnectionIdRef.current === connectionId) {
-      activePostForMeSyncConnectionIdRef.current = null;
-    }
-    if (syncingProviderConnectionId === connectionId) {
-      setSyncingProviderConnectionId(null);
-    }
-    if (postForMeAuthLaunchingConnectionId === connectionId) {
-      setPostForMeAuthLaunchingConnectionId(null);
-    }
-    setError("");
-    setAuthInfo("");
-    await loadAll();
   }
 
   async function uploadSelectedMedia(files: File[]) {
@@ -7443,9 +8177,10 @@ function App() {
     const selectedFiles = supportsMultiMediaUpload ? files : [files[0]!];
     if (supportsMultiMediaUpload) {
       const totalAfterUpload = uploadedSchedulerMedia.length + selectedFiles.length;
-      if (totalAfterUpload > INSTAGRAM_MULTI_MEDIA_MAX_FILES) {
+      const maxFiles = schedulerMultiMediaMaxFiles(publicationType);
+      if (totalAfterUpload > maxFiles) {
         setError("");
-        setSchedulerInfo(`Você pode enviar até ${INSTAGRAM_MULTI_MEDIA_MAX_FILES} mídias por publicação.`);
+        setSchedulerInfo(`Você pode enviar até ${maxFiles} mídias por publicação.`);
         schedulerMediaInputRef.current?.focus();
         return;
       }
@@ -7513,7 +8248,6 @@ function App() {
 
   function removeSchedulerUploadedMedia(filePath: string) {
     setUploadedSchedulerMedia((current) => current.filter((item) => item.filePath !== filePath));
-    closeMediaCaptionModal();
   }
 
   function reorderSchedulerUploadedMedia(fromIndex: number, toIndex: number) {
@@ -7580,40 +8314,6 @@ function App() {
     setDragOverSchedulerMediaIndex(null);
   }
 
-  function openMediaCaptionModal(index: number) {
-    const target = uploadedSchedulerMedia[index];
-    if (!target) {
-      return;
-    }
-
-    setMediaCaptionModalIndex(index);
-    setMediaCaptionDraft(target.caption?.trim() || "");
-  }
-
-  function closeMediaCaptionModal() {
-    setMediaCaptionModalIndex(null);
-    setMediaCaptionDraft("");
-  }
-
-  function saveMediaCaptionModal() {
-    if (mediaCaptionModalIndex === null) {
-      return;
-    }
-
-    const normalizedCaption = mediaCaptionDraft.trim();
-    setUploadedSchedulerMedia((current) =>
-      current.map((item, index) =>
-        index === mediaCaptionModalIndex
-          ? {
-              ...item,
-              caption: normalizedCaption.length > 0 ? normalizedCaption : null,
-            }
-          : item,
-      ),
-    );
-    closeMediaCaptionModal();
-  }
-
   function openStoryEditorModal(index: number) {
     const target = uploadedSchedulerMedia[index];
     if (!target || !isImagePath(target.filePath)) {
@@ -7624,7 +8324,6 @@ function App() {
     storyEditorDecorStickerDragRef.current = null;
     storyEditorTextStickerDragRef.current = null;
     storyEditorDrawRef.current = null;
-    closeMediaCaptionModal();
     setStoryEditorMediaIndex(index);
     setStoryEditorLocationEnabled(isInstagramForcedLocationEnabled);
     setStoryEditorLocationText(isInstagramForcedLocationEnabled ? instagramForcedLocationName : "");
@@ -7690,7 +8389,6 @@ function App() {
   }
 
   function discardSchedulerSelectedMedia() {
-    closeMediaCaptionModal();
     closeStoryEditorModal();
     setUploadedSchedulerMedia([]);
     setDraggingSchedulerMediaIndex(null);
@@ -7706,9 +8404,8 @@ function App() {
       return;
     }
 
-    if (uploadedSchedulerMedia.length > 0 || mediaCaptionModalIndex !== null || storyEditorMediaIndex !== null) {
-      discardSchedulerSelectedMedia();
-    } else if (schedulerMediaInputRef.current) {
+    closeStoryEditorModal();
+    if (schedulerMediaInputRef.current) {
       schedulerMediaInputRef.current.value = "";
     }
 
@@ -8636,6 +9333,11 @@ function App() {
     setWhatsappRelinkConnectionIds([]);
   }
 
+  function selectMetaLocationSuggestion(suggestion: MetaLocationSuggestion) {
+    setJobLocationName(suggestion.name);
+    setJobLocationId(suggestion.id);
+  }
+
   async function createJob(event: FormEvent) {
     event.preventDefault();
     if (!publicationType) {
@@ -8671,19 +9373,27 @@ function App() {
     }
 
     if (
-      (publicationType === "instagram_post" || publicationType === "instagram_story") &&
-      uploadedSchedulerMedia.length > INSTAGRAM_MULTI_MEDIA_MAX_FILES
+      supportsMultiMediaUpload &&
+      uploadedSchedulerMedia.length > schedulerMultiMediaMaxFiles(publicationType)
     ) {
       setError("");
-      setSchedulerInfo(`Você pode enviar até ${INSTAGRAM_MULTI_MEDIA_MAX_FILES} mídias por publicação.`);
+      setSchedulerInfo(`Você pode enviar até ${schedulerMultiMediaMaxFiles(publicationType)} mídias por publicação.`);
       return;
     }
 
-    if (requiresMediaUpload && uploadedFileName) {
-      const validationMessage = schedulerMediaValidationMessage(publicationType, uploadedFileName, uploadedFileSizeBytes);
+    if (supportsMediaUpload && uploadedSchedulerMedia.length > 0) {
+      const invalidMedia = uploadedSchedulerMedia.find((media) =>
+        schedulerMediaValidationMessage(publicationType, media.fileName, media.fileSizeBytes),
+      );
+      const validationMessage = invalidMedia
+        ? schedulerMediaValidationMessage(publicationType, invalidMedia.fileName, invalidMedia.fileSizeBytes)
+        : null;
       if (validationMessage) {
         setError("");
-        setSchedulerInfo(validationMessage);
+        const invalidMediaIndex = uploadedSchedulerMedia.findIndex((media) => media.filePath === invalidMedia?.filePath);
+        setSchedulerInfo(
+          invalidMediaIndex >= 0 ? `Mídia ${invalidMediaIndex + 1}: ${validationMessage}` : validationMessage,
+        );
         schedulerMediaInputRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
         schedulerMediaInputRef.current?.focus();
         return;
@@ -8711,6 +9421,12 @@ function App() {
       return;
     }
 
+    if (supportsMetaLocation && !hasForcedInstagramMetaLocation && jobLocationName.trim() && !jobLocationId.trim()) {
+      setError("");
+      setSchedulerInfo("Selecione uma localização da lista para preencher o ID automaticamente.");
+      return;
+    }
+
     setSubmittingJob(true);
     setError("");
     setSchedulerInfo(
@@ -8721,20 +9437,22 @@ function App() {
           : "Agendando postagem...",
     );
 
-    const scheduledAtIso = toIsoFromTimeZoneDateTime(scheduledDate, scheduledTime, effectiveUserTimeZone);
-    if (!scheduledAtIso) {
+    const scheduledPayload = buildScheduledPayload(scheduledDate, scheduledTime, effectiveUserTimeZone);
+    if (!scheduledPayload) {
       setSubmittingJob(false);
       setError("");
       setSchedulerInfo("Data/hora inválida para o fuso selecionado.");
       return;
     }
+    const normalizedLocationId = jobLocationId.trim();
+    const normalizedLocationName = jobLocationName.trim();
     const effectiveLocationId =
-      requiresInstagramMetadata
-        ? (isInstagramForcedLocationEnabled ? instagramForcedLocationId : null)
+      supportsMetaLocation
+        ? (hasForcedInstagramMetaLocation ? instagramForcedLocationId : normalizedLocationId || null)
         : null;
     const effectiveLocationName =
-      requiresInstagramMetadata
-        ? (isInstagramForcedLocationEnabled ? instagramForcedLocationName : null)
+      supportsMetaLocation
+        ? (hasForcedInstagramMetaLocation ? instagramForcedLocationName : normalizedLocationName || null)
         : null;
     const effectiveCaption = publicationType === "instagram_story" ? null : caption;
     const normalizedFirstComment =
@@ -8750,13 +9468,18 @@ function App() {
         schedulerWhatsappConnections.some((connection) => connection.id === id)
       )
       : [];
+    if (supportsWhatsappRelink && whatsappRelinkEnabled && whatsappRelinkMediaMessage) {
+      setSubmittingJob(false);
+      setError("");
+      setSchedulerInfo(whatsappRelinkMediaMessage);
+      return;
+    }
     if (canEnableWhatsappRelink && whatsappRelinkEnabled && normalizedWhatsappRelinkConnectionIds.length === 0) {
       setSubmittingJob(false);
       setError("");
       setSchedulerInfo("Selecione ao menos uma conta de WhatsApp para relink.");
       return;
     }
-    const fileCaptions = uploadedSchedulerMedia.map((item) => item.caption?.trim() || "");
     const effectiveWhatsappBackgroundColor =
       publicationType === "whatsapp_status_texto" || publicationType === "whatsapp_status_midia"
         ? whatsappBackgroundColor
@@ -8765,7 +9488,6 @@ function App() {
     const basePayload = {
       filePath: uploadedFilePath,
       filePaths: uploadedSchedulerMedia.map((item) => item.filePath),
-      fileCaptions: fileCaptions.some((entry) => entry.length > 0) ? fileCaptions : undefined,
       sequential: effectiveSequentialPublishing,
       title: normalizedTitle,
       caption: effectiveCaption,
@@ -8781,7 +9503,7 @@ function App() {
       locationId: effectiveLocationId,
       publicationType,
       publicationState,
-      dataPostagem: scheduledAtIso,
+      ...scheduledPayload,
     };
 
     try {
@@ -8852,14 +9574,14 @@ function App() {
     setFirstCommentEnabled(false);
     setHashtagsInput("");
     setJobHashtags([]);
+    setJobLocationName("");
+    setJobLocationId("");
     setWhatsappBackgroundColor(DEFAULT_WHATSAPP_BACKGROUND_COLOR);
     setWhatsappRelinkEnabled(false);
     setWhatsappRelinkConnectionIds([]);
     setUploadedSchedulerMedia([]);
     setDraggingSchedulerMediaIndex(null);
     setDragOverSchedulerMediaIndex(null);
-    setMediaCaptionModalIndex(null);
-    setMediaCaptionDraft("");
     storyEditorStickerDragRef.current = null;
     storyEditorDecorStickerDragRef.current = null;
     storyEditorTextStickerDragRef.current = null;
@@ -8912,7 +9634,7 @@ function App() {
     setJobCompanyId(job.companyId);
     setJobSocialConnectionId(job.socialConnectionId ?? "");
     setJobSelectedCompanyIds([job.companyId]);
-    const selectedFiles = (job.filePaths && job.filePaths.length > 0 ? job.filePaths : [job.filePath])
+    const selectedFiles = decodeJobMediaPaths(job)
       .map((entry) => entry.trim())
       .filter((entry) => entry.length > 0);
     setUploadedSchedulerMedia(
@@ -8925,8 +9647,6 @@ function App() {
     );
     setDraggingSchedulerMediaIndex(null);
     setDragOverSchedulerMediaIndex(null);
-    setMediaCaptionModalIndex(null);
-    setMediaCaptionDraft("");
     storyEditorStickerDragRef.current = null;
     storyEditorDecorStickerDragRef.current = null;
     storyEditorTextStickerDragRef.current = null;
@@ -8965,12 +9685,17 @@ function App() {
     setFirstCommentEnabled(Boolean(job.firstComment?.trim()));
     setHashtagsInput("");
     setJobHashtags(Array.isArray(job.hashtags) ? job.hashtags : []);
+    setJobLocationName(job.locationName?.trim() || "");
+    setJobLocationId(job.locationId?.trim() || "");
     setWhatsappBackgroundColor(job.whatsappBackgroundColor?.trim() || DEFAULT_WHATSAPP_BACKGROUND_COLOR);
     const jobMediaCount = Array.isArray(job.filePaths) && job.filePaths.length > 0 ? job.filePaths.length : (job.filePath ? 1 : 0);
     const supportsJobWhatsappRelink =
       job.publicationType === "instagram_post" ||
       job.publicationType === "instagram_reel" ||
-      (job.publicationType === "instagram_story" && jobMediaCount <= 1);
+      (job.publicationType === "instagram_story" && jobMediaCount <= 1) ||
+      job.publicationType === "threads_post" ||
+      job.publicationType === "x_post" ||
+      job.publicationType === "tiktok_post";
     const normalizedJobRelinkConnectionIds = (Array.isArray(job.whatsappRelinkConnectionIds) ? job.whatsappRelinkConnectionIds : [])
       .map((entry) => entry.trim())
       .filter((entry) => entry.length > 0);
@@ -9116,13 +9841,13 @@ function App() {
       return;
     }
 
-    const scheduledAtIso = toIsoFromTimeZoneDateTime(
+    const scheduledPayload = buildScheduledPayload(
       publicationDuplicateDate,
       publicationDuplicateTime,
       effectiveUserTimeZone,
     );
 
-    if (!scheduledAtIso) {
+    if (!scheduledPayload) {
       setError("Preencha uma data e um horário válidos para a duplicação.");
       return;
     }
@@ -9137,11 +9862,14 @@ function App() {
           const payload = buildHistoryBulkUpdatePayload(activePublicationDuplicateJob, {
             companyId,
             publicationState: "DRAFT",
-            dataPostagem: scheduledAtIso,
+            dataPostagem: scheduledPayload.dataPostagem,
           });
 
           return api.postJson<Job>("/jobs", {
             ...payload,
+            scheduledDateLocal: scheduledPayload.scheduledDateLocal,
+            scheduledTimeLocal: scheduledPayload.scheduledTimeLocal,
+            timeZone: scheduledPayload.timeZone,
             title: publicationDuplicateTitle.trim() || resolveHistoryCalendarTitle(activePublicationDuplicateJob),
           });
         }),
@@ -9260,6 +9988,101 @@ function App() {
     }
   }
 
+  function navigateDashboardCalendarMonth(delta: number) {
+    setDashboardCalendarPopoverJobId(null);
+    setDashboardCalendarEditingJobId(null);
+    setDashboardCalendarTimeValue("");
+    setDashboardCalendarDayPages({});
+    setDashboardCalendarPeriod((current) => shiftCalendarMonth(current.year, current.month, delta));
+  }
+
+  function setDashboardCalendarDayPage(dayKey: string, nextPage: number, totalJobs: number) {
+    const totalPages = Math.max(1, Math.ceil(totalJobs / 4));
+    setDashboardCalendarDayPages((current) => ({
+      ...current,
+      [dayKey]: clampNumber(nextPage, 0, totalPages - 1),
+    }));
+  }
+
+  function openDashboardCalendarPopover(job: Job) {
+    setDashboardCalendarPopoverJobId(job.id);
+  }
+
+  function closeDashboardCalendarPopover(jobId?: string) {
+    setDashboardCalendarPopoverJobId((current) => {
+      if (!jobId || current === jobId) {
+        return null;
+      }
+      return current;
+    });
+    setDashboardCalendarEditingJobId((current) => {
+      if (!jobId || current === jobId) {
+        return null;
+      }
+      return current;
+    });
+    if (!jobId || dashboardCalendarEditingJobId === jobId) {
+      setDashboardCalendarTimeValue("");
+    }
+  }
+
+  function startDashboardCalendarTimeEdit(job: Job) {
+    setDashboardCalendarPopoverJobId(job.id);
+    setDashboardCalendarEditingJobId(job.id);
+    setDashboardCalendarTimeValue(
+      toTimeLocal(job.dataPostagem, effectiveUserTimeZone) || getCurrentTimeValue(effectiveUserTimeZone, nowReferenceDate),
+    );
+  }
+
+  async function saveDashboardCalendarTime(job: Job) {
+    const nextDate = toDateLocal(job.dataPostagem, effectiveUserTimeZone);
+    const nextTime = dashboardCalendarTimeValue.trim();
+
+    if (!nextDate || !nextTime) {
+      setError("Preencha um horário válido para a postagem.");
+      return;
+    }
+
+    const scheduledPayload = buildScheduledPayload(nextDate, nextTime, effectiveUserTimeZone);
+    if (!scheduledPayload) {
+      setError("Horário inválido para reagendar a postagem.");
+      return;
+    }
+
+    if (isPastScheduledAt(scheduledPayload.dataPostagem, effectiveUserTimeZone, nowReferenceDate)) {
+      setError("Escolha um horário futuro para a postagem.");
+      return;
+    }
+
+    const payload = buildHistoryBulkUpdatePayload(job, {
+      publicationState: "PUBLISHED",
+      dataPostagem: scheduledPayload.dataPostagem,
+      scheduledDateLocal: scheduledPayload.scheduledDateLocal,
+      scheduledTimeLocal: scheduledPayload.scheduledTimeLocal,
+      timeZone: scheduledPayload.timeZone,
+    });
+
+    if (!payload.socialConnectionId) {
+      setError("Essa postagem está sem conta vinculada para reagendamento.");
+      return;
+    }
+
+    setDashboardCalendarSavingJobId(job.id);
+    setError("");
+
+    try {
+      await api.putJson(`/jobs/${job.id}`, payload);
+      setDashboardCalendarPopoverJobId(null);
+      setDashboardCalendarEditingJobId(null);
+      setDashboardCalendarTimeValue("");
+      await loadAll({ withSkeleton: false });
+    } catch (scheduleError) {
+      setError(scheduleError instanceof Error ? scheduleError.message : "Falha ao atualizar o agendamento.");
+    } finally {
+      setDashboardCalendarSavingJobId(null);
+    }
+  }
+
   function openHistoryWithFilter(filter: HistoryFilterKey): void {
     navigateToView("history", { historyFilter: filter });
   }
@@ -9277,6 +10100,46 @@ function App() {
     const nextMonth = shiftCalendarMonth(historyCalendarYear, historyCalendarMonth, delta);
     setHistoryCalendarYear(nextMonth.year);
     setHistoryCalendarMonth(nextMonth.month);
+  }
+
+  function navigatePublicationBoardSectionMonth(filterKey: HistoryFilterKey, delta: number) {
+    setPublicationBoardLoadingByFilter((current) => ({
+      ...current,
+      [filterKey]: true,
+    }));
+    setPublicationBoardPeriodByFilter((current) => {
+      const basePeriod = current[filterKey] ?? getYearMonthInTimeZone(nowReferenceDate, effectiveUserTimeZone);
+      const nextPeriod = shiftCalendarMonth(basePeriod.year, basePeriod.month, delta);
+      return {
+        ...current,
+        [filterKey]: nextPeriod,
+      };
+    });
+    setHistoryBoardPageByFilter((current) => ({
+      ...current,
+      [filterKey]: 0,
+    }));
+  }
+
+  function updatePublicationBoardSectionYear(filterKey: HistoryFilterKey, year: number) {
+    setPublicationBoardLoadingByFilter((current) => ({
+      ...current,
+      [filterKey]: true,
+    }));
+    setPublicationBoardPeriodByFilter((current) => {
+      const basePeriod = current[filterKey] ?? getYearMonthInTimeZone(nowReferenceDate, effectiveUserTimeZone);
+      return {
+        ...current,
+        [filterKey]: {
+          year,
+          month: basePeriod.month,
+        },
+      };
+    });
+    setHistoryBoardPageByFilter((current) => ({
+      ...current,
+      [filterKey]: 0,
+    }));
   }
 
   function setHistoryCalendarDayPage(dayKey: string, nextPage: number, totalJobs: number) {
@@ -9413,8 +10276,8 @@ function App() {
       return;
     }
 
-    const scheduledAtIso = toIsoFromTimeZoneDateTime(nextDate, normalizedTime, effectiveUserTimeZone);
-    if (!scheduledAtIso) {
+    const scheduledPayload = buildScheduledPayload(nextDate, normalizedTime, effectiveUserTimeZone);
+    if (!scheduledPayload) {
       const message = "Data ou horário inválido para reagendar a postagem.";
       if (feedbackMode === "alert") {
         window.alert(message);
@@ -9424,7 +10287,7 @@ function App() {
       return;
     }
 
-    if (isPastScheduledAt(scheduledAtIso, effectiveUserTimeZone, nowReferenceDate)) {
+    if (isPastScheduledAt(scheduledPayload.dataPostagem, effectiveUserTimeZone, nowReferenceDate)) {
       const message = "Escolha um horário futuro para a postagem.";
       if (feedbackMode === "alert") {
         window.alert(message);
@@ -9445,7 +10308,10 @@ function App() {
 
     const payload = buildHistoryBulkUpdatePayload(job, {
       publicationState: "PUBLISHED",
-      dataPostagem: scheduledAtIso,
+      dataPostagem: scheduledPayload.dataPostagem,
+      scheduledDateLocal: scheduledPayload.scheduledDateLocal,
+      scheduledTimeLocal: scheduledPayload.scheduledTimeLocal,
+      timeZone: scheduledPayload.timeZone,
     });
 
     if (!payload.socialConnectionId) {
@@ -9464,7 +10330,7 @@ function App() {
     const previousHistoryCalendarDayPages = historyCalendarDayPages;
     const previousJobs = jobs;
     const optimisticJobPatch = {
-      dataPostagem: scheduledAtIso,
+      dataPostagem: scheduledPayload.dataPostagem,
       publicationState: "PUBLISHED" as PublicationState,
       socialConnectionId: payload.socialConnectionId,
       companyId: payload.companyId,
@@ -9755,10 +10621,13 @@ function App() {
     options: {
       publicationState?: PublicationState;
       dataPostagem?: string | null;
+      scheduledDateLocal?: string;
+      scheduledTimeLocal?: string;
+      timeZone?: string;
       companyId?: string;
     },
   ) {
-    const selectedFilePaths = (job.filePaths && job.filePaths.length > 0 ? job.filePaths : [job.filePath])
+    const selectedFilePaths = decodeJobMediaPaths(job)
       .map((entry) => entry.trim())
       .filter((entry) => entry.length > 0);
 
@@ -9786,7 +10655,7 @@ function App() {
     return {
       companyId: targetCompanyId,
       socialConnectionId: targetSocialConnectionId,
-      filePath: job.filePath,
+      filePath: selectedFilePaths[0] ?? job.filePath,
       filePaths: selectedFilePaths.length > 1 ? selectedFilePaths : undefined,
       fileCaptions: selectedFilePaths.length > 0 ? (job.fileCaptions ?? []) : undefined,
       sequential: selectedFilePaths.length > 1 ? true : undefined,
@@ -9801,6 +10670,9 @@ function App() {
       publicationType: job.publicationType,
       publicationState: options.publicationState ?? job.publicationState,
       dataPostagem: options.dataPostagem === undefined ? job.dataPostagem : options.dataPostagem,
+      scheduledDateLocal: options.scheduledDateLocal,
+      scheduledTimeLocal: options.scheduledTimeLocal,
+      timeZone: options.timeZone,
     };
   }
 
@@ -9819,6 +10691,9 @@ function App() {
     const options: {
       publicationState?: PublicationState;
       dataPostagem?: string;
+      scheduledDateLocal?: string;
+      scheduledTimeLocal?: string;
+      timeZone?: string;
       companyId?: string;
     } = {};
 
@@ -9831,13 +10706,16 @@ function App() {
         setError("Preencha data e horário para publicar os rascunhos em massa.");
         return;
       }
-      const scheduledAtIso = toIsoFromTimeZoneDateTime(historyBulkDate, historyBulkTime, effectiveUserTimeZone);
-      if (!scheduledAtIso) {
+      const scheduledPayload = buildScheduledPayload(historyBulkDate, historyBulkTime, effectiveUserTimeZone);
+      if (!scheduledPayload) {
         setError("Data ou horário inválido para publicação em massa.");
         return;
       }
       options.publicationState = "PUBLISHED";
-      options.dataPostagem = scheduledAtIso;
+      options.dataPostagem = scheduledPayload.dataPostagem;
+      options.scheduledDateLocal = scheduledPayload.scheduledDateLocal;
+      options.scheduledTimeLocal = scheduledPayload.scheduledTimeLocal;
+      options.timeZone = scheduledPayload.timeZone;
     }
     if (historyBulkAction === "SET_DRAFT") {
       if (historyBulkSelectedJobs.some((job) => job.publicationState !== "PUBLISHED")) {
@@ -10509,8 +11387,6 @@ function App() {
     ]);
     setDraggingSchedulerMediaIndex(null);
     setDragOverSchedulerMediaIndex(null);
-    setMediaCaptionModalIndex(null);
-    setMediaCaptionDraft("");
     setPublicationType(media.publicationType);
     setPublicationState("");
     setJobCompanyId("");
@@ -10519,6 +11395,8 @@ function App() {
     setCaption("");
     setFirstComment("");
     setFirstCommentEnabled(false);
+    setJobLocationName("");
+    setJobLocationId("");
     setScheduledDate("");
     setScheduledTime("");
     setActiveView("scheduler");
@@ -10552,10 +11430,6 @@ function App() {
 
   function removeSchedulerHashtag(tag: string) {
     setJobHashtags((current) => current.filter((entry) => entry !== tag));
-  }
-
-  function appendEmojiToMediaCaption(emoji: string) {
-    setMediaCaptionDraft((current) => `${current}${emoji}`);
   }
 
   function appendEmojiToBroadcastAvisoMessage(emoji: string) {
@@ -10882,349 +11756,310 @@ function App() {
   }
 
   function renderDashboard() {
-    const hasDashboardTrendData =
-      dashboardTrendFocus === "all"
-        ? dashboardChartData.points.some((point) => point.published > 0 || point.failed > 0 || point.scheduled > 0)
-        : dashboardChartData.points.some((point) => point.total > 0);
-    const dashboardXAxisStep = Math.max(1, Math.ceil(dashboardChartData.points.length / 6));
-    const dashboardXAxisLabels = dashboardChartData.points.filter(
-      (point, index) =>
-        index === 0 ||
-        index === dashboardChartData.points.length - 1 ||
-        index % dashboardXAxisStep === 0,
-    );
-    const publishedPath = buildDashboardChartPath(
-      dashboardChartData.points.map((point) => point.published),
-      100,
-      100,
-    );
-    const failedPath = buildDashboardChartPath(
-      dashboardChartData.points.map((point) => point.failed),
-      100,
-      100,
-    );
-    const scheduledPath = buildDashboardChartPath(
-      dashboardChartData.points.map((point) => point.scheduled),
-      100,
-      100,
-    );
-    const focusPath = buildDashboardChartPath(
-      dashboardChartData.points.map((point) => point.total),
-      100,
-      100,
-    );
+    const welcomeName = authUser?.name?.trim().split(/\s+/)[0] || "por aqui";
+    const monthLabel = dashboardCalendarMonthLabel.charAt(0).toUpperCase() + dashboardCalendarMonthLabel.slice(1);
+    const hasMonthJobs = dashboardCalendarCells.some((cell) => cell.inCurrentMonth && cell.jobs.length > 0);
 
     return (
       <div className="view-stack">
-        <section className="dashboard-top-grid">
-          <div className="stats-grid dashboard-compact-metrics-grid">
-            <article className="metric-card dashboard-compact-metric-card">
-              <span className="metric-label">
-                <span className="metric-icon" aria-hidden="true">
-                  <FiCheckCircle />
-                </span>
-                <span className="metric-label-text">Enviados</span>
-              </span>
-              <strong>{dashboard.completedJobs}</strong>
-            </article>
-            <article className="metric-card dashboard-compact-metric-card">
-              <span className="metric-label">
-                <span className="metric-icon" aria-hidden="true">
-                  <FiClock />
-                </span>
-                <span className="metric-label-text">Pendentes</span>
-              </span>
-              <strong>{dashboard.pendingJobs}</strong>
-            </article>
-            <article className="metric-card dashboard-compact-metric-card">
-              <span className="metric-label">
-                <span className="metric-icon" aria-hidden="true">
-                  <FiWifi />
-                </span>
-                <span className="metric-label-text">Cancelados</span>
-              </span>
-              <strong>{dashboard.canceledJobs}</strong>
-            </article>
-            <article className="metric-card metric-card-failed dashboard-compact-metric-card">
-              <span className="metric-label">
-                <span className="metric-icon" aria-hidden="true">
-                  <FiAlertCircle />
-                </span>
-                <span className="metric-label-text">Falhados</span>
-              </span>
-              <strong className="metric-value-failed">{dashboard.failedJobs}</strong>
-            </article>
+        <section className="home-welcome-banner">
+          <div className="home-welcome-copy">
+            <small>Home</small>
+            <h2>
+              <span>Bem-vindo, </span>
+              <span className="home-welcome-highlight">{welcomeName}</span>
+            </h2>
+            <p>Seu mês inteiro num calendário interativo, com leitura mais limpa e detalhes rápidos quando você precisar.</p>
+          </div>
+          <button
+            type="button"
+            className="primary-button publications-primary-action"
+            onClick={() => navigateToView("scheduler")}
+          >
+            <FiPlus aria-hidden="true" />
+            Novo agendamento
+          </button>
+        </section>
+
+        <section className="panel-card home-calendar-shell">
+          <div className="home-calendar-toolbar">
+            <div className="home-calendar-toolbar-copy">
+              <strong>{monthLabel}</strong>
+              <span>{selectedCompanyId ? "Visualizando o workspace selecionado." : "Visualizando todos os workspaces."}</span>
+            </div>
+            <div className="home-calendar-toolbar-actions">
+              <button
+                type="button"
+                className="ghost-button home-calendar-nav-button"
+                onClick={() => navigateDashboardCalendarMonth(-1)}
+                aria-label="Mês anterior"
+              >
+                <FiChevronLeft />
+              </button>
+              <button
+                type="button"
+                className="ghost-button home-calendar-nav-button"
+                onClick={() => navigateDashboardCalendarMonth(1)}
+                aria-label="Próximo mês"
+              >
+                <FiChevronRight />
+              </button>
+            </div>
           </div>
 
-          <section className="panel-card dashboard-upcoming-carousel-panel">
-            <div className="section-head">
-              <div>
-                <div className="view-title-with-icon">
-                  <span className="view-title-icon" aria-hidden="true">
-                    <FiCalendar />
-                  </span>
-                  <h2>Próximos Agendamentos</h2>
-                </div>
-              </div>
-              {dashboardUpcomingPages.length > 1 ? (
-                <div className="dashboard-carousel-controls">
-                  <button
-                    type="button"
-                    className="ghost-button dashboard-carousel-arrow"
-                    onClick={() => setDashboardUpcomingPage((current) => Math.max(0, current - 1))}
-                    disabled={dashboardUpcomingPage === 0}
-                    aria-label="Página anterior"
-                  >
-                    <FiChevronLeft />
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost-button dashboard-carousel-arrow"
-                    onClick={() =>
-                      setDashboardUpcomingPage((current) => Math.min(dashboardUpcomingPages.length - 1, current + 1))
-                    }
-                    disabled={dashboardUpcomingPage >= dashboardUpcomingPages.length - 1}
-                    aria-label="Próxima página"
-                  >
-                    <FiChevronRight />
-                  </button>
-                </div>
-              ) : null}
+          <div className="home-calendar-month">
+            <div className="home-calendar-weekdays" aria-hidden="true">
+              {DASHBOARD_CALENDAR_WEEKDAY_LABELS.map((label) => (
+                <span key={`dashboard-weekday-${label}`}>{label}</span>
+              ))}
             </div>
 
-            {upcomingJobs.length === 0 ? (
-              <div className="empty-state dashboard-upcoming-empty-state">Não há próximos agendamentos nesse filtro.</div>
-            ) : (
-              <>
-                <div className="dashboard-carousel-shell">
-                  <div
-                    className="dashboard-carousel-track"
-                    style={{ transform: `translateX(-${dashboardUpcomingPage * 100}%)` }}
-                  >
-                    {dashboardUpcomingPages.map((page, pageIndex) => (
-                      <div key={`dashboard-upcoming-page-${pageIndex}`} className="dashboard-carousel-page">
-                        {page.map((job) => {
-                          const isRunningLike = shouldRenderUpcomingAsRunning(job, isPastScheduledAtForUser);
+            <div className="home-calendar-grid">
+              {dashboardCalendarCells.map((cell) => (
+                (() => {
+                  const pageCount = Math.max(1, Math.ceil(cell.jobs.length / 4));
+                  const currentPage = Math.min(dashboardCalendarDayPages[cell.dayKey] ?? 0, pageCount - 1);
+                  const visibleJobs = cell.jobs.slice(currentPage * 4, currentPage * 4 + 4);
 
-                          return (
-                            <article key={job.id} className="dashboard-upcoming-card">
-                              <strong>{resolveJobDisplayTitle(job)}</strong>
-                              <div className="meta-pill-row">
-                                {renderPublicationTypePill(job.publicationType)}
-                                <span className="unit-pill">
-                                  {`Workspace: ${companyNameMap[job.companyId] || "Workspace removido"}`}
-                                </span>
-                              </div>
-                              <span className="dashboard-upcoming-card-date">
-                                {formatJobScheduledAt(job, effectiveUserTimeZone)}
-                              </span>
-                              <div className="dashboard-upcoming-card-footer">
-                                {isRunningLike ? (
-                                  <span className="status-pill status-running-live">
-                                    <span className="status-pill-spinner" aria-hidden="true" />
-                                    Executando
-                                  </span>
-                                ) : (
-                                  <span className={`status-pill status-${jobStatusTone(job)}`}>{jobStatusDisplayLabel(job)}</span>
-                                )}
-                                {!isRunningLike && canToggleJobSchedule(job, isPastScheduledAtForUser) ? (
-                                  <button
-                                    type="button"
-                                    className={job.status === "CANCELED" ? "activate-button" : "ghost-button"}
-                                    onClick={() => void toggleJobSchedule(job)}
-                                    disabled={togglingScheduleJobId === job.id}
-                                  >
-                                    {togglingScheduleJobId === job.id
-                                      ? "Salvando..."
-                                      : job.status === "CANCELED"
-                                        ? "Ativar"
-                                        : "Cancelar"}
-                                  </button>
+                  return (
+                    <article
+                      key={cell.key}
+                      className={`home-calendar-day${cell.inCurrentMonth ? "" : " home-calendar-day-outside"}${
+                        cell.isToday ? " home-calendar-day-today" : ""
+                      }`}
+                    >
+                      <div className="home-calendar-day-head">
+                        {cell.inCurrentMonth ? <strong>{cell.displayDay}</strong> : <span aria-hidden="true" />}
+                      </div>
+
+                      <div className="home-calendar-day-body">
+                        {cell.inCurrentMonth && cell.jobs.length > 0
+                          ? (
+                              <div className="home-calendar-day-events-shell">
+                                <div className="home-calendar-day-events">
+                                  {visibleJobs.map((job) => {
+                                    const dashboardJobTitle = resolveHistoryCalendarTitle(job);
+                                    const participantNetworks = resolveJobParticipantNetworks(job);
+                                    const isRunningLike = shouldRenderUpcomingAsRunning(job, isPastScheduledAtForUser);
+                                    const isPopoverOpen = dashboardCalendarPopoverJobId === job.id;
+                                    const isEditingTime = dashboardCalendarEditingJobId === job.id;
+                                    const isSavingTime = dashboardCalendarSavingJobId === job.id;
+                                    const isRetryingJob = retryingJobId === job.id;
+                                    const isReactivatingJob = togglingScheduleJobId === job.id;
+                                    const canEditTime =
+                                      canEditPublicationBoardSchedule(job) && !isPastScheduledAtForUser(job.dataPostagem);
+                                    const canRetry = canRetryPublicationBoardJob(job);
+                                    const canReactivate = canReactivatePublicationBoardJob(job);
+                                    const popoverStatusTone = publicationBoardStatusChipTone(job, isPastScheduledAtForUser);
+
+                                    return (
+                                      <div
+                                        key={job.id}
+                                        className="home-calendar-entry-wrap"
+                                        onMouseLeave={() => closeDashboardCalendarPopover(job.id)}
+                                      >
+                                        <button
+                                          type="button"
+                                          className={`home-calendar-entry${isPopoverOpen ? " home-calendar-entry-active" : ""}`}
+                                          onMouseEnter={() => openDashboardCalendarPopover(job)}
+                                          onFocus={() => openDashboardCalendarPopover(job)}
+                                          onClick={() => openDashboardCalendarPopover(job)}
+                                          title={dashboardJobTitle}
+                                          aria-label={dashboardJobTitle}
+                                        >
+                                          <span className="home-calendar-entry-time">
+                                            {toTimeLocal(job.dataPostagem, effectiveUserTimeZone) || "--:--"}
+                                          </span>
+                                          <span className="home-calendar-entry-title">{dashboardJobTitle}</span>
+                                          {isRunningLike ? <span className="status-pill-spinner home-calendar-entry-spinner" aria-hidden="true" /> : null}
+                                        </button>
+
+                                        {isPopoverOpen ? (
+                                          <div
+                                            className={`home-calendar-popover${cell.columnIndex >= 4 ? " home-calendar-popover-right" : ""}`}
+                                            onMouseEnter={() => openDashboardCalendarPopover(job)}
+                                          >
+                                            <div className="home-calendar-popover-head">
+                                              <div className="home-calendar-popover-title">
+                                                <strong>{dashboardJobTitle}</strong>
+                                              </div>
+                                              <span
+                                                className={`publications-job-status-chip publications-job-status-chip-${popoverStatusTone} home-calendar-popover-status-chip`}
+                                              >
+                                                {isRunningLike ? (
+                                                  <span className="home-calendar-popover-status-chip-content">
+                                                    <span className="status-pill-spinner" aria-hidden="true" />
+                                                    Executando
+                                                  </span>
+                                                ) : (
+                                                  jobStatusDisplayLabel(job)
+                                                )}
+                                              </span>
+                                            </div>
+
+                                            <div className="home-calendar-popover-toolbar">
+                                              <div className="home-calendar-popover-platforms" aria-label="Canais da publicação">
+                                                {participantNetworks.map((network) => (
+                                                  <span key={`${job.id}-${network}`} className="home-calendar-popover-platform-item">
+                                                    {renderPublicationNetworkPill(network)}
+                                                  </span>
+                                                ))}
+                                              </div>
+                                              <div className="home-calendar-popover-actions">
+                                                <button
+                                                  type="button"
+                                                  className="publications-board-action-button publications-board-action-button-edit"
+                                                  title="Editar publicação"
+                                                  aria-label="Editar publicação"
+                                                  onClick={() => openHistoryJobEditor(job)}
+                                                >
+                                                  <FiEdit3 aria-hidden="true" />
+                                                </button>
+                                                {canEditTime ? (
+                                                  <button
+                                                    type="button"
+                                                    className="publications-board-action-button publications-board-action-button-schedule"
+                                                    title="Editar agendamento"
+                                                    aria-label="Editar agendamento"
+                                                    onClick={() => startDashboardCalendarTimeEdit(job)}
+                                                    disabled={isSavingTime}
+                                                  >
+                                                    <FiCalendar aria-hidden="true" />
+                                                  </button>
+                                                ) : null}
+                                                <button
+                                                  type="button"
+                                                  className="publications-board-action-button publications-board-action-button-duplicate"
+                                                  title="Duplicar publicação"
+                                                  aria-label="Duplicar publicação"
+                                                  onClick={() => openPublicationDuplicateModal(job)}
+                                                >
+                                                  <FiCopy aria-hidden="true" />
+                                                </button>
+                                                <button
+                                                  type="button"
+                                                  className="publications-board-action-button publications-board-action-button-template"
+                                                  title="Criar template"
+                                                  aria-label="Criar template"
+                                                  onClick={() => savePublicationAsTemplate(job)}
+                                                >
+                                                  <FiFileText aria-hidden="true" />
+                                                </button>
+                                                {canRetry ? (
+                                                  <button
+                                                    type="button"
+                                                    className="publications-board-action-button publications-board-action-button-retry"
+                                                    title="Tentar novamente"
+                                                    aria-label="Tentar novamente"
+                                                    onClick={() => void retryJob(job.id)}
+                                                    disabled={isRetryingJob}
+                                                  >
+                                                    <FiRotateCcw aria-hidden="true" />
+                                                  </button>
+                                                ) : null}
+                                                {canReactivate ? (
+                                                  <button
+                                                    type="button"
+                                                    className="publications-board-action-button publications-board-action-button-reactivate"
+                                                    title="Reativar publicação"
+                                                    aria-label="Reativar publicação"
+                                                    onClick={() => void toggleJobSchedule(job)}
+                                                    disabled={isReactivatingJob}
+                                                  >
+                                                    <FiCheckCircle aria-hidden="true" />
+                                                  </button>
+                                                ) : null}
+                                              </div>
+                                            </div>
+
+                                            <div className="home-calendar-popover-detail-grid">
+                                              <span className="home-calendar-popover-detail-card">
+                                                <strong>Agendada para</strong>
+                                                <small>{formatJobScheduledAt(job, effectiveUserTimeZone)}</small>
+                                              </span>
+                                              <span className="home-calendar-popover-detail-card">
+                                                <strong>Workspace</strong>
+                                                <small>{companyNameMap[job.companyId] || "Workspace removido"}</small>
+                                              </span>
+                                            </div>
+
+                                            {canEditTime && isEditingTime ? (
+                                              <div className="home-calendar-popover-time-editor publications-board-inline-schedule-editor">
+                                                <input
+                                                  type="time"
+                                                  value={dashboardCalendarTimeValue}
+                                                  onChange={(event) => setDashboardCalendarTimeValue(event.target.value)}
+                                                  disabled={isSavingTime}
+                                                />
+                                                <div className="publications-board-inline-schedule-actions">
+                                                  <button
+                                                    type="button"
+                                                    className="publications-board-inline-schedule-save"
+                                                    title="Salvar horário"
+                                                    aria-label="Salvar horário"
+                                                    onClick={() => void saveDashboardCalendarTime(job)}
+                                                    disabled={isSavingTime}
+                                                  >
+                                                    <FiCheckCircle aria-hidden="true" />
+                                                  </button>
+                                                  <button
+                                                    type="button"
+                                                    className="publications-board-inline-schedule-cancel"
+                                                    title="Cancelar edição de horário"
+                                                    aria-label="Cancelar edição de horário"
+                                                    onClick={() => {
+                                                      setDashboardCalendarEditingJobId(null);
+                                                      setDashboardCalendarTimeValue("");
+                                                    }}
+                                                    disabled={isSavingTime}
+                                                  >
+                                                    <FiX aria-hidden="true" />
+                                                  </button>
+                                                </div>
+                                              </div>
+                                            ) : null}
+                                          </div>
+                                        ) : null}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+
+                                {pageCount > 1 ? (
+                                  <div className="home-calendar-day-pager">
+                                    <button
+                                      type="button"
+                                      className="ghost-button home-calendar-day-pager-button"
+                                      onClick={() => setDashboardCalendarDayPage(cell.dayKey, currentPage - 1, cell.jobs.length)}
+                                      disabled={currentPage === 0}
+                                      aria-label="Itens anteriores do dia"
+                                    >
+                                      <FiChevronLeft />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="ghost-button home-calendar-day-pager-button"
+                                      onClick={() => setDashboardCalendarDayPage(cell.dayKey, currentPage + 1, cell.jobs.length)}
+                                      disabled={currentPage >= pageCount - 1}
+                                      aria-label="Próximos itens do dia"
+                                    >
+                                      <FiChevronRight />
+                                    </button>
+                                  </div>
                                 ) : null}
                               </div>
-                            </article>
-                          );
-                        })}
+                            )
+                          : cell.inCurrentMonth
+                            ? <span className="home-calendar-day-empty" />
+                            : null}
                       </div>
-                    ))}
-                  </div>
-                </div>
-
-                {dashboardUpcomingPages.length > 1 ? (
-                  <div className="dashboard-carousel-dots" aria-label="Paginação dos próximos agendamentos">
-                    {dashboardUpcomingPages.map((_, pageIndex) => (
-                      <button
-                        key={`dashboard-upcoming-dot-${pageIndex}`}
-                        type="button"
-                        className={`dashboard-carousel-dot${pageIndex === dashboardUpcomingPage ? " dashboard-carousel-dot-active" : ""}`}
-                        onClick={() => setDashboardUpcomingPage(pageIndex)}
-                        aria-label={`Ir para página ${pageIndex + 1}`}
-                      />
-                    ))}
-                  </div>
-                ) : null}
-              </>
-            )}
-          </section>
+                    </article>
+                  );
+                })()
+              ))}
+            </div>
+          </div>
         </section>
-
-        <section className="dashboard-analytics-grid">
-          <article className="panel-card dashboard-chart-panel">
-            <div className="section-head dashboard-chart-head">
-              <div>
-                <div className="view-title-with-icon">
-                  <span className="view-title-icon" aria-hidden="true">
-                    <FiTrendingUp />
-                  </span>
-                  <h2>Crescimento</h2>
-                </div>
-              </div>
-              <div className="dashboard-chart-filters">
-                <label className="dashboard-chart-filter">
-                  <span>Período</span>
-                  <select value={dashboardTrendRange} onChange={(event) => setDashboardTrendRange(event.target.value as DashboardTrendRange)}>
-                    <option value="7">7 dias</option>
-                    <option value="30">30 dias</option>
-                    <option value="90">90 dias</option>
-                  </select>
-                </label>
-                <label className="dashboard-chart-filter">
-                  <span>Rede</span>
-                  <select
-                    value={dashboardTrendNetwork}
-                    onChange={(event) => setDashboardTrendNetwork(event.target.value as DashboardTrendNetwork)}
-                  >
-                    <option value="all">Todas</option>
-                    <option value="instagram">Instagram</option>
-                    <option value="whatsapp">WhatsApp</option>
-                  </select>
-                </label>
-                <label className="dashboard-chart-filter">
-                  <span>Visão</span>
-                  <select value={dashboardTrendFocus} onChange={(event) => setDashboardTrendFocus(event.target.value as DashboardTrendFocus)}>
-                    <option value="all">Tudo</option>
-                    <option value="published">Publicados</option>
-                    <option value="failed">Falhados</option>
-                    <option value="scheduled">Agendados</option>
-                  </select>
-                </label>
-              </div>
-            </div>
-
-            {!hasDashboardTrendData ? (
-              <div className="empty-state dashboard-upcoming-empty-state dashboard-line-chart-empty-state">
-                Ainda não há dados suficientes para gerar o gráfico neste filtro.
-              </div>
-            ) : (
-              <>
-                <div className="dashboard-line-chart-shell">
-                  <div className="dashboard-line-chart-grid" aria-hidden="true">
-                    {Array.from({ length: 4 }, (_, index) => (
-                      <span key={`dashboard-grid-line-${index}`} />
-                    ))}
-                  </div>
-                  <svg className="dashboard-line-chart" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
-                    {dashboardTrendFocus === "all" ? (
-                      <>
-                        <path d={publishedPath} className="dashboard-line dashboard-line-published" />
-                        <path d={failedPath} className="dashboard-line dashboard-line-failed" />
-                        <path d={scheduledPath} className="dashboard-line dashboard-line-scheduled" />
-                      </>
-                    ) : (
-                      <path d={focusPath} className={`dashboard-line dashboard-line-${dashboardTrendFocus}`} />
-                    )}
-                  </svg>
-                  <div className="dashboard-line-chart-xaxis" aria-hidden="true">
-                    {dashboardXAxisLabels.map((point) => (
-                      <span key={point.key} className="dashboard-line-chart-xaxis-label">
-                        {point.label}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="dashboard-chart-legend">
-                  <span className="dashboard-chart-legend-item">
-                    <span className="dashboard-chart-dot dashboard-chart-dot-published" aria-hidden="true" />
-                    {`Publicados: ${dashboardChartData.publishedTotal}`}
-                  </span>
-                  <span className="dashboard-chart-legend-item">
-                    <span className="dashboard-chart-dot dashboard-chart-dot-failed" aria-hidden="true" />
-                    {`Falhados: ${dashboardChartData.failedTotal}`}
-                  </span>
-                  <span className="dashboard-chart-legend-item">
-                    <span className="dashboard-chart-dot dashboard-chart-dot-scheduled" aria-hidden="true" />
-                    {`Agendados: ${dashboardChartData.scheduledTotal}`}
-                  </span>
-                </div>
-              </>
-            )}
-          </article>
-
-          <article className="panel-card dashboard-breakdown-panel">
-            <div className="section-head">
-              <div>
-                <div className="view-title-with-icon">
-                  <span className="view-title-icon" aria-hidden="true">
-                    <FiBarChart2 />
-                  </span>
-                  <h2>Distribuição</h2>
-                </div>
-              </div>
-            </div>
-
-            <div className="dashboard-breakdown-list">
-              {dashboardChartData.distributionItems.filter((item) => item.count > 0).length === 0 ? (
-                <div className="empty-state dashboard-upcoming-empty-state">Sem movimentação neste recorte.</div>
-              ) : (
-                dashboardChartData.distributionItems
-                  .filter((item) => item.count > 0)
-                  .map((item) => (
-                    <div key={item.key} className="dashboard-breakdown-row">
-                      <div className="dashboard-breakdown-row-head">
-                        <span className="dashboard-breakdown-label">
-                        <span className={`dashboard-breakdown-label-icon dashboard-breakdown-label-icon-${item.network}`} aria-hidden="true">
-                            {(() => {
-                              const Icon = socialPlatformIcon(item.network);
-                              return <Icon />;
-                            })()}
-                          </span>
-                          <span>{item.label}</span>
-                        </span>
-                        <strong>{item.count}</strong>
-                      </div>
-                      <div className="dashboard-breakdown-track" aria-hidden="true">
-                        <span
-                          className={`dashboard-breakdown-fill dashboard-breakdown-fill-${item.network}`}
-                          style={{ width: `${Math.max(10, (item.count / dashboardChartData.distributionMax) * 100)}%` }}
-                        />
-                      </div>
-                    </div>
-                  ))
-              )}
-            </div>
-
-            <div className="dashboard-mini-stats">
-              <div className="dashboard-mini-stat">
-                <span>Taxa de sucesso</span>
-                <strong>{dashboardChartData.deliveryRate === null ? "—" : `${dashboardChartData.deliveryRate}%`}</strong>
-              </div>
-              <div className="dashboard-mini-stat">
-                <span>Workspaces ativos</span>
-                <strong>{dashboardChartData.activeProfiles}</strong>
-              </div>
-              <div className="dashboard-mini-stat">
-                <span>Pico diário</span>
-                <strong>
-                  {dashboardChartData.peakPoint && dashboardChartData.peakPoint.total > 0
-                    ? `${dashboardChartData.peakPoint.total} em ${dashboardChartData.peakPoint.label}`
-                    : "—"}
-                </strong>
-              </div>
-            </div>
-          </article>
-        </section>
-
       </div>
     );
   }
@@ -12142,7 +12977,7 @@ function App() {
                   </span>
                   <span className="workspace-overview-card-copy">
                     <small>{card.label}</small>
-                    <strong>{String(card.value).padStart(2, "0")}</strong>
+                    <strong>{card.value}</strong>
                   </span>
                 </article>
               );
@@ -12308,6 +13143,9 @@ function App() {
     const workspaceFilterOptions = agentWorkspaceFilterOptions;
     const selectedWorkspaceOption =
       workspaceFilterOptions.find((option) => option.value === workspaceFilterValue) ?? workspaceFilterOptions[0] ?? null;
+    const showAllWorkspacesOption = companies.length > 1;
+    const isAllWorkspacesView = showAllWorkspacesOption && workspaceFilterValue === "all";
+    const hasAnyAddedConnections = totalConnectedConnections > 0;
     const platformFilterOptions: Array<{
       value: AgentPlatformFilter;
       label: string;
@@ -12340,23 +13178,46 @@ function App() {
       platform: SocialConnection["platform"],
       connection: SocialConnection | null,
     ) {
+      const effectiveAuthStatus = resolveEffectiveAgentConnectionAuthStatus(connection);
+
       if (!connection) {
         if (!workspace.canConnectAccounts || workspace.status !== "ACTIVE") {
           return null;
         }
 
+        const connectionCardKey = `${workspace.id}:${platform}`;
+        const isCreatingConnection = creatingConnectionCardKey === connectionCardKey;
+
         return (
           <button
             type="button"
             className="agents-platform-card-primary"
-            onClick={() => openCreateConnectionModal(platform, workspace.id)}
+            disabled={isCreatingConnection}
+            onClick={() => void createConnectionForWorkspace(platform, workspace.id)}
           >
-            Conectar
+            {isCreatingConnection ? "Preparando..." : "Conectar"}
           </button>
         );
       }
 
-      const connectionIsExpired = connection.authStatus === "CONNECTED" && isConnectionTokenExpired(connection.tokenExpiresAt);
+      if (effectiveAuthStatus === "AUTH_REQUIRED") {
+        if (!workspace.canConnectAccounts || workspace.status !== "ACTIVE") {
+          return null;
+        }
+
+          return (
+            <button
+              type="button"
+              className="agents-platform-card-primary"
+              disabled={Boolean(postForMeAuthLaunchingConnectionId)}
+              onClick={() => void openConnectionVisualAuth(connection.id)}
+            >
+              {postForMeAuthLaunchingConnectionId === connection.id ? "Abrindo..." : "Conectar"}
+            </button>
+          );
+      }
+
+      const connectionIsExpired = effectiveAuthStatus === "CONNECTED" && isConnectionTokenExpired(connection.tokenExpiresAt);
       const canRenew =
         (workspace.canConnectAccounts || Boolean(connection.agencyCanRefresh)) &&
         shouldShowConnectionSyncAction(connection, { forceExpired: connectionIsExpired });
@@ -12364,7 +13225,7 @@ function App() {
       if (
         workspace.canConnectAccounts &&
         isMetaConnectionPlatform(connection.platform) &&
-        connection.authStatus !== "CONNECTED" &&
+        effectiveAuthStatus !== "CONNECTED" &&
         !connectionIsExpired
       ) {
         return (
@@ -12374,7 +13235,7 @@ function App() {
             disabled={Boolean(postForMeAuthLaunchingConnectionId)}
             onClick={() => void openConnectionVisualAuth(connection.id)}
           >
-            {postForMeAuthLaunchingConnectionId === connection.id ? "Abrindo..." : "Abrir login"}
+            {postForMeAuthLaunchingConnectionId === connection.id ? "Abrindo..." : "Conectar"}
           </button>
         );
       }
@@ -12422,54 +13283,19 @@ function App() {
         return null;
       }
 
+      const effectiveAuthStatus = resolveEffectiveAgentConnectionAuthStatus(connection);
       const actions: ReactNode[] = [];
-      const connectionIsExpired = connection.authStatus === "CONNECTED" && isConnectionTokenExpired(connection.tokenExpiresAt);
-      const canRenew =
-        (workspace.canConnectAccounts || Boolean(connection.agencyCanRefresh)) &&
-        shouldShowConnectionSyncAction(connection, { forceExpired: connectionIsExpired });
 
-      if (
-        workspace.canConnectAccounts &&
-        connection.platform === "whatsapp" &&
-        connection.authStatus === "CONNECTED"
-      ) {
-        actions.push(
-          <button
-            key={`${connection.id}-secondary-qr`}
-            type="button"
-            className="agents-platform-card-secondary"
-            disabled={qrRequestingConnectionId === connection.id || qrCancellingConnectionId === connection.id}
-            onClick={() => void regenerateConnectionQr(connection.id)}
-          >
-            QR
-          </button>,
-        );
-      }
-
-      if (workspace.canConnectAccounts && connection.authStatus === "CONNECTED") {
+      if (workspace.canConnectAccounts && effectiveAuthStatus === "CONNECTED") {
         actions.push(
           <button
             key={`${connection.id}-secondary-disconnect`}
             type="button"
-            className="agents-platform-card-inline-action"
+            className="agents-platform-card-inline-action agents-platform-card-inline-action-danger"
             onClick={() => void disconnectConnection(connection.id)}
           >
             <FiSlash aria-hidden="true" />
             Desconectar
-          </button>,
-        );
-      }
-
-      if (workspace.canConnectAccounts) {
-        actions.push(
-          <button
-            key={`${connection.id}-secondary-delete`}
-            type="button"
-            className="agents-platform-card-inline-action agents-platform-card-inline-action-danger"
-            onClick={() => void deleteConnection(connection.id)}
-          >
-            <FiTrash2 aria-hidden="true" />
-            Excluir
           </button>,
         );
       }
@@ -12589,77 +13415,85 @@ function App() {
                 ) : null}
               </div>
 
-              <div className="agents-platform-mini-select-shell">
-                <button
-                  type="button"
-                  className={`agents-platform-mini-select${activeAgentFilterMenu === "status" ? " agents-platform-mini-select-open" : ""}`}
-                  onClick={() => setActiveAgentFilterMenu((current) => (current === "status" ? null : "status"))}
-                >
-                  <span>{selectedStatusOption.label}</span>
-                  <FiChevronDown aria-hidden="true" />
-                </button>
-                {activeAgentFilterMenu === "status" ? (
-                  <div className="agents-platform-select-menu agents-platform-select-menu-compact">
-                    {statusFilterOptions.map((option) => (
-                      <button
-                        key={option.value}
-                        type="button"
-                        className={`agents-platform-select-option${
-                          agentStatusFilter === option.value ? " agents-platform-select-option-active" : ""
-                        }`}
-                        onClick={() => {
-                          setAgentStatusFilter(option.value);
-                          setActiveAgentFilterMenu(null);
-                        }}
-                      >
-                        <span className="agents-platform-select-copy">
-                          <strong>{option.label}</strong>
-                          <small>{option.description}</small>
-                        </span>
-                        {agentStatusFilter === option.value ? <FiCheck aria-hidden="true" /> : null}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
-              </div>
+              {!isAllWorkspacesView ? (
+                <div className="agents-platform-mini-select-shell">
+                  <button
+                    type="button"
+                    className={`agents-platform-mini-select${activeAgentFilterMenu === "status" ? " agents-platform-mini-select-open" : ""}`}
+                    onClick={() => setActiveAgentFilterMenu((current) => (current === "status" ? null : "status"))}
+                  >
+                    <span>{selectedStatusOption.label}</span>
+                    <FiChevronDown aria-hidden="true" />
+                  </button>
+                  {activeAgentFilterMenu === "status" ? (
+                    <div className="agents-platform-select-menu agents-platform-select-menu-compact">
+                      {statusFilterOptions.map((option) => (
+                        <button
+                          key={option.value}
+                          type="button"
+                          className={`agents-platform-select-option${
+                            agentStatusFilter === option.value ? " agents-platform-select-option-active" : ""
+                          }`}
+                          onClick={() => {
+                            setAgentStatusFilter(option.value);
+                            setActiveAgentFilterMenu(null);
+                          }}
+                        >
+                          <span className="agents-platform-select-copy">
+                            <strong>{option.label}</strong>
+                            <small>{option.description}</small>
+                          </span>
+                          {agentStatusFilter === option.value ? <FiCheck aria-hidden="true" /> : null}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
           </div>
 
           {companies.length === 0 ? (
             <div className="empty-state">Crie um workspace antes de conectar contas.</div>
+          ) : isAllWorkspacesView && !hasAnyAddedConnections ? (
+            <div className="empty-state">
+              Nenhuma conta conectada aos seus workspaces. Selecione um workspace para começar a adicionar contas.
+            </div>
           ) : agentConnectionBoardCards.length === 0 ? (
             <div className="empty-state">Nenhuma conta encontrada para os filtros aplicados.</div>
           ) : (
             <div className="agents-platform-board-grid">
               {agentConnectionBoardCards.map(({ workspace, platform, option, connection, isConnected }) => {
+                const effectiveAuthStatus = resolveEffectiveAgentConnectionAuthStatus(connection);
+                const isDisconnectedCard = !connection || effectiveAuthStatus === "AUTH_REQUIRED";
+                const showConnectionAccount = Boolean(connection) && effectiveAuthStatus === "CONNECTED";
                 const PlatformIcon = option.icon;
                 const avatarUrl = connection ? resolveConnectionAvatarUrl(connection) : null;
                 const accountLabel = connection ? resolveSchedulerTargetAccountLabel(connection) : null;
-                const accountMeta = connection ? resolveSchedulerTargetAccountMeta(connection) : null;
                 const showAccountLabel =
                   Boolean(accountLabel?.trim()) && accountLabel?.trim() !== connection?.displayName?.trim();
                 const connectionIsExpired =
-                  connection?.authStatus === "CONNECTED" ? isConnectionTokenExpired(connection.tokenExpiresAt) : false;
+                  effectiveAuthStatus === "CONNECTED" ? isConnectionTokenExpired(connection?.tokenExpiresAt ?? null) : false;
                 const expiryLabel =
-                  connection?.authStatus === "CONNECTED"
+                  effectiveAuthStatus === "CONNECTED"
                     ? connectionIsExpired
-                      ? formatConnectionExpiredInstructionLabel(connection.tokenExpiresAt, effectiveUserTimeZone)
-                      : formatConnectionTokenExpiryLabel(connection.tokenExpiresAt, effectiveUserTimeZone)
+                      ? formatConnectionExpiredInstructionLabel(connection?.tokenExpiresAt ?? null, effectiveUserTimeZone)
+                      : formatConnectionTokenExpiryLabel(connection?.tokenExpiresAt ?? null, effectiveUserTimeZone)
                     : null;
-                const statusLabel = !connection
+                const statusLabel = isDisconnectedCard
                   ? "Não conectada"
                   : connectionIsExpired
                     ? "Acesso expirado"
-                    : connection.authStatus === "CONNECTED"
+                    : effectiveAuthStatus === "CONNECTED"
                       ? "Conectada"
-                      : connection.authStatus === "AUTH_IN_PROGRESS"
+                      : effectiveAuthStatus === "AUTH_IN_PROGRESS"
                         ? "Autenticando"
                         : "Aguarda login";
-                const statusTone = !connection
+                const statusTone = isDisconnectedCard
                   ? "idle"
                   : connectionIsExpired
                     ? "expired"
-                    : connection.authStatus === "CONNECTED"
+                    : effectiveAuthStatus === "CONNECTED"
                       ? "connected"
                       : "pending";
                 const isWhatsappCard = platform === "whatsapp";
@@ -12670,7 +13504,9 @@ function App() {
                     ""
                   : "";
                 const whatsappNumberLabel = whatsappNumber ? `Número: ${whatsappNumber.replace(/^@/, "")}` : "";
-                const whatsappMeta = isWhatsappCard ? expiryLabel || accountMeta || null : null;
+                const accountMetaLine = connection ? expiryLabel : null;
+                const accountInitial =
+                  connection?.displayName?.trim().charAt(0).toUpperCase() || option.label.charAt(0).toUpperCase();
                 const primaryAction = renderAgentsPrimaryAction(workspace, platform, connection);
                 const secondaryActions = renderAgentsSecondaryActions(workspace, connection);
                 const hasFooterActions = Boolean(primaryAction) || Boolean(secondaryActions);
@@ -12680,6 +13516,8 @@ function App() {
                     key={`${workspace.id}-${platform}`}
                     className={`agents-platform-board-card agents-platform-board-card-${platform}${
                       isConnected ? " agents-platform-board-card-connected" : ""
+                    }${isDisconnectedCard ? " agents-platform-board-card-disconnected" : ""}${
+                      connection && effectiveAuthStatus === "AUTH_IN_PROGRESS" ? " agents-platform-board-card-pending" : ""
                     }${hasFooterActions ? " agents-platform-board-card-has-footer" : ""}${
                       !hasFooterActions ? " agents-platform-board-card-no-footer" : ""
                     }`}
@@ -12699,7 +13537,7 @@ function App() {
                       </div>
 
                       <div className="agents-platform-board-card-body">
-                        {connection ? (
+                        {showConnectionAccount ? (
                           <>
                             <div className="agents-platform-board-account-shell">
                               <span
@@ -12709,14 +13547,13 @@ function App() {
                                 {avatarUrl ? (
                                   <img src={avatarUrl} alt="" loading="lazy" />
                                 ) : (
-                                  <span>{connection.displayName.trim().charAt(0).toUpperCase() || option.label.charAt(0)}</span>
+                                  <span>{accountInitial}</span>
                                 )}
                                 <span className={`agents-platform-board-account-platform agents-platform-board-account-platform-${platform}`}>
                                   <PlatformIcon />
                                 </span>
                               </span>
                               <div className="agents-platform-board-account-copy">
-                                <strong className="agents-platform-board-account-name">{connection.displayName}</strong>
                                 <span
                                   className={`agents-platform-board-account-handle${
                                     (isWhatsappCard ? Boolean(whatsappNumberLabel) : showAccountLabel)
@@ -12726,8 +13563,8 @@ function App() {
                                 >
                                   {isWhatsappCard ? whatsappNumberLabel || "\u00A0" : showAccountLabel ? accountLabel : "\u00A0"}
                                 </span>
-                                {isWhatsappCard && whatsappMeta ? (
-                                  <small className="agents-platform-board-account-meta">{whatsappMeta}</small>
+                                {accountMetaLine ? (
+                                  <small className="agents-platform-board-account-meta">{accountMetaLine}</small>
                                 ) : null}
                               </div>
                             </div>
@@ -12758,8 +13595,6 @@ function App() {
   }
 
   function renderScheduler() {
-    const activeMediaCaptionTarget =
-      mediaCaptionModalIndex !== null ? uploadedSchedulerMedia[mediaCaptionModalIndex] ?? null : null;
     const activeStoryEditorTarget =
       storyEditorMediaIndex !== null ? uploadedSchedulerMedia[storyEditorMediaIndex] ?? null : null;
     const canOpenStoryEditor = publicationType === "instagram_story";
@@ -12976,6 +13811,10 @@ function App() {
                     ? ".jpg,.jpeg,.png"
                     : publicationType === "instagram_reel"
                       ? ".mp4"
+                    : publicationType === "tiktok_post"
+                      ? "video/*"
+                    : publicationType === "x_post"
+                      ? "image/*,video/*"
                     : "image/*,video/*"
                 }
                 disabled={submittingJob || uploading}
@@ -12985,6 +13824,10 @@ function App() {
                     ? "Selecione uma imagem JPG ou PNG (máximo de 8 MB)."
                     : publicationType === "instagram_reel"
                       ? "Selecione um vídeo MP4."
+                      : publicationType === "tiktok_post"
+                        ? "Selecione um vídeo para o TikTok."
+                        : publicationType === "x_post"
+                          ? "Selecione imagem ou vídeo para o X. Mídia é opcional."
                       : publicationType === "instagram_story"
                         ? "Selecione imagem JPG/PNG (máximo de 8 MB) ou vídeo."
                       : "Selecione um arquivo de imagem ou vídeo para a postagem."
@@ -13015,7 +13858,11 @@ function App() {
                         (publicationType === "instagram_post"
                           ? "Arraste uma imagem JPG ou PNG aqui (máx. 8 MB)"
                           : publicationType === "instagram_reel"
-                            ? "Arraste um vídeo MP4 aqui"
+                          ? "Arraste um vídeo MP4 aqui"
+                            : publicationType === "tiktok_post"
+                              ? "Arraste um vídeo do TikTok aqui"
+                              : publicationType === "x_post"
+                                ? "Arraste mídia aqui ou publique só com texto"
                             : publicationType === "instagram_story"
                               ? "Arraste imagem (máx. 8 MB) ou vídeo aqui"
                             : "Arraste uma imagem ou vídeo aqui")}
@@ -13027,8 +13874,14 @@ function App() {
                         ? "Ou clique aqui para selecionar imagens JPG/PNG de até 8 MB (máximo de 10)."
                         : publicationType === "instagram_reel"
                           ? "Ou clique aqui para selecionar um vídeo MP4."
+                          : publicationType === "tiktok_post"
+                            ? "Ou clique aqui para selecionar um vídeo para o TikTok."
+                            : publicationType === "x_post"
+                              ? "Ou clique aqui para selecionar até 4 mídias opcionais para o X."
                           : publicationType === "instagram_story"
                             ? "Ou clique aqui para selecionar imagens/vídeos (máximo de 10)."
+                            : publicationType === "threads_post"
+                              ? "Ou clique aqui para selecionar imagens/vídeos para Threads (máximo de 20)."
                           : "Ou clique aqui para selecionar do computador."}
                   </small>
                 </div>
@@ -13038,10 +13891,20 @@ function App() {
 
           {supportsMultiMediaUpload && uploadedMediaCount > 1 ? (
             <label className="field-shell scheduler-sequence-shell">
-              <span>Publicação em sequência</span>
+              <span>
+                {publicationType === "threads_post"
+                  ? "Carrossel do Threads"
+                  : publicationType === "x_post"
+                    ? "Mídias do X"
+                    : "Publicação em sequência"}
+              </span>
               <div className="scheduler-sequence-row">
                 <small>
-                  Arraste as miniaturas para direita para ordenar a sequencia.
+                  {publicationType === "threads_post"
+                    ? "Arraste as miniaturas para definir a ordem do carrossel."
+                    : publicationType === "x_post"
+                      ? "Arraste as miniaturas para definir a ordem das mídias do post."
+                    : "Arraste as miniaturas para direita para ordenar a sequencia."}
                 </small>
               </div>
             </label>
@@ -13068,14 +13931,6 @@ function App() {
                     aria-label={`Remover mídia ${index + 1}`}
                   >
                     <FiX />
-                  </button>
-                  <button
-                    type="button"
-                    className={`scheduler-media-preview-caption${media.caption?.trim() ? " scheduler-media-preview-caption-filled" : ""}`}
-                    onClick={() => openMediaCaptionModal(index)}
-                    disabled={submittingJob || uploading}
-                  >
-                    {media.caption?.trim() ? "Editar" : "Add. legenda"}
                   </button>
                   {canOpenStoryEditor && isImagePath(media.filePath) ? (
                     <button
@@ -13240,11 +14095,22 @@ function App() {
                 <small>
                   {publicationType === "instagram_story" && !canEnableWhatsappRelink
                     ? "Relink no momento está disponível apenas para story único"
-                    : "Após publicar no Instagram, cria um status com a primeira mídia e o link do conteúdo para as contas selecionadas."}
+                    : publicationType === "threads_post"
+                      ? "Após publicar no Threads, cria um status com a primeira mídia e o link do conteúdo para as contas selecionadas."
+                      : publicationType === "x_post"
+                        ? "Após publicar no X, cria um status com a primeira mídia e o link do conteúdo para as contas selecionadas."
+                        : publicationType === "tiktok_post"
+                          ? "Após publicar no TikTok, cria um status com o vídeo e o link da postagem na legenda para as contas selecionadas."
+                          : "Após publicar no Instagram, cria um status com a primeira mídia e o link do conteúdo para as contas selecionadas."}
                 </small>
               </div>
               {whatsappRelinkEnabled && canEnableWhatsappRelink ? (
                 <div className="scheduler-whatsapp-relink-shell">
+                  {whatsappRelinkMediaMessage ? (
+                    <div className="info-banner info-banner-warning">
+                      {whatsappRelinkMediaMessage}
+                    </div>
+                  ) : null}
                   <div className="scheduler-whatsapp-relink-actions">
                     <button
                       type="button"
@@ -13263,8 +14129,27 @@ function App() {
                       Limpar
                     </button>
                   </div>
+                  <small>
+                    {schedulerWhatsappConnections.length === 0
+                      ? "Nenhuma conta de WhatsApp conectada disponível para relink."
+                      : `${schedulerWhatsappConnections.length} conta(s) de WhatsApp conectada(s) disponível(is). Somente contas conectadas aparecem aqui.`}
+                  </small>
+                  {schedulerDisconnectedWhatsappConnections.length > 0 ? (
+                    <div className="info-banner info-banner-warning">
+                      {schedulerDisconnectedWhatsappConnections.length === 1
+                        ? `1 conta de WhatsApp precisa de reautenticação e não entrará no relink: ${
+                            companyNameMap[schedulerDisconnectedWhatsappConnections[0]!.companyId] || "Workspace removido"
+                          } · ${schedulerDisconnectedWhatsappConnections[0]!.displayName}.`
+                        : `${schedulerDisconnectedWhatsappConnections.length} contas de WhatsApp precisam de reautenticação e não entrarão no relink: ${schedulerDisconnectedWhatsappConnections
+                            .map(
+                              (connection) =>
+                                `${companyNameMap[connection.companyId] || "Workspace removido"} · ${connection.displayName}`,
+                            )
+                            .join(", ")}.`}
+                    </div>
+                  ) : null}
                   {schedulerWhatsappConnections.length === 0 ? (
-                    <small>Nenhuma conta de WhatsApp conectada para seu usuário.</small>
+                    null
                   ) : (
                     <div className="scheduler-whatsapp-relink-list">
                       {schedulerWhatsappConnections.map((connection) => (
@@ -13275,7 +14160,7 @@ function App() {
                             onChange={() => toggleWhatsappRelinkConnectionSelection(connection.id)}
                             disabled={submittingJob}
                           />
-                          <span>{`${connection.displayName} (${companyNameMap[connection.companyId] || "Workspace removido"})`}</span>
+                          <span>{`${companyNameMap[connection.companyId] || "Workspace removido"} · ${connection.displayName}`}</span>
                         </label>
                       ))}
                     </div>
@@ -13285,12 +14170,61 @@ function App() {
             </label>
           ) : null}
 
-          {requiresInstagramMetadata &&
-          (isInstagramForcedLocationEnabled || publicationType !== "instagram_story") ? (
-            <div className="text-chip">
-              {isInstagramForcedLocationEnabled
-                ? `Localização fixa ativa: ${instagramForcedLocationName} (#${instagramForcedLocationId}).`
-                : "Post/Reel usam automaticamente a localização da Page vinculada à conta Instagram Business. Se não houver localização válida, publica sem localização."}
+          {supportsMetaLocation ? (
+            <div className="field-shell scheduler-location-shell">
+              <span>Localização</span>
+              {hasForcedInstagramMetaLocation ? (
+                <div className="text-chip">
+                  {`Localização fixa ativa para Instagram: ${instagramForcedLocationName} (#${instagramForcedLocationId}).`}
+                </div>
+              ) : null}
+              <label className="field-label">
+                <span>Buscar local</span>
+                <input
+                  type="text"
+                  value={hasForcedInstagramMetaLocation ? instagramForcedLocationName : jobLocationName}
+                  onChange={(event) => {
+                    setJobLocationName(event.target.value);
+                    if (!hasForcedInstagramMetaLocation) {
+                      setJobLocationId("");
+                    }
+                  }}
+                  disabled={submittingJob || hasForcedInstagramMetaLocation}
+                  placeholder="Ex: São Paulo, Rio de Janeiro, Bahia..."
+                  maxLength={120}
+                />
+              </label>
+              {!hasForcedInstagramMetaLocation && metaLocationSuggestions.length > 0 ? (
+                <div className="scheduler-location-suggestion-list">
+                  {metaLocationSuggestions.map((suggestion) => (
+                    <button
+                      key={`${suggestion.type}-${suggestion.id}-${suggestion.name}`}
+                      type="button"
+                      className={`scheduler-location-suggestion${
+                        jobLocationId === suggestion.id ? " scheduler-location-suggestion-active" : ""
+                      }`}
+                      onClick={() => selectMetaLocationSuggestion(suggestion)}
+                      disabled={submittingJob}
+                    >
+                      <strong>{suggestion.name}</strong>
+                      <small>{suggestion.subtitle}</small>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              {!hasForcedInstagramMetaLocation &&
+              !jobLocationId &&
+              jobLocationName.trim().length >= 2 &&
+              metaLocationSuggestions.length === 0 ? (
+                <small className="scheduler-location-hint">Nenhum local da base interna encontrado para essa busca.</small>
+              ) : null}
+              <small className="scheduler-location-hint">
+                {hasForcedInstagramMetaLocation
+                  ? "O sistema usará a localização fixa configurada para Instagram."
+                  : jobLocationId
+                    ? "Local selecionado. O ID fica interno e será enviado automaticamente para a Post for Me."
+                    : "Escolha um local da lista. O sistema guarda o ID internamente e envia para a Post for Me sem expor isso ao usuário."}
+              </small>
             </div>
           ) : null}
 
@@ -13307,93 +14241,6 @@ function App() {
             </span>
           </button>
         </form>
-
-        {activeMediaCaptionTarget ? (
-          <div
-            className="scheduler-media-caption-modal-backdrop"
-            onClick={() => {
-              if (!submittingJob) {
-                closeMediaCaptionModal();
-              }
-            }}
-          >
-            <section
-              className="scheduler-media-caption-modal"
-              aria-label="Editar legenda da mídia"
-              onClick={(event) => event.stopPropagation()}
-            >
-              <div className="scheduler-media-caption-modal-header">
-                <div>
-                  <strong>{`Legenda da mídia #${(mediaCaptionModalIndex ?? 0) + 1}`}</strong>
-                  <span>{activeMediaCaptionTarget.fileName}</span>
-                </div>
-                <button
-                  type="button"
-                  className="qr-modal-close"
-                  onClick={() => {
-                    if (!submittingJob) {
-                      closeMediaCaptionModal();
-                    }
-                  }}
-                  aria-label="Fechar"
-                  disabled={submittingJob}
-                >
-                  <span className="modal-close-icon" aria-hidden="true">
-                    X
-                  </span>
-                </button>
-              </div>
-              <div className="scheduler-media-caption-modal-preview">
-                {isVideoPath(activeMediaCaptionTarget.filePath) ? (
-                  <video
-                    src={`${api.baseUrl}${activeMediaCaptionTarget.filePath}`}
-                    muted
-                    playsInline
-                    preload="metadata"
-                  />
-                ) : (
-                  <img
-                    src={`${api.baseUrl}${activeMediaCaptionTarget.filePath}`}
-                    alt={`Prévia da mídia ${activeMediaCaptionTarget.fileName}`}
-                  />
-                )}
-              </div>
-              <div className="field-shell">
-                <div className="field-head-with-action">
-                  <span>Legenda da mídia</span>
-                  {renderQuickEmojiPicker({
-                    pickerKey: "scheduler-media-caption",
-                    disabled: submittingJob,
-                    onPick: appendEmojiToMediaCaption,
-                    label: "Emojis da legenda da mídia",
-                    className: "emoji-picker-shell-right",
-                  })}
-                </div>
-                <textarea
-                  value={mediaCaptionDraft}
-                  onChange={(event) => setMediaCaptionDraft(event.target.value)}
-                  disabled={submittingJob}
-                  placeholder="Digite a legenda desta mídia (opcional)"
-                  rows={4}
-                  maxLength={2000}
-                />
-              </div>
-              <div className="scheduler-media-caption-modal-actions">
-                <button
-                  type="button"
-                  className="ghost-button"
-                  onClick={() => setMediaCaptionDraft("")}
-                  disabled={submittingJob}
-                >
-                  Limpar
-                </button>
-                <button type="button" onClick={saveMediaCaptionModal} disabled={submittingJob}>
-                  Salvar legenda
-                </button>
-              </div>
-            </section>
-          </div>
-        ) : null}
 
         {activeStoryEditorTarget && canOpenStoryEditor ? (
           <div
@@ -14525,12 +15372,19 @@ function App() {
     );
   }
 
+  function toggleHistoryBoardSection(filterKey: HistoryFilterKey) {
+    setHistoryCollapsedSections((current) => ({
+      ...current,
+      [filterKey]: !current[filterKey],
+    }));
+  }
+
   function renderHistory() {
     const activePublicationBoardFilter: HistoryFilterKey = historyFilter === "published" ? "sent" : historyFilter;
     const normalizedSearchQuery = historySearchQuery.trim().toLocaleLowerCase("pt-BR");
-    const selectedMonthJobs = jobsOrderedByCreatedAtDesc.filter((job) => {
-      const yearMonth = getYearMonthInTimeZone(new Date(job.dataPostagem), effectiveUserTimeZone);
-      if (yearMonth.year !== historyCalendarYear || yearMonth.month !== historyCalendarMonth) {
+    const defaultPublicationBoardPeriod = getYearMonthInTimeZone(nowReferenceDate, effectiveUserTimeZone);
+    const publicationBoardBaseJobs = publicationHistoryJobsOrderedByCreatedAtDesc.filter((job) => {
+      if (selectedCompanyId && job.companyId !== selectedCompanyId) {
         return false;
       }
 
@@ -14552,274 +15406,36 @@ function App() {
     });
     const publicationFilterOptions: Array<{ value: HistoryFilterKey; label: string }> = [
       { value: "all", label: "Todos os status" },
-      { value: "draft", label: "Rascunhos" },
       { value: "upcoming", label: "Agendadas" },
-      { value: "waiting_login", label: "Aguarda login" },
-      { value: "failed", label: "Falharam" },
-      { value: "canceled", label: "Canceladas" },
       { value: "sent", label: "Publicadas" },
+      { value: "canceled", label: "Canceladas" },
+      { value: "waiting_login", label: "Aguarda login" },
+      { value: "failed", label: "Falhadas" },
+      { value: "draft", label: "Rascunhos" },
     ];
     const visibleWorkspaceCount = selectedCompanyId ? 1 : companies.length;
     const shouldShowWorkspaceColumn = visibleWorkspaceCount > 1;
-    const mockWorkspaceLabels = companies.length
-      ? companies.slice(0, 4).map((company) => company.name)
-      : ["Agência Premium", "Clínica Sorriso", "Loja Bella", "Cliente Enterprise"];
-    const mockBlueprintsByFilter: Record<
-      Exclude<HistoryFilterKey, "all" | "published">,
-      Array<{
-        title: string;
-        caption: string;
-        publicationType: Job["publicationType"];
-        workspaceIndex: number;
-        day: number;
-        span?: number;
-        time: string;
-      }>
-    > = {
-      draft: [
-        {
-          title: "Campanha institucional de março",
-          caption: "Peça aguardando aprovação final do cliente antes do disparo.",
-          publicationType: "instagram_post",
-          workspaceIndex: 0,
-          day: 3,
-          span: 3,
-          time: "09:00",
-        },
-        {
-          title: "Sequência de Stories promocionais",
-          caption: "Rascunho com mídia pronta para revisão interna da equipe.",
-          publicationType: "instagram_story",
-          workspaceIndex: 1,
-          day: 7,
-          span: 2,
-          time: "14:30",
-        },
-        {
-          title: "Oferta do consultório premium",
-          caption: "Terceira peça da fila criativa aguardando liberação comercial.",
-          publicationType: "facebook_post",
-          workspaceIndex: 2,
-          day: 16,
-          span: 3,
-          time: "10:15",
-        },
-        {
-          title: "Sequência de depoimentos em carrossel",
-          caption: "Última revisão pendente para seguir ao calendário oficial.",
-          publicationType: "instagram_post",
-          workspaceIndex: 3,
-          day: 22,
-          span: 4,
-          time: "17:20",
-        },
-      ],
-      upcoming: [
-        {
-          title: "Lançamento do plano premium",
-          caption: "Publicação pronta para ir ao ar na janela principal da campanha.",
-          publicationType: "facebook_post",
-          workspaceIndex: 2,
-          day: 9,
-          span: 5,
-          time: "11:00",
-        },
-        {
-          title: "Conteúdo evergreen da semana",
-          caption: "Fila principal da marca com janela definida e assets validados.",
-          publicationType: "threads_post",
-          workspaceIndex: 0,
-          day: 13,
-          span: 4,
-          time: "16:00",
-        },
-        {
-          title: "Campanha de remarketing do feriado",
-          caption: "Peça confirmada para o segundo pico de audiência da semana.",
-          publicationType: "instagram_reel",
-          workspaceIndex: 1,
-          day: 18,
-          span: 3,
-          time: "19:00",
-        },
-        {
-          title: "Vídeo institucional da nova unidade",
-          caption: "Entrega já aprovada para disparo no bloco noturno.",
-          publicationType: "facebook_post",
-          workspaceIndex: 3,
-          day: 24,
-          span: 4,
-          time: "20:10",
-        },
-      ],
-      waiting_login: [
-        {
-          title: "Reativar acesso da conta Threads",
-          caption: "Conteúdo pronto, aguardando autenticação para seguir o envio.",
-          publicationType: "threads_post",
-          workspaceIndex: 3,
-          day: 6,
-          span: 3,
-          time: "10:00",
-        },
-        {
-          title: "Fila travada por autenticação no Facebook",
-          caption: "Aguardando o cliente renovar a sessão para continuar o fluxo.",
-          publicationType: "facebook_post",
-          workspaceIndex: 1,
-          day: 14,
-          span: 3,
-          time: "13:45",
-        },
-        {
-          title: "Novo lote de posts institucionais",
-          caption: "Conta precisa concluir login antes de liberar o envio desta sequência.",
-          publicationType: "threads_post",
-          workspaceIndex: 0,
-          day: 21,
-          span: 3,
-          time: "09:40",
-        },
-        {
-          title: "Stories da campanha de awareness",
-          caption: "Autorização pendente para concluir o calendário do mês.",
-          publicationType: "instagram_story",
-          workspaceIndex: 2,
-          day: 27,
-          span: 2,
-          time: "18:15",
-        },
-      ],
-      failed: [
-        {
-          title: "Oferta relâmpago da semana",
-          caption: "Falhou após tentativa inicial e precisa de revisão operacional.",
-          publicationType: "instagram_reel",
-          workspaceIndex: 1,
-          day: 5,
-          span: 4,
-          time: "08:45",
-        },
-        {
-          title: "Status com mídia da filial",
-          caption: "Publicação com erro de entrega, aguardando novo encaminhamento.",
-          publicationType: "whatsapp_status_midia",
-          workspaceIndex: 2,
-          day: 17,
-          span: 3,
-          time: "18:00",
-        },
-        {
-          title: "Campanha local da filial norte",
-          caption: "Falha no envio do vídeo principal e fila depende de novo processamento.",
-          publicationType: "facebook_post",
-          workspaceIndex: 0,
-          day: 22,
-          span: 3,
-          time: "11:35",
-        },
-        {
-          title: "Resumo executivo do mês",
-          caption: "Conteúdo foi rejeitado pela rede e precisa de intervenção manual.",
-          publicationType: "threads_post",
-          workspaceIndex: 3,
-          day: 28,
-          span: 2,
-          time: "16:50",
-        },
-      ],
-      canceled: [
-        {
-          title: "Comunicado de agenda do feriado",
-          caption: "Item interrompido após alteração de planejamento do cliente.",
-          publicationType: "facebook_post",
-          workspaceIndex: 0,
-          day: 11,
-          span: 3,
-          time: "12:30",
-        },
-        {
-          title: "Promoção do fim de semana",
-          caption: "Planejamento mudou e a publicação foi retirada da operação.",
-          publicationType: "instagram_post",
-          workspaceIndex: 2,
-          day: 15,
-          span: 3,
-          time: "15:00",
-        },
-        {
-          title: "Status da clínica matriz",
-          caption: "Interrompido por mudança estratégica do cliente antes da publicação.",
-          publicationType: "whatsapp_status_texto",
-          workspaceIndex: 1,
-          day: 23,
-          span: 2,
-          time: "08:30",
-        },
-        {
-          title: "Post de agradecimento da campanha",
-          caption: "Item cancelado na etapa final para substituição por peça nova.",
-          publicationType: "facebook_post",
-          workspaceIndex: 3,
-          day: 29,
-          span: 2,
-          time: "18:05",
-        },
-      ],
-      sent: [
-        {
-          title: "Resultados comerciais da semana",
-          caption: "Publicação entregue no calendário principal com bom desempenho.",
-          publicationType: "instagram_post",
-          workspaceIndex: 1,
-          day: 2,
-          span: 4,
-          time: "09:15",
-        },
-        {
-          title: "Resumo executivo para Threads",
-          caption: "Conteúdo distribuído com sucesso no fluxo editorial da operação.",
-          publicationType: "threads_post",
-          workspaceIndex: 3,
-          day: 20,
-          span: 5,
-          time: "15:40",
-        },
-        {
-          title: "Campanha de agendamento concluída",
-          caption: "Peça publicada com sucesso no calendário principal da operação.",
-          publicationType: "facebook_post",
-          workspaceIndex: 0,
-          day: 11,
-          span: 4,
-          time: "10:30",
-        },
-        {
-          title: "Story de prova social",
-          caption: "Conteúdo entregue dentro do bloco de alta audiência do cliente.",
-          publicationType: "instagram_story",
-          workspaceIndex: 2,
-          day: 26,
-          span: 2,
-          time: "17:45",
-        },
-      ],
-    };
-
     const publicationBoardGroups = [
-      {
-        filterKey: "draft" as const,
-        label: "Rascunhos",
-        caption: "Conteúdos aguardando liberação",
-        icon: FiEdit3,
-        tone: "draft",
-      },
       {
         filterKey: "upcoming" as const,
         label: "Agendadas",
         caption: "Publicações prontas para disparo",
         icon: FiClock,
         tone: "scheduled",
+      },
+      {
+        filterKey: "sent" as const,
+        label: "Publicadas",
+        caption: "Já concluídas ou enviadas sem confirmação",
+        icon: FiCheckCircle,
+        tone: "published",
+      },
+      {
+        filterKey: "canceled" as const,
+        label: "Canceladas",
+        caption: "Itens interrompidos manualmente",
+        icon: FiSlash,
+        tone: "canceled",
       },
       {
         filterKey: "waiting_login" as const,
@@ -14830,80 +15446,75 @@ function App() {
       },
       {
         filterKey: "failed" as const,
-        label: "Falharam",
+        label: "Falhadas",
         caption: "Precisam de revisão ou novo envio",
         icon: FiX,
         tone: "failed",
       },
       {
-        filterKey: "canceled" as const,
-        label: "Canceladas",
-        caption: "Itens interrompidos manualmente",
-        icon: FiSlash,
-        tone: "canceled",
-      },
-      {
-        filterKey: "sent" as const,
-        label: "Publicadas",
-        caption: "Já concluídas ou enviadas sem confirmação",
-        icon: FiCheckCircle,
-        tone: "published",
+        filterKey: "draft" as const,
+        label: "Rascunhos",
+        caption: "Conteúdos aguardando liberação",
+        icon: FiEdit3,
+        tone: "draft",
       },
     ].map((group) => {
-      const jobs = selectedMonthJobs.filter((job) => matchesHistoryFilterKey(job, group.filterKey, isPastScheduledAtForUser));
-      const mockBlueprints = mockBlueprintsByFilter[group.filterKey] ?? [];
-      const previewItems =
-        jobs.length > 0
-          ? jobs.map((job) => {
-              const jobDateLabel = toDateLocal(job.dataPostagem, effectiveUserTimeZone);
-              const jobDay = Number.parseInt(jobDateLabel.slice(-2), 10) || 1;
-              return {
-                id: job.id,
-                isMock: false,
-                title: resolveJobDisplayTitle(job),
-                caption: (job.caption?.trim() || "Sem legenda").slice(0, 120),
-                workspaceLabel: companyNameMap[job.companyId] || "Workspace removido",
-                dateLabel: jobDateLabel,
-                timeLabel: toTimeLocal(job.dataPostagem, effectiveUserTimeZone),
-                publicationType: job.publicationType,
-                statusLabel: jobStatusDisplayLabel(job),
-                day: jobDay,
-                span: 1,
-                job,
-              };
-            })
-          : mockBlueprints.map((mock, index) => {
-              const dayLabel = String(mock.day).padStart(2, "0");
-              const monthLabel = String(historyCalendarMonth).padStart(2, "0");
-              return {
-                id: `mock-${group.filterKey}-${index}`,
-                isMock: true,
-                title: mock.title,
-                caption: mock.caption,
-                workspaceLabel: mockWorkspaceLabels[mock.workspaceIndex % mockWorkspaceLabels.length] || "Workspace preview",
-                dateLabel: `${dayLabel}/${monthLabel}/${historyCalendarYear}`,
-                timeLabel: mock.time,
-                publicationType: mock.publicationType,
-                statusLabel: group.label,
-                day: mock.day,
-                span: mock.span ?? 3,
-                job: null,
-              };
-            });
+      const matchingGroupJobs = publicationBoardBaseJobs.filter((job) =>
+        matchesHistoryFilterKey(job, group.filterKey, isPastScheduledAtForUser),
+      );
+      const totalMatchingCount = matchingGroupJobs.length;
+      const latestGroupJob = matchingGroupJobs[0] ?? null;
+      const sectionPeriod =
+        publicationBoardPeriodByFilter[group.filterKey] ??
+        (latestGroupJob
+          ? getYearMonthInTimeZone(new Date(latestGroupJob.dataPostagem), effectiveUserTimeZone)
+          : defaultPublicationBoardPeriod);
+      const sectionMonthJobs = matchingGroupJobs.filter((job) => {
+        const yearMonth = getYearMonthInTimeZone(new Date(job.dataPostagem), effectiveUserTimeZone);
+        return yearMonth.year === sectionPeriod.year && yearMonth.month === sectionPeriod.month;
+      });
+      const jobs = sectionMonthJobs;
+      const previewItems = jobs.map((job) => {
+        const jobDateLabel = toDateLocal(job.dataPostagem, effectiveUserTimeZone);
+        const jobDay = Number.parseInt(jobDateLabel.slice(-2), 10) || 1;
+        return {
+          id: job.id,
+          title: resolveJobDisplayTitle(job),
+          caption: (job.caption?.trim() || "Sem legenda").slice(0, 120),
+          workspaceLabel: companyNameMap[job.companyId] || "Workspace removido",
+          dateLabel: jobDateLabel,
+          timeLabel: toTimeLocal(job.dataPostagem, effectiveUserTimeZone),
+          publicationType: job.publicationType,
+          statusLabel: jobStatusDisplayLabel(job),
+          day: jobDay,
+          span: 1,
+          job,
+        };
+      });
       return {
         ...group,
         jobs,
         previewItems,
         count: jobs.length,
-        displayCount: jobs.length > 0 ? jobs.length : mockBlueprints.length,
+        totalCount: totalMatchingCount,
+        displayCount: totalMatchingCount,
+        sectionPeriod,
+        monthLabel: formatHistoryCalendarMonthLabel(sectionPeriod.year, sectionPeriod.month),
       };
     });
 
+    const nonEmptyPublicationBoardGroups = publicationBoardGroups.filter((group) => group.totalCount > 0);
     const visiblePublicationSections =
       activePublicationBoardFilter === "all"
-        ? publicationBoardGroups
-        : publicationBoardGroups.filter((group) => group.filterKey === activePublicationBoardFilter);
+        ? nonEmptyPublicationBoardGroups
+        : publicationBoardGroups.filter((group) => group.filterKey === activePublicationBoardFilter && group.totalCount > 0);
+    const allVisibleSectionsCollapsed =
+      visiblePublicationSections.length > 0 &&
+      visiblePublicationSections.every((group) => Boolean(historyCollapsedSections[group.filterKey]));
+    const preferredExpandedPublicationFilter =
+      visiblePublicationSections.find((group) => group.count > 0)?.filterKey ?? visiblePublicationSections[0]?.filterKey ?? null;
     const selectedJobsCount = historyBulkSelectedJobIds.length;
+    const visiblePublicationJobsCount = visiblePublicationSections.reduce((total, group) => total + group.count, 0);
 
     return (
       <section ref={historySectionRef} className="panel-card view-stack publications-shell">
@@ -14918,7 +15529,8 @@ function App() {
         <div className="publications-overview-grid">
           {publicationBoardGroups.map((group) => {
             const Icon = group.icon;
-            const isActive = activePublicationBoardFilter === group.filterKey;
+            const isActive = activePublicationBoardFilter === group.filterKey && group.totalCount > 0;
+            const isDisabled = group.totalCount === 0;
 
             return (
               <button
@@ -14926,15 +15538,21 @@ function App() {
                 type="button"
                 className={`publications-overview-card publications-overview-card-${group.tone}${
                   isActive ? " publications-overview-card-active" : ""
-                }`}
-                onClick={() => setHistoryFilter((current) => (current === group.filterKey ? "all" : group.filterKey))}
+                }${isDisabled ? " publications-overview-card-disabled" : ""}`}
+                onClick={() => {
+                  if (isDisabled) {
+                    return;
+                  }
+                  setHistoryFilter((current) => (current === group.filterKey ? "all" : group.filterKey));
+                }}
+                disabled={isDisabled}
               >
                 <span className="publications-overview-card-icon" aria-hidden="true">
                   <Icon />
                 </span>
                 <span className="publications-overview-card-copy">
                   <small>{group.label}</small>
-                  <strong>{String(group.displayCount).padStart(2, "0")}</strong>
+                  <strong>{group.displayCount}</strong>
                 </span>
               </button>
             );
@@ -15062,7 +15680,7 @@ function App() {
         <div className="publications-period-toolbar">
           <div className="publications-period-meta">
             <span className="count-pill">{`Horário: ${formatHistoryCalendarTimeZoneLabel(effectiveUserTimeZone)}`}</span>
-            <span className="count-pill">{`${selectedMonthJobs.length} publicação(ões) no período`}</span>
+            <span className="count-pill">{`${visiblePublicationJobsCount} publicação(ões) no período`}</span>
             <span className="count-pill">{`${selectedJobsCount} selecionada(s)`}</span>
           </div>
           <div className="publications-period-controls">
@@ -15085,14 +15703,19 @@ function App() {
           </div>
         ) : null}
 
-        {visiblePublicationSections.length === 0 ? (
-          <div className="empty-state publications-empty-state">
-            Nenhuma publicação encontrada para {historyCalendarMonthLabel.toLocaleLowerCase("pt-BR")}.
-          </div>
-        ) : (
-          <div className="publications-board-stack">
-            {visiblePublicationSections.map((group) => {
+        <div className="publications-board-stack">
+          {visiblePublicationSections.length === 0 ? (
+            <div className="publications-board-empty-global">Nenhuma publicação encontrada com os filtros atuais.</div>
+          ) : null}
+          {visiblePublicationSections.map((group) => {
               const Icon = group.icon;
+              const pageCount = Math.max(1, Math.ceil(group.previewItems.length / 2));
+              const currentPage = Math.min(historyBoardPageByFilter[group.filterKey] ?? 0, pageCount - 1);
+              const pagedItems = pageCount > 1 ? group.previewItems.slice(currentPage * 2, currentPage * 2 + 2) : group.previewItems;
+              const isCollapsed = allVisibleSectionsCollapsed
+                ? group.filterKey !== preferredExpandedPublicationFilter
+                : Boolean(historyCollapsedSections[group.filterKey]);
+              const isSectionPeriodLoading = Boolean(publicationBoardLoadingByFilter[group.filterKey]);
 
               return (
                 <section key={group.filterKey} className="publications-board-section">
@@ -15100,9 +15723,13 @@ function App() {
                     <div className="publications-board-section-title">
                       <button
                         type="button"
-                        className="publications-board-section-toggle"
-                        title={`Sessão ${group.label}`}
-                        aria-label={`Sessão ${group.label}`}
+                        className={`publications-board-section-toggle${
+                          isCollapsed ? " publications-board-section-toggle-collapsed" : ""
+                        }`}
+                        title={`${isCollapsed ? "Expandir" : "Recolher"} ${group.label}`}
+                        aria-label={`${isCollapsed ? "Expandir" : "Recolher"} ${group.label}`}
+                        aria-expanded={!isCollapsed}
+                        onClick={() => toggleHistoryBoardSection(group.filterKey)}
                       >
                         <FiChevronDown />
                       </button>
@@ -15114,21 +15741,21 @@ function App() {
                         <p>{group.caption}</p>
                       </div>
                     </div>
-                    <div className="publications-board-section-meta">
-                      <span className="count-pill">{String(group.displayCount).padStart(2, "0")}</span>
+                      <div className="publications-board-section-meta">
+                      <span className="count-pill">{group.count}</span>
                       <div className="publications-board-section-period">
                         <button
                           type="button"
                           className="publications-board-timeline-monthbar-nav"
-                          onClick={() => navigateHistoryCalendarMonth(-1)}
+                          onClick={() => navigatePublicationBoardSectionMonth(group.filterKey, -1)}
                           aria-label="Mês anterior"
                         >
                           <FiChevronLeft />
                         </button>
-                        <span className="publications-board-section-period-label">{historyCalendarMonthLabel}</span>
+                        <span className="publications-board-section-period-label">{group.monthLabel}</span>
                         <select
-                          value={historyCalendarYear}
-                          onChange={(event) => setHistoryCalendarYear(Number(event.target.value))}
+                          value={group.sectionPeriod.year}
+                          onChange={(event) => updatePublicationBoardSectionYear(group.filterKey, Number(event.target.value))}
                           disabled={historyBulkApplying}
                           className="publications-board-timeline-monthbar-year"
                           aria-label="Ano do calendário"
@@ -15142,7 +15769,7 @@ function App() {
                         <button
                           type="button"
                           className="publications-board-timeline-monthbar-nav"
-                          onClick={() => navigateHistoryCalendarMonth(1)}
+                          onClick={() => navigatePublicationBoardSectionMonth(group.filterKey, 1)}
                           aria-label="Próximo mês"
                         >
                           <FiChevronRight />
@@ -15151,262 +15778,268 @@ function App() {
                     </div>
                   </div>
 
-                  <div className="publications-board-section-body publications-board-section-body-list-only">
-                    <div className={`publications-board-list${shouldShowWorkspaceColumn ? "" : " publications-board-list-single-workspace"}`}>
-                      <div className={`publications-board-list-head${shouldShowWorkspaceColumn ? "" : " publications-board-list-head-single-workspace"}`}>
-                        <span className="publications-board-list-col-preview" />
-                        <span className="publications-board-list-col-main">Publicação</span>
-                        {shouldShowWorkspaceColumn ? <span className="publications-board-list-col-workspace">Workspace</span> : null}
-                        <span className="publications-board-list-col-date">Agendada para</span>
-                        <span className="publications-board-list-col-type">Tipo</span>
-                        <span className="publications-board-list-col-actions">Ações</span>
-                        <span className="publications-board-list-col-status">Status</span>
-                      </div>
-                      <div className="publications-board-list-body">
-                        {group.previewItems.length > 0 ? (
-                          group.previewItems.map((item) => {
-                            const isEditingSchedule = item.job ? historyInlineTimeJobId === item.job.id : false;
-                            const canEditSchedule = item.job ? canEditPublicationBoardSchedule(item.job) : false;
-                            const canRetry = item.job ? canRetryPublicationBoardJob(item.job) : false;
-                            const canReactivate = item.job ? canReactivatePublicationBoardJob(item.job) : false;
-                            const isSavingRow = item.job ? historyInlineSavingJobId === item.job.id : false;
-                            const isRetryingRow = item.job ? retryingJobId === item.job.id : false;
-                            const isReactivatingRow = item.job ? togglingScheduleJobId === item.job.id : false;
-                            const mediaPreviewPaths = item.job ? resolveJobMediaPaths(item.job) : [];
-                            const firstMediaPreviewPath = mediaPreviewPaths[0] ?? null;
-                            const hasMediaPreview = mediaPreviewPaths.length > 0;
+                  <div
+                    className={`publications-board-section-collapse${
+                      isCollapsed ? " publications-board-section-collapse-collapsed" : ""
+                    }`}
+                    aria-hidden={isCollapsed}
+                  >
+                    <div className="publications-board-section-collapse-inner">
+                      <div
+                        className={`publications-board-section-body publications-board-section-body-list-only${
+                          isSectionPeriodLoading ? " publications-board-section-body-loading" : ""
+                        }`}
+                      >
+                      {isSectionPeriodLoading ? (
+                        <div className="publications-board-section-loading-overlay" aria-hidden="true">
+                          <span className="spinner" />
+                        </div>
+                      ) : null}
+                      <div
+                        className={`publications-board-list${shouldShowWorkspaceColumn ? "" : " publications-board-list-single-workspace"}`}
+                      >
+                        <div
+                          className={`publications-board-list-head${shouldShowWorkspaceColumn ? "" : " publications-board-list-head-single-workspace"}`}
+                        >
+                          <span className="publications-board-list-col-preview" />
+                          <span className="publications-board-list-col-main">Publicação</span>
+                          {shouldShowWorkspaceColumn ? <span className="publications-board-list-col-workspace">Workspace</span> : null}
+                          <span className="publications-board-list-col-date">Agendada para</span>
+                          <span className="publications-board-list-col-type">Tipo</span>
+                          <span className="publications-board-list-col-actions">Ações</span>
+                          <span className="publications-board-list-col-status">Status</span>
+                        </div>
+                        <div className="publications-board-list-body">
+                          {pagedItems.length > 0 ? (
+                            pagedItems.map((item) => {
+                              const isEditingSchedule = item.job ? historyInlineTimeJobId === item.job.id : false;
+                              const canEditSchedule = item.job ? canEditPublicationBoardSchedule(item.job) : false;
+                              const canRetry = item.job ? canRetryPublicationBoardJob(item.job) : false;
+                              const canReactivate = item.job ? canReactivatePublicationBoardJob(item.job) : false;
+                              const isSavingRow = item.job ? historyInlineSavingJobId === item.job.id : false;
+                              const isRetryingRow = item.job ? retryingJobId === item.job.id : false;
+                              const isReactivatingRow = item.job ? togglingScheduleJobId === item.job.id : false;
+                              const mediaPreviewPaths = item.job ? resolveJobMediaPaths(item.job) : [];
+                              const firstMediaPreviewPath = mediaPreviewPaths[0] ?? null;
+                              const hasMediaPreview = mediaPreviewPaths.length > 0;
 
-                            return (
-                              <div
-                                key={`list-${group.filterKey}-${item.id}`}
-                                className={`publications-board-list-row${shouldShowWorkspaceColumn ? "" : " publications-board-list-row-single-workspace"}${
-                                  item.isMock ? " publications-board-list-row-preview" : ""
-                                }`}
-                              >
-                                {hasMediaPreview && item.job ? (
-                                  <button
-                                    type="button"
-                                    className="publications-board-list-preview-button"
-                                    title="Ver mídias da publicação"
-                                    aria-label="Ver mídias da publicação"
-                                    onClick={() => openPublicationMediaModal(item.job!)}
-                                  >
-                                    {firstMediaPreviewPath && isVideoPath(firstMediaPreviewPath) ? (
-                                      <video
-                                        src={`${api.baseUrl}${firstMediaPreviewPath}`}
-                                        muted
-                                        playsInline
-                                        preload="metadata"
-                                        aria-hidden="true"
-                                      />
-                                    ) : firstMediaPreviewPath ? (
-                                      <img
-                                        src={`${api.baseUrl}${firstMediaPreviewPath}`}
-                                        alt={`Prévia da publicação ${item.title}`}
-                                      />
-                                    ) : null}
-                                  </button>
-                                ) : (
-                                  <span className="publications-board-list-preview-placeholder" aria-hidden="true">
-                                    <FiImage />
-                                  </span>
-                                )}
-                                <div className="publications-board-list-main">
-                                  <strong>{item.title}</strong>
-                                  <small>{item.caption}</small>
-                                </div>
-                                {shouldShowWorkspaceColumn ? (
-                                  <span className="publications-board-list-workspace">{item.workspaceLabel}</span>
-                                ) : null}
-                                <div className="publications-board-list-date">
-                                  {isEditingSchedule && item.job ? (
-                                    <div className="publications-board-inline-schedule-editor">
-                                      <input
-                                        type="date"
-                                        value={historyInlineDateValue}
-                                        onChange={(event) => setHistoryInlineDateValue(event.target.value)}
-                                        disabled={isSavingRow}
-                                      />
-                                      <input
-                                        type="time"
-                                        value={historyInlineTimeValue}
-                                        onChange={(event) => setHistoryInlineTimeValue(event.target.value)}
-                                        disabled={isSavingRow}
-                                      />
-                                      <div className="publications-board-inline-schedule-actions">
-                                        <button
-                                          type="button"
-                                          className="publications-board-inline-schedule-save"
-                                          title="Salvar agendamento"
-                                          aria-label="Salvar agendamento"
-                                          onClick={() =>
-                                            void updateHistoryCalendarJobSchedule(
-                                              item.job!,
-                                              historyInlineDateValue,
-                                              historyInlineTimeValue,
-                                            )
-                                          }
-                                          disabled={isSavingRow}
-                                        >
-                                          <FiCheck aria-hidden="true" />
-                                        </button>
-                                        <button
-                                          type="button"
-                                          className="publications-board-inline-schedule-cancel"
-                                          title="Cancelar edição"
-                                          aria-label="Cancelar edição"
-                                          onClick={cancelHistoryInlineTimeEdit}
-                                          disabled={isSavingRow}
-                                        >
-                                          <FiX aria-hidden="true" />
-                                        </button>
-                                      </div>
-                                    </div>
+                              return (
+                                <div
+                                  key={`list-${group.filterKey}-${item.id}`}
+                                  className={`publications-board-list-row${shouldShowWorkspaceColumn ? "" : " publications-board-list-row-single-workspace"}`}
+                                >
+                                  {hasMediaPreview && item.job ? (
+                                    <button
+                                      type="button"
+                                      className="publications-board-list-preview-button"
+                                      title="Ver mídias da publicação"
+                                      aria-label="Ver mídias da publicação"
+                                      onClick={() => openPublicationMediaModal(item.job!)}
+                                    >
+                                      {firstMediaPreviewPath && isVideoPath(firstMediaPreviewPath) ? (
+                                        <video
+                                          src={`${api.baseUrl}${firstMediaPreviewPath}`}
+                                          muted
+                                          playsInline
+                                          preload="metadata"
+                                          aria-hidden="true"
+                                        />
+                                      ) : firstMediaPreviewPath ? (
+                                        <img
+                                          src={`${api.baseUrl}${firstMediaPreviewPath}`}
+                                          alt={`Prévia da publicação ${item.title}`}
+                                        />
+                                      ) : null}
+                                    </button>
                                   ) : (
-                                    <>
-                                      <strong>{item.dateLabel}</strong>
-                                      <small>{item.timeLabel}</small>
-                                    </>
+                                    <span className="publications-board-list-preview-placeholder" aria-hidden="true">
+                                      <FiImage />
+                                    </span>
                                   )}
-                                </div>
-                                <span className="publications-board-list-type">{renderPublicationTypePill(item.publicationType)}</span>
-                                <div className="publications-board-list-actions">
-                                  {item.job ? (
-                                    <button
-                                      type="button"
-                                      className="publications-board-action-button publications-board-action-button-edit"
-                                      title="Editar publicação"
-                                      aria-label="Editar publicação"
-                                      onClick={() => openHistoryJobEditor(item.job!)}
-                                    >
-                                      <FiEdit3 aria-hidden="true" />
-                                    </button>
-                                  ) : item.isMock ? (
-                                    renderPublicationBoardActionPreview(
-                                      <FiEdit3 aria-hidden="true" />,
-                                      "Editar publicação",
-                                      "publications-board-action-button-edit",
-                                    )
+                                  <div className="publications-board-list-main">
+                                    <strong>{item.title}</strong>
+                                    <small>{item.caption}</small>
+                                  </div>
+                                  {shouldShowWorkspaceColumn ? (
+                                    <span className="publications-board-list-workspace">{item.workspaceLabel}</span>
                                   ) : null}
-                                  {canEditSchedule && item.job ? (
-                                    <button
-                                      type="button"
-                                      className="publications-board-action-button publications-board-action-button-schedule"
-                                      title="Editar agendamento"
-                                      aria-label="Editar agendamento"
-                                      onClick={() => startHistoryInlineTimeEdit(item.job!)}
-                                      disabled={isSavingRow}
-                                    >
-                                      <FiCalendar aria-hidden="true" />
-                                    </button>
-                                  ) : item.isMock ? (
-                                    renderPublicationBoardActionPreview(
-                                      <FiCalendar aria-hidden="true" />,
-                                      "Editar agendamento",
-                                      "publications-board-action-button-schedule",
-                                    )
-                                  ) : null}
-                                  {item.job ? (
-                                    <button
-                                      type="button"
-                                      className="publications-board-action-button publications-board-action-button-duplicate"
-                                      title="Duplicar publicação"
-                                      aria-label="Duplicar publicação"
-                                      onClick={() => openPublicationDuplicateModal(item.job!)}
-                                    >
-                                      <FiCopy aria-hidden="true" />
-                                    </button>
-                                  ) : item.isMock ? (
-                                    renderPublicationBoardActionPreview(
-                                      <FiCopy aria-hidden="true" />,
-                                      "Duplicar publicação",
-                                      "publications-board-action-button-duplicate",
-                                    )
-                                  ) : null}
-                                  {item.job ? (
-                                    <button
-                                      type="button"
-                                      className="publications-board-action-button publications-board-action-button-template"
-                                      title="Criar template"
-                                      aria-label="Criar template"
-                                      onClick={() => savePublicationAsTemplate(item.job!)}
-                                    >
-                                      <FiFileText aria-hidden="true" />
-                                    </button>
-                                  ) : item.isMock ? (
-                                    renderPublicationBoardActionPreview(
-                                      <FiFileText aria-hidden="true" />,
-                                      "Criar template",
-                                      "publications-board-action-button-template",
-                                    )
-                                  ) : null}
-                                  {canRetry && item.job ? (
-                                    <button
-                                      type="button"
-                                      className="publications-board-action-button publications-board-action-button-retry"
-                                      title="Tentar novamente"
-                                      aria-label="Tentar novamente"
-                                      onClick={() => void retryJob(item.job!.id)}
-                                      disabled={isRetryingRow}
-                                    >
-                                      <FiRotateCcw aria-hidden="true" />
-                                    </button>
-                                  ) : item.isMock && group.filterKey === "failed" ? (
-                                    renderPublicationBoardActionPreview(
-                                      <FiRotateCcw aria-hidden="true" />,
-                                      "Tentar novamente",
-                                      "publications-board-action-button-retry",
-                                    )
-                                  ) : null}
-                                  {canReactivate && item.job ? (
-                                    <button
-                                      type="button"
-                                      className="publications-board-action-button publications-board-action-button-reactivate"
-                                      title="Reativar publicação"
-                                      aria-label="Reativar publicação"
-                                      onClick={() => void toggleJobSchedule(item.job!)}
-                                      disabled={isReactivatingRow}
-                                    >
-                                      <FiCheckCircle aria-hidden="true" />
-                                    </button>
-                                  ) : item.isMock && group.filterKey === "canceled" ? (
-                                    renderPublicationBoardActionPreview(
-                                      <FiCheckCircle aria-hidden="true" />,
-                                      "Reativar publicação",
-                                      "publications-board-action-button-reactivate",
-                                    )
-                                  ) : null}
-                                </div>
-                                <span className="publications-board-list-status">
-                                  <span className={`publications-job-status-chip publications-job-status-chip-${group.tone}`}>
-                                    {item.statusLabel}
+                                  <div className="publications-board-list-date">
+                                    {isEditingSchedule && item.job ? (
+                                      <div className="publications-board-inline-schedule-editor">
+                                        <input
+                                          type="date"
+                                          value={historyInlineDateValue}
+                                          onChange={(event) => setHistoryInlineDateValue(event.target.value)}
+                                          disabled={isSavingRow}
+                                        />
+                                        <input
+                                          type="time"
+                                          value={historyInlineTimeValue}
+                                          onChange={(event) => setHistoryInlineTimeValue(event.target.value)}
+                                          disabled={isSavingRow}
+                                        />
+                                        <div className="publications-board-inline-schedule-actions">
+                                          <button
+                                            type="button"
+                                            className="publications-board-inline-schedule-save"
+                                            title="Salvar agendamento"
+                                            aria-label="Salvar agendamento"
+                                            onClick={() =>
+                                              void updateHistoryCalendarJobSchedule(
+                                                item.job!,
+                                                historyInlineDateValue,
+                                                historyInlineTimeValue,
+                                              )
+                                            }
+                                            disabled={isSavingRow}
+                                          >
+                                            <FiCheck aria-hidden="true" />
+                                          </button>
+                                          <button
+                                            type="button"
+                                            className="publications-board-inline-schedule-cancel"
+                                            title="Cancelar edição"
+                                            aria-label="Cancelar edição"
+                                            onClick={cancelHistoryInlineTimeEdit}
+                                            disabled={isSavingRow}
+                                          >
+                                            <FiX aria-hidden="true" />
+                                          </button>
+                                        </div>
+                                      </div>
+                                    ) : (
+                                      <>
+                                        <strong>{item.dateLabel}</strong>
+                                        <small>{item.timeLabel}</small>
+                                      </>
+                                    )}
+                                  </div>
+                                  <span className="publications-board-list-type">{renderPublicationTypePill(item.publicationType)}</span>
+                                  <div className="publications-board-list-actions">
+                                    {item.job ? (
+                                      <button
+                                        type="button"
+                                        className="publications-board-action-button publications-board-action-button-edit"
+                                        title="Editar publicação"
+                                        aria-label="Editar publicação"
+                                        onClick={() => openHistoryJobEditor(item.job!)}
+                                      >
+                                        <FiEdit3 aria-hidden="true" />
+                                      </button>
+                                    ) : null}
+                                    {canEditSchedule && item.job ? (
+                                      <button
+                                        type="button"
+                                        className="publications-board-action-button publications-board-action-button-schedule"
+                                        title="Editar agendamento"
+                                        aria-label="Editar agendamento"
+                                        onClick={() => startHistoryInlineTimeEdit(item.job!)}
+                                        disabled={isSavingRow}
+                                      >
+                                        <FiCalendar aria-hidden="true" />
+                                      </button>
+                                    ) : null}
+                                    {item.job ? (
+                                      <button
+                                        type="button"
+                                        className="publications-board-action-button publications-board-action-button-duplicate"
+                                        title="Duplicar publicação"
+                                        aria-label="Duplicar publicação"
+                                        onClick={() => openPublicationDuplicateModal(item.job!)}
+                                      >
+                                        <FiCopy aria-hidden="true" />
+                                      </button>
+                                    ) : null}
+                                    {item.job ? (
+                                      <button
+                                        type="button"
+                                        className="publications-board-action-button publications-board-action-button-template"
+                                        title="Criar template"
+                                        aria-label="Criar template"
+                                        onClick={() => savePublicationAsTemplate(item.job!)}
+                                      >
+                                        <FiFileText aria-hidden="true" />
+                                      </button>
+                                    ) : null}
+                                    {canRetry && item.job ? (
+                                      <button
+                                        type="button"
+                                        className="publications-board-action-button publications-board-action-button-retry"
+                                        title="Tentar novamente"
+                                        aria-label="Tentar novamente"
+                                        onClick={() => void retryJob(item.job!.id)}
+                                        disabled={isRetryingRow}
+                                      >
+                                        <FiRotateCcw aria-hidden="true" />
+                                      </button>
+                                    ) : null}
+                                    {canReactivate && item.job ? (
+                                      <button
+                                        type="button"
+                                        className="publications-board-action-button publications-board-action-button-reactivate"
+                                        title="Reativar publicação"
+                                        aria-label="Reativar publicação"
+                                        onClick={() => void toggleJobSchedule(item.job!)}
+                                        disabled={isReactivatingRow}
+                                      >
+                                        <FiCheckCircle aria-hidden="true" />
+                                      </button>
+                                    ) : null}
+                                  </div>
+                                  <span className="publications-board-list-status">
+                                    <span className={`publications-job-status-chip publications-job-status-chip-${group.tone}`}>
+                                      {item.statusLabel}
+                                    </span>
                                   </span>
-                                </span>
-                              </div>
-                            );
-                          })
-                        ) : (
-                          <div className="publications-board-list-empty">Nenhuma publicação nesta coluna.</div>
-                        )}
+                                </div>
+                              );
+                            })
+                          ) : (
+                            <div className="publications-board-list-empty">Nenhuma publicação nesta coluna.</div>
+                          )}
+                        </div>
                       </div>
-                      <div className="publications-board-list-pagination" aria-label={`Paginação visual de ${group.label}`}>
-                        {Array.from({ length: Math.max(1, Math.ceil(group.previewItems.length / 2)) }, (_, index) => (
-                          <span
-                            key={`${group.filterKey}-dot-${index}`}
-                            className={`publications-board-list-pagination-dot${
-                              index === 0 ? " publications-board-list-pagination-dot-active" : ""
-                            }`}
-                            aria-hidden="true"
-                          />
-                        ))}
                       </div>
+                      {pageCount > 1 ? (
+                        <div className="publications-board-list-pagination" aria-label={`Paginação visual de ${group.label}`}>
+                          <div
+                            className="publications-board-list-pagination-track"
+                            style={
+                              {
+                                "--pagination-active-index": currentPage,
+                              } as CSSProperties
+                            }
+                          >
+                            <span
+                              key={`${group.filterKey}-worm-${currentPage}`}
+                              className="publications-board-list-pagination-worm"
+                              aria-hidden="true"
+                            />
+                            {Array.from({ length: pageCount }, (_, index) => (
+                              <button
+                                key={`${group.filterKey}-dot-${index}`}
+                                type="button"
+                                className={`publications-board-list-pagination-dot${
+                                  index === currentPage ? " publications-board-list-pagination-dot-active" : ""
+                                }`}
+                                onClick={() =>
+                                  setHistoryBoardPageByFilter((current) => ({
+                                    ...current,
+                                    [group.filterKey]: index,
+                                  }))
+                                }
+                                aria-label={`Página ${index + 1} de ${group.label}`}
+                              />
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
                     </div>
                   </div>
                 </section>
               );
             })}
-          </div>
-        )}
+        </div>
       </section>
     );
   }
@@ -15596,57 +16229,48 @@ function App() {
   function renderDashboardSkeleton() {
     return (
       <div className="view-stack skeleton-shell" aria-busy="true">
-        <section className="dashboard-top-grid" aria-hidden="true">
-          <div className="stats-grid dashboard-compact-metrics-grid">
-            {Array.from({ length: 4 }, (_, index) => (
-              <article key={`dashboard-metric-skeleton-${index}`} className="metric-card skeleton-metric-card dashboard-compact-metric-card">
-                <span className="skeleton-line skeleton-line-chip" />
-                <span className="skeleton-line skeleton-line-metric-value" />
-              </article>
+        <section className="home-welcome-banner" aria-hidden="true">
+          <div className="home-welcome-copy">
+            <span className="skeleton-line skeleton-line-kicker" />
+            <span className="skeleton-line skeleton-line-heading" />
+            <span className="skeleton-line skeleton-line-text-wide" />
+          </div>
+          <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" />
+        </section>
+
+        <section className="panel-card home-calendar-shell" aria-hidden="true">
+          <div className="home-calendar-toolbar">
+            <div className="home-calendar-toolbar-copy">
+              <span className="skeleton-line skeleton-line-title" />
+              <span className="skeleton-line skeleton-line-text" />
+            </div>
+            <div className="home-calendar-toolbar-actions">
+              <span className="skeleton-line skeleton-line-chip" />
+              <span className="skeleton-line skeleton-line-chip" />
+              <span className="skeleton-line skeleton-line-chip" />
+            </div>
+          </div>
+
+          <div className="home-calendar-weekdays">
+            {DASHBOARD_CALENDAR_WEEKDAY_LABELS.map((label) => (
+              <span key={`dashboard-skeleton-weekday-${label}`} className="skeleton-line skeleton-line-text" />
             ))}
           </div>
 
-          <section className="panel-card">
-            {renderSkeletonSectionHead()}
-            <div className="dashboard-upcoming-skeleton-grid">
-              {Array.from({ length: 2 }, (_, index) => (
-                <article key={`dashboard-upcoming-skeleton-${index}`} className="dashboard-upcoming-card dashboard-upcoming-card-skeleton">
-                  <span className="skeleton-line skeleton-line-title" />
-                  <div className="meta-pill-row">
-                    <span className="skeleton-line skeleton-line-pill" />
-                    <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
-                  </div>
-                  <span className="skeleton-line skeleton-line-text" />
-                  <div className="dashboard-upcoming-card-footer">
-                    <span className="skeleton-line skeleton-line-chip" />
-                    <span className="skeleton-line skeleton-line-button" />
-                  </div>
-                </article>
-              ))}
-            </div>
-          </section>
-        </section>
-
-        <section className="dashboard-analytics-grid" aria-hidden="true">
-          <article className="panel-card">
-            {renderSkeletonSectionHead(3)}
-            <div className="dashboard-chart-skeleton" />
-          </article>
-          <article className="panel-card">
-            {renderSkeletonSectionHead()}
-            <div className="dashboard-breakdown-skeleton">
-              {Array.from({ length: 4 }, (_, index) => (
-                <span key={`dashboard-breakdown-skeleton-${index}`} className="skeleton-line skeleton-line-text-wide" />
-              ))}
-            </div>
-          </article>
-        </section>
-
-        <section className="content-grid">
-          <article className="panel-card full-width-panel">
-            {renderSkeletonSectionHead(1)}
-            {renderSkeletonRows(3)}
-          </article>
+          <div className="home-calendar-grid">
+            {Array.from({ length: 35 }, (_, index) => (
+              <article key={`dashboard-calendar-skeleton-${index}`} className="home-calendar-day home-calendar-day-skeleton">
+                <div className="home-calendar-day-head">
+                  <span className="skeleton-line skeleton-line-chip" />
+                </div>
+                <div className="home-calendar-day-body home-calendar-day-events">
+                  <span className="skeleton-line skeleton-line-chip" />
+                  <span className="skeleton-line skeleton-line-chip" />
+                  <span className="skeleton-line skeleton-line-chip" />
+                </div>
+              </article>
+            ))}
+          </div>
         </section>
       </div>
     );
@@ -15654,44 +16278,135 @@ function App() {
 
   function renderCompaniesSkeleton() {
     return (
-      <section className="panel-card view-stack skeleton-shell" aria-busy="true">
-        {renderSkeletonSectionHead()}
-        <div className="form-grid" aria-hidden="true">
-          <span className="skeleton-line skeleton-line-input" />
-          <span className="skeleton-line skeleton-line-button" />
-        </div>
-        {renderSkeletonRows(4)}
-      </section>
+      <div className="view-stack workspace-shell skeleton-shell" aria-busy="true">
+        <section className="panel-card view-stack workspace-panel">
+          <div className="section-head publications-section-head skeleton-section-head-inline">
+            <div className="skeleton-title-stack">
+              <span className="skeleton-line skeleton-line-kicker" />
+              <span className="skeleton-line skeleton-line-heading" />
+            </div>
+            <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" />
+          </div>
+
+          <div className="workspace-overview-grid" aria-hidden="true">
+            {Array.from({ length: 4 }, (_, index) => (
+              <article key={`workspace-overview-skeleton-${index}`} className="workspace-overview-card workspace-overview-card-skeleton">
+                <span className="skeleton-line skeleton-line-icon-badge" />
+                <span className="workspace-overview-card-copy">
+                  <span className="skeleton-line skeleton-line-chip" />
+                  <span className="skeleton-line skeleton-line-metric-value" />
+                </span>
+              </article>
+            ))}
+          </div>
+
+          <div className="workspace-toolbar-shell workspace-toolbar-shell-skeleton" aria-hidden="true">
+            <div className="workspace-toolbar-copy">
+              <span className="skeleton-line skeleton-line-title" />
+              <span className="skeleton-line skeleton-line-text-medium" />
+            </div>
+            <div className="workspace-toolbar-meta">
+              <span className="skeleton-line skeleton-line-chip" />
+              <span className="skeleton-line skeleton-line-chip" />
+            </div>
+          </div>
+
+          <div className="table-list workspace-board-grid" aria-hidden="true">
+            {Array.from({ length: 3 }, (_, index) => (
+              <article key={`workspace-card-skeleton-${index}`} className="workspace-board-card workspace-board-card-skeleton">
+                <div className="workspace-board-card-head workspace-board-card-head-skeleton">
+                  <div className="workspace-board-card-identity">
+                    <span className="workspace-board-avatar workspace-board-avatar-skeleton" />
+                    <div className="workspace-board-card-copy workspace-board-card-copy-skeleton">
+                      <span className="skeleton-line skeleton-line-title" />
+                      <span className="skeleton-line skeleton-line-text" />
+                    </div>
+                  </div>
+                  <div className="workspace-board-card-aside workspace-board-card-aside-skeleton">
+                    <div className="workspace-card-actions workspace-card-actions-top workspace-card-actions-skeleton">
+                      <span className="skeleton-line skeleton-line-icon-button" />
+                      <span className="skeleton-line skeleton-line-icon-button" />
+                      <span className="skeleton-line skeleton-line-icon-button" />
+                    </div>
+                    <span className="skeleton-line skeleton-line-chip" />
+                  </div>
+                </div>
+                <div className="workspace-board-card-footer workspace-board-card-footer-skeleton">
+                  <div className="workspace-inline-summary-item workspace-inline-summary-item-card workspace-inline-summary-item-skeleton">
+                    <span className="skeleton-line skeleton-line-icon-button" />
+                    <span className="skeleton-line skeleton-line-text-short" />
+                    <span className="skeleton-line skeleton-line-icon-button" />
+                  </div>
+                  <div className="workspace-inline-summary-item workspace-inline-summary-item-card workspace-inline-summary-item-skeleton">
+                    <span className="skeleton-line skeleton-line-icon-button" />
+                    <span className="skeleton-line skeleton-line-text-short" />
+                    <span className="skeleton-line skeleton-line-icon-button" />
+                  </div>
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+      </div>
     );
   }
 
   function renderAgentsSkeleton() {
     return (
       <section className="panel-card view-stack skeleton-shell" aria-busy="true">
-        {renderSkeletonSectionHead()}
-        <section className="connection-platform-grid" aria-hidden="true">
-          {Array.from({ length: 4 }, (_, index) => (
-            <div key={`connection-platform-skeleton-${index}`} className="connection-platform-card skeleton-platform-card" />
-          ))}
-        </section>
-        <div className="agent-company-section-note" aria-hidden="true">
-          <div className="view-title-with-icon">
-            <span className="view-title-icon skeleton-line skeleton-line-chip" />
+        <div className="section-head skeleton-section-head-inline">
+          <div className="skeleton-title-stack">
+            <span className="skeleton-line skeleton-line-kicker" />
             <span className="skeleton-line skeleton-line-heading" />
           </div>
         </div>
-        <div className="table-list" aria-hidden="true">
-          {Array.from({ length: 3 }, (_, index) => (
-            <section key={`agent-company-skeleton-${index}`} className="agent-company-group">
-              <div className="agent-company-toggle skeleton-agent-company-toggle">
-                <span className="skeleton-line skeleton-line-title" />
-                <span className="agent-company-toggle-meta">
-                  <span className="skeleton-line skeleton-line-pill" />
-                  <span className="agent-company-toggle-icon skeleton-agent-company-toggle-icon" />
-                </span>
-              </div>
-            </section>
-          ))}
+
+        <div className="agents-platform-shell" aria-hidden="true">
+          <div className="agents-platform-toolbar agents-platform-toolbar-skeleton">
+            <div className="agents-platform-toolbar-left">
+              <span className="skeleton-line skeleton-line-kicker" />
+              <span className="skeleton-line agents-skeleton-select-large" />
+            </div>
+            <div className="agents-platform-toolbar-right">
+              <span className="skeleton-line agents-skeleton-select-small" />
+              <span className="skeleton-line agents-skeleton-select-small" />
+            </div>
+          </div>
+
+          <div className="agents-platform-board-grid">
+            {Array.from({ length: 6 }, (_, index) => (
+              <article key={`agent-card-skeleton-${index}`} className="agents-platform-board-card agents-platform-board-card-skeleton">
+                <div className="agents-platform-board-card-content">
+                  <div className="agents-platform-board-card-head">
+                    <div className="agents-platform-board-card-title">
+                      <span className="skeleton-line agents-skeleton-platform-icon" />
+                      <div className="agents-skeleton-card-copy">
+                        <span className="skeleton-line skeleton-line-title" />
+                        <span className="skeleton-line skeleton-line-text" />
+                      </div>
+                    </div>
+                    <span className="skeleton-line agents-skeleton-status-pill" />
+                  </div>
+
+                  <div className="agents-platform-board-card-body">
+                    <div className="agents-platform-board-account-shell agents-platform-board-account-shell-skeleton">
+                      <span className="skeleton-line agents-skeleton-account-avatar" />
+                      <div className="agents-platform-board-account-copy agents-skeleton-card-copy">
+                        <span className="skeleton-line skeleton-line-title" />
+                        <span className="skeleton-line skeleton-line-text" />
+                        <span className="skeleton-line skeleton-line-text-short" />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="agents-platform-board-card-footer agents-platform-board-card-footer-skeleton">
+                  <span className="skeleton-line skeleton-line-button" />
+                  <span className="skeleton-line skeleton-line-button" />
+                </div>
+              </article>
+            ))}
+          </div>
         </div>
       </section>
     );
@@ -15700,27 +16415,60 @@ function App() {
   function renderSchedulerSkeleton() {
     return (
       <section className="panel-card view-stack skeleton-shell" aria-busy="true">
-        {renderSkeletonSectionHead(1)}
-        <div className="form-stack" aria-hidden="true">
-          <div className="form-grid form-grid-three">
-            <span className="skeleton-line skeleton-line-input" />
-            <span className="skeleton-line skeleton-line-input" />
-            <span className="skeleton-line skeleton-line-input" />
+        <div className="section-head skeleton-section-head-inline">
+          <div className="skeleton-title-stack">
+            <span className="skeleton-line skeleton-line-kicker" />
+            <span className="skeleton-line skeleton-line-heading" />
           </div>
+          <span className="skeleton-line skeleton-line-button" />
+        </div>
+        <div className="form-stack" aria-hidden="true">
+          <div className="form-grid form-grid-two scheduler-choice-grid">
+            <div className="field-shell scheduler-choice-shell scheduler-choice-shell-types scheduler-skeleton-shell">
+              <span className="skeleton-line skeleton-line-kicker" />
+              <div className="scheduler-choice-row scheduler-skeleton-choice-row">
+                <span className="skeleton-line scheduler-skeleton-choice-button" />
+                <span className="skeleton-line scheduler-skeleton-choice-button" />
+                <span className="skeleton-line scheduler-skeleton-choice-button" />
+              </div>
+            </div>
+            <div className="field-shell scheduler-choice-shell scheduler-choice-shell-status scheduler-skeleton-shell">
+              <span className="skeleton-line skeleton-line-kicker" />
+              <div className="scheduler-choice-row scheduler-skeleton-choice-row">
+                <span className="skeleton-line scheduler-skeleton-choice-button" />
+                <span className="skeleton-line scheduler-skeleton-choice-button" />
+              </div>
+            </div>
+          </div>
+
+          <div className="field-shell scheduler-profile-selector-shell scheduler-skeleton-shell">
+            <span className="skeleton-line skeleton-line-kicker" />
+            <div className="scheduler-selected-target-grid scheduler-skeleton-target-grid">
+              <span className="skeleton-line scheduler-skeleton-target-card" />
+              <span className="skeleton-line scheduler-skeleton-target-card" />
+            </div>
+          </div>
+
           <span className="skeleton-line skeleton-line-input" />
+
           <div className="form-grid form-grid-two scheduler-top-grid">
             <span className="skeleton-line skeleton-line-input" />
             <span className="skeleton-line skeleton-line-input" />
           </div>
-          <span className="skeleton-line skeleton-line-text" />
-          <div className="form-grid form-grid-two">
-            <span className="skeleton-line skeleton-line-input" />
-            <span className="skeleton-line skeleton-line-input" />
+
+          <span className="skeleton-line skeleton-line-text-medium" />
+
+          <div className="upload-shell scheduler-skeleton-upload-shell">
+            <span className="skeleton-line skeleton-line-kicker" />
+            <span className="skeleton-line scheduler-skeleton-upload-dropzone" />
+            <div className="scheduler-skeleton-upload-preview-row">
+              <span className="skeleton-line scheduler-skeleton-upload-thumb" />
+              <span className="skeleton-line scheduler-skeleton-upload-thumb" />
+              <span className="skeleton-line scheduler-skeleton-upload-thumb" />
+            </div>
           </div>
-          <div className="upload-shell">
-            <span className="skeleton-line skeleton-line-input" />
-            <span className="skeleton-line skeleton-line-text skeleton-line-text-wide" />
-          </div>
+
+          <span className="skeleton-line skeleton-line-textarea" />
           <span className="skeleton-line skeleton-line-input" />
           <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" />
         </div>
@@ -15773,37 +16521,64 @@ function App() {
 
   function renderHistorySkeleton() {
     return (
-      <section className="panel-card view-stack skeleton-shell" aria-busy="true">
-        {renderSkeletonSectionHead()}
+      <section className="panel-card view-stack publications-shell skeleton-shell" aria-busy="true">
+        <div className="section-head publications-section-head skeleton-section-head-inline">
+          <div className="skeleton-title-stack">
+            <span className="skeleton-line skeleton-line-kicker" />
+            <span className="skeleton-line skeleton-line-heading" />
+          </div>
+          <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" />
+        </div>
         <div className="publications-overview-grid" aria-hidden="true">
           {Array.from({ length: 6 }, (_, index) => (
             <div key={`publication-card-skeleton-${index}`} className="publications-overview-card publications-overview-card-skeleton">
-              <span className="skeleton-line skeleton-line-chip" />
-              <span className="skeleton-line skeleton-line-button" />
+              <span className="skeleton-line skeleton-line-icon-badge" />
+              <span className="publications-overview-card-copy">
+                <span className="skeleton-line skeleton-line-chip" />
+                <span className="skeleton-line skeleton-line-metric-value" />
+              </span>
             </div>
           ))}
         </div>
         <div className="publications-toolbar-shell" aria-hidden="true">
           <div className="publications-toolbar-row">
-            <span className="skeleton-line skeleton-line-button" />
-            <span className="skeleton-line skeleton-line-input" />
-            <span className="skeleton-line skeleton-line-input" />
+            <div className="publications-toolbar-right publications-toolbar-right-skeleton">
+              <span className="skeleton-line publications-skeleton-search" />
+              <span className="skeleton-line publications-skeleton-select" />
+              <span className="skeleton-line publications-skeleton-select" />
+            </div>
           </div>
           <div className="publications-period-toolbar">
-            <span className="skeleton-line skeleton-line-chip" />
-            <span className="skeleton-line skeleton-line-input" />
+            <div className="publications-period-meta">
+              <span className="skeleton-line skeleton-line-chip" />
+              <span className="skeleton-line skeleton-line-chip" />
+              <span className="skeleton-line skeleton-line-chip" />
+            </div>
+            <span className="skeleton-line skeleton-line-button" />
           </div>
         </div>
         <div className="publications-board-stack" aria-hidden="true">
           {Array.from({ length: 3 }, (_, index) => (
             <div key={`publication-section-skeleton-${index}`} className="publications-board-section">
               <div className="publications-board-section-head">
-                <span className="skeleton-line skeleton-line-button" />
-                <span className="skeleton-line skeleton-line-chip" />
+                <div className="publications-board-section-title publications-board-section-title-skeleton">
+                  <span className="skeleton-line skeleton-line-icon-button publications-skeleton-toggle" />
+                  <span className="skeleton-line skeleton-line-icon-badge" />
+                  <div className="skeleton-title-stack">
+                    <span className="skeleton-line skeleton-line-title" />
+                    <span className="skeleton-line skeleton-line-text" />
+                  </div>
+                </div>
+                <div className="publications-board-section-meta publications-board-section-meta-skeleton">
+                  <span className="skeleton-line skeleton-line-chip" />
+                  <span className="skeleton-line publications-skeleton-period" />
+                </div>
               </div>
-              <div className="publications-board-section-body">
+              <div className="publications-board-section-body publications-board-section-body-list-only">
                 <div className="publications-board-list">
                   <div className="publications-board-list-head">
+                    <span className="skeleton-line publications-skeleton-preview-col" />
+                    <span className="skeleton-line skeleton-line-chip" />
                     <span className="skeleton-line skeleton-line-chip" />
                     <span className="skeleton-line skeleton-line-chip" />
                     <span className="skeleton-line skeleton-line-chip" />
@@ -15811,19 +16586,31 @@ function App() {
                     <span className="skeleton-line skeleton-line-chip" />
                   </div>
                   {Array.from({ length: 3 }, (_, rowIndex) => (
-                    <div key={`publication-row-skeleton-${index}-${rowIndex}`} className="publications-board-list-row">
+                    <div key={`publication-row-skeleton-${index}-${rowIndex}`} className="publications-board-list-row publications-board-list-row-skeleton">
+                      <span className="skeleton-line publications-skeleton-preview" />
+                      <div className="publications-board-list-main publications-skeleton-main-copy">
+                        <span className="skeleton-line skeleton-line-title" />
+                        <span className="skeleton-line skeleton-line-text-medium" />
+                      </div>
                       <span className="skeleton-line skeleton-line-chip" />
-                      <span className="skeleton-line skeleton-line-input" />
+                      <div className="publications-board-list-date publications-skeleton-date-copy">
+                        <span className="skeleton-line skeleton-line-text-short" />
+                        <span className="skeleton-line skeleton-line-text-short" />
+                      </div>
                       <span className="skeleton-line skeleton-line-chip" />
+                      <div className="publications-board-list-actions publications-skeleton-actions">
+                        <span className="skeleton-line skeleton-line-icon-button" />
+                        <span className="skeleton-line skeleton-line-icon-button" />
+                        <span className="skeleton-line skeleton-line-icon-button" />
+                      </div>
                       <span className="skeleton-line skeleton-line-chip" />
-                      <span className="skeleton-line skeleton-line-button" />
                     </div>
                   ))}
                 </div>
-                <div className="publications-board-timeline">
-                  <div className="publications-board-timeline-scroll">
-                    <div className="history-calendar-shell">{renderHistoryCalendarGridSkeleton(HISTORY_CALENDAR_SKELETON_CELL_COUNT)}</div>
-                  </div>
+                <div className="publications-board-list-pagination publications-board-list-pagination-skeleton">
+                  <span className="skeleton-line publications-skeleton-dot" />
+                  <span className="skeleton-line publications-skeleton-dot" />
+                  <span className="skeleton-line publications-skeleton-dot" />
                 </div>
               </div>
             </div>
@@ -16193,6 +16980,18 @@ function App() {
                   </span>
                 </button>
               </div>
+              {workspaceModalInfo ? (
+                <div
+                  className={`workspace-modal-inline-feedback${
+                    workspaceModalInfoTone === "error" ? " workspace-modal-inline-feedback-error" : ""
+                  }`}
+                  role="status"
+                  aria-live="polite"
+                >
+                  {workspaceModalInfoTone === "error" ? <FiAlertCircle aria-hidden="true" /> : <FiCheckCircle aria-hidden="true" />}
+                  <span>{workspaceModalInfo}</span>
+                </div>
+              ) : null}
               <form onSubmit={createCompany} className="connection-create-form">
                 <label className="field-label">
                   <span>Nome do workspace</span>
@@ -16256,83 +17055,6 @@ function App() {
                   </button>
                   <button type="submit" disabled={creatingWorkspace}>
                     {creatingWorkspace ? (editingWorkspaceId ? "Salvando..." : "Criando...") : editingWorkspaceId ? "Salvar workspace" : "Criar workspace"}
-                  </button>
-                </div>
-              </form>
-            </section>
-          </button>
-        ) : null}
-
-        {isCreateConnectionModalOpen ? (
-          <button
-            type="button"
-            className="connection-create-modal-backdrop"
-            aria-label="Fechar cadastro de conta"
-            onClick={() => {
-              setConnectionCreateAttempted(false);
-              setIsCreateConnectionModalOpen(false);
-            }}
-          >
-            <section
-              className="connection-create-modal"
-              aria-label="Cadastrar nova conta"
-              onClick={(event) => event.stopPropagation()}
-            >
-              <div className="connection-create-modal-header">
-                <div>
-                  <strong>{`Adicionar ${connectionPlatformLabel(connectionPlatform)}`}</strong>
-                </div>
-                <button
-                  type="button"
-                  className="qr-modal-close"
-                  aria-label="Fechar"
-                  title="Fechar"
-                  onClick={() => {
-                    setConnectionCreateAttempted(false);
-                    setIsCreateConnectionModalOpen(false);
-                  }}
-                >
-                  <span className="modal-close-icon" aria-hidden="true">
-                    ×
-                  </span>
-                </button>
-              </div>
-              <form
-                onSubmit={createConnection}
-                className={`connection-create-form${connectionCreateAttempted ? " connection-create-form-attempted" : ""}`}
-              >
-                <label className="field-label">
-                  Nome
-                  <input
-                    value={connectionDisplayName}
-                    onChange={(event) => setConnectionDisplayName(event.target.value)}
-                    placeholder="Ex: Matriz Instagram"
-                    required
-                    minLength={2}
-                    maxLength={80}
-                    title="Informe um nome interno para identificar essa conta conectada."
-                  />
-                </label>
-                <label className="field-label">
-                  Workspace
-                  <select
-                    value={connectionCompanyId}
-                    onChange={(event) => setConnectionCompanyId(event.target.value)}
-                    required
-                  >
-                    <option value="">
-                      {creatableConnectionWorkspaces.length === 0 ? "Nenhum workspace disponível" : "Selecione o workspace"}
-                    </option>
-                    {creatableConnectionWorkspaces.map((company) => (
-                      <option key={company.id} value={company.id}>
-                        {company.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <div className="connection-create-modal-actions">
-                  <button type="submit" disabled={creatableConnectionWorkspaces.length === 0}>
-                    Adicionar conta
                   </button>
                 </div>
               </form>
@@ -16606,8 +17328,14 @@ function App() {
                   ) : null}
                 </div>
                 {workspaceModalInfo ? (
-                  <div className="workspace-modal-inline-feedback" role="status" aria-live="polite">
-                    <FiCheckCircle aria-hidden="true" />
+                  <div
+                    className={`workspace-modal-inline-feedback${
+                      workspaceModalInfoTone === "error" ? " workspace-modal-inline-feedback-error" : ""
+                    }`}
+                    role="status"
+                    aria-live="polite"
+                  >
+                    {workspaceModalInfoTone === "error" ? <FiAlertCircle aria-hidden="true" /> : <FiCheckCircle aria-hidden="true" />}
                     <span>{workspaceModalInfo}</span>
                   </div>
                 ) : null}
@@ -16661,8 +17389,14 @@ function App() {
               </div>
 
               {workspaceModalInfo ? (
-                <div className="workspace-modal-inline-feedback" role="status" aria-live="polite">
-                  <FiCheckCircle aria-hidden="true" />
+                <div
+                  className={`workspace-modal-inline-feedback${
+                    workspaceModalInfoTone === "error" ? " workspace-modal-inline-feedback-error" : ""
+                  }`}
+                  role="status"
+                  aria-live="polite"
+                >
+                  {workspaceModalInfoTone === "error" ? <FiAlertCircle aria-hidden="true" /> : <FiCheckCircle aria-hidden="true" />}
                   <span>{workspaceModalInfo}</span>
                 </div>
               ) : null}
@@ -16909,32 +17643,50 @@ function App() {
                 </button>
               </div>
 
+              {qrModalInfo ? (
+                <div
+                  className={`qr-modal-inline-feedback${
+                    qrModalInfoTone === "error" ? " qr-modal-inline-feedback-error" : ""
+                  }`}
+                  role="status"
+                  aria-live="polite"
+                >
+                  {qrModalInfoTone === "error" ? <FiAlertCircle aria-hidden="true" /> : <FiCheckCircle aria-hidden="true" />}
+                  <span>{qrModalInfo}</span>
+                </div>
+              ) : null}
+
               <div className="qr-shell qr-shell-modal">
                 {activeQrConnection?.qrImageDataUrl ? (
-                  <img className="qr-image" src={activeQrConnection.qrImageDataUrl} alt="QR Code do WhatsApp" />
+                  <>
+                    <img className="qr-image" src={activeQrConnection.qrImageDataUrl} alt="QR Code do WhatsApp" />
+                    {activeQrPrimaryMessage ? (
+                      <div className="qr-primary-message">{activeQrPrimaryMessage}</div>
+                    ) : null}
+                  </>
                 ) : (
                   <div className="qr-placeholder">
-                    {activeQrState === "PREPARING" ? <span className="spinner" aria-hidden="true" /> : null}
-                    <span>{activeQrHeading}</span>
+                    {activeQrState === "PREPARING" && !hasQrModalError ? <span className="spinner" aria-hidden="true" /> : null}
+                    <span>{activeQrPrimaryMessage}</span>
                   </div>
                 )}
-                <div className="qr-meta">
-                  {activeQrConnection?.qrGeneratedAt ? (
-                    <span>Gerado em {formatDate(activeQrConnection.qrGeneratedAt, effectiveUserTimeZone)}</span>
-                  ) : null}
-                  {activeQrConnection?.workerLastSeenAt ? (
-                    <span>Última atualização em {formatDate(activeQrConnection.workerLastSeenAt, effectiveUserTimeZone)}</span>
-                  ) : null}
-                </div>
-                {activeQrState !== "CONNECTED" ? (
-                  <button
-                    type="button"
-                    className="ghost-button"
-                    disabled={qrCancellingConnectionId === activeQrConnectionId}
-                    onClick={() => void cancelConnectionQr(activeQrConnectionId)}
-                  >
-                    {qrCancellingConnectionId === activeQrConnectionId ? "Cancelando..." : "Cancelar geração"}
-                  </button>
+                {!hasQrModalError ? (
+                  <div className="qr-close-hint" role="status" aria-live="polite">
+                    <FiAlertCircle aria-hidden="true" />
+                    <span>Quando o dispositivo conectar no celular, você pode fechar esta janela.</span>
+                  </div>
+                ) : null}
+                {activeQrState !== "CONNECTED" && (hasQrModalError || activeQrState === "QR_EXPIRED") ? (
+                  <div className="qr-modal-actions">
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      disabled={qrRequestingConnectionId === activeQrConnectionId || qrCancellingConnectionId === activeQrConnectionId}
+                      onClick={() => void regenerateConnectionQr(activeQrConnectionId)}
+                    >
+                      {qrRequestingConnectionId === activeQrConnectionId ? "Gerando..." : "Gerar novo QR"}
+                    </button>
+                  </div>
                 ) : null}
               </div>
             </section>
