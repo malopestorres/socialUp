@@ -1,4 +1,4 @@
-type PostForMePlatform = "instagram" | "facebook" | "threads";
+type PostForMePlatform = "instagram" | "facebook" | "threads" | "tiktok" | "x";
 
 type PostForMePlacement = "timeline" | "reels" | "stories";
 
@@ -33,9 +33,25 @@ type PostForMePlatformPostRecord = {
 type PostForMeSocialPostResultRecord = {
   id: string;
   status: string | null;
+  success: boolean | null;
   postId: string | null;
+  socialAccountId: string | null;
+  platformDataId: string | null;
+  platformDataUrl: string | null;
   error: string | null;
   platformPosts: PostForMePlatformPostRecord[];
+  raw: Record<string, unknown>;
+};
+
+type PostForMeSocialAccountFeedRecord = {
+  id: string | null;
+  platform: string | null;
+  socialPostId: string | null;
+  socialPostResultId: string | null;
+  socialAccountId: string | null;
+  platformUrl: string | null;
+  caption: string | null;
+  postedAt: string | null;
   raw: Record<string, unknown>;
 };
 
@@ -74,6 +90,24 @@ function parseString(value: unknown): string | null {
 
   if (typeof value === "number" && Number.isFinite(value)) {
     return String(value);
+  }
+
+  return null;
+}
+
+function parseBoolean(value: unknown): boolean | null {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") {
+      return true;
+    }
+    if (normalized === "false") {
+      return false;
+    }
   }
 
   return null;
@@ -215,7 +249,13 @@ async function postForMeRequest<T>(
 
 function normalizePostForMePlatform(value: unknown): PostForMePlatform | null {
   const normalized = parseString(value)?.toLowerCase();
-  if (normalized === "instagram" || normalized === "facebook" || normalized === "threads") {
+  if (
+    normalized === "instagram" ||
+    normalized === "facebook" ||
+    normalized === "threads" ||
+    normalized === "tiktok" ||
+    normalized === "x"
+  ) {
     return normalized;
   }
   return null;
@@ -315,7 +355,13 @@ function parsePostForMeSocialPostList(payload: unknown): PostForMeSocialPostReco
 }
 
 export function isPostForMeManagedPlatform(platform: string): platform is PostForMePlatform {
-  return platform === "instagram" || platform === "facebook" || platform === "threads";
+  return (
+    platform === "instagram" ||
+    platform === "facebook" ||
+    platform === "threads" ||
+    platform === "tiktok" ||
+    platform === "x"
+  );
 }
 
 function parsePostForMeSocialPostRecord(value: unknown): PostForMeSocialPostRecord | null {
@@ -376,11 +422,21 @@ function parsePostForMeSocialPostResultRecord(value: unknown): PostForMeSocialPo
         .map((entry) => parsePostForMePlatformPostRecord(entry))
         .filter((entry): entry is PostForMePlatformPostRecord => Boolean(entry))
     : [];
+  const platformData = asRecord(record.platform_data);
 
   return {
     id,
     status: parseString(record.status)?.toLowerCase() || null,
+    success: parseBoolean(record.success),
     postId: parseString(record.post_id) || parseString(record.social_post_id),
+    socialAccountId: parseString(record.social_account_id),
+    platformDataId: parseString(platformData?.id),
+    platformDataUrl:
+      parseString(platformData?.url) ||
+      parseString(platformData?.platform_url) ||
+      parseString(platformData?.permalink) ||
+      parseString(platformData?.share_url) ||
+      parseString(platformData?.link),
     error: normalizeErrorDetail(record.error) || parseString(record.error),
     platformPosts,
     raw: record,
@@ -412,10 +468,58 @@ function parsePostForMeSocialPostResultList(payload: unknown): PostForMeSocialPo
   return single ? [single] : [];
 }
 
+function parsePostForMeSocialAccountFeedRecord(value: unknown): PostForMeSocialAccountFeedRecord | null {
+  const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+
+  return {
+    id: parseString(record.platform_post_id) || parseString(record.id),
+    platform: parseString(record.platform)?.toLowerCase() || null,
+    socialPostId: parseString(record.social_post_id),
+    socialPostResultId: parseString(record.social_post_result_id),
+    socialAccountId: parseString(record.social_account_id),
+    platformUrl:
+      parseString(record.platform_url) ||
+      parseString(record.url) ||
+      parseString(record.permalink),
+    caption: parseString(record.caption),
+    postedAt: parseString(record.posted_at),
+    raw: record,
+  };
+}
+
+function parsePostForMeSocialAccountFeedList(payload: unknown): PostForMeSocialAccountFeedRecord[] {
+  if (Array.isArray(payload)) {
+    return payload
+      .map((entry) => parsePostForMeSocialAccountFeedRecord(entry))
+      .filter((entry): entry is PostForMeSocialAccountFeedRecord => Boolean(entry));
+  }
+
+  const record = asRecord(payload);
+  if (!record) {
+    return [];
+  }
+
+  const nestedCandidates = [record.data, record.items, record.platform_posts];
+  for (const candidate of nestedCandidates) {
+    if (Array.isArray(candidate)) {
+      return candidate
+        .map((entry) => parsePostForMeSocialAccountFeedRecord(entry))
+        .filter((entry): entry is PostForMeSocialAccountFeedRecord => Boolean(entry));
+    }
+  }
+
+  const single = parsePostForMeSocialAccountFeedRecord(record);
+  return single ? [single] : [];
+}
+
 export type {
   PostForMePlacement,
   PostForMePlatform,
   PostForMePlatformPostRecord,
+  PostForMeSocialAccountFeedRecord,
   PostForMeSocialAccountRecord,
   PostForMeSocialPostRecord,
   PostForMeSocialPostResultRecord,
@@ -530,6 +634,30 @@ export async function listPostForMeSocialPostResults(input: {
   });
 
   return parsePostForMeSocialPostResultList(payload);
+}
+
+export async function listPostForMeSocialAccountFeed(input: {
+  socialAccountId: string;
+  socialPostId?: string | null;
+  platformPostId?: string | null;
+  externalPostId?: string | null;
+  limit?: number;
+  expand?: string[];
+}): Promise<PostForMeSocialAccountFeedRecord[]> {
+  const payload = await postForMeRequest<unknown>(
+    `/social-account-feeds/${encodeURIComponent(input.socialAccountId)}`,
+    {
+      query: {
+        social_post_id: input.socialPostId ?? undefined,
+        platform_post_id: input.platformPostId ?? undefined,
+        external_post_id: input.externalPostId ?? undefined,
+        expand: input.expand?.length ? input.expand : undefined,
+        limit: input.limit ?? undefined,
+      },
+    },
+  );
+
+  return parsePostForMeSocialAccountFeedList(payload);
 }
 
 export async function createPostForMeSocialPost(input: {

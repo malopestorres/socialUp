@@ -15,6 +15,8 @@ export type PublicationType =
   | "instagram_post"
   | "facebook_post"
   | "threads_post"
+  | "tiktok_post"
+  | "x_post"
   | "whatsapp_status_midia"
   | "whatsapp_status_texto";
 
