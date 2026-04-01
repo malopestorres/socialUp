@@ -180,4 +180,17 @@ export const api = {
   getSessionToken,
   sessionStorageKey: PERSISTENT_SESSION_STORAGE_KEY,
   baseUrl: API_URL,
+  createEventSource(input: string): EventSource {
+    if (typeof window === "undefined") {
+      throw new Error("EventSource indisponível fora do navegador.");
+    }
+
+    const sessionToken = getSessionToken().trim();
+    const url = new URL(`${API_URL}${input}`);
+    if (sessionToken) {
+      url.searchParams.set("sessionToken", sessionToken);
+    }
+
+    return new window.EventSource(url.toString());
+  },
 };

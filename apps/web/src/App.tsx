@@ -412,6 +412,15 @@ type Aviso = {
   createdAt: string;
 };
 
+type LiveUpdateScope = "jobs" | "dashboard" | "avisos" | "connections" | "companies" | "logs";
+
+type LiveEventMessage = {
+  type?: string;
+  scopes?: LiveUpdateScope[];
+  companyId?: string | null;
+  issuedAt?: string;
+};
+
 type AuthUser = {
   id: string;
   name: string;
@@ -2950,6 +2959,9 @@ const REMEMBER_ME_STORAGE_KEY = "socialup-remember-me";
 const REMEMBERED_USERNAME_STORAGE_KEY = "socialup-remembered-username";
 const THEME_STORAGE_KEY = "socialup-theme";
 const DESKTOP_SIDEBAR_EXPANDED_STORAGE_KEY = "socialup-desktop-sidebar-expanded";
+const TEMP_DISABLE_BACKGROUND_POLLING = true;
+const LIVE_EVENT_REFRESH_DEBOUNCE_MS = 180;
+const LIVE_EVENT_RECONNECT_DELAY_MS = 1500;
 
 function initialThemeMode(): ThemeMode {
   if (typeof window === "undefined") {
@@ -3409,6 +3421,7 @@ function App() {
   );
   const [dashboardCalendarDayPages, setDashboardCalendarDayPages] = useState<Record<string, number>>({});
   const [dashboardCalendarPopoverJobId, setDashboardCalendarPopoverJobId] = useState<string | null>(null);
+  const [dashboardCalendarPopoverMediaIndex, setDashboardCalendarPopoverMediaIndex] = useState(0);
   const [dashboardCalendarEditingJobId, setDashboardCalendarEditingJobId] = useState<string | null>(null);
   const [dashboardCalendarTimeValue, setDashboardCalendarTimeValue] = useState("");
   const [dashboardCalendarSavingJobId, setDashboardCalendarSavingJobId] = useState<string | null>(null);
@@ -3658,6 +3671,11 @@ function App() {
   const historyCalendarCelebrationTimeoutRef = useRef<number | null>(null);
   const avisosSectionRef = useRef<HTMLElement | null>(null);
   const lastUnreadAvisosCountRef = useRef(0);
+  const liveEventsSourceRef = useRef<EventSource | null>(null);
+  const liveEventsReconnectTimeoutRef = useRef<number | null>(null);
+  const liveEventsFlushTimeoutRef = useRef<number | null>(null);
+  const liveEventsPendingScopesRef = useRef<Set<LiveUpdateScope>>(new Set());
+  const liveEventsRefreshInFlightRef = useRef(false);
   const noticesBellDesktopRef = useRef<HTMLDivElement | null>(null);
   const noticesBellMobileRef = useRef<HTMLDivElement | null>(null);
   const profileMenuDesktopRef = useRef<HTMLDivElement | null>(null);
@@ -5055,45 +5073,24 @@ function App() {
     }
 
     const { year, month } = dashboardCalendarPeriod;
-    const firstWeekdayIndex = getCalendarWeekdayIndex(year, month, 1);
     const daysInMonth = getDaysInMonth(year, month);
-    const previousPeriod = shiftCalendarMonth(year, month, -1);
-    const previousMonthDayCount = getDaysInMonth(previousPeriod.year, previousPeriod.month);
-
-    return Array.from({ length: 42 }, (_, index) => {
-      const relativeDay = index - firstWeekdayIndex + 1;
-      let cellYear = year;
-      let cellMonth = month;
-      let cellDay = relativeDay;
-      let inCurrentMonth = true;
-
-      if (relativeDay < 1) {
-        cellYear = previousPeriod.year;
-        cellMonth = previousPeriod.month;
-        cellDay = previousMonthDayCount + relativeDay;
-        inCurrentMonth = false;
-      } else if (relativeDay > daysInMonth) {
-        const nextPeriod = shiftCalendarMonth(year, month, 1);
-        cellYear = nextPeriod.year;
-        cellMonth = nextPeriod.month;
-        cellDay = relativeDay - daysInMonth;
-        inCurrentMonth = false;
-      }
-
-      const dayKey = buildCalendarDayKey(cellYear, cellMonth, cellDay);
-      const jobs = inCurrentMonth ? jobsByDay.get(dayKey) ?? [] : [];
+    return Array.from({ length: daysInMonth }, (_, index) => {
+      const cellDay = index + 1;
+      const dayKey = buildCalendarDayKey(year, month, cellDay);
+      const jobs = jobsByDay.get(dayKey) ?? [];
+      const weekdayLabel = DASHBOARD_CALENDAR_WEEKDAY_LABELS[getCalendarWeekdayIndex(year, month, cellDay)] ?? "";
 
       return {
         key: dayKey,
-        year: cellYear,
-        month: cellMonth,
+        year,
+        month,
         day: cellDay,
-        displayDay: inCurrentMonth ? cellDay : null,
+        weekdayLabel,
         dayKey,
-        inCurrentMonth,
         isToday: dayKey === dashboardCalendarTodayKey,
         jobs,
-        columnIndex: index % 7,
+        columnIndex: index % 4,
+        rowIndex: Math.floor(index / 4),
       };
     });
   }, [dashboardCalendarJobs, dashboardCalendarPeriod, dashboardCalendarTodayKey, effectiveUserTimeZone]);
@@ -5109,6 +5106,23 @@ function App() {
       setDashboardCalendarTimeValue("");
     }
   }, [dashboardCalendarJobs, dashboardCalendarPopoverJobId]);
+
+  useEffect(() => {
+    if (!dashboardCalendarPopoverJobId || typeof document === "undefined") {
+      return;
+    }
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [dashboardCalendarPopoverJobId]);
+
+  useEffect(() => {
+    setDashboardCalendarPopoverMediaIndex(0);
+  }, [dashboardCalendarPopoverJobId]);
 
   const dashboardUpcomingPages = useMemo(() => {
     const chunkSize = 2;
@@ -5948,6 +5962,114 @@ function App() {
     }
   }
 
+  async function refreshRecentAvisosSnapshot(options?: { withLoading?: boolean }): Promise<void> {
+    const withLoading = options?.withLoading ?? false;
+    if (withLoading) {
+      setNoticesPopoverLoading(true);
+    }
+
+    try {
+      const recent = await api.get<{ items: Aviso[]; unreadCount: number }>("/avisos/recent?limit=5");
+      setRecentAvisos(recent.items);
+      setUnreadAvisosCount(recent.unreadCount);
+      lastUnreadAvisosCountRef.current = Math.max(0, recent.unreadCount);
+    } catch (noticesError) {
+      if (withLoading) {
+        setError(noticesError instanceof Error ? noticesError.message : "Falha ao atualizar avisos.");
+      }
+    } finally {
+      if (withLoading) {
+        setNoticesPopoverLoading(false);
+      }
+    }
+  }
+
+  async function applyLiveEventRefresh(scopes: LiveUpdateScope[]): Promise<void> {
+    const scopeSet = new Set(scopes);
+
+    if (scopeSet.has("avisos")) {
+      await refreshRecentAvisosSnapshot();
+      if (activeView === "notices") {
+        await loadAvisosPage(avisosPage, { withSkeleton: false });
+      }
+    }
+
+    const shouldRefreshHistory = scopeSet.has("jobs") && activeView === "history";
+    if (shouldRefreshHistory) {
+      await Promise.all([
+        reloadHistoryCalendarLoadedPages({
+          withSkeleton: false,
+          targetPage: Math.max(1, historyCalendarVisibleWeekCount || historyCalendarPage || 1),
+        }),
+        reloadHistoryDraftLoadedPages({
+          targetPage: Math.max(1, historyDraftPage || 1),
+        }),
+      ]);
+      return;
+    }
+
+    const shouldRefreshPrimaryViews =
+      scopeSet.has("jobs") ||
+      scopeSet.has("dashboard") ||
+      scopeSet.has("connections") ||
+      scopeSet.has("companies") ||
+      (scopeSet.has("logs") && activeView === "logs");
+
+    if (
+      shouldRefreshPrimaryViews &&
+      authUser &&
+      activeView !== "notices" &&
+      activeView !== "profile" &&
+      activeView !== "plan" &&
+      activeView !== "planConfig" &&
+      activeView !== "beeUpAdmin" &&
+      activeView !== "history"
+    ) {
+      await loadAll({ withSkeleton: false });
+    }
+  }
+
+  function flushLiveEventRefreshQueue(): void {
+    if (liveEventsRefreshInFlightRef.current) {
+      return;
+    }
+
+    const scopes = [...liveEventsPendingScopesRef.current];
+    if (scopes.length === 0) {
+      return;
+    }
+
+    liveEventsPendingScopesRef.current.clear();
+    liveEventsRefreshInFlightRef.current = true;
+
+    void applyLiveEventRefresh(scopes)
+      .catch(() => {
+        // Atualização silenciosa por SSE: se uma chamada falhar, o próximo evento tenta de novo.
+      })
+      .finally(() => {
+        liveEventsRefreshInFlightRef.current = false;
+        if (liveEventsPendingScopesRef.current.size > 0 && liveEventsFlushTimeoutRef.current === null) {
+          liveEventsFlushTimeoutRef.current = window.setTimeout(() => {
+            liveEventsFlushTimeoutRef.current = null;
+            flushLiveEventRefreshQueue();
+          }, LIVE_EVENT_REFRESH_DEBOUNCE_MS);
+        }
+      });
+  }
+
+  function queueLiveEventRefresh(scopes: LiveUpdateScope[]): void {
+    scopes.forEach((scope) => liveEventsPendingScopesRef.current.add(scope));
+
+    if (liveEventsFlushTimeoutRef.current !== null) {
+      return;
+    }
+
+    liveEventsFlushTimeoutRef.current = window.setTimeout(() => {
+      liveEventsFlushTimeoutRef.current = null;
+      flushLiveEventRefreshQueue();
+    }, LIVE_EVENT_REFRESH_DEBOUNCE_MS);
+  }
+
   function formatPriceFromCents(value: number | null): string {
     if (value === null || !Number.isFinite(value)) {
       return "—";
@@ -6225,11 +6347,121 @@ function App() {
   }, [setupKey, workspaceInviteKey]);
 
   useEffect(() => {
+    if (!authChecked || !authUser || isPopupWindowContext()) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const clearReconnect = () => {
+      if (liveEventsReconnectTimeoutRef.current !== null) {
+        window.clearTimeout(liveEventsReconnectTimeoutRef.current);
+        liveEventsReconnectTimeoutRef.current = null;
+      }
+    };
+
+    const closeSource = () => {
+      if (liveEventsSourceRef.current) {
+        liveEventsSourceRef.current.close();
+        liveEventsSourceRef.current = null;
+      }
+    };
+
+    const scheduleReconnect = () => {
+      if (cancelled || liveEventsReconnectTimeoutRef.current !== null) {
+        return;
+      }
+
+      liveEventsReconnectTimeoutRef.current = window.setTimeout(() => {
+        liveEventsReconnectTimeoutRef.current = null;
+        connect();
+      }, LIVE_EVENT_RECONNECT_DELAY_MS);
+    };
+
+    const connect = () => {
+      if (cancelled || !api.getSessionToken().trim()) {
+        return;
+      }
+
+      clearReconnect();
+      closeSource();
+
+      try {
+        const source = api.createEventSource("/events");
+        liveEventsSourceRef.current = source;
+
+        source.onmessage = (event) => {
+          try {
+            const payload = JSON.parse(event.data) as LiveEventMessage;
+            if (payload.type !== "update" || !Array.isArray(payload.scopes) || payload.scopes.length === 0) {
+              return;
+            }
+
+            queueLiveEventRefresh(
+              payload.scopes.filter(
+                (scope): scope is LiveUpdateScope =>
+                  scope === "jobs" ||
+                  scope === "dashboard" ||
+                  scope === "avisos" ||
+                  scope === "connections" ||
+                  scope === "companies" ||
+                  scope === "logs",
+              ),
+            );
+          } catch {
+            // Ignora eventos inválidos sem derrubar o stream.
+          }
+        };
+
+        source.onerror = () => {
+          if (liveEventsSourceRef.current === source) {
+            liveEventsSourceRef.current = null;
+          }
+          source.close();
+          scheduleReconnect();
+        };
+      } catch {
+        scheduleReconnect();
+      }
+    };
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      clearReconnect();
+      closeSource();
+      if (liveEventsFlushTimeoutRef.current !== null) {
+        window.clearTimeout(liveEventsFlushTimeoutRef.current);
+        liveEventsFlushTimeoutRef.current = null;
+      }
+      liveEventsPendingScopesRef.current.clear();
+    };
+  }, [
+    authChecked,
+    authUser,
+    activeView,
+    selectedCompanyId,
+    avisosPage,
+    noticesPopoverOpen,
+    historyCalendarYear,
+    historyCalendarMonth,
+    historySearchQuery,
+    historyCalendarVisibleWeekCount,
+    historyCalendarPage,
+    historyDraftPage,
+  ]);
+
+  useEffect(() => {
     const tick = () => {
       setNowTickMs(Date.now());
     };
 
     tick();
+    if (TEMP_DISABLE_BACKGROUND_POLLING) {
+      return;
+    }
+
     const intervalId = window.setInterval(tick, 30_000);
     const handleVisibilityChange = () => {
       if (document.visibilityState === "visible") {
@@ -6376,6 +6608,11 @@ function App() {
     };
 
     void tick();
+    if (TEMP_DISABLE_BACKGROUND_POLLING) {
+      return () => {
+        cancelled = true;
+      };
+    }
 
     const refreshIntervalMs = activeView === "dashboard" ? 1_000 : 5_000;
     const intervalId = window.setInterval(() => {
@@ -6433,6 +6670,11 @@ function App() {
     };
 
     void refreshUnreadCount();
+    if (TEMP_DISABLE_BACKGROUND_POLLING) {
+      return () => {
+        cancelled = true;
+      };
+    }
 
     const intervalId = window.setInterval(() => {
       void refreshUnreadCount();
@@ -6475,6 +6717,13 @@ function App() {
       }
     };
 
+    tick();
+    if (TEMP_DISABLE_BACKGROUND_POLLING) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
     const intervalId = window.setInterval(tick, 3000);
 
     const handleVisibilityChange = () => {
@@ -6507,6 +6756,11 @@ function App() {
     };
 
     refreshAvisosPage();
+    if (TEMP_DISABLE_BACKGROUND_POLLING) {
+      return () => {
+        cancelled = true;
+      };
+    }
 
     const intervalId = window.setInterval(() => {
       if (document.visibilityState === "visible") {
@@ -10005,7 +10259,9 @@ function App() {
   }
 
   function openDashboardCalendarPopover(job: Job) {
-    setDashboardCalendarPopoverJobId(job.id);
+    setDashboardCalendarPopoverJobId((current) => (current === job.id ? null : job.id));
+    setDashboardCalendarEditingJobId(null);
+    setDashboardCalendarTimeValue("");
   }
 
   function closeDashboardCalendarPopover(jobId?: string) {
@@ -10801,18 +11057,9 @@ function App() {
     }
 
     setNoticesPopoverOpen(true);
-    setNoticesPopoverLoading(true);
     setError("");
 
-    try {
-      const recent = await api.get<{ items: Aviso[]; unreadCount: number }>("/avisos/recent?limit=5");
-      setRecentAvisos(recent.items);
-      setUnreadAvisosCount(recent.unreadCount);
-    } catch (noticesError) {
-      setError(noticesError instanceof Error ? noticesError.message : "Falha ao atualizar avisos.");
-    } finally {
-      setNoticesPopoverLoading(false);
-    }
+    await refreshRecentAvisosSnapshot({ withLoading: true });
   }
 
   async function markAllAvisosAsRead() {
@@ -10821,9 +11068,7 @@ function App() {
 
     try {
       await api.postJson<{ updated: number }>("/avisos/mark-all-read", {});
-      const recent = await api.get<{ items: Aviso[]; unreadCount: number }>("/avisos/recent?limit=5");
-      setRecentAvisos(recent.items);
-      setUnreadAvisosCount(recent.unreadCount);
+      await refreshRecentAvisosSnapshot();
 
       if (activeView === "notices") {
         await loadAvisosPage(avisosPage, { withSkeleton: false });
@@ -10864,13 +11109,7 @@ function App() {
         await loadAvisosPage(avisosPage, { withSkeleton: false });
       }
       try {
-        const unread = await api.get<{ count: number }>("/avisos/unread-count");
-        setUnreadAvisosCount(unread.count);
-        if (noticesPopoverOpen) {
-          const recent = await api.get<{ items: Aviso[]; unreadCount: number }>("/avisos/recent?limit=5");
-          setRecentAvisos(recent.items);
-          setUnreadAvisosCount(recent.unreadCount);
-        }
+        await refreshRecentAvisosSnapshot();
       } catch {
         // Mantém o feedback de sucesso mesmo se a atualização do sino falhar.
       }
@@ -11758,7 +11997,60 @@ function App() {
   function renderDashboard() {
     const welcomeName = authUser?.name?.trim().split(/\s+/)[0] || "por aqui";
     const monthLabel = dashboardCalendarMonthLabel.charAt(0).toUpperCase() + dashboardCalendarMonthLabel.slice(1);
-    const hasMonthJobs = dashboardCalendarCells.some((cell) => cell.inCurrentMonth && cell.jobs.length > 0);
+    const selectedDashboardPopoverJob = dashboardCalendarPopoverJobId
+      ? dashboardCalendarJobs.find((job) => job.id === dashboardCalendarPopoverJobId) ?? null
+      : null;
+    const selectedDashboardPopoverParticipantNetworks = selectedDashboardPopoverJob
+      ? resolveJobParticipantNetworks(selectedDashboardPopoverJob)
+      : [];
+    const selectedDashboardPopoverTitle = selectedDashboardPopoverJob
+      ? resolveHistoryCalendarTitle(selectedDashboardPopoverJob)
+      : "";
+    const selectedDashboardPopoverWorkspace = selectedDashboardPopoverJob
+      ? companyMapById[selectedDashboardPopoverJob.companyId] ?? null
+      : null;
+    const selectedDashboardPopoverWorkspaceColor = selectedDashboardPopoverWorkspace?.color?.trim()
+      ? selectedDashboardPopoverWorkspace.color.trim()
+      : DEFAULT_WORKSPACE_COLOR;
+    const selectedDashboardPopoverWorkspaces = selectedDashboardPopoverJob
+      ? [{
+          id: selectedDashboardPopoverWorkspace?.id ?? selectedDashboardPopoverJob.companyId,
+          label:
+            selectedDashboardPopoverWorkspace?.name?.trim()
+            || companyNameMap[selectedDashboardPopoverJob.companyId]
+            || "Workspace removido",
+          color: selectedDashboardPopoverWorkspaceColor,
+        }]
+      : [];
+    const selectedDashboardPopoverMediaPaths = selectedDashboardPopoverJob
+      ? resolveJobMediaPaths(selectedDashboardPopoverJob)
+      : [];
+    const selectedDashboardPopoverHasMedia = selectedDashboardPopoverMediaPaths.length > 0;
+    const selectedDashboardPopoverMediaCount = selectedDashboardPopoverMediaPaths.length;
+    const selectedDashboardPopoverActiveMediaIndex = selectedDashboardPopoverMediaCount > 0
+      ? Math.min(dashboardCalendarPopoverMediaIndex, selectedDashboardPopoverMediaCount - 1)
+      : 0;
+    const selectedDashboardPopoverActiveMediaPath = selectedDashboardPopoverMediaPaths[selectedDashboardPopoverActiveMediaIndex] ?? null;
+    const selectedDashboardPopoverRunningLike = selectedDashboardPopoverJob
+      ? shouldRenderUpcomingAsRunning(selectedDashboardPopoverJob, isPastScheduledAtForUser)
+      : false;
+    const selectedDashboardPopoverEditingTime = dashboardCalendarEditingJobId === selectedDashboardPopoverJob?.id;
+    const selectedDashboardPopoverSavingTime = dashboardCalendarSavingJobId === selectedDashboardPopoverJob?.id;
+    const selectedDashboardPopoverRetryingJob = retryingJobId === selectedDashboardPopoverJob?.id;
+    const selectedDashboardPopoverReactivatingJob = togglingScheduleJobId === selectedDashboardPopoverJob?.id;
+    const selectedDashboardPopoverCanEditTime = selectedDashboardPopoverJob
+      ? canEditPublicationBoardSchedule(selectedDashboardPopoverJob) &&
+        !isPastScheduledAtForUser(selectedDashboardPopoverJob.dataPostagem)
+      : false;
+    const selectedDashboardPopoverCanRetry = selectedDashboardPopoverJob
+      ? canRetryPublicationBoardJob(selectedDashboardPopoverJob)
+      : false;
+    const selectedDashboardPopoverCanReactivate = selectedDashboardPopoverJob
+      ? canReactivatePublicationBoardJob(selectedDashboardPopoverJob)
+      : false;
+    const selectedDashboardPopoverStatusTone = selectedDashboardPopoverJob
+      ? publicationBoardStatusChipTone(selectedDashboardPopoverJob, isPastScheduledAtForUser)
+      : "neutral";
 
     return (
       <div className="view-stack">
@@ -11769,7 +12061,6 @@ function App() {
               <span>Bem-vindo, </span>
               <span className="home-welcome-highlight">{welcomeName}</span>
             </h2>
-            <p>Seu mês inteiro num calendário interativo, com leitura mais limpa e detalhes rápidos quando você precisar.</p>
           </div>
           <button
             type="button"
@@ -11784,8 +12075,10 @@ function App() {
         <section className="panel-card home-calendar-shell">
           <div className="home-calendar-toolbar">
             <div className="home-calendar-toolbar-copy">
-              <strong>{monthLabel}</strong>
-              <span>{selectedCompanyId ? "Visualizando o workspace selecionado." : "Visualizando todos os workspaces."}</span>
+              <strong>
+                <FiCalendar aria-hidden="true" />
+                <span>{monthLabel}</span>
+              </strong>
             </div>
             <div className="home-calendar-toolbar-actions">
               <button
@@ -11808,12 +12101,6 @@ function App() {
           </div>
 
           <div className="home-calendar-month">
-            <div className="home-calendar-weekdays" aria-hidden="true">
-              {DASHBOARD_CALENDAR_WEEKDAY_LABELS.map((label) => (
-                <span key={`dashboard-weekday-${label}`}>{label}</span>
-              ))}
-            </div>
-
             <div className="home-calendar-grid">
               {dashboardCalendarCells.map((cell) => (
                 (() => {
@@ -11824,16 +12111,15 @@ function App() {
                   return (
                     <article
                       key={cell.key}
-                      className={`home-calendar-day${cell.inCurrentMonth ? "" : " home-calendar-day-outside"}${
-                        cell.isToday ? " home-calendar-day-today" : ""
-                      }`}
+                      className={`home-calendar-day${cell.isToday ? " home-calendar-day-today" : ""}`}
                     >
                       <div className="home-calendar-day-head">
-                        {cell.inCurrentMonth ? <strong>{cell.displayDay}</strong> : <span aria-hidden="true" />}
+                        <strong>{cell.day}</strong>
+                        <small>{cell.weekdayLabel}</small>
                       </div>
 
                       <div className="home-calendar-day-body">
-                        {cell.inCurrentMonth && cell.jobs.length > 0
+                        {cell.jobs.length > 0
                           ? (
                               <div className="home-calendar-day-events-shell">
                                 <div className="home-calendar-day-events">
@@ -11842,184 +12128,49 @@ function App() {
                                     const participantNetworks = resolveJobParticipantNetworks(job);
                                     const isRunningLike = shouldRenderUpcomingAsRunning(job, isPastScheduledAtForUser);
                                     const isPopoverOpen = dashboardCalendarPopoverJobId === job.id;
-                                    const isEditingTime = dashboardCalendarEditingJobId === job.id;
-                                    const isSavingTime = dashboardCalendarSavingJobId === job.id;
-                                    const isRetryingJob = retryingJobId === job.id;
-                                    const isReactivatingJob = togglingScheduleJobId === job.id;
-                                    const canEditTime =
-                                      canEditPublicationBoardSchedule(job) && !isPastScheduledAtForUser(job.dataPostagem);
-                                    const canRetry = canRetryPublicationBoardJob(job);
-                                    const canReactivate = canReactivatePublicationBoardJob(job);
-                                    const popoverStatusTone = publicationBoardStatusChipTone(job, isPastScheduledAtForUser);
 
                                     return (
                                       <div
                                         key={job.id}
-                                        className="home-calendar-entry-wrap"
-                                        onMouseLeave={() => closeDashboardCalendarPopover(job.id)}
+                                        className={`home-calendar-entry-wrap${isPopoverOpen ? " home-calendar-entry-wrap-active" : ""}`}
                                       >
-                                        <button
-                                          type="button"
-                                          className={`home-calendar-entry${isPopoverOpen ? " home-calendar-entry-active" : ""}`}
-                                          onMouseEnter={() => openDashboardCalendarPopover(job)}
-                                          onFocus={() => openDashboardCalendarPopover(job)}
-                                          onClick={() => openDashboardCalendarPopover(job)}
-                                          title={dashboardJobTitle}
-                                          aria-label={dashboardJobTitle}
-                                        >
-                                          <span className="home-calendar-entry-time">
-                                            {toTimeLocal(job.dataPostagem, effectiveUserTimeZone) || "--:--"}
-                                          </span>
-                                          <span className="home-calendar-entry-title">{dashboardJobTitle}</span>
-                                          {isRunningLike ? <span className="status-pill-spinner home-calendar-entry-spinner" aria-hidden="true" /> : null}
-                                        </button>
-
-                                        {isPopoverOpen ? (
-                                          <div
-                                            className={`home-calendar-popover${cell.columnIndex >= 4 ? " home-calendar-popover-right" : ""}`}
-                                            onMouseEnter={() => openDashboardCalendarPopover(job)}
+                                        <div className="home-calendar-entry-row">
+                                          <button
+                                            type="button"
+                                            className={`home-calendar-entry${isPopoverOpen ? " home-calendar-entry-active" : ""}`}
+                                            onClick={() => openDashboardCalendarPopover(job)}
+                                            title={dashboardJobTitle}
+                                            aria-label={dashboardJobTitle}
                                           >
-                                            <div className="home-calendar-popover-head">
-                                              <div className="home-calendar-popover-title">
-                                                <strong>{dashboardJobTitle}</strong>
-                                              </div>
-                                              <span
-                                                className={`publications-job-status-chip publications-job-status-chip-${popoverStatusTone} home-calendar-popover-status-chip`}
-                                              >
-                                                {isRunningLike ? (
-                                                  <span className="home-calendar-popover-status-chip-content">
-                                                    <span className="status-pill-spinner" aria-hidden="true" />
-                                                    Executando
-                                                  </span>
-                                                ) : (
-                                                  jobStatusDisplayLabel(job)
-                                                )}
+                                            <span className="home-calendar-entry-copy">
+                                              <span className="home-calendar-entry-title-row">
+                                                <span className="home-calendar-entry-platforms" aria-label="Canais da publicação">
+                                                  {participantNetworks.map((network) => {
+                                                    const EntryPlatformIcon = socialPlatformIcon(network);
+                                                    return (
+                                                      <span
+                                                        key={`${job.id}-entry-${network}`}
+                                                        className={`home-calendar-entry-platform-item home-calendar-entry-platform-item-${network}`}
+                                                        title={socialPlatformLabel(network)}
+                                                        aria-label={socialPlatformLabel(network)}
+                                                      >
+                                                        <EntryPlatformIcon aria-hidden="true" />
+                                                      </span>
+                                                    );
+                                                  })}
+                                                </span>
+                                                <span className="home-calendar-entry-title">{dashboardJobTitle}</span>
                                               </span>
-                                            </div>
-
-                                            <div className="home-calendar-popover-toolbar">
-                                              <div className="home-calendar-popover-platforms" aria-label="Canais da publicação">
-                                                {participantNetworks.map((network) => (
-                                                  <span key={`${job.id}-${network}`} className="home-calendar-popover-platform-item">
-                                                    {renderPublicationNetworkPill(network)}
-                                                  </span>
-                                                ))}
-                                              </div>
-                                              <div className="home-calendar-popover-actions">
-                                                <button
-                                                  type="button"
-                                                  className="publications-board-action-button publications-board-action-button-edit"
-                                                  title="Editar publicação"
-                                                  aria-label="Editar publicação"
-                                                  onClick={() => openHistoryJobEditor(job)}
-                                                >
-                                                  <FiEdit3 aria-hidden="true" />
-                                                </button>
-                                                {canEditTime ? (
-                                                  <button
-                                                    type="button"
-                                                    className="publications-board-action-button publications-board-action-button-schedule"
-                                                    title="Editar agendamento"
-                                                    aria-label="Editar agendamento"
-                                                    onClick={() => startDashboardCalendarTimeEdit(job)}
-                                                    disabled={isSavingTime}
-                                                  >
-                                                    <FiCalendar aria-hidden="true" />
-                                                  </button>
-                                                ) : null}
-                                                <button
-                                                  type="button"
-                                                  className="publications-board-action-button publications-board-action-button-duplicate"
-                                                  title="Duplicar publicação"
-                                                  aria-label="Duplicar publicação"
-                                                  onClick={() => openPublicationDuplicateModal(job)}
-                                                >
-                                                  <FiCopy aria-hidden="true" />
-                                                </button>
-                                                <button
-                                                  type="button"
-                                                  className="publications-board-action-button publications-board-action-button-template"
-                                                  title="Criar template"
-                                                  aria-label="Criar template"
-                                                  onClick={() => savePublicationAsTemplate(job)}
-                                                >
-                                                  <FiFileText aria-hidden="true" />
-                                                </button>
-                                                {canRetry ? (
-                                                  <button
-                                                    type="button"
-                                                    className="publications-board-action-button publications-board-action-button-retry"
-                                                    title="Tentar novamente"
-                                                    aria-label="Tentar novamente"
-                                                    onClick={() => void retryJob(job.id)}
-                                                    disabled={isRetryingJob}
-                                                  >
-                                                    <FiRotateCcw aria-hidden="true" />
-                                                  </button>
-                                                ) : null}
-                                                {canReactivate ? (
-                                                  <button
-                                                    type="button"
-                                                    className="publications-board-action-button publications-board-action-button-reactivate"
-                                                    title="Reativar publicação"
-                                                    aria-label="Reativar publicação"
-                                                    onClick={() => void toggleJobSchedule(job)}
-                                                    disabled={isReactivatingJob}
-                                                  >
-                                                    <FiCheckCircle aria-hidden="true" />
-                                                  </button>
-                                                ) : null}
-                                              </div>
-                                            </div>
-
-                                            <div className="home-calendar-popover-detail-grid">
-                                              <span className="home-calendar-popover-detail-card">
-                                                <strong>Agendada para</strong>
-                                                <small>{formatJobScheduledAt(job, effectiveUserTimeZone)}</small>
+                                              <span className="home-calendar-entry-time">
+                                                <FiClock aria-hidden="true" />
+                                                <span className="home-calendar-entry-time-label">
+                                                  {toTimeLocal(job.dataPostagem, effectiveUserTimeZone) || "--:--"}
+                                                </span>
                                               </span>
-                                              <span className="home-calendar-popover-detail-card">
-                                                <strong>Workspace</strong>
-                                                <small>{companyNameMap[job.companyId] || "Workspace removido"}</small>
-                                              </span>
-                                            </div>
-
-                                            {canEditTime && isEditingTime ? (
-                                              <div className="home-calendar-popover-time-editor publications-board-inline-schedule-editor">
-                                                <input
-                                                  type="time"
-                                                  value={dashboardCalendarTimeValue}
-                                                  onChange={(event) => setDashboardCalendarTimeValue(event.target.value)}
-                                                  disabled={isSavingTime}
-                                                />
-                                                <div className="publications-board-inline-schedule-actions">
-                                                  <button
-                                                    type="button"
-                                                    className="publications-board-inline-schedule-save"
-                                                    title="Salvar horário"
-                                                    aria-label="Salvar horário"
-                                                    onClick={() => void saveDashboardCalendarTime(job)}
-                                                    disabled={isSavingTime}
-                                                  >
-                                                    <FiCheckCircle aria-hidden="true" />
-                                                  </button>
-                                                  <button
-                                                    type="button"
-                                                    className="publications-board-inline-schedule-cancel"
-                                                    title="Cancelar edição de horário"
-                                                    aria-label="Cancelar edição de horário"
-                                                    onClick={() => {
-                                                      setDashboardCalendarEditingJobId(null);
-                                                      setDashboardCalendarTimeValue("");
-                                                    }}
-                                                    disabled={isSavingTime}
-                                                  >
-                                                    <FiX aria-hidden="true" />
-                                                  </button>
-                                                </div>
-                                              </div>
-                                            ) : null}
-                                          </div>
-                                        ) : null}
+                                            </span>
+                                          </button>
+                                          {isRunningLike ? <span className="status-pill-spinner home-calendar-entry-spinner" aria-hidden="true" /> : null}
+                                        </div>
                                       </div>
                                     );
                                   })}
@@ -12027,31 +12178,34 @@ function App() {
 
                                 {pageCount > 1 ? (
                                   <div className="home-calendar-day-pager">
-                                    <button
-                                      type="button"
-                                      className="ghost-button home-calendar-day-pager-button"
-                                      onClick={() => setDashboardCalendarDayPage(cell.dayKey, currentPage - 1, cell.jobs.length)}
-                                      disabled={currentPage === 0}
-                                      aria-label="Itens anteriores do dia"
-                                    >
-                                      <FiChevronLeft />
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="ghost-button home-calendar-day-pager-button"
-                                      onClick={() => setDashboardCalendarDayPage(cell.dayKey, currentPage + 1, cell.jobs.length)}
-                                      disabled={currentPage >= pageCount - 1}
-                                      aria-label="Próximos itens do dia"
-                                    >
-                                      <FiChevronRight />
-                                    </button>
+                                    <span className="home-calendar-day-pager-count" aria-label={`Página ${currentPage + 1} de ${pageCount}`}>
+                                      {currentPage + 1}/{pageCount}
+                                    </span>
+                                    <div className="home-calendar-day-pager-actions">
+                                      <button
+                                        type="button"
+                                        className="ghost-button home-calendar-day-pager-button"
+                                        onClick={() => setDashboardCalendarDayPage(cell.dayKey, currentPage - 1, cell.jobs.length)}
+                                        disabled={currentPage === 0}
+                                        aria-label="Itens anteriores do dia"
+                                      >
+                                        <FiChevronLeft />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="ghost-button home-calendar-day-pager-button"
+                                        onClick={() => setDashboardCalendarDayPage(cell.dayKey, currentPage + 1, cell.jobs.length)}
+                                        disabled={currentPage >= pageCount - 1}
+                                        aria-label="Próximos itens do dia"
+                                      >
+                                        <FiChevronRight />
+                                      </button>
+                                    </div>
                                   </div>
                                 ) : null}
                               </div>
                             )
-                          : cell.inCurrentMonth
-                            ? <span className="home-calendar-day-empty" />
-                            : null}
+                          : <span className="home-calendar-day-empty" />}
                       </div>
                     </article>
                   );
@@ -12060,6 +12214,246 @@ function App() {
             </div>
           </div>
         </section>
+
+        {selectedDashboardPopoverJob ? (
+          <div
+            className="home-calendar-popover-backdrop"
+            onClick={() => closeDashboardCalendarPopover(selectedDashboardPopoverJob.id)}
+          >
+            <div className="home-calendar-popover-frame" onClick={(event) => event.stopPropagation()}>
+              <button
+                type="button"
+                className="home-calendar-popover-close home-calendar-popover-close-floating"
+                onClick={() => closeDashboardCalendarPopover(selectedDashboardPopoverJob.id)}
+                aria-label="Fechar detalhes da publicação"
+                title="Fechar"
+              >
+                <FiX aria-hidden="true" />
+              </button>
+              <div
+                className="home-calendar-popover home-calendar-popover-modal"
+                role="dialog"
+                aria-modal="true"
+                aria-label={`Detalhes da publicação ${selectedDashboardPopoverTitle}`}
+              >
+              <div className="home-calendar-popover-head">
+                {selectedDashboardPopoverActiveMediaPath ? (
+                  <div className="home-calendar-popover-title-media" aria-label="Prévia da mídia da publicação">
+                    <div className="home-calendar-popover-title-media-stage">
+                      {isVideoPath(selectedDashboardPopoverActiveMediaPath) ? (
+                        <video
+                          src={`${api.baseUrl}${selectedDashboardPopoverActiveMediaPath}`}
+                          muted
+                          playsInline
+                          preload="metadata"
+                        />
+                      ) : (
+                        <img
+                          src={`${api.baseUrl}${selectedDashboardPopoverActiveMediaPath}`}
+                          alt={`Prévia da mídia ${selectedDashboardPopoverActiveMediaIndex + 1}`}
+                        />
+                      )}
+                    </div>
+                    {selectedDashboardPopoverMediaCount > 1 ? (
+                      <div className="home-calendar-popover-title-media-nav">
+                        <button
+                          type="button"
+                          className="home-calendar-popover-media-nav-button"
+                          onClick={() =>
+                            setDashboardCalendarPopoverMediaIndex((current) =>
+                              current <= 0 ? selectedDashboardPopoverMediaCount - 1 : current - 1
+                            )
+                          }
+                          aria-label="Mídia anterior"
+                        >
+                          <FiChevronLeft aria-hidden="true" />
+                        </button>
+                        <span className="home-calendar-popover-media-counter">
+                          {selectedDashboardPopoverActiveMediaIndex + 1}/{selectedDashboardPopoverMediaCount}
+                        </span>
+                        <button
+                          type="button"
+                          className="home-calendar-popover-media-nav-button"
+                          onClick={() =>
+                            setDashboardCalendarPopoverMediaIndex((current) =>
+                              current >= selectedDashboardPopoverMediaCount - 1 ? 0 : current + 1
+                            )
+                          }
+                          aria-label="Próxima mídia"
+                        >
+                          <FiChevronRight aria-hidden="true" />
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+                <div className="home-calendar-popover-head-main">
+                  <div className="home-calendar-popover-title">
+                    <strong>{selectedDashboardPopoverTitle}</strong>
+                  </div>
+                  <div className="home-calendar-popover-head-side">
+                    <span
+                      className={`publications-job-status-chip publications-job-status-chip-${selectedDashboardPopoverStatusTone} home-calendar-popover-status-chip`}
+                    >
+                      {selectedDashboardPopoverRunningLike ? (
+                        <span className="home-calendar-popover-status-chip-content">
+                          <span className="status-pill-spinner" aria-hidden="true" />
+                          Executando
+                        </span>
+                      ) : (
+                        jobStatusDisplayLabel(selectedDashboardPopoverJob)
+                      )}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="home-calendar-popover-toolbar">
+                <div className="home-calendar-popover-platforms" aria-label="Canais da publicação">
+                  {selectedDashboardPopoverParticipantNetworks.map((network) => (
+                    <span
+                      key={`${selectedDashboardPopoverJob.id}-${network}`}
+                      className="home-calendar-popover-platform-item"
+                    >
+                      {renderPublicationNetworkPill(network)}
+                    </span>
+                  ))}
+                </div>
+                <div className="home-calendar-popover-actions">
+                  <button
+                    type="button"
+                    className="publications-board-action-button publications-board-action-button-edit"
+                    title="Editar publicação"
+                    aria-label="Editar publicação"
+                    onClick={() => openHistoryJobEditor(selectedDashboardPopoverJob)}
+                  >
+                    <FiEdit3 aria-hidden="true" />
+                  </button>
+                  {selectedDashboardPopoverCanEditTime ? (
+                    <button
+                      type="button"
+                      className="publications-board-action-button publications-board-action-button-schedule"
+                      title="Editar agendamento"
+                      aria-label="Editar agendamento"
+                      onClick={() => startDashboardCalendarTimeEdit(selectedDashboardPopoverJob)}
+                      disabled={selectedDashboardPopoverSavingTime}
+                    >
+                      <FiCalendar aria-hidden="true" />
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="publications-board-action-button publications-board-action-button-duplicate"
+                    title="Duplicar publicação"
+                    aria-label="Duplicar publicação"
+                    onClick={() => openPublicationDuplicateModal(selectedDashboardPopoverJob)}
+                  >
+                    <FiCopy aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className="publications-board-action-button publications-board-action-button-template"
+                    title="Criar template"
+                    aria-label="Criar template"
+                    onClick={() => savePublicationAsTemplate(selectedDashboardPopoverJob)}
+                  >
+                    <FiFileText aria-hidden="true" />
+                  </button>
+                  {selectedDashboardPopoverCanRetry ? (
+                    <button
+                      type="button"
+                      className="publications-board-action-button publications-board-action-button-retry"
+                      title="Tentar novamente"
+                      aria-label="Tentar novamente"
+                      onClick={() => void retryJob(selectedDashboardPopoverJob.id)}
+                      disabled={selectedDashboardPopoverRetryingJob}
+                    >
+                      <FiRotateCcw aria-hidden="true" />
+                    </button>
+                  ) : null}
+                  {selectedDashboardPopoverCanReactivate ? (
+                    <button
+                      type="button"
+                      className="publications-board-action-button publications-board-action-button-reactivate"
+                      title="Reativar publicação"
+                      aria-label="Reativar publicação"
+                      onClick={() => void toggleJobSchedule(selectedDashboardPopoverJob)}
+                      disabled={selectedDashboardPopoverReactivatingJob}
+                    >
+                      <FiCheckCircle aria-hidden="true" />
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="home-calendar-popover-body">
+                <div className="home-calendar-popover-detail-grid">
+                  <span className="home-calendar-popover-detail-card">
+                    <strong>Agendada para</strong>
+                    <small>{formatJobScheduledAt(selectedDashboardPopoverJob, effectiveUserTimeZone)}</small>
+                  </span>
+                  <span className="home-calendar-popover-detail-card">
+                    <strong>Workspace(s)</strong>
+                    <small className="home-calendar-popover-workspaces">
+                      {selectedDashboardPopoverWorkspaces.map((workspace, index) => (
+                        <span key={workspace.id} className="home-calendar-popover-workspace-entry">
+                          <span
+                            className="home-calendar-popover-workspace-value"
+                            style={{ color: workspace.color || DEFAULT_WORKSPACE_COLOR }}
+                          >
+                            {workspace.label}
+                          </span>
+                          {index < selectedDashboardPopoverWorkspaces.length - 1 ? (
+                            <span className="home-calendar-popover-workspace-separator" aria-hidden="true">
+                              ,{" "}
+                            </span>
+                          ) : null}
+                        </span>
+                      ))}
+                    </small>
+                  </span>
+                </div>
+              </div>
+
+              {selectedDashboardPopoverCanEditTime && selectedDashboardPopoverEditingTime ? (
+                <div className="home-calendar-popover-time-editor publications-board-inline-schedule-editor">
+                  <input
+                    type="time"
+                    value={dashboardCalendarTimeValue}
+                    onChange={(event) => setDashboardCalendarTimeValue(event.target.value)}
+                    disabled={selectedDashboardPopoverSavingTime}
+                  />
+                  <div className="publications-board-inline-schedule-actions">
+                    <button
+                      type="button"
+                      className="publications-board-inline-schedule-save"
+                      title="Salvar horário"
+                      aria-label="Salvar horário"
+                      onClick={() => void saveDashboardCalendarTime(selectedDashboardPopoverJob)}
+                      disabled={selectedDashboardPopoverSavingTime}
+                    >
+                      <FiCheckCircle aria-hidden="true" />
+                    </button>
+                    <button
+                      type="button"
+                      className="publications-board-inline-schedule-cancel"
+                      title="Cancelar edição de horário"
+                      aria-label="Cancelar edição de horário"
+                      onClick={() => {
+                        setDashboardCalendarEditingJobId(null);
+                        setDashboardCalendarTimeValue("");
+                      }}
+                      disabled={selectedDashboardPopoverSavingTime}
+                    >
+                      <FiX aria-hidden="true" />
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+              </div>
+            </div>
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -16233,40 +16627,51 @@ function App() {
           <div className="home-welcome-copy">
             <span className="skeleton-line skeleton-line-kicker" />
             <span className="skeleton-line skeleton-line-heading" />
-            <span className="skeleton-line skeleton-line-text-wide" />
           </div>
           <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" />
         </section>
 
         <section className="panel-card home-calendar-shell" aria-hidden="true">
           <div className="home-calendar-toolbar">
-            <div className="home-calendar-toolbar-copy">
-              <span className="skeleton-line skeleton-line-title" />
-              <span className="skeleton-line skeleton-line-text" />
+            <div className="home-calendar-toolbar-copy home-calendar-toolbar-copy-skeleton">
+              <FiCalendar aria-hidden="true" />
+              <span className="skeleton-line home-calendar-title-skeleton" />
             </div>
             <div className="home-calendar-toolbar-actions">
-              <span className="skeleton-line skeleton-line-chip" />
-              <span className="skeleton-line skeleton-line-chip" />
-              <span className="skeleton-line skeleton-line-chip" />
+              <span className="skeleton-line home-calendar-nav-button-skeleton" />
+              <span className="skeleton-line home-calendar-nav-button-skeleton" />
             </div>
-          </div>
-
-          <div className="home-calendar-weekdays">
-            {DASHBOARD_CALENDAR_WEEKDAY_LABELS.map((label) => (
-              <span key={`dashboard-skeleton-weekday-${label}`} className="skeleton-line skeleton-line-text" />
-            ))}
           </div>
 
           <div className="home-calendar-grid">
-            {Array.from({ length: 35 }, (_, index) => (
+            {Array.from({ length: 12 }, (_, index) => (
               <article key={`dashboard-calendar-skeleton-${index}`} className="home-calendar-day home-calendar-day-skeleton">
                 <div className="home-calendar-day-head">
-                  <span className="skeleton-line skeleton-line-chip" />
+                  <span className="skeleton-line home-calendar-day-number-skeleton" />
+                  <span className="skeleton-line home-calendar-day-weekday-skeleton" />
                 </div>
-                <div className="home-calendar-day-body home-calendar-day-events">
-                  <span className="skeleton-line skeleton-line-chip" />
-                  <span className="skeleton-line skeleton-line-chip" />
-                  <span className="skeleton-line skeleton-line-chip" />
+                <div className="home-calendar-day-body">
+                  <div className="home-calendar-day-events-shell">
+                    <div className="home-calendar-day-events">
+                      {Array.from({ length: index % 3 === 0 ? 2 : 3 }, (_, itemIndex) => (
+                        <div key={`dashboard-calendar-skeleton-entry-${index}-${itemIndex}`} className="home-calendar-entry-skeleton">
+                          <div className="home-calendar-entry-skeleton-time">
+                            <span className="skeleton-line home-calendar-entry-skeleton-network" />
+                            <span className="skeleton-line home-calendar-entry-skeleton-network" />
+                            <span className="skeleton-line home-calendar-entry-skeleton-clock" />
+                            <span className="skeleton-line home-calendar-entry-skeleton-time-line" />
+                          </div>
+                          <span className="skeleton-line home-calendar-entry-skeleton-title" />
+                        </div>
+                      ))}
+                    </div>
+                    {index % 4 === 3 ? (
+                      <div className="home-calendar-day-pager" aria-hidden="true">
+                        <span className="skeleton-line home-calendar-day-pager-skeleton" />
+                        <span className="skeleton-line home-calendar-day-pager-skeleton" />
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
               </article>
             ))}
