@@ -104,6 +104,7 @@ const INSTAGRAM_WORKER_AUTO_RETRY_DELAY_MS = parseEnvPositiveInt(
   process.env.INSTAGRAM_WORKER_AUTO_RETRY_DELAY_MS,
   20_000,
 );
+const LIVE_EVENTS_HEARTBEAT_INTERVAL_MS = 20_000;
 const INSTAGRAM_STORY_SEQUENCE_STEP_DELAY_MS = parseEnvPositiveInt(
   process.env.INSTAGRAM_STORY_SEQUENCE_STEP_DELAY_MS,
   1_500,
@@ -4570,6 +4571,7 @@ async function syncPostForMeConnectionsForBase(input: {
         authStatus: "AUTH_IN_PROGRESS",
       },
     });
+    notifyLiveUpdateForWorkspace(refreshedBaseConnection.companyId, ["connections", "dashboard"]);
 
     return {
       primaryConnection: refreshedBaseConnection,
@@ -4604,7 +4606,7 @@ async function syncPostForMeConnectionsForBase(input: {
   });
 
   if (conflictingConnection) {
-    await prisma.socialConnection.update({
+    const resetConnection = await prisma.socialConnection.update({
       where: { id: baseConnection.id },
       data: {
         authStatus: "AUTH_REQUIRED",
@@ -4619,6 +4621,7 @@ async function syncPostForMeConnectionsForBase(input: {
         secretCipher: null,
       },
     });
+    notifyLiveUpdateForWorkspace(resetConnection.companyId, ["connections", "dashboard"]);
     throw new Error("POST_FOR_ME_ACCOUNT_ALREADY_CONNECTED_TO_ANOTHER_PROFILE");
   }
 
@@ -4665,6 +4668,7 @@ async function syncPostForMeConnectionsForBase(input: {
       id: { not: baseConnection.id },
     },
   });
+  notifyLiveUpdateForWorkspace(primaryConnection.companyId, ["connections", "dashboard"]);
 
   return {
     primaryConnection,
@@ -4760,6 +4764,7 @@ async function syncConnectionRuntimeState(connection: {
       `Estado da conta ${updatedConnection.displayName} sincronizado ao abrir conexoes: ` +
       `${connection.authStatus} -> ${runtimeAuthStatus}.`,
   });
+  notifyLiveUpdateForWorkspace(updatedConnection.companyId, ["connections", "dashboard"]);
 
   return updatedConnection;
 }
@@ -4812,6 +4817,144 @@ function mapAviso(aviso: {
   };
 }
 
+type LiveUpdateScope = "jobs" | "dashboard" | "avisos" | "connections" | "companies" | "logs";
+
+type LiveEventClient = {
+  response: Response;
+  heartbeatIntervalId: ReturnType<typeof setInterval>;
+};
+
+const liveEventClientsByUserId = new Map<string, Map<string, LiveEventClient>>();
+
+function normalizeLiveUpdateScopes(scopes: LiveUpdateScope[]): LiveUpdateScope[] {
+  return Array.from(new Set(scopes));
+}
+
+function writeLiveEvent(response: Response, payload: Record<string, unknown>): void {
+  response.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function registerLiveEventClient(userId: string, clientId: string, client: LiveEventClient): void {
+  const userClients = liveEventClientsByUserId.get(userId) ?? new Map<string, LiveEventClient>();
+  userClients.set(clientId, client);
+  liveEventClientsByUserId.set(userId, userClients);
+}
+
+function unregisterLiveEventClient(userId: string, clientId: string): void {
+  const userClients = liveEventClientsByUserId.get(userId);
+  if (!userClients) {
+    return;
+  }
+
+  const client = userClients.get(clientId);
+  if (client) {
+    clearInterval(client.heartbeatIntervalId);
+  }
+
+  userClients.delete(clientId);
+  if (userClients.size === 0) {
+    liveEventClientsByUserId.delete(userId);
+  }
+}
+
+function emitLiveUpdateToUser(userId: string, scopes: LiveUpdateScope[], companyId?: string | null): void {
+  const userClients = liveEventClientsByUserId.get(userId);
+  if (!userClients || userClients.size === 0) {
+    return;
+  }
+
+  const normalizedScopes = normalizeLiveUpdateScopes(scopes);
+  const payload = {
+    type: "update",
+    scopes: normalizedScopes,
+    companyId: companyId ?? null,
+    issuedAt: new Date().toISOString(),
+  } satisfies Record<string, unknown>;
+
+  for (const [clientId, client] of userClients.entries()) {
+    try {
+      writeLiveEvent(client.response, payload);
+    } catch {
+      unregisterLiveEventClient(userId, clientId);
+    }
+  }
+}
+
+async function resolveLiveUpdateRecipientUserIdsForWorkspace(companyId: string): Promise<string[]> {
+  const [workspace, rootUsers] = await Promise.all([
+    prisma.company.findUnique({
+      where: { id: companyId },
+      select: {
+        createdByUserId: true,
+        members: {
+          select: {
+            userId: true,
+          },
+        },
+      },
+    }),
+    prisma.user.findMany({
+      where: {
+        role: "ROOT",
+      },
+      select: {
+        id: true,
+      },
+    }),
+  ]);
+
+  const userIds = new Set<string>();
+  const ownerUserId = workspace?.createdByUserId?.trim() || "";
+  if (ownerUserId) {
+    userIds.add(ownerUserId);
+  }
+
+  for (const member of workspace?.members ?? []) {
+    const memberUserId = member.userId.trim();
+    if (memberUserId) {
+      userIds.add(memberUserId);
+    }
+  }
+
+  for (const rootUser of rootUsers) {
+    const rootUserId = rootUser.id.trim();
+    if (rootUserId) {
+      userIds.add(rootUserId);
+    }
+  }
+
+  return [...userIds];
+}
+
+function notifyLiveUpdateForUser(userId: string, scopes: LiveUpdateScope[], companyId?: string | null): void {
+  emitLiveUpdateToUser(userId, scopes, companyId);
+}
+
+function notifyLiveUpdateForUsers(userIds: string[], scopes: LiveUpdateScope[], companyId?: string | null): void {
+  const normalizedUserIds = [...new Set(userIds.map((value) => value.trim()).filter(Boolean))];
+  if (normalizedUserIds.length === 0) {
+    return;
+  }
+
+  for (const userId of normalizedUserIds) {
+    notifyLiveUpdateForUser(userId, scopes, companyId);
+  }
+}
+
+function notifyLiveUpdateForWorkspace(companyId: string, scopes: LiveUpdateScope[]): void {
+  if (liveEventClientsByUserId.size === 0) {
+    return;
+  }
+
+  void resolveLiveUpdateRecipientUserIdsForWorkspace(companyId)
+    .then((userIds) => {
+      notifyLiveUpdateForUsers(userIds, scopes, companyId);
+    })
+    .catch((error) => {
+      console.error("Failed to resolve live update recipients for workspace", error);
+    });
+}
+
 async function appendLog(input: {
   companyId: string;
   level: "INFO" | "WARN" | "ERROR";
@@ -4829,6 +4972,7 @@ async function appendLog(input: {
       screenshotPath: input.screenshotPath,
     },
   });
+  notifyLiveUpdateForWorkspace(input.companyId, ["logs"]);
 }
 
 function shouldMirrorToDeliveryEventFile(input: {
@@ -4902,6 +5046,7 @@ async function appendAviso(input: {
       createdByUserId: input.createdByUserId ?? null,
     },
   });
+  notifyLiveUpdateForUser(input.userId, ["avisos"]);
 }
 
 async function appendBillingAvisoSafely(input: {
@@ -4925,6 +5070,7 @@ async function appendBillingAvisoSafely(input: {
 async function appendJobAvisoSafely(
   job: {
     id: string;
+    companyId?: string | null;
     createdByUserId: string | null;
     title?: string | null;
     caption: string | null;
@@ -4957,6 +5103,10 @@ async function appendJobAvisoSafely(
       message: composedMessage,
       kind: input.kind,
     });
+    const companyId = job.companyId?.trim() || "";
+    if (companyId) {
+      notifyLiveUpdateForWorkspace(companyId, ["jobs", "dashboard"]);
+    }
   } catch (error) {
     console.error("Failed to append job aviso", error);
   }
@@ -8205,6 +8355,7 @@ function startServerInstagramJobWorker(): void {
         if (lock.count === 0) {
           continue;
         }
+        notifyLiveUpdateForWorkspace(job.companyId, ["jobs", "dashboard"]);
 
         try {
           await enqueueJobForExecution({
@@ -8222,6 +8373,7 @@ function startServerInstagramJobWorker(): void {
               lastError: "Falha ao enfileirar job para processamento.",
             },
           });
+          notifyLiveUpdateForWorkspace(job.companyId, ["jobs", "dashboard"]);
 
           await appendLog({
             companyId: job.companyId,
@@ -8287,6 +8439,7 @@ function startInstagramTokenKeepAliveWorker(): void {
               lastSeenAt: new Date(),
             },
           });
+          notifyLiveUpdateForWorkspace(connection.companyId, ["connections", "dashboard"]);
         } catch (refreshError) {
           const message = refreshError instanceof Error ? refreshError.message : "INSTAGRAM_GRAPH_TOKEN_REFRESH_FAILED";
           if (!isInstagramLoginRequiredErrorMessage(message)) {
@@ -8324,6 +8477,7 @@ function startInstagramTokenKeepAliveWorker(): void {
                 lastSeenAt: null,
             },
           });
+          notifyLiveUpdateForWorkspace(connection.companyId, ["connections", "dashboard"]);
 
           await appendLog({
             companyId: connection.companyId,
@@ -9222,6 +9376,7 @@ function startServerWhatsappJobWorker(): void {
         if (lock.count === 0) {
           continue;
         }
+        notifyLiveUpdateForWorkspace(job.companyId, ["jobs", "dashboard"]);
 
         try {
           await enqueueJobForExecution({
@@ -9239,6 +9394,7 @@ function startServerWhatsappJobWorker(): void {
               lastError: "Falha ao enfileirar job para processamento.",
             },
           });
+          notifyLiveUpdateForWorkspace(job.companyId, ["jobs", "dashboard"]);
 
           await appendLog({
             companyId: job.companyId,
@@ -9263,6 +9419,66 @@ function startServerWhatsappJobWorker(): void {
 
 app.get("/health", (_request, response) => {
   response.json({ ok: true });
+});
+
+app.get("/events", async (request, response) => {
+  const sessionToken = typeof request.query.sessionToken === "string" ? request.query.sessionToken.trim() : "";
+  if (!sessionToken) {
+    response.status(401).json({ error: "Sessao invalida ou expirada." });
+    return;
+  }
+
+  const user = await prisma.user.findFirst({
+    where: {
+      sessionToken,
+    },
+    select: {
+      id: true,
+      username: true,
+    },
+  });
+
+  if (!user) {
+    response.status(401).json({ error: "Sessao invalida ou expirada." });
+    return;
+  }
+
+  response.setHeader("Content-Type", "text/event-stream");
+  response.setHeader("Cache-Control", "no-cache, no-transform");
+  response.setHeader("Connection", "keep-alive");
+  response.setHeader("X-Accel-Buffering", "no");
+  response.flushHeaders();
+
+  const clientId = createHash("sha1")
+    .update(`${user.id}:${Date.now()}:${Math.random()}:${user.username}`)
+    .digest("hex");
+
+  const heartbeatIntervalId = setInterval(() => {
+    try {
+      writeLiveEvent(response, {
+        type: "ping",
+        issuedAt: new Date().toISOString(),
+      });
+    } catch {
+      unregisterLiveEventClient(user.id, clientId);
+    }
+  }, LIVE_EVENTS_HEARTBEAT_INTERVAL_MS);
+
+  registerLiveEventClient(user.id, clientId, {
+    response,
+    heartbeatIntervalId,
+  });
+
+  writeLiveEvent(response, {
+    type: "connected",
+    scopes: [],
+    issuedAt: new Date().toISOString(),
+  });
+
+  request.on("close", () => {
+    unregisterLiveEventClient(user.id, clientId);
+    response.end();
+  });
 });
 
 app.get("/auth/setup-access", async (request, response) => {
@@ -11746,6 +11962,7 @@ app.post("/jobs", async (request, response) => {
         ? `Job ${job.id} salvo como rascunho para ${job.dataPostagem.toISOString()} (execução suspensa até publicação).`
         : `Job ${job.id} agendado para ${job.dataPostagem.toISOString()}.`,
   });
+  notifyLiveUpdateForWorkspace(job.companyId, ["jobs", "dashboard"]);
   response.status(201).json(job);
 });
 
@@ -11902,6 +12119,7 @@ app.put("/jobs/:id", async (request, response) => {
           ? `Job ${existingJob.id} foi preservado no histórico e gerou o novo agendamento ${job.id} para ${job.dataPostagem.toISOString()}.`
           : `Job ${job.id} foi editado e reagendado para ${job.dataPostagem.toISOString()}.`,
   });
+  notifyLiveUpdateForWorkspace(job.companyId, ["jobs", "dashboard"]);
 
   response.json(job);
 });
@@ -11961,6 +12179,7 @@ app.post("/jobs/:id/retry", async (request, response) => {
     level: "INFO",
     message: `Job ${existingJob.id} foi preservado no histórico e gerou o novo job ${job.id} para tentativa imediata.`,
   });
+  notifyLiveUpdateForWorkspace(job.companyId, ["jobs", "dashboard"]);
 
   response.json(job);
 });
@@ -12036,6 +12255,7 @@ app.post("/jobs/:id/reschedule-failed-media", async (request, response) => {
         ? `Job ${existingJob.id} gerou novo job ${job.id} com ${mediaRetryBundle.mediaCount} mídia(s) restante(s), reagendado para ${retryAt.toISOString()}.`
         : `Job ${existingJob.id} gerou novo job ${job.id} reagendado para ${retryAt.toISOString()} com ${mediaRetryBundle.mediaCount} mídia(s).`,
   });
+  notifyLiveUpdateForWorkspace(job.companyId, ["jobs", "dashboard"]);
 
   response.json({
     job,
@@ -12104,6 +12324,7 @@ app.post("/jobs/:id/duplicate-draft", async (request, response) => {
     level: "INFO",
     message: `Job ${existingJob.id} duplicado como rascunho (${duplicatedJob.id}).`,
   });
+  notifyLiveUpdateForWorkspace(duplicatedJob.companyId, ["jobs", "dashboard"]);
 
   response.status(201).json(serializeJobForClient(duplicatedJob));
 });
@@ -12157,6 +12378,7 @@ app.post("/jobs/:id/cancel", async (request, response) => {
     level: "WARN",
     message: `Job ${job.id} foi cancelado manualmente.`,
   });
+  notifyLiveUpdateForWorkspace(job.companyId, ["jobs", "dashboard"]);
 
   response.json(job);
 });
@@ -12219,6 +12441,7 @@ app.post("/jobs/:id/publish", async (request, response) => {
       ? `Rascunho ${job.id} foi publicado e está com data no passado; será executado imediatamente.`
       : `Rascunho ${job.id} foi publicado para execução em ${job.dataPostagem.toISOString()}.`,
   });
+  notifyLiveUpdateForWorkspace(job.companyId, ["jobs", "dashboard"]);
 
   response.json({
     ...job,
@@ -12286,6 +12509,7 @@ app.post("/jobs/:id/activate", async (request, response) => {
       ? `Job ${existingJob.id} foi preservado no histórico e gerou o novo job ${job.id}, que será executado imediatamente.`
       : `Job ${existingJob.id} foi preservado no histórico e gerou o novo job ${job.id} para execução em ${job.dataPostagem.toISOString()}.`,
   });
+  notifyLiveUpdateForWorkspace(job.companyId, ["jobs", "dashboard"]);
 
   response.json(job);
 });
@@ -12310,6 +12534,7 @@ app.delete("/jobs/:id", async (request, response) => {
     level: "WARN",
     message: `Job ${existingJob.id} foi excluido.`,
   });
+  notifyLiveUpdateForWorkspace(existingJob.companyId, ["jobs", "dashboard"]);
 
   response.status(204).send();
 });
@@ -13637,6 +13862,10 @@ app.post("/avisos/broadcast", async (request, response) => {
       message: payload.message,
     })),
   });
+  notifyLiveUpdateForUsers(
+    recipients.map((recipient) => recipient.id),
+    ["avisos"],
+  );
 
   response.status(201).json({ created: recipients.length });
 });

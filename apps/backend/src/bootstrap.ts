@@ -60,7 +60,7 @@ async function waitForDatabaseReady(): Promise<void> {
   const lastMessage = lastError instanceof Error ? lastError.message : "Erro desconhecido ao conectar no banco.";
   throw new Error(
     `Banco indisponível em ${databaseTarget}. ` +
-      `Rode \`npm run db:start\` ou verifique se o PostgreSQL está ativo antes de subir o backend.\n` +
+      `Verifique se o PostgreSQL de destino está ativo e se a DATABASE_URL está correta antes de subir o backend.\n` +
       lastMessage,
   );
 }
