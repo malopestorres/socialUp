@@ -32,6 +32,7 @@ export interface JobDto {
   id: string;
   companyId: string;
   socialConnectionId: string | null;
+  schedulerGroupId?: string | null;
   filePath: string;
   filePaths?: string[];
   fileCaptions?: Array<string | null>;

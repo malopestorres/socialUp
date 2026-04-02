@@ -29,6 +29,11 @@ type JobIdentity = {
   whatsappBackgroundColor?: string | null;
 };
 
+type JobMediaBundle = {
+  files: string[];
+  captions: Array<string | null>;
+};
+
 type EvolutionCredentials = {
   instanceName: string;
   apiKey: string;
@@ -127,6 +132,7 @@ const EVOLUTION_STATUS_CONFIRMATION_DELAY_MS = Math.max(
 
 const HARD_CODED_INSTANCE_NAME = (process.env.EVOLUTION_HARD_CODED_INSTANCE_NAME || "").trim();
 const HARD_CODED_INSTANCE_API_KEY = (process.env.EVOLUTION_HARD_CODED_INSTANCE_API_KEY || "").trim();
+const JOB_MEDIA_BUNDLE_STORAGE_PREFIX = "__JOB_MEDIA_BUNDLE__";
 
 const qrOverlayByConnectionId = new Map<string, QrOverlayState>();
 const qrPollersByConnectionId = new Map<string, NodeJS.Timeout>();
@@ -162,6 +168,63 @@ function parseStatusTextFont(value: string | undefined, fallback: number): numbe
 
 function normalizeBaseUrl(url: string): string {
   return url.trim().replace(/\/+$/, "");
+}
+
+function decodeJobMediaBundleStorage(filePath: string | null | undefined): JobMediaBundle {
+  const raw = filePath?.trim() || "";
+  if (!raw) {
+    return {
+      files: [],
+      captions: [],
+    };
+  }
+
+  if (!raw.startsWith(JOB_MEDIA_BUNDLE_STORAGE_PREFIX)) {
+    return {
+      files: [raw],
+      captions: [],
+    };
+  }
+
+  const encodedPayload = raw.slice(JOB_MEDIA_BUNDLE_STORAGE_PREFIX.length).trim();
+  if (!encodedPayload) {
+    return {
+      files: [],
+      captions: [],
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(Buffer.from(encodedPayload, "base64").toString("utf8")) as {
+      files?: unknown;
+      captions?: unknown;
+    };
+
+    const files = Array.isArray(parsed.files)
+      ? parsed.files
+          .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+          .filter((entry) => entry.length > 0)
+      : [];
+    const rawCaptions = Array.isArray(parsed.captions) ? parsed.captions : [];
+    const captions = files.map((_, index) => {
+      const rawCaption = rawCaptions[index];
+      if (typeof rawCaption !== "string") {
+        return null;
+      }
+      const normalizedCaption = rawCaption.trim();
+      return normalizedCaption.length > 0 ? normalizedCaption : null;
+    });
+
+    return {
+      files,
+      captions,
+    };
+  } catch {
+    return {
+      files: [raw],
+      captions: [],
+    };
+  }
 }
 
 function decodeSecret(secretCipher?: string | null): string | null {
@@ -1349,40 +1412,54 @@ export async function executeWhatsappJobWithEvolutionApi(
     };
   }
 
-  const sourceFilePath = job.filePath?.trim() ?? "";
-  if (!sourceFilePath) {
+  const mediaBundle = decodeJobMediaBundleStorage(job.filePath);
+  const sourceFilePaths = mediaBundle.files.length > 0
+    ? mediaBundle.files
+    : (job.filePath?.trim() ? [job.filePath.trim()] : []);
+  if (sourceFilePaths.length === 0) {
     throw new Error("WHATSAPP_STATUS_MEDIA_REQUIRED");
   }
+  const normalizedJobCaption = job.caption?.trim() ?? "";
+  let lastRemoteJid = "status@broadcast";
+  let lastMessageId: string | null = null;
+  let allConfirmed = true;
 
-  const absoluteFilePath = path.join(uploadsDir, path.basename(sourceFilePath));
-  const fileBuffer = await fs.readFile(absoluteFilePath);
-  const fileName = path.basename(absoluteFilePath);
-  const mimeType = mimeTypeForFile(fileName);
-  const statusType = statusMediaTypeFromMimeType(mimeType);
-  const dataUrl = `data:${mimeType};base64,${fileBuffer.toString("base64")}`;
-  const caption = job.caption?.trim() ?? "";
+  for (const [index, sourceFilePath] of sourceFilePaths.entries()) {
+    const absoluteFilePath = path.join(uploadsDir, path.basename(sourceFilePath));
+    const fileBuffer = await fs.readFile(absoluteFilePath);
+    const fileName = path.basename(absoluteFilePath);
+    const mimeType = mimeTypeForFile(fileName);
+    const statusType = statusMediaTypeFromMimeType(mimeType);
+    const dataUrl = `data:${mimeType};base64,${fileBuffer.toString("base64")}`;
+    const caption =
+      sourceFilePaths.length > 1
+        ? mediaBundle.captions[index]?.trim() ?? ""
+        : mediaBundle.captions[0]?.trim() ?? normalizedJobCaption;
 
-  if (caption.length > 1024) {
-    throw new Error("WHATSAPP_STATUS_CAPTION_TOO_LONG");
+    if (caption.length > 1024) {
+      throw new Error("WHATSAPP_STATUS_CAPTION_TOO_LONG");
+    }
+
+    const response = await evolutionRequest<EvolutionSendStatusResponse>(credentials, route, {
+      method: "POST",
+      jsonBody: buildMediaStatusPayload({
+        statusType,
+        dataUrl,
+        caption,
+        recipients: statusRecipients.recipients,
+        backgroundColor: job.whatsappBackgroundColor,
+      }),
+    });
+
+    lastRemoteJid = extractRemoteJid(response);
+    lastMessageId = extractMessageId(response);
+    const confirmed = await waitStatusPersistenceConfirmation(credentials, lastMessageId);
+    allConfirmed = allConfirmed && confirmed;
   }
 
-  const response = await evolutionRequest<EvolutionSendStatusResponse>(credentials, route, {
-    method: "POST",
-    jsonBody: buildMediaStatusPayload({
-      statusType,
-      dataUrl,
-      caption,
-      recipients: statusRecipients.recipients,
-      backgroundColor: job.whatsappBackgroundColor,
-    }),
-  });
-
-  const messageId = extractMessageId(response);
-  const confirmed = await waitStatusPersistenceConfirmation(credentials, messageId);
-
   return {
-    remoteJid: extractRemoteJid(response),
-    messageId,
-    confirmed,
+    remoteJid: lastRemoteJid,
+    messageId: lastMessageId,
+    confirmed: allConfirmed,
   };
 }
