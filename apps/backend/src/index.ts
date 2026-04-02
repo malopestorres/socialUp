@@ -46,6 +46,7 @@ import {
 } from "./infra-rabbitmq.js";
 import { acquireDistributedLock, isDistributedLockHeld, closeRedisInfra } from "./infra-redis.js";
 import {
+  createPostForMeWebhook,
   createPostForMeSocialAccountAuthUrl,
   createPostForMeSocialPost,
   disconnectPostForMeSocialAccount,
@@ -61,7 +62,7 @@ import {
   type PostForMeSocialPostResultRecord,
 } from "./post-for-me.js";
 import { META_LOCATION_CATALOG, type MetaLocationCatalogEntry } from "./meta-location-catalog.js";
-import { prisma } from "./prisma.js";
+import { prisma, withPrismaConnectionRetry } from "./prisma.js";
 import { createRandomToken, verifyPassword, hashPassword } from "./security.js";
 import {
   dismissWhatsappQr,
@@ -185,15 +186,25 @@ const DEFAULT_USER_TIME_ZONE = "America/Sao_Paulo";
 const STRIPE_SECRET_KEY = (process.env.STRIPE_SECRET_KEY || "").trim();
 const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
 const STRIPE_WEBHOOK_PATH = "/billing/stripe/webhook";
+const POST_FOR_ME_WEBHOOK_SECRET = (process.env.POST_FOR_ME_WEBHOOK_SECRET || "").trim();
+const POST_FOR_ME_WEBHOOK_PATH = "/integrations/post-for-me/webhook";
+const POST_FOR_ME_WEBHOOK_PUBLIC_BASE_URL = (process.env.POST_FOR_ME_WEBHOOK_PUBLIC_BASE_URL || "")
+  .trim()
+  .replace(/\/+$/, "");
 const STRIPE_CHECKOUT_SUCCESS_URL = (process.env.STRIPE_CHECKOUT_SUCCESS_URL || "").trim();
 const STRIPE_CHECKOUT_CANCEL_URL = (process.env.STRIPE_CHECKOUT_CANCEL_URL || "").trim();
 const BILLING_SETTING_AUTO_TRIAL_ENABLED = "billing.autoTrialEnabled";
 const BILLING_SETTING_AUTO_TRIAL_DAYS = "billing.autoTrialDays";
 const BILLING_SETTING_ROOT_DISPLAY_PLAN_ID = "billing.rootDisplayPlanId";
+const BILLING_SETTING_POST_FOR_ME_WEBHOOK_ID = "postForMe.webhookId";
+const BILLING_SETTING_POST_FOR_ME_WEBHOOK_URL = "postForMe.webhookUrl";
+const BILLING_SETTING_POST_FOR_ME_WEBHOOK_SECRET = "postForMe.webhookSecret";
 const BILLING_TRIAL_PLAN_CODE = "FREE_TRIAL";
 const BILLING_TRIAL_REFERENCE_DAYS = 30;
 const DEFAULT_AUTO_TRIAL_ENABLED = true;
 const DEFAULT_AUTO_TRIAL_DAYS = 10;
+const POST_FOR_ME_ACCOUNT_WEBHOOK_EVENT_TYPES = ["social.account.created", "social.account.updated"] as const;
+const POST_FOR_ME_RENEWAL_AVISO_DEDUPE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 type DefaultPlanSeed = {
   code: string;
@@ -261,6 +272,19 @@ function parseEnvBoolean(value: string | undefined, fallback: boolean): boolean 
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function parseUnknownString(value: unknown): string | null {
+  if (typeof value === "string") {
+    const normalized = value.trim();
+    return normalized.length > 0 ? normalized : null;
+  }
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  return null;
 }
 
 function isValidIanaTimeZone(value: string): boolean {
@@ -619,8 +643,23 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutCod
   }
 }
 
-function encodeMetaLocationStorage(locationName: string | null, locationId: string | null): string | null {
+const JOB_LOCATION_METADATA_PREFIX = "__jobmeta__:";
+
+function encodeMetaLocationStorage(
+  locationName: string | null,
+  locationId: string | null,
+  schedulerGroupId?: string | null,
+): string | null {
   const normalizedName = locationName?.trim() || "";
+  const normalizedGroupId = schedulerGroupId?.trim() || "";
+  if (normalizedGroupId) {
+    const payload = {
+      locationName: normalizedName || null,
+      locationId: locationId?.trim() || null,
+      schedulerGroupId: normalizedGroupId,
+    };
+    return `${JOB_LOCATION_METADATA_PREFIX}${Buffer.from(JSON.stringify(payload), "utf8").toString("base64url")}`;
+  }
   if (!normalizedName) {
     return null;
   }
@@ -633,19 +672,55 @@ function encodeMetaLocationStorage(locationName: string | null, locationId: stri
   return `${META_LOCATION_STORAGE_PREFIX}${normalizedId}::${normalizedName}`;
 }
 
-function decodeMetaLocationStorage(input: string | null | undefined): { locationName: string | null; locationId: string | null } {
+function decodeMetaLocationStorage(
+  input: string | null | undefined,
+): { locationName: string | null; locationId: string | null; schedulerGroupId: string | null } {
   const raw = input?.trim() || "";
   if (!raw) {
     return {
       locationName: null,
       locationId: null,
+      schedulerGroupId: null,
     };
+  }
+
+  if (raw.startsWith(JOB_LOCATION_METADATA_PREFIX)) {
+    const encoded = raw.slice(JOB_LOCATION_METADATA_PREFIX.length).trim();
+    if (!encoded) {
+      return {
+        locationName: null,
+        locationId: null,
+        schedulerGroupId: null,
+      };
+    }
+
+    try {
+      const decoded = Buffer.from(encoded, "base64url").toString("utf8");
+      const parsed = JSON.parse(decoded) as {
+        locationName?: unknown;
+        locationId?: unknown;
+        schedulerGroupId?: unknown;
+      };
+      return {
+        locationName: typeof parsed.locationName === "string" ? parsed.locationName.trim() || null : null,
+        locationId: typeof parsed.locationId === "string" ? parsed.locationId.trim() || null : null,
+        schedulerGroupId:
+          typeof parsed.schedulerGroupId === "string" ? parsed.schedulerGroupId.trim() || null : null,
+      };
+    } catch {
+      return {
+        locationName: null,
+        locationId: null,
+        schedulerGroupId: null,
+      };
+    }
   }
 
   if (!raw.startsWith(META_LOCATION_STORAGE_PREFIX)) {
     return {
       locationName: raw,
       locationId: null,
+      schedulerGroupId: null,
     };
   }
 
@@ -655,6 +730,7 @@ function decodeMetaLocationStorage(input: string | null | undefined): { location
     return {
       locationName: raw,
       locationId: null,
+      schedulerGroupId: null,
     };
   }
 
@@ -665,21 +741,31 @@ function decodeMetaLocationStorage(input: string | null | undefined): { location
     return {
       locationName: raw,
       locationId: null,
+      schedulerGroupId: null,
     };
   }
 
   return {
     locationName,
     locationId,
+    schedulerGroupId: null,
   };
 }
 
-function encodeInstagramLocationStorage(locationName: string | null, locationId: string | null): string | null {
-  return encodeMetaLocationStorage(locationName, locationId);
+function encodeInstagramLocationStorage(
+  locationName: string | null,
+  locationId: string | null,
+  schedulerGroupId?: string | null,
+): string | null {
+  return encodeMetaLocationStorage(locationName, locationId, schedulerGroupId);
 }
 
 function decodeInstagramLocationStorage(input: string | null | undefined): { locationName: string | null; locationId: string | null } {
-  return decodeMetaLocationStorage(input);
+  const decoded = decodeMetaLocationStorage(input);
+  return {
+    locationName: decoded.locationName,
+    locationId: decoded.locationId,
+  };
 }
 
 function normalizeSearchText(value: string): string {
@@ -915,6 +1001,10 @@ const setConnectionAgencyRefreshSchema = z.object({
   enabled: z.boolean(),
 });
 
+const syncProviderConnectionSchema = z.object({
+  providerAccountIdHint: z.string().trim().min(1).max(255).optional(),
+});
+
 const openVisualAuthSchema = z.object({
   returnToUrl: z.string().trim().url().max(2000).optional().nullable(),
 });
@@ -967,6 +1057,7 @@ const createJobSchema = z.object({
   whatsappBackgroundColor: z.string().trim().regex(/^#[0-9a-fA-F]{6}$/).optional().nullable(),
   whatsappRelinkEnabled: z.boolean().optional().default(false),
   whatsappRelinkConnectionIds: z.array(z.string().trim().min(1)).optional().nullable(),
+  schedulerGroupId: z.string().trim().min(1).max(120).optional().nullable(),
   locationName: z.string().optional().nullable(),
   locationId: z.string().optional().nullable(),
   publicationType: z.enum([
@@ -1000,6 +1091,7 @@ const updateJobSchema = z.object({
   whatsappBackgroundColor: z.string().trim().regex(/^#[0-9a-fA-F]{6}$/).optional().nullable(),
   whatsappRelinkEnabled: z.boolean().optional(),
   whatsappRelinkConnectionIds: z.array(z.string().trim().min(1)).optional().nullable(),
+  schedulerGroupId: z.string().trim().min(1).max(120).optional().nullable(),
   locationName: z.string().optional().nullable(),
   locationId: z.string().optional().nullable(),
   publicationType: z.enum([
@@ -1078,6 +1170,10 @@ const updateBillingSettingsSchema = z.object({
   autoTrialEnabled: z.boolean().optional(),
   autoTrialDays: z.coerce.number().int().min(0).max(60).optional(),
   rootDisplayPlanId: z.string().trim().min(1).optional().nullable(),
+});
+
+const registerPostForMeWebhookSchema = z.object({
+  force: z.boolean().optional().default(false),
 });
 
 const assignUserPlanSchema = z.object({
@@ -1259,6 +1355,10 @@ function validateSingleFilePathForPublication(publicationType: PublicationType, 
   return trimmedPath;
 }
 
+function isVideoFilePathForManagedPublication(filePath: string): boolean {
+  return /\.(mp4|mov|m4v|webm)$/i.test(filePath.trim());
+}
+
 function ensureFilePathForPublication(
   publicationType: PublicationType,
   filePath?: string | null,
@@ -1299,6 +1399,7 @@ function ensureFilePathForPublication(
   });
 
   const uniqueFiles = dedupedMedia.map((entry) => entry.file);
+  const videoFileCount = uniqueFiles.filter((entry) => isVideoFilePathForManagedPublication(entry)).length;
 
   if (uniqueFiles.length === 0) {
     if (allowsMediaOptional) {
@@ -1309,6 +1410,14 @@ function ensureFilePathForPublication(
 
   if (publicationType === "instagram_reel" && uniqueFiles.length > 1) {
     throw createFilePathValidationError("Instagram Reel aceita apenas uma mídia por agendamento.");
+  }
+
+  if (publicationType === "facebook_post" && uniqueFiles.length > INSTAGRAM_MULTI_MEDIA_MAX_FILES) {
+    throw createFilePathValidationError(`Facebook aceita até ${INSTAGRAM_MULTI_MEDIA_MAX_FILES} imagens por agendamento.`);
+  }
+
+  if (publicationType === "facebook_post" && videoFileCount > 0 && uniqueFiles.length > 1) {
+    throw createFilePathValidationError("Facebook aceita múltiplas imagens no feed ou apenas 1 vídeo por agendamento.");
   }
 
   if ((publicationType === "instagram_post" || publicationType === "instagram_story") && uniqueFiles.length > INSTAGRAM_MULTI_MEDIA_MAX_FILES) {
@@ -1516,6 +1625,7 @@ function ensureMetaPublicationMetadata(
   fileCaptions?: Array<string | null | undefined> | null,
   locationName?: string | null,
   locationId?: string | null,
+  schedulerGroupId?: string | null,
 ): { caption: string | null; locationName: string | null } {
   const normalizedCaption = caption?.trim() || null;
   const normalizedFileCaptions = (Array.isArray(fileCaptions) ? fileCaptions : [])
@@ -1528,7 +1638,11 @@ function ensureMetaPublicationMetadata(
         ? normalizedFileCaptions[0]!
         : normalizedFileCaptions.map((entry, index) => `${index + 1}. ${entry}`).join("\n");
   const effectiveCaption =
-    publicationType !== "instagram_story" && !normalizedCaption ? fallbackCaption : normalizedCaption;
+    publicationType !== "instagram_story" &&
+    publicationType !== "whatsapp_status_midia" &&
+    !normalizedCaption
+      ? fallbackCaption
+      : normalizedCaption;
   const normalizedLocation = locationName?.trim() || null;
   const normalizedLocationId = locationId?.trim() || null;
   const isForcedInstagramLocation =
@@ -1562,10 +1676,16 @@ function ensureMetaPublicationMetadata(
   }
 
   return {
-    caption: publicationType === "instagram_story" ? null : effectiveCaption,
+    caption:
+      publicationType === "instagram_story"
+        ? null
+        : publicationType === "whatsapp_status_midia"
+          ? normalizedCaption
+          : effectiveCaption,
     locationName: encodeMetaLocationStorage(
       effectiveLocationName || (effectiveLocationId ? `Local #${effectiveLocationId}` : null),
       effectiveLocationId,
+      schedulerGroupId,
     ),
   };
 }
@@ -1696,16 +1816,27 @@ function resolvePostForMeCaptionForPublication(job: {
   return POST_FOR_ME_REQUIRED_CAPTION_FALLBACK;
 }
 
-function resolvePostForMePlacementForMetaPublication(publicationType: PublicationType): PostForMePlacement | undefined {
+function resolvePostForMePlacementForMetaPublication(
+  publicationType: PublicationType,
+  encodedFilePath?: string | null,
+): PostForMePlacement | undefined {
   switch (publicationType) {
     case "instagram_reel":
       return "reels";
     case "instagram_story":
       return "stories";
     case "instagram_post":
-    case "facebook_post":
     case "threads_post":
       return "timeline";
+    case "facebook_post": {
+      const mediaBundle = decodeJobMediaBundleStorage(encodedFilePath);
+      const mediaFiles = mediaBundle.files.length > 0
+        ? mediaBundle.files
+        : (encodedFilePath?.trim() ? [encodedFilePath.trim()] : []);
+      return mediaFiles.length === 1 && isVideoFilePathForManagedPublication(mediaFiles[0]!)
+        ? "reels"
+        : "timeline";
+    }
     default:
       return undefined;
   }
@@ -2003,6 +2134,7 @@ function isRootUser(request: Request & { adminUser?: AdminUserAuth }): boolean {
 
 function serializeJobForClient(job: Prisma.JobGetPayload<Record<string, never>>) {
   const locationMetadata = decodeInstagramLocationStorage(job.locationName);
+  const schedulerMetadata = decodeMetaLocationStorage(job.locationName);
   const mediaBundle = decodeJobMediaBundleStorage(job.filePath);
   const hashtags = Array.isArray(job.hashtags)
     ? job.hashtags
@@ -2014,6 +2146,7 @@ function serializeJobForClient(job: Prisma.JobGetPayload<Record<string, never>>)
     id: job.id,
     companyId: job.companyId,
     socialConnectionId: job.socialConnectionId,
+    schedulerGroupId: schedulerMetadata.schedulerGroupId,
     filePath: mediaBundle.files[0] ?? job.filePath,
     filePaths: mediaBundle.files,
     fileCaptions: mediaBundle.captions,
@@ -3141,6 +3274,16 @@ type BillingSettingsSnapshot = {
   rootDisplayPlanId: string | null;
 };
 
+type PostForMeWebhookSettingsSnapshot = {
+  configured: boolean;
+  secretConfigured: boolean;
+  secretSource: "app_setting" | "env" | "none";
+  webhookId: string | null;
+  webhookUrl: string | null;
+  publicEndpointUrl: string | null;
+  eventTypes: string[];
+};
+
 type BillingAccessSnapshot = {
   status: string;
   billingModel: string;
@@ -3202,6 +3345,80 @@ async function upsertBillingSetting(key: string, value: string): Promise<void> {
     update: { value },
     create: { key, value },
   });
+}
+
+function resolvePublicBaseUrlFromRequest(request: Request): string | null {
+  const host = request.get("host")?.trim();
+  if (!host) {
+    return null;
+  }
+
+  const forwardedProto = request.get("x-forwarded-proto")?.split(",")[0]?.trim();
+  const protocol = forwardedProto || request.protocol || "https";
+  return `${protocol}://${host}`.replace(/\/+$/, "");
+}
+
+function resolvePostForMeWebhookEndpointUrl(request: Request): string | null {
+  const requestBaseUrl = resolvePublicBaseUrlFromRequest(request);
+  const requestHost = request.get("host")?.trim().toLowerCase() || "";
+  const looksLocalHost =
+    requestHost.startsWith("localhost") ||
+    requestHost.startsWith("127.0.0.1") ||
+    requestHost.startsWith("0.0.0.0");
+  const baseUrl =
+    POST_FOR_ME_WEBHOOK_PUBLIC_BASE_URL ||
+    (looksLocalHost ? "" : requestBaseUrl || "");
+  if (!baseUrl) {
+    return null;
+  }
+  return `${baseUrl}${POST_FOR_ME_WEBHOOK_PATH}`;
+}
+
+async function resolveStoredPostForMeWebhookSecret(): Promise<string | null> {
+  const setting = await prisma.appSetting.findUnique({
+    where: { key: BILLING_SETTING_POST_FOR_ME_WEBHOOK_SECRET },
+  });
+
+  return trimNullable(setting?.value);
+}
+
+async function resolveEffectivePostForMeWebhookSecret(): Promise<{
+  secret: string | null;
+  source: "app_setting" | "env" | "none";
+}> {
+  const storedSecret = await resolveStoredPostForMeWebhookSecret();
+  if (storedSecret) {
+    return { secret: storedSecret, source: "app_setting" };
+  }
+
+  if (POST_FOR_ME_WEBHOOK_SECRET) {
+    return { secret: POST_FOR_ME_WEBHOOK_SECRET, source: "env" };
+  }
+
+  return { secret: null, source: "none" };
+}
+
+async function getPostForMeWebhookSettingsSnapshot(request: Request): Promise<PostForMeWebhookSettingsSnapshot> {
+  const [webhookIdSetting, webhookUrlSetting, effectiveSecret] = await Promise.all([
+    prisma.appSetting.findUnique({ where: { key: BILLING_SETTING_POST_FOR_ME_WEBHOOK_ID } }),
+    prisma.appSetting.findUnique({ where: { key: BILLING_SETTING_POST_FOR_ME_WEBHOOK_URL } }),
+    resolveEffectivePostForMeWebhookSecret(),
+  ]);
+
+  const webhookId = trimNullable(webhookIdSetting?.value);
+  const webhookUrl = trimNullable(webhookUrlSetting?.value);
+  const publicEndpointUrl = resolvePostForMeWebhookEndpointUrl(request);
+  const secretConfigured = Boolean(effectiveSecret.secret);
+
+  return {
+    configured: Boolean(webhookUrl && secretConfigured),
+    secretConfigured,
+    secretSource: effectiveSecret.source,
+    webhookId,
+    webhookUrl,
+    publicEndpointUrl,
+    eventTypes: [...POST_FOR_ME_ACCOUNT_WEBHOOK_EVENT_TYPES],
+  };
 }
 
 async function backfillLegacyPlanWorkspaceConfig(): Promise<void> {
@@ -3466,7 +3683,7 @@ function computeBillingBlockMessage(
   return `Seu acesso ao plano ${planName} está bloqueado.`;
 }
 
-async function resolveUserBillingAccess(userId: string): Promise<BillingAccessSnapshot> {
+async function resolveUserBillingAccessOnce(userId: string): Promise<BillingAccessSnapshot> {
   const now = new Date();
   const monthBounds = currentMonthBounds(now);
   const [subscription, workspaceMembershipsCount, profilesUsed, workspaceClientUsed, workspaceAgencyBonusUsed, connectionsUsed, postsUsedThisMonth] = await Promise.all([
@@ -3681,6 +3898,13 @@ async function resolveUserBillingAccess(userId: string): Promise<BillingAccessSn
   };
 }
 
+async function resolveUserBillingAccess(userId: string): Promise<BillingAccessSnapshot> {
+  return withPrismaConnectionRetry(() => resolveUserBillingAccessOnce(userId), {
+    maxAttempts: 3,
+    retryDelayMs: 350,
+  });
+}
+
 async function ensureBillingWritableAccess(request: Request & { adminUser?: AdminUserAuth }): Promise<BillingAccessSnapshot | null> {
   if (isRootUser(request)) {
     return null;
@@ -3831,8 +4055,19 @@ function buildPostForMeConnectionExternalId(connectionId: string): string {
   return `socialup:connection:${connectionId}`;
 }
 
-function buildPostForMeConnectionAuthAttemptExternalId(connectionId: string): string {
-  return `${buildPostForMeConnectionExternalId(connectionId)}:${Date.now()}`;
+function resolvePostForMeStoredExternalId(connection: {
+  id: string;
+  providerExternalId?: string | null;
+  providerMetadata?: Prisma.JsonValue | null;
+}): string {
+  const metadata = asRecord(connection.providerMetadata);
+  const metadataExternalId =
+    parseUnknownString(metadata?.external_id) ??
+    parseUnknownString(metadata?.externalId) ??
+    parseUnknownString(metadata?.external_id_hint) ??
+    parseUnknownString(metadata?.externalIdHint);
+  const providerExternalId = parseUnknownString(connection.providerExternalId);
+  return metadataExternalId ?? providerExternalId ?? buildPostForMeConnectionExternalId(connection.id);
 }
 
 function buildPostForMeJobExternalId(jobId: string): string {
@@ -4410,6 +4645,92 @@ function resolvePostForMeConnectionAuthStatus(status: string | null | undefined)
   return "AUTH_REQUIRED";
 }
 
+type PostForMeWebhookAccountRecord = {
+  id: string;
+  externalId: string | null;
+  platform: PostForMePlatform | null;
+  status: string | null;
+  tokenExpiresAt: Date | null;
+  username: string | null;
+  name: string | null;
+  raw: Record<string, unknown>;
+};
+
+function normalizePostForMeWebhookEventType(value: unknown): string | null {
+  return parseUnknownString(value)?.trim().toLowerCase() || null;
+}
+
+function parsePostForMeWebhookAccountRecord(value: unknown): PostForMeWebhookAccountRecord | null {
+  const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+
+  const id = parseUnknownString(record.id);
+  if (!id) {
+    return null;
+  }
+
+  const platformRaw = parseUnknownString(record.platform)?.toLowerCase() || null;
+  const platform =
+    platformRaw === "instagram" ||
+    platformRaw === "facebook" ||
+    platformRaw === "threads" ||
+    platformRaw === "tiktok" ||
+    platformRaw === "x"
+      ? platformRaw
+      : null;
+
+  return {
+    id,
+    externalId: parseUnknownString(record.external_id) || parseUnknownString(record.externalId),
+    platform,
+    status: parseUnknownString(record.status)?.toLowerCase() || null,
+    tokenExpiresAt: parseOptionalDateFromUnknown(
+      parseUnknownString(record.access_token_expires_at) ||
+        parseUnknownString(record.token_expires_at) ||
+        parseUnknownString(record.expires_at),
+    ),
+    username:
+      parseUnknownString(record.username) ||
+      parseUnknownString(record.handle) ||
+      parseUnknownString(record.login_identifier),
+    name: parseUnknownString(record.name) || parseUnknownString(record.display_name),
+    raw: record,
+  };
+}
+
+function resolvePostForMeWebhookAccountPayload(payload: unknown): PostForMeWebhookAccountRecord | null {
+  const record = asRecord(payload);
+  if (!record) {
+    return null;
+  }
+
+  const directAccount = parsePostForMeWebhookAccountRecord(record);
+  if (directAccount) {
+    return directAccount;
+  }
+
+  const nestedCandidates = [
+    record.data,
+    record.account,
+    record.social_account,
+    asRecord(record.data)?.account,
+    asRecord(record.data)?.social_account,
+    asRecord(record.resource)?.account,
+    asRecord(record.resource)?.social_account,
+  ];
+
+  for (const candidate of nestedCandidates) {
+    const parsed = parsePostForMeWebhookAccountRecord(candidate);
+    if (parsed) {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
 function resolvePostForMeAccountDisplayName(
   account: PostForMeSocialAccountRecord,
   fallbackDisplayName: string,
@@ -4431,6 +4752,49 @@ function resolvePostForMeAccountLoginIdentifier(
   }
 
   return normalizedUsername;
+}
+
+function doesPostForMeConnectionNeedRenewal(input: {
+  platform: string;
+  authStatus: string;
+  tokenExpiresAt: Date | null;
+}, now: Date): boolean {
+  if (input.authStatus === "AUTH_REQUIRED") {
+    return true;
+  }
+
+  if (input.platform === "tiktok") {
+    return false;
+  }
+
+  return (
+    (input.tokenExpiresAt instanceof Date && input.tokenExpiresAt.getTime() <= now.getTime())
+  );
+}
+
+function resolvePostForMeConnectionAccountLabel(input: {
+  loginIdentifier: string | null;
+  displayName: string;
+}): string {
+  const normalizedLoginIdentifier = input.loginIdentifier?.trim() || "";
+  if (normalizedLoginIdentifier) {
+    return normalizedLoginIdentifier.startsWith("@")
+      ? normalizedLoginIdentifier
+      : `@${normalizedLoginIdentifier}`;
+  }
+
+  return input.displayName;
+}
+
+function buildPostForMeRenewalAvisoMessage(input: {
+  platform: "instagram" | "facebook" | "threads" | "tiktok" | "x";
+  accountLabel: string;
+  workspaceName: string;
+}): string {
+  return (
+    `${postForMePlatformNoticeLabel(input.platform)} ${input.accountLabel} expirou e precisa de renovação ` +
+    `no workspace ${input.workspaceName}.`
+  );
 }
 
 type ConnectionRuntimeMetadata = {
@@ -4530,6 +4894,7 @@ async function resolveConnectionRuntimeMetadata(connection: {
 async function syncPostForMeConnectionsForBase(input: {
   baseConnectionId: string;
   actorUserId: string;
+  providerAccountIdHint?: string | null;
 }): Promise<{
   primaryConnection: Prisma.SocialConnectionGetPayload<Record<string, never>>;
   importedConnections: Prisma.SocialConnectionGetPayload<Record<string, never>>[];
@@ -4547,7 +4912,7 @@ async function syncPostForMeConnectionsForBase(input: {
     throw new Error("POST_FOR_ME_CONNECTION_PROVIDER_INVALID");
   }
 
-  const externalId = baseConnection.providerExternalId || buildPostForMeConnectionExternalId(baseConnection.id);
+  const externalId = resolvePostForMeStoredExternalId(baseConnection);
   if (externalId !== baseConnection.providerExternalId) {
     await prisma.socialConnection.update({
       where: { id: baseConnection.id },
@@ -4557,10 +4922,32 @@ async function syncPostForMeConnectionsForBase(input: {
     });
   }
 
-  const remoteAccounts = await listPostForMeSocialAccounts({
+  const remoteAccountsByExternalId = await listPostForMeSocialAccounts({
     platform: baseConnection.platform,
     externalId,
   });
+  const normalizedProviderAccountIdHint = input.providerAccountIdHint?.trim() || "";
+  let remoteAccounts = remoteAccountsByExternalId;
+
+  if (
+    normalizedProviderAccountIdHint &&
+    !remoteAccounts.some((account) => account.id === normalizedProviderAccountIdHint)
+  ) {
+    const remoteAccountsByPlatform = await listPostForMeSocialAccounts({
+      platform: baseConnection.platform,
+    });
+    const hintedRemoteAccount = remoteAccountsByPlatform.find(
+      (account) => account.id === normalizedProviderAccountIdHint,
+    );
+
+    if (hintedRemoteAccount) {
+      const mergedRemoteAccounts = [
+        hintedRemoteAccount,
+        ...remoteAccounts.filter((account) => account.id !== hintedRemoteAccount.id),
+      ];
+      remoteAccounts = mergedRemoteAccounts;
+    }
+  }
 
   if (remoteAccounts.length === 0) {
     const refreshedBaseConnection = await prisma.socialConnection.update({
@@ -4583,46 +4970,21 @@ async function syncPostForMeConnectionsForBase(input: {
   const orderedRemoteAccounts = [...remoteAccounts].sort(
     (left, right) => resolvePostForMeAccountSyncTimestamp(right) - resolvePostForMeAccountSyncTimestamp(left),
   );
+  const hintedPrimaryRemoteAccount = normalizedProviderAccountIdHint
+    ? orderedRemoteAccounts.find((account) => account.id === normalizedProviderAccountIdHint) ?? null
+    : null;
   const replacementCandidates =
     baseConnection.providerAccountId?.trim()
       ? orderedRemoteAccounts.filter((account) => account.id !== baseConnection.providerAccountId)
       : orderedRemoteAccounts;
-  const primaryRemoteAccount = replacementCandidates[0] ?? orderedRemoteAccounts[0] ?? null;
+  const primaryRemoteAccount =
+    hintedPrimaryRemoteAccount ??
+    replacementCandidates[0] ??
+    orderedRemoteAccounts[0] ??
+    null;
 
   if (!primaryRemoteAccount) {
     throw new Error("POST_FOR_ME_REMOTE_ACCOUNT_SELECTION_FAILED");
-  }
-
-  const conflictingConnection = await prisma.socialConnection.findFirst({
-    where: {
-      provider: "POST_FOR_ME",
-      providerAccountId: primaryRemoteAccount.id,
-      id: { not: baseConnection.id },
-    },
-    select: {
-      id: true,
-      companyId: true,
-    },
-  });
-
-  if (conflictingConnection) {
-    const resetConnection = await prisma.socialConnection.update({
-      where: { id: baseConnection.id },
-      data: {
-        authStatus: "AUTH_REQUIRED",
-        authLaunchUrl: defaultAuthLaunchUrlForPlatform(baseConnection.platform),
-        tokenExpiresAt: null,
-        lastAuthAt: null,
-        lastSeenAt: null,
-        providerAccountId: null,
-        providerExternalId: externalId,
-        providerStatus: "awaiting_remote_connection",
-        providerMetadata: Prisma.DbNull,
-        secretCipher: null,
-      },
-    });
-    notifyLiveUpdateForWorkspace(resetConnection.companyId, ["connections", "dashboard"]);
-    throw new Error("POST_FOR_ME_ACCOUNT_ALREADY_CONNECTED_TO_ANOTHER_PROFILE");
   }
 
   const providerMetadata = primaryRemoteAccount.raw as Prisma.InputJsonValue;
@@ -4637,7 +4999,7 @@ async function syncPostForMeConnectionsForBase(input: {
     lastSeenAt: new Date(),
     provider: "POST_FOR_ME",
     providerAccountId: primaryRemoteAccount.id,
-    providerExternalId: externalId,
+    providerExternalId: primaryRemoteAccount.externalId || externalId,
     providerStatus: primaryRemoteAccount.status,
     providerMetadata,
     secretCipher: null,
@@ -4675,6 +5037,32 @@ async function syncPostForMeConnectionsForBase(input: {
     importedConnections: [],
     remoteCount: remoteAccounts.length,
   };
+}
+
+async function shouldDisconnectPostForMeSocialAccountRemotely(input: {
+  providerAccountId: string;
+  excludeConnectionIds?: string[];
+}): Promise<boolean> {
+  const providerAccountId = input.providerAccountId.trim();
+  if (!providerAccountId) {
+    return false;
+  }
+
+  const otherConnectionsCount = await prisma.socialConnection.count({
+    where: {
+      provider: "POST_FOR_ME",
+      providerAccountId,
+      ...(input.excludeConnectionIds?.length
+        ? {
+            id: {
+              notIn: input.excludeConnectionIds,
+            },
+          }
+        : {}),
+    },
+  });
+
+  return otherConnectionsCount === 0;
 }
 
 async function syncConnectionRuntimeState(connection: {
@@ -4767,6 +5155,238 @@ async function syncConnectionRuntimeState(connection: {
   notifyLiveUpdateForWorkspace(updatedConnection.companyId, ["connections", "dashboard"]);
 
   return updatedConnection;
+}
+
+async function handlePostForMeAccountWebhook(payload: unknown): Promise<{
+  processed: boolean;
+  connectionId?: string;
+  companyId?: string;
+}> {
+  const eventRecord = asRecord(payload);
+  const eventType = normalizePostForMeWebhookEventType(
+    eventRecord?.event_type || eventRecord?.eventType || eventRecord?.type,
+  );
+  if (eventType !== "social.account.updated" && eventType !== "social.account.created") {
+    return { processed: false };
+  }
+
+  const account = resolvePostForMeWebhookAccountPayload(payload);
+  if (!account || !account.platform) {
+    return { processed: false };
+  }
+
+  const connections = await prisma.socialConnection.findMany({
+    where: {
+      provider: "POST_FOR_ME",
+      platform: account.platform,
+      OR: [
+        { providerAccountId: account.id },
+        ...(account.externalId ? [{ providerExternalId: account.externalId }] : []),
+      ],
+    },
+    select: {
+      id: true,
+      companyId: true,
+      platform: true,
+      displayName: true,
+      loginIdentifier: true,
+      authStatus: true,
+      tokenExpiresAt: true,
+      providerStatus: true,
+      company: {
+        select: {
+          name: true,
+        },
+      },
+    },
+  });
+
+  if (connections.length === 0) {
+    return { processed: false };
+  }
+
+  const nextAuthStatus = resolvePostForMeConnectionAuthStatus(account.status);
+  const now = new Date();
+  const nextTokenExpiresAt = account.tokenExpiresAt;
+  let firstProcessedConnectionId: string | undefined;
+  let firstProcessedCompanyId: string | undefined;
+  const notifiedWorkspaceIds = new Set<string>();
+
+  for (const connection of connections) {
+    const nextRenewalRequired = doesPostForMeConnectionNeedRenewal(
+      { platform: connection.platform, authStatus: nextAuthStatus, tokenExpiresAt: nextTokenExpiresAt },
+      now,
+    );
+    const previousRenewalRequired = doesPostForMeConnectionNeedRenewal(
+      { platform: connection.platform, authStatus: connection.authStatus, tokenExpiresAt: connection.tokenExpiresAt },
+      now,
+    );
+
+    const normalizedLoginIdentifier =
+      resolvePostForMeAccountLoginIdentifier(account.platform, {
+        id: account.id,
+        platform: account.platform,
+        name: account.name,
+        username: account.username,
+        status: account.status,
+        externalId: account.externalId,
+        tokenExpiresAt: account.tokenExpiresAt?.toISOString() ?? null,
+        raw: account.raw,
+      }) ?? connection.loginIdentifier;
+    const accountLabel = resolvePostForMeConnectionAccountLabel({
+      loginIdentifier: normalizedLoginIdentifier,
+      displayName: connection.displayName,
+    });
+
+    await prisma.socialConnection.update({
+      where: { id: connection.id },
+      data: {
+        loginIdentifier: normalizedLoginIdentifier,
+        authStatus: nextAuthStatus,
+        authLaunchUrl: nextRenewalRequired ? defaultAuthLaunchUrlForPlatform(connection.platform) : null,
+        tokenExpiresAt: nextTokenExpiresAt,
+        lastSeenAt: nextRenewalRequired ? null : now,
+        lastAuthAt:
+          nextAuthStatus === "CONNECTED" && connection.authStatus !== "CONNECTED"
+            ? now
+            : undefined,
+        providerAccountId: account.id,
+        providerExternalId: account.externalId ?? undefined,
+        providerStatus: account.status,
+        providerMetadata: account.raw as Prisma.InputJsonValue,
+      },
+    });
+
+    await appendLog({
+      companyId: connection.companyId,
+      level: nextRenewalRequired ? "WARN" : "INFO",
+      errorCode: "POST_FOR_ME_ACCOUNT_WEBHOOK_SYNC",
+      message:
+        `Conta ${connection.displayName} (${postForMePlatformNoticeLabel(account.platform)}) ` +
+        `atualizada via webhook do Post for Me: ${connection.authStatus} -> ${nextAuthStatus}.`,
+    });
+
+    if (!previousRenewalRequired && nextRenewalRequired) {
+      await appendWorkspaceAvisoSafely({
+        companyId: connection.companyId,
+        kind: "SYSTEM",
+        title: "Conta precisa de renovação",
+        message: buildPostForMeRenewalAvisoMessage({
+          platform: account.platform,
+          accountLabel,
+          workspaceName: connection.company.name,
+        }),
+        dedupeWindowMs: POST_FOR_ME_RENEWAL_AVISO_DEDUPE_WINDOW_MS,
+      });
+    }
+
+    if (!notifiedWorkspaceIds.has(connection.companyId)) {
+      notifyLiveUpdateForWorkspace(connection.companyId, ["connections", "dashboard", "avisos"]);
+      notifiedWorkspaceIds.add(connection.companyId);
+    }
+
+    if (!firstProcessedConnectionId) {
+      firstProcessedConnectionId = connection.id;
+      firstProcessedCompanyId = connection.companyId;
+    }
+  }
+
+  return {
+    processed: true,
+    connectionId: firstProcessedConnectionId,
+    companyId: firstProcessedCompanyId,
+  };
+}
+
+async function backfillPostForMeRenewalAvisos(): Promise<{
+  connectionsNeedingRenewal: number;
+  avisosCreated: number;
+  connectionsUpdated: number;
+}> {
+  const now = new Date();
+  const connections = await prisma.socialConnection.findMany({
+    where: {
+      provider: "POST_FOR_ME",
+      OR: [
+        { authStatus: "AUTH_REQUIRED" },
+        { tokenExpiresAt: { lte: now } },
+      ],
+    },
+    select: {
+      id: true,
+      companyId: true,
+      platform: true,
+      displayName: true,
+      loginIdentifier: true,
+      authStatus: true,
+      tokenExpiresAt: true,
+      authLaunchUrl: true,
+      company: {
+        select: {
+          name: true,
+        },
+      },
+    },
+  });
+
+  let connectionsNeedingRenewal = 0;
+  let avisosCreated = 0;
+  let connectionsUpdated = 0;
+
+  for (const connection of connections) {
+    if (!isPostForMeManagedPlatform(connection.platform)) {
+      continue;
+    }
+
+    if (!doesPostForMeConnectionNeedRenewal(connection, now)) {
+      continue;
+    }
+
+    connectionsNeedingRenewal += 1;
+
+    let updatedThisConnection = false;
+    if (!connection.authLaunchUrl) {
+      const defaultLaunchUrl = defaultAuthLaunchUrlForPlatform(connection.platform);
+      if (defaultLaunchUrl) {
+        await prisma.socialConnection.update({
+          where: { id: connection.id },
+          data: {
+            authLaunchUrl: defaultLaunchUrl,
+          },
+        });
+        connectionsUpdated += 1;
+        updatedThisConnection = true;
+      }
+    }
+
+    const accountLabel = resolvePostForMeConnectionAccountLabel({
+      loginIdentifier: connection.loginIdentifier,
+      displayName: connection.displayName,
+    });
+
+    const appended = await appendWorkspaceAvisoSafely({
+      companyId: connection.companyId,
+      kind: "SYSTEM",
+      title: "Conta precisa de renovação",
+      message: buildPostForMeRenewalAvisoMessage({
+        platform: connection.platform,
+        accountLabel,
+        workspaceName: connection.company.name,
+      }),
+      dedupeWindowMs: POST_FOR_ME_RENEWAL_AVISO_DEDUPE_WINDOW_MS,
+    });
+    avisosCreated += appended.createdCount;
+
+    if (updatedThisConnection || appended.createdCount > 0) {
+      notifyLiveUpdateForWorkspace(connection.companyId, ["connections", "dashboard", "avisos"]);
+    }
+  }
+
+  return {
+    connectionsNeedingRenewal,
+    avisosCreated,
+    connectionsUpdated,
+  };
 }
 
 async function waitForWhatsappRuntimeConnected(input: {
@@ -5047,6 +5667,61 @@ async function appendAviso(input: {
     },
   });
   notifyLiveUpdateForUser(input.userId, ["avisos"]);
+}
+
+async function appendWorkspaceAvisoSafely(input: {
+  companyId: string;
+  title: string;
+  message: string;
+  kind?: string;
+  dedupeWindowMs?: number;
+}): Promise<{ createdCount: number }> {
+  try {
+    const userIds = await resolveLiveUpdateRecipientUserIdsForWorkspace(input.companyId);
+    const normalizedUserIds = [...new Set(userIds.map((entry) => entry.trim()).filter(Boolean))];
+    if (normalizedUserIds.length === 0) {
+      return { createdCount: 0 };
+    }
+
+    let targetUserIds = normalizedUserIds;
+    if ((input.dedupeWindowMs ?? 0) > 0) {
+      const existingAvisos = await prisma.aviso.findMany({
+        where: {
+          userId: { in: normalizedUserIds },
+          title: input.title,
+          message: input.message,
+          createdAt: {
+            gte: new Date(Date.now() - (input.dedupeWindowMs ?? 0)),
+          },
+        },
+        select: {
+          userId: true,
+        },
+      });
+      const existingUserIds = new Set(existingAvisos.map((entry) => entry.userId));
+      targetUserIds = normalizedUserIds.filter((userId) => !existingUserIds.has(userId));
+    }
+
+    if (targetUserIds.length === 0) {
+      return { createdCount: 0 };
+    }
+
+    await prisma.aviso.createMany({
+      data: targetUserIds.map((userId) => ({
+        userId,
+        title: input.title,
+        message: input.message,
+        kind: input.kind ?? "SYSTEM",
+        createdByUserId: null,
+      })),
+    });
+
+    notifyLiveUpdateForUsers(targetUserIds, ["avisos"], input.companyId);
+    return { createdCount: targetUserIds.length };
+  } catch (error) {
+    console.error("Failed to append workspace aviso", error);
+    return { createdCount: 0 };
+  }
 }
 
 async function appendBillingAvisoSafely(input: {
@@ -7532,7 +8207,7 @@ async function executePostForMeManagedMetaRunningJob(job: {
     socialAccountIds: [socialAccountId],
     mediaUrls,
     platform: connection.platform,
-    placement: resolvePostForMePlacementForMetaPublication(publicationType),
+    placement: resolvePostForMePlacementForMetaPublication(publicationType, job.filePath),
     locationId: locationMetadata.locationId,
     externalId: buildPostForMeJobExternalId(job.id),
   });
@@ -10329,6 +11004,36 @@ app.post(STRIPE_WEBHOOK_PATH, async (request, response) => {
   }
 });
 
+app.post(POST_FOR_ME_WEBHOOK_PATH, async (request, response) => {
+  const { secret: configuredSecret } = await resolveEffectivePostForMeWebhookSecret();
+  if (!configuredSecret) {
+    response.status(503).json({
+      error: "Webhook do Post for Me indisponível. Configure o secret no SocialUp ou em POST_FOR_ME_WEBHOOK_SECRET.",
+    });
+    return;
+  }
+
+  const secretHeader = request.headers["post-for-me-webhook-secret"];
+  const providedSecret = Array.isArray(secretHeader) ? secretHeader[0]?.trim() : `${secretHeader || ""}`.trim();
+  if (!providedSecret) {
+    response.status(400).json({ error: "Cabeçalho Post-For-Me-Webhook-Secret ausente." });
+    return;
+  }
+
+  if (providedSecret !== configuredSecret) {
+    response.status(401).json({ error: "Webhook do Post for Me com secret inválido." });
+    return;
+  }
+
+  try {
+    await handlePostForMeAccountWebhook(request.body);
+    response.json({ received: true });
+  } catch (error) {
+    console.error("Post for Me webhook processing failed", error);
+    response.status(500).json({ error: "Falha ao processar webhook do Post for Me." });
+  }
+});
+
 app.use(
   ["/companies", "/connections", "/upload", "/jobs", "/dashboard", "/logs", "/avisos", "/billing", "/bee-up"],
   adminAuthMiddleware,
@@ -10650,7 +11355,7 @@ app.post("/connections/:id/open-visual-auth", async (request, response) => {
   }
 
   if (isPostForMeProviderConnection(connection)) {
-    const connectionExternalId = buildPostForMeConnectionAuthAttemptExternalId(connection.id);
+    const connectionExternalId = resolvePostForMeStoredExternalId(connection);
     let launchUrl: string;
     try {
       launchUrl = await createPostForMeSocialAccountAuthUrl({
@@ -10794,6 +11499,7 @@ app.post("/connections/:id/open-visual-auth", async (request, response) => {
 
 app.post("/connections/:id/sync-provider", async (request, response) => {
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  const payload = syncProviderConnectionSchema.parse(request.body ?? {});
   const connection = await findConnectionWithWorkspaceContext(request.params.id);
 
   if (!connection) {
@@ -10824,6 +11530,7 @@ app.post("/connections/:id/sync-provider", async (request, response) => {
     const syncResult = await syncPostForMeConnectionsForBase({
       baseConnectionId: connection.id,
       actorUserId: authRequest.adminUser!.id,
+      providerAccountIdHint: payload.providerAccountIdHint ?? null,
     });
 
     response.json({
@@ -10833,13 +11540,6 @@ app.post("/connections/:id/sync-provider", async (request, response) => {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "POST_FOR_ME_SYNC_FAILED";
-    if (message === "POST_FOR_ME_ACCOUNT_ALREADY_CONNECTED_TO_ANOTHER_PROFILE") {
-      response.status(409).json({
-        error: "Esta conta já está conectada em outro workspace.",
-      });
-      return;
-    }
-
     response.status(400).json({
       error: message.startsWith("POST_FOR_ME_CONFIG_MISSING:")
         ? `Provedor externo não configurado no backend: ${message.replace("POST_FOR_ME_CONFIG_MISSING:", "")}.`
@@ -11016,14 +11716,18 @@ app.post("/connections/:id/cancel-auth", async (request, response) => {
     return;
   }
 
+  const shouldPreservePostForMeLinkedAccount =
+    isPostForMeProviderConnection(connection) && Boolean(connection.providerAccountId?.trim());
+
   const updatedConnection = await prisma.socialConnection.update({
     where: { id: request.params.id },
     data: {
-      authStatus: "AUTH_REQUIRED",
+      authStatus: shouldPreservePostForMeLinkedAccount ? "CONNECTED" : "AUTH_REQUIRED",
       authLaunchUrl: null,
-      lastSeenAt: null,
-      providerStatus:
-        isPostForMeManagedPlatform(connection.platform) && connection.providerStatus === "auth_in_progress"
+      lastSeenAt: shouldPreservePostForMeLinkedAccount ? connection.lastSeenAt : null,
+      providerStatus: shouldPreservePostForMeLinkedAccount
+        ? "connected"
+        : isPostForMeManagedPlatform(connection.platform) && connection.providerStatus === "auth_in_progress"
           ? "disconnected"
           : connection.providerStatus,
     },
@@ -11052,7 +11756,14 @@ app.post("/connections/:id/disconnect", async (request, response) => {
     return;
   }
 
-  if (isPostForMeProviderConnection(connection) && connection.providerAccountId) {
+  if (
+    isPostForMeProviderConnection(connection) &&
+    connection.providerAccountId &&
+    (await shouldDisconnectPostForMeSocialAccountRemotely({
+      providerAccountId: connection.providerAccountId,
+      excludeConnectionIds: [connection.id],
+    }))
+  ) {
     try {
       await disconnectPostForMeSocialAccount(connection.providerAccountId);
     } catch (error) {
@@ -11151,7 +11862,15 @@ app.delete("/connections/:id", async (request, response) => {
     }
   }
 
-  if (canConnectAccounts && isPostForMeProviderConnection(connection) && connection.providerAccountId) {
+  if (
+    canConnectAccounts &&
+    isPostForMeProviderConnection(connection) &&
+    connection.providerAccountId &&
+    (await shouldDisconnectPostForMeSocialAccountRemotely({
+      providerAccountId: connection.providerAccountId,
+      excludeConnectionIds: [connection.id],
+    }))
+  ) {
     try {
       await disconnectPostForMeSocialAccount(connection.providerAccountId);
     } catch (error) {
@@ -11504,7 +12223,14 @@ app.delete("/companies/:id", async (request, response) => {
       await disconnectWhatsappConnectionSession(connection.id).catch(() => undefined);
     }
 
-    if (isPostForMeProviderConnection(connection) && connection.providerAccountId) {
+    if (
+      isPostForMeProviderConnection(connection) &&
+      connection.providerAccountId &&
+      (await shouldDisconnectPostForMeSocialAccountRemotely({
+        providerAccountId: connection.providerAccountId,
+        excludeConnectionIds: relatedConnections.map((item) => item.id),
+      }))
+    ) {
       await disconnectPostForMeSocialAccount(connection.providerAccountId);
     }
   }
@@ -11897,6 +12623,7 @@ app.post("/jobs", async (request, response) => {
     payload.fileCaptions,
     resolvedLocation.locationName,
     resolvedLocation.locationId,
+    payload.schedulerGroupId,
   );
   const firstComment = normalizeFirstComment(payload.publicationType, payload.firstComment);
   const relinkOptions = await resolveWhatsappRelinkOptions({
@@ -11973,6 +12700,24 @@ app.put("/jobs/:id", async (request, response) => {
     request: authRequest,
     ...payload,
   });
+  const existingJob = await findJobWithWorkspaceContext(request.params.id);
+
+  if (!existingJob) {
+    response.status(404).json({ error: "Job nao encontrado." });
+    return;
+  }
+
+  const workspace = existingJob.company as WorkspacePermissionContext;
+  if (!canCurrentUserAccessWorkspace(authRequest, workspace)) {
+    response.status(403).json({ error: "Voce nao pode editar esta postagem." });
+    return;
+  }
+
+  if (workspace.status !== "ACTIVE") {
+    response.status(409).json({ error: "Este workspace está inativo e não aceita edições." });
+    return;
+  }
+
   const legacyFields = deriveLegacyJobFields(payload.publicationType);
   const filePath = ensureFilePathForPublication(
     payload.publicationType,
@@ -11994,26 +12739,10 @@ app.put("/jobs/:id", async (request, response) => {
     payload.fileCaptions,
     resolvedLocation.locationName,
     resolvedLocation.locationId,
+    payload.schedulerGroupId ?? decodeMetaLocationStorage(existingJob.locationName).schedulerGroupId,
   );
   const firstComment = normalizeFirstComment(payload.publicationType, payload.firstComment);
   const normalizedTitle = normalizeJobTitle(payload.title);
-  const existingJob = await findJobWithWorkspaceContext(request.params.id);
-
-  if (!existingJob) {
-    response.status(404).json({ error: "Job nao encontrado." });
-    return;
-  }
-
-  const workspace = existingJob.company as WorkspacePermissionContext;
-  if (!canCurrentUserAccessWorkspace(authRequest, workspace)) {
-    response.status(403).json({ error: "Voce nao pode editar esta postagem." });
-    return;
-  }
-
-  if (workspace.status !== "ACTIVE") {
-    response.status(409).json({ error: "Este workspace está inativo e não aceita edições." });
-    return;
-  }
 
   const existingRelinkConnectionIds = parseStoredWhatsappRelinkConnectionIds(existingJob.whatsappRelinkConnectionIds);
   const relinkOptions = await resolveWhatsappRelinkOptions({
@@ -12596,6 +13325,27 @@ app.get("/billing/me", async (request, response) => {
 
   if (isRootUser(authRequest)) {
     const bestPlan = await getRootDisplayPlanForDisplay();
+    const rootUsage = await withPrismaConnectionRetry(
+      async () => ({
+        profilesUsed: await prisma.company.count(),
+        workspaceClientUsed: await prisma.company.count({ where: { kind: "CLIENT" } }),
+        workspaceAgencyBonusUsed: await prisma.company.count({ where: { kind: "AGENCY_BONUS" } }),
+        connectionsUsed: await prisma.socialConnection.count(),
+        postsUsedThisMonth: await prisma.job.count({
+          where: {
+            publicationState: "PUBLISHED",
+            criadoEm: {
+              gte: monthBounds.start,
+              lt: monthBounds.end,
+            },
+          },
+        }),
+      }),
+      {
+        maxAttempts: 3,
+        retryDelayMs: 350,
+      },
+    );
     response.json({
       status: "ACTIVE",
       billingModel: "MANUAL",
@@ -12616,21 +13366,7 @@ app.get("/billing/me", async (request, response) => {
         maxConnections: bestPlan?.maxConnections ?? 999999,
         maxMonthlyPublications: bestPlan?.maxMonthlyPublications ?? 999999999,
       },
-      usage: {
-        profilesUsed: await prisma.company.count(),
-        workspaceClientUsed: await prisma.company.count({ where: { kind: "CLIENT" } }),
-        workspaceAgencyBonusUsed: await prisma.company.count({ where: { kind: "AGENCY_BONUS" } }),
-        connectionsUsed: await prisma.socialConnection.count(),
-        postsUsedThisMonth: await prisma.job.count({
-          where: {
-            publicationState: "PUBLISHED",
-            criadoEm: {
-              gte: monthBounds.start,
-              lt: monthBounds.end,
-            },
-          },
-        }),
-      },
+      usage: rootUsage,
       canCancelStripeSubscription: false,
       stripeCancelAtPeriodEnd: false,
       stripePixAvailable,
@@ -13441,6 +14177,88 @@ app.put("/billing/settings", async (request, response) => {
   });
 });
 
+app.get("/billing/post-for-me-webhook", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  if (!isRootUser(authRequest)) {
+    response.status(403).json({ error: "Apenas root pode visualizar a configuração do webhook da Post for Me." });
+    return;
+  }
+
+  const settings = await getPostForMeWebhookSettingsSnapshot(request);
+  response.json(settings);
+});
+
+app.post("/billing/post-for-me-webhook/register", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  if (!isRootUser(authRequest)) {
+    response.status(403).json({ error: "Apenas root pode configurar o webhook da Post for Me." });
+    return;
+  }
+
+  const payload = registerPostForMeWebhookSchema.parse(request.body ?? {});
+  const currentSettings = await getPostForMeWebhookSettingsSnapshot(request);
+
+  if (currentSettings.configured && !payload.force) {
+    response.json({
+      ...currentSettings,
+      reused: true,
+    });
+    return;
+  }
+
+  const publicEndpointUrl = currentSettings.publicEndpointUrl;
+  if (!publicEndpointUrl) {
+    response.status(400).json({
+      error: "Não foi possível resolver a URL pública do backend para registrar o webhook da Post for Me.",
+    });
+    return;
+  }
+
+  try {
+    const webhook = await createPostForMeWebhook({
+      url: publicEndpointUrl,
+      eventTypes: [...POST_FOR_ME_ACCOUNT_WEBHOOK_EVENT_TYPES],
+    });
+
+    if (!webhook.secret) {
+      response.status(502).json({
+        error: "A Post for Me não devolveu o secret do webhook. Não foi possível concluir o cadastro automático.",
+      });
+      return;
+    }
+
+    await Promise.all([
+      upsertBillingSetting(BILLING_SETTING_POST_FOR_ME_WEBHOOK_ID, webhook.id ?? ""),
+      upsertBillingSetting(BILLING_SETTING_POST_FOR_ME_WEBHOOK_URL, webhook.url ?? publicEndpointUrl),
+      upsertBillingSetting(BILLING_SETTING_POST_FOR_ME_WEBHOOK_SECRET, webhook.secret),
+    ]);
+
+    const nextSettings = await getPostForMeWebhookSettingsSnapshot(request);
+    response.status(201).json({
+      ...nextSettings,
+      reused: false,
+    });
+  } catch (error) {
+    response.status(502).json({
+      error:
+        error instanceof Error && error.message
+          ? `Falha ao registrar webhook na Post for Me: ${error.message}`
+          : "Falha ao registrar webhook na Post for Me.",
+    });
+  }
+});
+
+app.post("/billing/post-for-me-webhook/backfill-renewal-avisos", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  if (!isRootUser(authRequest)) {
+    response.status(403).json({ error: "Apenas root pode executar o backfill de avisos da Post for Me." });
+    return;
+  }
+
+  const result = await backfillPostForMeRenewalAvisos();
+  response.json(result);
+});
+
 app.get("/billing/user-discounts", async (request, response) => {
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
   if (!isRootUser(authRequest)) {
@@ -13796,6 +14614,68 @@ app.post("/avisos/mark-all-read", async (request, response) => {
   });
 
   response.json({ updated: result.count });
+});
+
+app.post("/avisos/:id/mark-read", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  const aviso = await prisma.aviso.findFirst({
+    where: {
+      id: request.params.id,
+      userId: authRequest.adminUser!.id,
+    },
+    select: {
+      id: true,
+      userId: true,
+      readAt: true,
+    },
+  });
+
+  if (!aviso) {
+    response.status(404).json({ error: "Aviso não encontrado." });
+    return;
+  }
+
+  if (!aviso.readAt) {
+    await prisma.aviso.update({
+      where: {
+        id: aviso.id,
+      },
+      data: {
+        readAt: new Date(),
+      },
+    });
+    notifyLiveUpdateForUser(aviso.userId, ["avisos"]);
+  }
+
+  response.json({ updated: 1 });
+});
+
+app.delete("/avisos/:id", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  const aviso = await prisma.aviso.findFirst({
+    where: {
+      id: request.params.id,
+      userId: authRequest.adminUser!.id,
+    },
+    select: {
+      id: true,
+      userId: true,
+    },
+  });
+
+  if (!aviso) {
+    response.status(404).json({ error: "Aviso não encontrado." });
+    return;
+  }
+
+  await prisma.aviso.delete({
+    where: {
+      id: aviso.id,
+    },
+  });
+
+  notifyLiveUpdateForUser(aviso.userId, ["avisos"]);
+  response.status(204).send();
 });
 
 app.get("/avisos", async (request, response) => {

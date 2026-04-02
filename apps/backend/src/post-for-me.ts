@@ -55,6 +55,14 @@ type PostForMeSocialAccountFeedRecord = {
   raw: Record<string, unknown>;
 };
 
+type PostForMeWebhookRecord = {
+  id: string | null;
+  url: string | null;
+  secret: string | null;
+  eventTypes: string[];
+  raw: Record<string, unknown>;
+};
+
 const POST_FOR_ME_API_KEY = (process.env.POST_FOR_ME_API_KEY || "").trim();
 const POST_FOR_ME_API_BASE_URL = (process.env.POST_FOR_ME_API_BASE_URL || "https://api.postforme.dev/v1")
   .trim()
@@ -111,6 +119,16 @@ function parseBoolean(value: unknown): boolean | null {
   }
 
   return null;
+}
+
+function parseStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry) => parseString(entry))
+    .filter((entry): entry is string => Boolean(entry));
 }
 
 function normalizeErrorDetail(payload: unknown): string {
@@ -327,6 +345,56 @@ function parsePostForMeAuthUrl(payload: unknown): string | null {
     parseString(record.authUrl) ||
     parseString(record.redirect_url)
   );
+}
+
+function parsePostForMeWebhookRecord(value: unknown): PostForMeWebhookRecord | null {
+  const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+
+  const nestedCandidates = [
+    record,
+    asRecord(record.data),
+    asRecord(record.webhook),
+    asRecord(asRecord(record.resource)?.webhook),
+  ].filter((candidate): candidate is Record<string, unknown> => Boolean(candidate));
+
+  for (const candidate of nestedCandidates) {
+    const id = parseString(candidate.id);
+    const url =
+      parseString(candidate.url) ||
+      parseString(candidate.callback_url) ||
+      parseString(candidate.callbackUrl) ||
+      parseString(candidate.target_url) ||
+      parseString(candidate.targetUrl);
+    const secret =
+      parseString(candidate.secret) ||
+      parseString(candidate.signing_secret) ||
+      parseString(candidate.signingSecret) ||
+      parseString(candidate.webhook_secret) ||
+      parseString(candidate.webhookSecret);
+    const eventTypesFromSnake = parseStringArray(candidate.event_types);
+    const eventTypesFromCamel = parseStringArray(candidate.eventTypes);
+    const eventTypes =
+      eventTypesFromSnake.length > 0
+        ? eventTypesFromSnake
+        : eventTypesFromCamel.length > 0
+          ? eventTypesFromCamel
+          : parseStringArray(candidate.events);
+
+    if (id || url || secret || eventTypes.length > 0) {
+      return {
+        id,
+        url,
+        secret,
+        eventTypes,
+        raw: candidate,
+      };
+    }
+  }
+
+  return null;
 }
 
 function parsePostForMeSocialPostList(payload: unknown): PostForMeSocialPostRecord[] {
@@ -702,4 +770,24 @@ export async function createPostForMeSocialPost(input: {
   }
 
   return post;
+}
+
+export async function createPostForMeWebhook(input: {
+  url: string;
+  eventTypes: string[];
+}): Promise<PostForMeWebhookRecord> {
+  const payload = await postForMeRequest<unknown>("/webhooks", {
+    method: "POST",
+    jsonBody: {
+      url: parseString(input.url) ?? undefined,
+      event_types: input.eventTypes.map((eventType) => parseString(eventType)).filter((eventType): eventType is string => Boolean(eventType)),
+    },
+  });
+
+  const webhook = parsePostForMeWebhookRecord(payload);
+  if (!webhook) {
+    throw new Error("POST_FOR_ME_WEBHOOK_MISSING");
+  }
+
+  return webhook;
 }
