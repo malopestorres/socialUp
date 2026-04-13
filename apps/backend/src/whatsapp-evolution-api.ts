@@ -1152,6 +1152,59 @@ async function hasPersistedStatusMessage(
   return total > 0 || records > 0;
 }
 
+async function getPersistedStatusMessageCount(credentials: EvolutionCredentials): Promise<number> {
+  const payload = await evolutionRequest<EvolutionFindMessagesResponse>(
+    credentials,
+    `/chat/findMessages/${encodeURIComponent(credentials.instanceName)}`,
+    {
+      method: "POST",
+      jsonBody: {
+        where: {
+          key: {
+            remoteJid: "status@broadcast",
+            fromMe: true,
+          },
+        },
+        offset: 1,
+        page: 1,
+      },
+    },
+  );
+
+  const total = payload?.messages?.total;
+  if (typeof total === "number" && Number.isFinite(total)) {
+    return total;
+  }
+
+  return Array.isArray(payload?.messages?.records) ? payload.messages.records.length : 0;
+}
+
+function isWhatsappAbortError(error: unknown): boolean {
+  return error instanceof Error && error.message.trim().toLowerCase() === "this operation was aborted";
+}
+
+async function waitStatusCountIncrease(
+  credentials: EvolutionCredentials,
+  baselineCount: number,
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= EVOLUTION_STATUS_CONFIRMATION_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const currentCount = await getPersistedStatusMessageCount(credentials);
+      if (currentCount > baselineCount) {
+        return true;
+      }
+    } catch {
+      // Ignora falhas transitórias e tenta novamente.
+    }
+
+    if (attempt < EVOLUTION_STATUS_CONFIRMATION_MAX_ATTEMPTS) {
+      await delay(EVOLUTION_STATUS_CONFIRMATION_DELAY_MS);
+    }
+  }
+
+  return false;
+}
+
 async function waitStatusPersistenceConfirmation(
   credentials: EvolutionCredentials,
   messageId: string | null,
@@ -1397,10 +1450,32 @@ export async function executeWhatsappJobWithEvolutionApi(
       throw new Error("WHATSAPP_STATUS_TEXT_TOO_LONG");
     }
 
-    const response = await evolutionRequest<EvolutionSendStatusResponse>(credentials, route, {
-      method: "POST",
-      jsonBody: buildTextStatusPayload(message, statusRecipients.recipients, job.whatsappBackgroundColor),
-    });
+    const baselineCount = await getPersistedStatusMessageCount(credentials).catch(() => null);
+    let response: EvolutionSendStatusResponse;
+    try {
+      response = await evolutionRequest<EvolutionSendStatusResponse>(credentials, route, {
+        method: "POST",
+        jsonBody: buildTextStatusPayload(message, statusRecipients.recipients, job.whatsappBackgroundColor),
+      });
+    } catch (error) {
+      if (typeof baselineCount === "number" && isWhatsappAbortError(error)) {
+        const recovered = await waitStatusCountIncrease(credentials, baselineCount);
+        if (recovered) {
+          await appendWhatsappDiagnosticLog({
+            companyId: connection.companyId,
+            level: "WARN",
+            errorCode: "WHATSAPP_STATUS_RECOVERED_AFTER_ABORT",
+            message: `Job ${job.id} teve abort no envio do status texto, mas o histórico do WhatsApp confirmou um novo status.`,
+          });
+          return {
+            remoteJid: "status@broadcast",
+            messageId: null,
+            confirmed: true,
+          };
+        }
+      }
+      throw error;
+    }
 
     const messageId = extractMessageId(response);
     const confirmed = await waitStatusPersistenceConfirmation(credentials, messageId);
@@ -1440,16 +1515,37 @@ export async function executeWhatsappJobWithEvolutionApi(
       throw new Error("WHATSAPP_STATUS_CAPTION_TOO_LONG");
     }
 
-    const response = await evolutionRequest<EvolutionSendStatusResponse>(credentials, route, {
-      method: "POST",
-      jsonBody: buildMediaStatusPayload({
-        statusType,
-        dataUrl,
-        caption,
-        recipients: statusRecipients.recipients,
-        backgroundColor: job.whatsappBackgroundColor,
-      }),
-    });
+    const baselineCount = await getPersistedStatusMessageCount(credentials).catch(() => null);
+    let response: EvolutionSendStatusResponse;
+    try {
+      response = await evolutionRequest<EvolutionSendStatusResponse>(credentials, route, {
+        method: "POST",
+        jsonBody: buildMediaStatusPayload({
+          statusType,
+          dataUrl,
+          caption,
+          recipients: statusRecipients.recipients,
+          backgroundColor: job.whatsappBackgroundColor,
+        }),
+      });
+    } catch (error) {
+      if (typeof baselineCount === "number" && isWhatsappAbortError(error)) {
+        const recovered = await waitStatusCountIncrease(credentials, baselineCount);
+        if (recovered) {
+          await appendWhatsappDiagnosticLog({
+            companyId: connection.companyId,
+            level: "WARN",
+            errorCode: "WHATSAPP_STATUS_RECOVERED_AFTER_ABORT",
+            message: `Job ${job.id} teve abort no envio do status mídia, mas o histórico do WhatsApp confirmou um novo status.`,
+          });
+          lastRemoteJid = "status@broadcast";
+          lastMessageId = null;
+          allConfirmed = allConfirmed && true;
+          continue;
+        }
+      }
+      throw error;
+    }
 
     lastRemoteJid = extractRemoteJid(response);
     lastMessageId = extractMessageId(response);

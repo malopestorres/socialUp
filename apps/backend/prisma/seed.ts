@@ -4,13 +4,16 @@ import { createRandomToken, hashPassword } from "../src/security.js";
 const prisma = new PrismaClient();
 
 const ROOT_USERNAME = "root";
+const ROOT_EMAIL = "root@socialup.local";
 const ROOT_PASSWORD = "Root@SocialUp2026!";
 const BILLING_SETTING_AUTO_TRIAL_ENABLED = "billing.autoTrialEnabled";
 const BILLING_SETTING_AUTO_TRIAL_DAYS = "billing.autoTrialDays";
 
 const AGENCY_X_USERNAME = "agenciax";
+const AGENCY_X_EMAIL = "agenciax@socialup.local";
 const AGENCY_X_PASSWORD = "AgenciaX2026@";
 const MARCUS_USERNAME = "marcus";
+const MARCUS_EMAIL = "marcus@socialup.local";
 const MARCUS_FALLBACK_PASSWORD = "Marcus@SocialUp2026!";
 
 const DEFAULT_BILLING_PLANS = [
@@ -344,6 +347,7 @@ const AGENCY_X_JOBS: SeedJobDefinition[] = [
 
 async function ensureUser(input: {
   username: string;
+  email: string;
   name: string;
   password: string;
   role?: string;
@@ -352,11 +356,13 @@ async function ensureUser(input: {
   return prisma.user.upsert({
     where: { username: input.username },
     update: {
+      email: input.email,
       name: input.name,
       passwordHash,
       role: input.role ?? "ADMIN",
     },
     create: {
+      email: input.email,
       name: input.name,
       username: input.username,
       passwordHash,
@@ -429,6 +435,7 @@ async function ensureAgencyXFixtures() {
   const [agencyUser, existingMarcus, enterprisePlan] = await Promise.all([
     ensureUser({
       username: AGENCY_X_USERNAME,
+      email: AGENCY_X_EMAIL,
       name: "Agencia X",
       password: AGENCY_X_PASSWORD,
       role: "ADMIN",
@@ -446,6 +453,7 @@ async function ensureAgencyXFixtures() {
     existingMarcus ??
     (await ensureUser({
       username: MARCUS_USERNAME,
+      email: MARCUS_EMAIL,
       name: "Marcus Torres",
       password: MARCUS_FALLBACK_PASSWORD,
       role: "ADMIN",
@@ -712,6 +720,7 @@ async function main() {
   const rootUser = await prisma.user.upsert({
     where: { username: ROOT_USERNAME },
     update: {
+      email: ROOT_EMAIL,
       name: "Root",
       passwordHash,
       role: "ROOT",
@@ -719,6 +728,7 @@ async function main() {
       sessionIssuedAt: null,
     },
     create: {
+      email: ROOT_EMAIL,
       name: "Root",
       username: ROOT_USERNAME,
       passwordHash,

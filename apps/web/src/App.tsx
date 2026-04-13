@@ -42,14 +42,16 @@ import {
   FiDownload,
   FiEdit3,
   FiFileText,
+  FiGrid,
   FiHome,
   FiImage,
   FiLink2,
+  FiList,
   FiLogOut,
   FiMapPin,
+  FiSend,
   FiMessageCircle,
   FiRotateCcw,
-  FiSettings,
   FiSlash,
   FiSmile,
   FiTrash2,
@@ -57,6 +59,8 @@ import {
   FiUsers,
   FiUser,
   FiCreditCard,
+  FiThumbsDown,
+  FiThumbsUp,
   FiWifi,
   FiX,
   FiEye,
@@ -69,12 +73,18 @@ import { api } from "./api";
 import appLogo from "./assets/logo.svg";
 import confettiGif from "./assets/confetti.gif";
 import { BeeUpDrawer, BeeUpKnowledgeAdmin, type BeeUpOpenViewKey } from "./bee-up";
+import {
+  isFirebaseGoogleLoginCancelledError,
+  resolveFirebaseGoogleLoginErrorMessage,
+  signInWithGoogleViaFirebase,
+} from "./firebase-auth";
 import { searchLocalMetaLocationSuggestions, type MetaLocationSuggestion } from "./meta-location-catalog";
 
 type ViewKey =
   | "dashboard"
   | "profile"
   | "plan"
+  | "planStart"
   | "planConfig"
   | "beeUpAdmin"
   | "companies"
@@ -82,6 +92,7 @@ type ViewKey =
   | "scheduler"
   | "media"
   | "history"
+  | "historyPreview"
   | "logs"
   | "notices"
   | "noticeAdmin";
@@ -89,7 +100,9 @@ type ViewKey =
 type ThemeMode = "light" | "dark";
 
 type HistoryFilterKey = "all" | "upcoming" | "canceled" | "sent" | "failed" | "waiting_login" | "draft" | "published";
-type HistoryBulkAction = "" | "SET_PUBLISHED" | "SET_DRAFT" | "SET_SCHEDULE" | "SET_COMPANY";
+type HistoryViewMode = "board" | "list";
+type ProfilePageTab = "profile" | "plan" | "danger";
+type HistoryBulkAction = "" | "SET_PUBLISHED" | "SET_DRAFT" | "SET_SCHEDULE" | "SET_COMPANY" | "SET_CANCEL";
 type PublicationState = "PUBLISHED" | "DRAFT";
 type SchedulerPublicationState = PublicationState | "";
 type StoryEditorToolMode = "MOVE" | "DRAW";
@@ -148,6 +161,9 @@ type Company = {
   canManageWorkspace: boolean;
   canManageMembers: boolean;
   canConnectAccounts: boolean;
+  canManagePublications: boolean;
+  supportsWorkspaceInvites: boolean;
+  supportsClientApproval: boolean;
   members: Array<{
     id: string;
     userId: string;
@@ -243,9 +259,22 @@ type Job = {
 };
 
 const WHATSAPP_RELINK_PARENT_MARKER_PREFIX = "__wa_relink_parent__:";
+const publicationPreviewQuickReactionEmojis = ["👍", "🎉", "❤️", "🔥", "💡"] as const;
 
 function isWhatsappRelinkChildJob(job: Pick<Job, "locationName">): boolean {
   return typeof job.locationName === "string" && job.locationName.startsWith(WHATSAPP_RELINK_PARENT_MARKER_PREFIX);
+}
+
+function clampPublicationPreviewTargetLabel(value: string | null | undefined, maxChars = 18): string {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  if (!normalized) {
+    return "Conta conectada";
+  }
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+  const safeMax = Math.max(6, maxChars - 3);
+  return `${normalized.slice(0, safeMax).trimEnd()}...`;
 }
 
 type HistoryCalendarPageResponse = {
@@ -448,20 +477,69 @@ type Aviso = {
   message: string;
   readAt: string | null;
   createdAt: string;
+  createdBy?: {
+    id: string;
+    name: string;
+    username: string;
+  } | null;
 };
 
 type NoticesPopoverTabKey = "panel" | "feedbacks" | "socialup";
 
-type MockFeedbackNotice = {
+type PublicationPreviewApprovalStatus = "PENDING" | "APPROVED" | "REJECTED";
+type PublicationPreviewDecisionIntent = Extract<PublicationPreviewApprovalStatus, "APPROVED" | "REJECTED">;
+
+type PublicationPreviewComment = {
   id: string;
-  clientName: string;
-  clientRole: string;
-  clientAvatar: string;
-  projectName: string;
-  workspaceName: string;
+  parentCommentId: string | null;
   message: string;
-  createdAtLabel: string;
-  unread: boolean;
+  createdAt: string;
+  updatedAt: string;
+  author: {
+    id: string;
+    name: string;
+    username: string;
+  };
+  reactions: Array<{
+    emoji: string;
+    count: number;
+    reactedByCurrentUser: boolean;
+  }>;
+};
+
+type PublicationPreviewJob = Job & {
+  connectionLabel: string | null;
+  connectionLoginIdentifier: string | null;
+};
+
+type PublicationPreviewPayload = {
+  schedulerGroupKey: string;
+  subject: string;
+  company: {
+    id: string;
+    name: string;
+    color?: string | null;
+  };
+  currentUserRole: Company["currentUserRole"];
+  collaborationEnabled: boolean;
+  title: string | null;
+  caption: string | null;
+  publicationState: PublicationState;
+  scheduledAt: string;
+  mediaPaths: string[];
+  mediaCaptions: Array<string | null>;
+  jobs: PublicationPreviewJob[];
+  approval: {
+    id: string | null;
+    status: PublicationPreviewApprovalStatus;
+    decidedAt: string | null;
+    decidedBy: {
+      id: string;
+      name: string;
+      username: string;
+    } | null;
+  };
+  comments: PublicationPreviewComment[];
 };
 
 type MockSocialUpNotice = {
@@ -486,8 +564,13 @@ type AuthUser = {
   id: string;
   name: string;
   username: string;
+  email: string | null;
+  avatarUrl?: string | null;
   timeZone: string;
   role: string;
+  needsPlanSelection?: boolean;
+  hasPassword?: boolean;
+  authProviders?: Array<{ provider: string; email: string | null }>;
   billingStatus?: string;
   billingPlanName?: string | null;
   billingPlanCode?: string | null;
@@ -599,6 +682,12 @@ type BillingMe = {
   canCancelStripeSubscription?: boolean;
   stripeCancelAtPeriodEnd?: boolean;
   stripePixAvailable?: boolean;
+  requiresInitialPlanSelection?: boolean;
+  planCapabilities?: {
+    supportsWorkspaceInvites: boolean;
+    supportsClientApproval: boolean;
+    maxWhatsappConnections: number | null;
+  };
 };
 
 type BillingUserDiscountItem = {
@@ -631,12 +720,30 @@ type InstagramOauthWindowMessage = {
   connectionId?: string | null;
 };
 
+type GoogleOauthWindowMessage = {
+  type: "socialup-google-oauth";
+  success: boolean;
+  message?: string;
+  sessionToken?: string | null;
+  user?: AuthUser | null;
+};
+
 type PostForMeOauthWindowMessage = {
   type: "socialup-postforme-oauth";
-  connectionId: string;
+  connectionId?: string | null;
   success?: boolean;
   message?: string;
   accountId?: string | null;
+};
+
+type PostForMeOauthPreviewWindowMessage = {
+  type: "socialup-postforme-oauth-preview-success";
+  connectionId?: string | null;
+  accountId?: string | null;
+};
+
+type PostForMeOauthCloseWindowMessage = {
+  type: "socialup-postforme-oauth-close";
 };
 
 type WorkspaceInvitePreview = {
@@ -748,10 +855,12 @@ const POST_FOR_ME_CONNECTION_ID_QUERY_PARAM = "postForMeConnectionId";
 const POST_FOR_ME_PENDING_SYNC_STORAGE_KEY = "socialup.postForMePendingSync";
 const POST_FOR_ME_PENDING_SYNC_FALLBACK_STORAGE_KEY = "socialup.postForMePendingSyncPersistent";
 const POST_FOR_ME_COMPLETION_STORAGE_KEY = "socialup.postForMeConnectionCompleted";
+const POST_FOR_ME_PREVIEW_SUCCESS_STORAGE_KEY = "socialup.postForMePreviewSuccess";
 const POST_FOR_ME_PENDING_SYNC_MAX_AGE_MS = 10 * 60 * 1000;
 const POST_FOR_ME_POPUP_WINDOW_NAME = "socialup-postforme-auth";
 const PUBLICATION_TEMPLATE_STORAGE_KEY = "socialup.publicationTemplates";
 const HISTORY_COLLAPSED_SECTIONS_COOKIE = "socialup.historyCollapsedSections";
+const HISTORY_VIEW_MODE_COOKIE = "socialup.historyViewMode";
 const STRIPE_CHECKOUT_RESULT_QUERY_PARAM = "stripeCheckout";
 const STRIPE_CHECKOUT_SESSION_ID_QUERY_PARAM = "session_id";
 const BILLING_PLAN_CHECKOUT_ANCHOR_ID = "billing-plan-checkout";
@@ -763,6 +872,7 @@ const INSTAGRAM_IMAGE_MAX_SIZE_BYTES = 8 * 1024 * 1024;
 const INSTAGRAM_MULTI_MEDIA_MAX_FILES = 10;
 const THREADS_MULTI_MEDIA_MAX_FILES = 20;
 const X_MULTI_MEDIA_MAX_FILES = 4;
+const X_POST_MAX_TEXT_LENGTH = 280;
 const INSTAGRAM_POST_ASPECT_RATIO_MIN = 4 / 5;
 const INSTAGRAM_POST_ASPECT_RATIO_MAX = 1.91;
 const STORY_EDITOR_CANVAS_WIDTH = 1080;
@@ -835,6 +945,8 @@ const CONNECTION_PLATFORM_ORDER: Record<SocialConnection["platform"], number> = 
 };
 const HISTORY_CALENDAR_SKELETON_CELL_COUNT = 7;
 const HISTORY_CALENDAR_WEEKDAY_LABELS = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"];
+const PROFILE_TAB_QUERY_PARAM = "tab";
+const CANONICAL_BILLING_PLAN_CODES = new Set(["TRIAL", "SINGLE", "AGENCY"]);
 const EDIT_PUBLISHED_RESCHEDULE_CONFIRM_STATUSES = new Set([
   "COMPLETED",
   "SENT_UNCONFIRMED",
@@ -847,6 +959,7 @@ const VIEW_ROUTE_MAP: Record<ViewKey, string> = {
   dashboard: "/dashboard",
   profile: "/perfil",
   plan: "/meu-plano",
+  planStart: "/selecionar-plano",
   planConfig: "/configurar-planos",
   beeUpAdmin: "/assistente-bee-up",
   companies: "/workspaces",
@@ -854,6 +967,7 @@ const VIEW_ROUTE_MAP: Record<ViewKey, string> = {
   scheduler: "/agendar",
   media: "/midias",
   history: "/publicacoes",
+  historyPreview: "/publicacoes/preview",
   logs: "/logs",
   notices: "/avisos",
   noticeAdmin: "/avisos/cadastrar",
@@ -863,6 +977,7 @@ const beeUpViewLabelByView: Record<ViewKey, string> = {
   dashboard: "Dashboard",
   profile: "Meu perfil",
   plan: "Meu plano",
+  planStart: "Selecionar plano",
   planConfig: "Configurar planos",
   beeUpAdmin: "Assistente Bee Up",
   companies: "Workspaces",
@@ -870,10 +985,38 @@ const beeUpViewLabelByView: Record<ViewKey, string> = {
   scheduler: "Agendar",
   media: "Mídias",
   history: "Publicações",
+  historyPreview: "Visualização da publicação",
   logs: "Logs",
   notices: "Avisos",
   noticeAdmin: "Cadastrar avisos",
 };
+
+function readPublicationPreviewJobIdFromPathname(pathname: string): string | null {
+  const normalizedPath = normalizePath(pathname);
+  const previewPrefix = `${VIEW_ROUTE_MAP.historyPreview}/`;
+  if (!normalizedPath.startsWith(previewPrefix)) {
+    return null;
+  }
+
+  const rawJobId = normalizedPath.slice(previewPrefix.length).trim();
+  if (!rawJobId) {
+    return null;
+  }
+
+  try {
+    return decodeURIComponent(rawJobId);
+  } catch {
+    return rawJobId;
+  }
+}
+
+function buildPublicationPreviewHref(jobId: string): string {
+  const normalizedJobId = jobId.trim();
+  if (!normalizedJobId) {
+    return VIEW_ROUTE_MAP.history;
+  }
+  return `${VIEW_ROUTE_MAP.historyPreview}/${encodeURIComponent(normalizedJobId)}`;
+}
 
 function parseHistoryFilterKey(value: string | null | undefined): HistoryFilterKey {
   if (
@@ -909,6 +1052,7 @@ function normalizePath(pathname: string): string {
 type PendingPostForMeConnectionSync = {
   connectionId: string;
   createdAtMs: number;
+  knownRemoteAccountIds?: string[];
 };
 
 type CompletedPostForMeConnectionSync = {
@@ -917,6 +1061,12 @@ type CompletedPostForMeConnectionSync = {
   success: boolean;
   message?: string;
   providerAccountIdHint?: string;
+};
+
+type PostForMePreviewSuccessSignal = {
+  createdAtMs: number;
+  success: boolean;
+  accountIdHint?: string;
 };
 
 function readPendingPostForMeConnectionSync(): PendingPostForMeConnectionSync | null {
@@ -935,6 +1085,11 @@ function readPendingPostForMeConnectionSync(): PendingPostForMeConnectionSync | 
     const parsed = JSON.parse(raw) as Partial<PendingPostForMeConnectionSync>;
     const connectionId = typeof parsed.connectionId === "string" ? parsed.connectionId.trim() : "";
     const createdAtMs = typeof parsed.createdAtMs === "number" ? parsed.createdAtMs : 0;
+    const knownRemoteAccountIds = Array.isArray(parsed.knownRemoteAccountIds)
+      ? parsed.knownRemoteAccountIds
+          .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+          .filter((entry): entry is string => Boolean(entry))
+      : [];
     if (!connectionId || !Number.isFinite(createdAtMs) || createdAtMs <= 0) {
       window.sessionStorage.removeItem(POST_FOR_ME_PENDING_SYNC_STORAGE_KEY);
       window.localStorage.removeItem(POST_FOR_ME_PENDING_SYNC_FALLBACK_STORAGE_KEY);
@@ -946,8 +1101,7 @@ function readPendingPostForMeConnectionSync(): PendingPostForMeConnectionSync | 
       window.localStorage.removeItem(POST_FOR_ME_PENDING_SYNC_FALLBACK_STORAGE_KEY);
       return null;
     }
-
-    return { connectionId, createdAtMs };
+    return { connectionId, createdAtMs, knownRemoteAccountIds };
   } catch {
     window.sessionStorage.removeItem(POST_FOR_ME_PENDING_SYNC_STORAGE_KEY);
     window.localStorage.removeItem(POST_FOR_ME_PENDING_SYNC_FALLBACK_STORAGE_KEY);
@@ -955,7 +1109,7 @@ function readPendingPostForMeConnectionSync(): PendingPostForMeConnectionSync | 
   }
 }
 
-function savePendingPostForMeConnectionSync(connectionId: string): void {
+function savePendingPostForMeConnectionSync(connectionId: string, knownRemoteAccountIds?: string[] | null): void {
   if (typeof window === "undefined") {
     return;
   }
@@ -963,6 +1117,10 @@ function savePendingPostForMeConnectionSync(connectionId: string): void {
   const serialized = JSON.stringify({
     connectionId,
     createdAtMs: Date.now(),
+    knownRemoteAccountIds:
+      knownRemoteAccountIds
+        ?.map((entry) => entry.trim())
+        .filter((entry): entry is string => Boolean(entry)) ?? [],
   } satisfies PendingPostForMeConnectionSync);
   window.sessionStorage.setItem(
     POST_FOR_ME_PENDING_SYNC_STORAGE_KEY,
@@ -1068,6 +1226,65 @@ function clearCompletedPostForMeConnectionSync(connectionId?: string | null): vo
   }
 }
 
+function readPostForMePreviewSuccessSignal(): PostForMePreviewSuccessSignal | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  const raw = window.localStorage.getItem(POST_FOR_ME_PREVIEW_SUCCESS_STORAGE_KEY);
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<PostForMePreviewSuccessSignal>;
+    const createdAtMs = typeof parsed.createdAtMs === "number" ? parsed.createdAtMs : 0;
+    const success = parsed.success === true;
+    const accountIdHint = typeof parsed.accountIdHint === "string" ? parsed.accountIdHint.trim() : "";
+    if (!Number.isFinite(createdAtMs) || createdAtMs <= 0) {
+      window.localStorage.removeItem(POST_FOR_ME_PREVIEW_SUCCESS_STORAGE_KEY);
+      return null;
+    }
+
+    if (Date.now() - createdAtMs > POST_FOR_ME_PENDING_SYNC_MAX_AGE_MS) {
+      window.localStorage.removeItem(POST_FOR_ME_PREVIEW_SUCCESS_STORAGE_KEY);
+      return null;
+    }
+
+    return {
+      createdAtMs,
+      success,
+      accountIdHint: accountIdHint || undefined,
+    };
+  } catch {
+    window.localStorage.removeItem(POST_FOR_ME_PREVIEW_SUCCESS_STORAGE_KEY);
+    return null;
+  }
+}
+
+function savePostForMePreviewSuccessSignal(accountIdHint?: string | null): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.localStorage.setItem(
+    POST_FOR_ME_PREVIEW_SUCCESS_STORAGE_KEY,
+    JSON.stringify({
+      createdAtMs: Date.now(),
+      success: true,
+      accountIdHint: accountIdHint?.trim() || undefined,
+    } satisfies PostForMePreviewSuccessSignal),
+  );
+}
+
+function clearPostForMePreviewSuccessSignal(): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.localStorage.removeItem(POST_FOR_ME_PREVIEW_SUCCESS_STORAGE_KEY);
+}
+
 function viewFromPathname(pathname: string): ViewKey | null {
   const normalizedPath = normalizePath(pathname);
   if (normalizedPath === "/unidades" || normalizedPath === "/empresa" || normalizedPath === "/perfis") {
@@ -1076,11 +1293,83 @@ function viewFromPathname(pathname: string): ViewKey | null {
   if (normalizedPath === "/historico") {
     return "history";
   }
+  if (readPublicationPreviewJobIdFromPathname(normalizedPath)) {
+    return "historyPreview";
+  }
+  if (readProfileUsernameFromPathname(normalizedPath)) {
+    return "profile";
+  }
   if (normalizedPath === "/plano") {
     return "plan";
   }
   const entry = (Object.entries(VIEW_ROUTE_MAP) as Array<[ViewKey, string]>).find(([, route]) => route === normalizedPath);
   return entry?.[0] ?? null;
+}
+
+function normalizeProfileRouteUsername(username: string | null | undefined): string {
+  return (username || "").trim().replace(/^@+/, "");
+}
+
+function readProfileUsernameFromPathname(pathname: string): string | null {
+  const normalizedPath = normalizePath(pathname);
+  if (!normalizedPath || normalizedPath === "/") {
+    return null;
+  }
+
+  if (readPublicationPreviewJobIdFromPathname(normalizedPath)) {
+    return null;
+  }
+
+  const rawPath = normalizedPath.replace(/^\/+|\/+$/g, "");
+  if (!rawPath || rawPath.includes("/")) {
+    return null;
+  }
+
+  const reservedSegments = new Set(
+    [
+      ...Object.values(VIEW_ROUTE_MAP).map((route) => route.replace(/^\/+|\/+$/g, "").toLowerCase()),
+      "unidades",
+      "empresa",
+      "perfis",
+      "historico",
+      "plano",
+    ].filter(Boolean),
+  );
+  if (reservedSegments.has(rawPath.toLowerCase())) {
+    return null;
+  }
+
+  const normalizedUsername = normalizeProfileRouteUsername(rawPath);
+  return normalizedUsername || null;
+}
+
+function parseProfilePageTab(pathname: string, search: string): ProfilePageTab {
+  const normalizedPath = normalizePath(pathname);
+  if (normalizedPath === "/plano" || normalizedPath === VIEW_ROUTE_MAP.plan || normalizedPath === VIEW_ROUTE_MAP.planStart) {
+    return "plan";
+  }
+
+  const params = new URLSearchParams(search);
+  const rawTab = (params.get(PROFILE_TAB_QUERY_PARAM) || "").trim().toLowerCase();
+  if (rawTab === "plan") {
+    return "plan";
+  }
+  if (rawTab === "danger") {
+    return "danger";
+  }
+  return "profile";
+}
+
+function buildProfilePageHref(username: string | null | undefined, tab: ProfilePageTab = "profile"): string {
+  const normalizedUsername = normalizeProfileRouteUsername(username);
+  const pathname = normalizedUsername ? `/${encodeURIComponent(normalizedUsername)}` : VIEW_ROUTE_MAP.profile;
+  if (tab === "profile") {
+    return pathname;
+  }
+
+  const params = new URLSearchParams();
+  params.set(PROFILE_TAB_QUERY_PARAM, tab);
+  return `${pathname}?${params.toString()}`;
 }
 
 function buildViewHref(view: ViewKey, options?: { historyFilter?: HistoryFilterKey }): string {
@@ -1109,6 +1398,30 @@ function initialViewFromLocation(): ViewKey {
   }
 
   return "dashboard";
+}
+
+function initialProfileRouteUsernameFromLocation(): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  return readProfileUsernameFromPathname(window.location.pathname);
+}
+
+function initialProfileTabFromLocation(): ProfilePageTab {
+  if (typeof window === "undefined") {
+    return "profile";
+  }
+
+  return parseProfilePageTab(window.location.pathname, window.location.search);
+}
+
+function initialPublicationPreviewJobIdFromLocation(): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  return readPublicationPreviewJobIdFromPathname(window.location.pathname);
 }
 
 const fullEmojiList = [
@@ -1165,6 +1478,23 @@ function formatDate(
   }
 
   return parsed.toLocaleString("pt-BR", {
+    timeZone: normalizeTimeZone(timeZone),
+  });
+}
+
+function formatDateOnly(
+  value: string | null | undefined,
+  timeZone: string = DEFAULT_USER_TIME_ZONE,
+): string {
+  if (!value) {
+    return "Não definido";
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "Não definido";
+  }
+
+  return parsed.toLocaleDateString("pt-BR", {
     timeZone: normalizeTimeZone(timeZone),
   });
 }
@@ -1252,12 +1582,52 @@ function isAuthAviso(aviso: Pick<Aviso, "kind" | "title" | "message">): boolean 
   );
 }
 
+function isApprovalPositiveAviso(aviso: Pick<Aviso, "kind" | "title" | "message">): boolean {
+  const normalizedKind = aviso.kind.trim().toUpperCase();
+  const normalizedTitle = aviso.title.trim().toUpperCase();
+
+  if (normalizedKind === "APPROVAL_DECISION") {
+    return normalizedTitle.includes("PROJETO APROVADO") || normalizedTitle.includes("APROVADO");
+  }
+
+  return false;
+}
+
+function isApprovalNegativeAviso(aviso: Pick<Aviso, "kind" | "title" | "message">): boolean {
+  const normalizedKind = aviso.kind.trim().toUpperCase();
+  const normalizedTitle = aviso.title.trim().toUpperCase();
+
+  if (normalizedKind === "APPROVAL_DECISION") {
+    return (
+      normalizedTitle.includes("PROJETO NÃO APROVADO") ||
+      normalizedTitle.includes("PROJETO NAO APROVADO") ||
+      normalizedTitle.includes("PROJETO REJEITADO") ||
+      normalizedTitle.includes("NÃO APROVADO") ||
+      normalizedTitle.includes("NAO APROVADO") ||
+      normalizedTitle.includes("REJEITADO")
+    );
+  }
+
+  return false;
+}
+
 function avisoTone(aviso: Pick<Aviso, "kind" | "title" | "message">): AvisoTone {
   if (isWhatsappAviso(aviso)) {
     return "whatsapp";
   }
 
+  if (isApprovalNegativeAviso(aviso)) {
+    return "error";
+  }
+
+  if (isApprovalPositiveAviso(aviso)) {
+    return "success";
+  }
+
   const normalizedKind = aviso.kind.trim().toUpperCase();
+  if (normalizedKind === "FEEDBACK") {
+    return "info";
+  }
   if (isAuthAviso(aviso)) {
     return "auth";
   }
@@ -1278,6 +1648,16 @@ function avisoToneClass(aviso: Pick<Aviso, "kind" | "title" | "message">): strin
 }
 
 function resolveAvisoPopoverIcon(aviso: Pick<Aviso, "kind" | "title" | "message">): IconType {
+  if (isApprovalNegativeAviso(aviso)) {
+    return FiSlash;
+  }
+  if (isApprovalPositiveAviso(aviso)) {
+    return FiThumbsUp;
+  }
+  const normalizedKind = aviso.kind.trim().toUpperCase();
+  if (normalizedKind === "FEEDBACK") {
+    return FiMessageCircle;
+  }
   const tone = avisoTone(aviso);
   if (tone === "success") {
     return FiCheckCircle;
@@ -1292,6 +1672,12 @@ function resolveAvisoPopoverIcon(aviso: Pick<Aviso, "kind" | "title" | "message"
 }
 
 function resolveAvisoPopoverThumbClass(aviso: Pick<Aviso, "kind" | "title" | "message">): string {
+  if (isApprovalNegativeAviso(aviso)) {
+    return "notices-entry-thumb-approval-negative";
+  }
+  if (isApprovalPositiveAviso(aviso)) {
+    return "notices-entry-thumb-approval-positive";
+  }
   return `notices-entry-thumb-${avisoTone(aviso)}`;
 }
 
@@ -1309,6 +1695,43 @@ function resolveJobDisplayTitle(job: Pick<Job, "id" | "title" | "caption">): str
   return `Job ${job.id}`;
 }
 
+type PublicationPreviewCommentTreeNode = PublicationPreviewComment & {
+  replies: PublicationPreviewCommentTreeNode[];
+};
+
+function buildPublicationPreviewCommentTree(
+  comments: PublicationPreviewComment[],
+): PublicationPreviewCommentTreeNode[] {
+  const byId = new Map<string, PublicationPreviewCommentTreeNode>();
+  const roots: PublicationPreviewCommentTreeNode[] = [];
+
+  comments.forEach((comment) => {
+    byId.set(comment.id, {
+      ...comment,
+      replies: [],
+    });
+  });
+
+  comments.forEach((comment) => {
+    const node = byId.get(comment.id);
+    if (!node) {
+      return;
+    }
+
+    if (comment.parentCommentId) {
+      const parentNode = byId.get(comment.parentCommentId);
+      if (parentNode) {
+        parentNode.replies.push(node);
+        return;
+      }
+    }
+
+    roots.push(node);
+  });
+
+  return roots;
+}
+
 function resolveHistoryCalendarTitle(job: Pick<Job, "id" | "title">): string {
   const normalizedTitle = job.title?.trim();
   if (normalizedTitle) {
@@ -1316,6 +1739,15 @@ function resolveHistoryCalendarTitle(job: Pick<Job, "id" | "title">): string {
   }
 
   return "Sem título";
+}
+
+function clampCompactPublicationTitle(title: string, maxChars = 24): string {
+  const normalizedTitle = title.trim();
+  if (normalizedTitle.length <= maxChars) {
+    return normalizedTitle;
+  }
+
+  return `${normalizedTitle.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
 }
 
 function clampNumber(value: number, min: number, max: number): number {
@@ -1537,27 +1969,78 @@ function parseInstagramOauthWindowMessage(data: unknown): InstagramOauthWindowMe
   };
 }
 
+function parseGoogleOauthWindowMessage(data: unknown): GoogleOauthWindowMessage | null {
+  if (!data || typeof data !== "object") {
+    return null;
+  }
+
+  const payload = data as Record<string, unknown>;
+  if (payload.type !== "socialup-google-oauth" || typeof payload.success !== "boolean") {
+    return null;
+  }
+
+  return {
+    type: "socialup-google-oauth",
+    success: payload.success,
+    message: typeof payload.message === "string" ? payload.message : undefined,
+    sessionToken: typeof payload.sessionToken === "string" ? payload.sessionToken : null,
+    user: payload.user && typeof payload.user === "object" ? (payload.user as AuthUser) : null,
+  };
+}
+
 function parsePostForMeOauthWindowMessage(data: unknown): PostForMeOauthWindowMessage | null {
   if (!data || typeof data !== "object") {
     return null;
   }
 
   const payload = data as Record<string, unknown>;
-  if (payload.type !== "socialup-postforme-oauth" || typeof payload.connectionId !== "string") {
+  if (payload.type !== "socialup-postforme-oauth") {
     return null;
   }
 
-  const connectionId = payload.connectionId.trim();
-  if (!connectionId) {
-    return null;
-  }
+  const connectionId =
+    typeof payload.connectionId === "string" && payload.connectionId.trim()
+      ? payload.connectionId.trim()
+      : null;
 
   return {
     type: "socialup-postforme-oauth",
     connectionId,
     success: typeof payload.success === "boolean" ? payload.success : undefined,
     message: typeof payload.message === "string" ? payload.message : undefined,
+    accountId: typeof payload.accountId === "string" ? payload.accountId : null,
   };
+}
+
+function parsePostForMeOauthPreviewWindowMessage(data: unknown): PostForMeOauthPreviewWindowMessage | null {
+  if (!data || typeof data !== "object") {
+    return null;
+  }
+
+  const payload = data as Record<string, unknown>;
+  if (payload.type !== "socialup-postforme-oauth-preview-success") {
+    return null;
+  }
+
+  const connectionId =
+    typeof payload.connectionId === "string" && payload.connectionId.trim()
+      ? payload.connectionId.trim()
+      : null;
+
+  return {
+    type: "socialup-postforme-oauth-preview-success",
+    connectionId,
+    accountId: typeof payload.accountId === "string" ? payload.accountId : null,
+  };
+}
+
+function isPostForMeOauthCloseWindowMessage(data: unknown): data is PostForMeOauthCloseWindowMessage {
+  if (!data || typeof data !== "object") {
+    return false;
+  }
+
+  const payload = data as Record<string, unknown>;
+  return payload.type === "socialup-postforme-oauth-close";
 }
 
 function isPopupWindowContext(): boolean {
@@ -1584,11 +2067,25 @@ function requestPopupWindowClose(): void {
   }
 
   try {
-    window.open("", "_self");
+    window.open("about:blank", "_self");
     window.close();
   } catch {
     // ignore
   }
+
+  try {
+    window.location.replace("about:blank");
+  } catch {
+    // ignore
+  }
+
+  window.setTimeout(() => {
+    try {
+      window.close();
+    } catch {
+      // ignore
+    }
+  }, 30);
 }
 
 function closeManagedPopupWindow(popupWindow: Window | null | undefined): void {
@@ -1597,6 +2094,20 @@ function closeManagedPopupWindow(popupWindow: Window | null | undefined): void {
   }
 
   try {
+    popupWindow.close();
+  } catch {
+    // ignore
+  }
+
+  try {
+    popupWindow.focus();
+    popupWindow.close();
+  } catch {
+    // ignore
+  }
+
+  try {
+    popupWindow.open("about:blank", "_self");
     popupWindow.close();
   } catch {
     // ignore
@@ -1753,6 +2264,29 @@ function openCenteredPopup(name: string, width: number, height: number): Window 
   return popup;
 }
 
+function GoogleGlyph() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="auth-google-glyph">
+      <path
+        fill="#EA4335"
+        d="M12.24 10.285v3.821h5.445c-.236 1.24-.943 2.29-2.01 2.997l3.25 2.522c1.894-1.745 2.985-4.315 2.985-7.354 0-.703-.063-1.378-.18-2.035H12.24z"
+      />
+      <path
+        fill="#34A853"
+        d="M12 22c2.7 0 4.964-.896 6.618-2.425l-3.25-2.522c-.896.6-2.043.953-3.368.953-2.59 0-4.786-1.745-5.57-4.09H3.07v2.57A9.996 9.996 0 0012 22z"
+      />
+      <path
+        fill="#4A90E2"
+        d="M6.43 13.916A5.997 5.997 0 016.12 12c0-.665.116-1.307.31-1.916V7.514H3.07A9.996 9.996 0 002 12c0 1.614.39 3.146 1.07 4.486l3.36-2.57z"
+      />
+      <path
+        fill="#FBBC05"
+        d="M12 5.993c1.47 0 2.785.506 3.82 1.494l2.864-2.864C16.96 3.01 14.696 2 12 2A9.996 9.996 0 003.07 7.514l3.36 2.57c.784-2.346 2.98-4.09 5.57-4.09z"
+      />
+    </svg>
+  );
+}
+
 function getCurrentTimeValue(
   timeZone: string = DEFAULT_USER_TIME_ZONE,
   referenceDate: Date = new Date(),
@@ -1780,6 +2314,27 @@ function getFutureTimeValue(
   offsetMinutes: number = 5,
 ): string {
   return getCurrentTimeValue(timeZone, new Date(referenceDate.getTime() + offsetMinutes * 60_000));
+}
+
+function shiftDateInputValue(dateValue: string, deltaDays: number): string {
+  if (!dateValue) {
+    return dateValue;
+  }
+
+  const [yearRaw, monthRaw, dayRaw] = dateValue.split("-");
+  const year = Number.parseInt(yearRaw ?? "", 10);
+  const month = Number.parseInt(monthRaw ?? "", 10);
+  const day = Number.parseInt(dayRaw ?? "", 10);
+
+  if (!year || !month || !day) {
+    return dateValue;
+  }
+
+  const nextDate = new Date(Date.UTC(year, month - 1, day + deltaDays));
+  const nextYear = String(nextDate.getUTCFullYear()).padStart(4, "0");
+  const nextMonth = String(nextDate.getUTCMonth() + 1).padStart(2, "0");
+  const nextDay = String(nextDate.getUTCDate()).padStart(2, "0");
+  return `${nextYear}-${nextMonth}-${nextDay}`;
 }
 
 function readCookieValue(name: string): string | null {
@@ -1826,6 +2381,11 @@ function readHistoryCollapsedSectionsCookie(): Record<string, boolean> {
   } catch {
     return {};
   }
+}
+
+function readHistoryViewModeCookie(): HistoryViewMode {
+  const raw = readCookieValue(HISTORY_VIEW_MODE_COOKIE);
+  return raw === "list" ? "list" : "board";
 }
 
 function isVideoPath(filePath: string): boolean {
@@ -2328,6 +2888,40 @@ function resolveJobSchedulerGroupKey(job: Pick<Job, "id" | "schedulerGroupId">):
   return normalizedGroupId || job.id;
 }
 
+function resolveJobSchedulerCompanyGroupKey(job: Pick<Job, "id" | "companyId" | "schedulerGroupId">): string {
+  const normalizedGroupId = job.schedulerGroupId?.trim() || "";
+  return normalizedGroupId ? `${job.companyId}:${normalizedGroupId}` : job.id;
+}
+
+function resolveLatestJobsPerPublicationType<T extends Pick<Job, "publicationType" | "createdAt">>(jobs: T[]): T[] {
+  const latestByPublicationType = new Map<Job["publicationType"], T>();
+
+  jobs.forEach((job) => {
+    const current = latestByPublicationType.get(job.publicationType);
+    if (!current || new Date(job.createdAt).getTime() > new Date(current.createdAt).getTime()) {
+      latestByPublicationType.set(job.publicationType, job);
+    }
+  });
+
+  return Array.from(latestByPublicationType.values());
+}
+
+function resolveLatestJobsPerCompanyPublicationType<T extends Pick<Job, "companyId" | "publicationType" | "createdAt">>(
+  jobs: T[],
+): T[] {
+  const latestByTarget = new Map<string, T>();
+
+  jobs.forEach((job) => {
+    const groupKey = `${job.companyId}:${job.publicationType}`;
+    const current = latestByTarget.get(groupKey);
+    if (!current || new Date(job.createdAt).getTime() > new Date(current.createdAt).getTime()) {
+      latestByTarget.set(groupKey, job);
+    }
+  });
+
+  return Array.from(latestByTarget.values());
+}
+
 function isSchedulerSelectablePublicationType(value: string): value is SchedulerSelectablePublicationType {
   return schedulerPublicationTypeChoices.some((option) => option.value === value);
 }
@@ -2475,6 +3069,48 @@ function resolveJobParticipantNetworks(
   }
 
   return Array.from(new Set(networks));
+}
+
+function appendSchedulerHashtagsToCaption(
+  publicationType: SchedulerPublicationType,
+  caption: string,
+  hashtags: string[],
+): string {
+  const normalizedCaption = caption.trim();
+  if (hashtags.length === 0) {
+    return normalizedCaption;
+  }
+
+  const hashtagBlock = hashtags.map((tag) => `#${tag}`).join(" ");
+
+  if (!normalizedCaption) {
+    return hashtagBlock;
+  }
+
+  if (publicationType === "threads_post") {
+    return `${normalizedCaption}\n\n${hashtagBlock}`;
+  }
+
+  return `${normalizedCaption}\n\n${hashtagBlock}`;
+}
+
+function resolveSchedulerComposedCaptionForPublicationType(
+  publicationType: SchedulerPublicationType,
+  caption: string,
+  hashtags: string[],
+): string {
+  if (
+    publicationType !== "instagram_post" &&
+    publicationType !== "instagram_reel" &&
+    publicationType !== "facebook_post" &&
+    publicationType !== "threads_post" &&
+    publicationType !== "tiktok_post" &&
+    publicationType !== "x_post"
+  ) {
+    return caption.trim();
+  }
+
+  return appendSchedulerHashtagsToCaption(publicationType, caption, hashtags);
 }
 
 function isProviderMetaPublication(publicationType: SchedulerPublicationType): boolean {
@@ -2713,6 +3349,36 @@ function jobStatusDisplayLabel(job: Job): string {
   return jobStatusLabel(job.status);
 }
 
+function isSuccessfulPublicationJobStatus(status: Job["status"]): boolean {
+  return status === "COMPLETED" || status === "SENT_UNCONFIRMED";
+}
+
+function formatNaturalLabelList(labels: string[]): string {
+  if (labels.length === 0) {
+    return "";
+  }
+
+  if (labels.length === 1) {
+    return labels[0]!;
+  }
+
+  if (labels.length === 2) {
+    return `${labels[0]} e ${labels[1]}`;
+  }
+
+  return `${labels.slice(0, -1).join(", ")} e ${labels[labels.length - 1]}`;
+}
+
+function resolveUniquePublicationNetworkLabels(
+  jobs: Array<Pick<Job, "publicationType">>,
+): string[] {
+  return Array.from(
+    new Set(
+      jobs.map((job) => socialPlatformLabel(publicationTypeNetwork(job.publicationType))),
+    ),
+  );
+}
+
 function canEditPublicationBoardSchedule(job: Job): boolean {
   return (
     job.publicationState === "PUBLISHED" &&
@@ -2755,6 +3421,61 @@ function publicationBoardStatusChipTone(
   }
 
   return "scheduled";
+}
+
+function resolveGroupedPublicationStatusMeta(
+  jobs: Job[],
+  isPastScheduledAtInUserTimeZone: (dateIso: string) => boolean,
+): {
+  tone: "draft" | "scheduled" | "waiting" | "failed" | "canceled" | "published";
+  label: string;
+} {
+  if (jobs.some((job) => isSuccessfulPublicationJobStatus(job.status))) {
+    return {
+      tone: "published",
+      label: "Publicado",
+    };
+  }
+
+  if (jobs.some((job) => shouldRenderUpcomingAsRunning(job, isPastScheduledAtInUserTimeZone))) {
+    return {
+      tone: "scheduled",
+      label: "Executando",
+    };
+  }
+
+  if (jobs.some((job) => job.status === "WAITING_LOGIN")) {
+    return {
+      tone: "waiting",
+      label: "Aguarda login",
+    };
+  }
+
+  if (jobs.some((job) => job.status === "FAILED")) {
+    return {
+      tone: "failed",
+      label: "Falhou",
+    };
+  }
+
+  if (jobs.some((job) => job.status === "CANCELED")) {
+    return {
+      tone: "canceled",
+      label: "Cancelado",
+    };
+  }
+
+  if (jobs.some((job) => job.publicationState === "DRAFT")) {
+    return {
+      tone: "draft",
+      label: "Rascunho",
+    };
+  }
+
+  return {
+    tone: "scheduled",
+    label: "Aguarda publicação",
+  };
 }
 
 function historyCalendarStatusVisual(job: Job): {
@@ -3328,6 +4049,95 @@ function resolveSchedulerTargetAccountMeta(connection: SocialConnection): string
   return null;
 }
 
+function normalizeConnectionDispatchDedupToken(value: string | null | undefined): string {
+  return (value || "").trim().toLowerCase().replace(/^@+/, "");
+}
+
+function resolveConnectionDispatchDedupKey(connection: SocialConnection): string {
+  const normalizedPlatform = connection.platform.trim().toLowerCase();
+
+  if (connection.platform === "whatsapp") {
+    const ownerNumber = resolveWhatsappOwnerNumber(connection.whatsappOwnerJid);
+    if (ownerNumber) {
+      return `${normalizedPlatform}:owner:${ownerNumber}`;
+    }
+
+    const normalizedProfileName = normalizeConnectionDispatchDedupToken(connection.whatsappProfileName);
+    if (normalizedProfileName) {
+      return `${normalizedPlatform}:profile:${normalizedProfileName}`;
+    }
+
+    return `${normalizedPlatform}:connection:${connection.id}`;
+  }
+
+  const providerAccountId = connection.providerAccountId?.trim() || "";
+  if (providerAccountId) {
+    return `${normalizedPlatform}:provider:${providerAccountId}`;
+  }
+
+  const providerExternalId = normalizeConnectionDispatchDedupToken(connection.providerExternalId);
+  if (providerExternalId) {
+    return `${normalizedPlatform}:external:${providerExternalId}`;
+  }
+
+  if (connection.platform === "instagram") {
+    const instagramUserId = normalizeConnectionDispatchDedupToken(connection.instagramUserId);
+    if (instagramUserId) {
+      return `${normalizedPlatform}:user:${instagramUserId}`;
+    }
+
+    const instagramUsername = normalizeConnectionDispatchDedupToken(connection.instagramUsername || connection.loginIdentifier);
+    if (instagramUsername) {
+      return `${normalizedPlatform}:login:${instagramUsername}`;
+    }
+  }
+
+  if (connection.platform === "threads") {
+    const threadsUserId = normalizeConnectionDispatchDedupToken(connection.threadsUserId);
+    if (threadsUserId) {
+      return `${normalizedPlatform}:user:${threadsUserId}`;
+    }
+
+    const threadsUsername = normalizeConnectionDispatchDedupToken(connection.threadsUsername || connection.loginIdentifier);
+    if (threadsUsername) {
+      return `${normalizedPlatform}:login:${threadsUsername}`;
+    }
+  }
+
+  const loginIdentifier = normalizeConnectionDispatchDedupToken(connection.loginIdentifier);
+  if (loginIdentifier) {
+    return `${normalizedPlatform}:login:${loginIdentifier}`;
+  }
+
+  return `${normalizedPlatform}:connection:${connection.id}`;
+}
+
+function dedupeConnectionIdsByDispatchKey(
+  connectionIds: string[],
+  availableConnections: SocialConnection[],
+): string[] {
+  const connectionById = new Map(availableConnections.map((connection) => [connection.id, connection] as const));
+  const seenDispatchKeys = new Set<string>();
+  const uniqueIds: string[] = [];
+
+  for (const connectionId of connectionIds) {
+    const connection = connectionById.get(connectionId);
+    if (!connection) {
+      continue;
+    }
+
+    const dispatchKey = resolveConnectionDispatchDedupKey(connection);
+    if (seenDispatchKeys.has(dispatchKey)) {
+      continue;
+    }
+
+    seenDispatchKeys.add(dispatchKey);
+    uniqueIds.push(connectionId);
+  }
+
+  return uniqueIds;
+}
+
 function isInstagramPublication(publicationType: SchedulerPublicationType): boolean {
   return (
     publicationType === "instagram_post" ||
@@ -3390,42 +4200,6 @@ const DESKTOP_SIDEBAR_EXPANDED_STORAGE_KEY = "socialup-desktop-sidebar-expanded"
 const TEMP_DISABLE_BACKGROUND_POLLING = true;
 const LIVE_EVENT_REFRESH_DEBOUNCE_MS = 180;
 const LIVE_EVENT_RECONNECT_DELAY_MS = 1500;
-
-const MOCK_FEEDBACK_NOTICES: MockFeedbackNotice[] = [
-  {
-    id: "mock-feedback-1",
-    clientName: "Marina Costa",
-    clientRole: "Cliente",
-    clientAvatar: "MC",
-    projectName: "Campanha de Abril",
-    workspaceName: "Social Up",
-    message: "Gostei da proposta, mas queria testar uma versão com CTA mais direto no último card.",
-    createdAtLabel: "há 12 min",
-    unread: true,
-  },
-  {
-    id: "mock-feedback-2",
-    clientName: "Rafael Lima",
-    clientRole: "Cliente",
-    clientAvatar: "RL",
-    projectName: "Aprovação de Reels",
-    workspaceName: "Workspace 2",
-    message: "Podemos trocar a trilha e subir uma versão mais curta para o TikTok?",
-    createdAtLabel: "há 47 min",
-    unread: true,
-  },
-  {
-    id: "mock-feedback-3",
-    clientName: "Julia Mendes",
-    clientRole: "Cliente",
-    clientAvatar: "JM",
-    projectName: "Identidade do feed",
-    workspaceName: "Workspace 3",
-    message: "Aprovado. Só queria registrar que a capa ficou bem mais alinhada com a marca agora.",
-    createdAtLabel: "ontem",
-    unread: false,
-  },
-];
 
 const MOCK_SOCIALUP_NOTICES: MockSocialUpNotice[] = [
   {
@@ -3806,7 +4580,7 @@ function HistoryCalendarDraggableCard({
 function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
-  const [loginUsername, setLoginUsername] = useState(() => {
+  const [loginIdentifier, setLoginIdentifier] = useState(() => {
     if (typeof window === "undefined") {
       return "";
     }
@@ -3833,10 +4607,14 @@ function App() {
   const [acceptingWorkspaceInvite, setAcceptingWorkspaceInvite] = useState(false);
   const [creatingWorkspaceInviteUser, setCreatingWorkspaceInviteUser] = useState(false);
   const [setupName, setSetupName] = useState("");
+  const [setupEmail, setSetupEmail] = useState("");
   const [setupUsername, setSetupUsername] = useState("");
   const [setupPassword, setSetupPassword] = useState("");
   const [authError, setAuthError] = useState("");
   const [authInfo, setAuthInfo] = useState("");
+  const googleAuthPopupRef = useRef<Window | null>(null);
+  const googleAuthPopupWatchIntervalRef = useRef<number | null>(null);
+  const googleAuthResultReceivedRef = useRef(false);
   const activePostForMeSyncConnectionIdRef = useRef<string | null>(null);
   const postForMeAuthPopupRef = useRef<Window | null>(null);
   const postForMeAuthPopupConnectionIdRef = useRef<string | null>(null);
@@ -3851,13 +4629,17 @@ function App() {
   const [agentPlatformFilter, setAgentPlatformFilter] = useState<AgentPlatformFilter>("all");
   const [agentStatusFilter, setAgentStatusFilter] = useState<AgentConnectionStatusFilter>("all");
   const [activeAgentFilterMenu, setActiveAgentFilterMenu] = useState<"workspace" | "platform" | "status" | null>(null);
+  const [googleAuthSubmitting, setGoogleAuthSubmitting] = useState(false);
   const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [profileName, setProfileName] = useState("");
+  const [profileEmail, setProfileEmail] = useState("");
   const [profileUsername, setProfileUsername] = useState("");
   const [profilePassword, setProfilePassword] = useState("");
   const [profileTimeZone, setProfileTimeZone] = useState(DEFAULT_USER_TIME_ZONE);
   const [nowTickMs, setNowTickMs] = useState(() => Date.now());
   const [activeView, setActiveView] = useState<ViewKey>(initialViewFromLocation);
+  const [profilePageTab, setProfilePageTab] = useState<ProfilePageTab>(initialProfileTabFromLocation);
+  const [profileRouteUsername, setProfileRouteUsername] = useState<string | null>(initialProfileRouteUsernameFromLocation);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isDesktopViewport, setIsDesktopViewport] = useState(() => {
     if (typeof window === "undefined") {
@@ -3919,6 +4701,7 @@ function App() {
   const [workspaceModalInfoTone, setWorkspaceModalInfoTone] = useState<"success" | "error">("success");
   const [creatingConnectionCardKey, setCreatingConnectionCardKey] = useState<string | null>(null);
   const [transientAgentError, setTransientAgentError] = useState("");
+  const [agentsConnectionTransitionLoading, setAgentsConnectionTransitionLoading] = useState(false);
   const [activeQrConnectionId, setActiveQrConnectionId] = useState<string | null>(null);
   const [qrModalInfo, setQrModalInfo] = useState("");
   const [qrModalInfoTone, setQrModalInfoTone] = useState<"success" | "error">("success");
@@ -3989,6 +4772,8 @@ function App() {
   const [scheduledDate, setScheduledDate] = useState("");
   const [scheduledTime, setScheduledTime] = useState("");
   const [editingJobId, setEditingJobId] = useState<string | null>(null);
+  const [editingJobScope, setEditingJobScope] = useState<"group" | "single">("group");
+  const [editingJobSubsetIds, setEditingJobSubsetIds] = useState<string[] | null>(null);
   const [error, setError] = useState("");
   const [companyInfo, setCompanyInfo] = useState("");
   const [schedulerInfo, setSchedulerInfo] = useState("");
@@ -4031,6 +4816,7 @@ function App() {
   const [checkoutPlanId, setCheckoutPlanId] = useState("");
   const [checkoutCycle, setCheckoutCycle] = useState<"" | "MONTHLY" | "YEARLY">("");
   const [startingCheckout, setStartingCheckout] = useState(false);
+  const [startingInitialTrialPlanId, setStartingInitialTrialPlanId] = useState<string | null>(null);
   const [rootAssignPlanId, setRootAssignPlanId] = useState("");
   const [assigningRootPlan, setAssigningRootPlan] = useState(false);
   const [cancelingStripeSubscription, setCancelingStripeSubscription] = useState(false);
@@ -4049,9 +4835,14 @@ function App() {
   const [historyFilter, setHistoryFilter] = useState<HistoryFilterKey>(() =>
     parseHistoryFilterKey(readSearchParam(HISTORY_FILTER_QUERY_PARAM)),
   );
+  const [historyViewMode, setHistoryViewMode] = useState<HistoryViewMode>(() => readHistoryViewModeCookie());
   const [historyMonthFilter, setHistoryMonthFilter] = useState<string>("all");
   const [historyYearFilter, setHistoryYearFilter] = useState<string>("all");
+  const [historyDirectMonth, setHistoryDirectMonth] = useState(() => getYearMonthInTimeZone(new Date(), DEFAULT_USER_TIME_ZONE).month);
+  const [historyDirectYear, setHistoryDirectYear] = useState(() => getYearMonthInTimeZone(new Date(), DEFAULT_USER_TIME_ZONE).year);
   const [historySearchQuery, setHistorySearchQuery] = useState("");
+  const [historySearchLoading, setHistorySearchLoading] = useState(false);
+  const [historyHasLoadedOnce, setHistoryHasLoadedOnce] = useState(false);
   const [historyBulkAction, setHistoryBulkAction] = useState<HistoryBulkAction>("");
   const [historyBulkSelectedJobIds, setHistoryBulkSelectedJobIds] = useState<string[]>([]);
   const [historyBulkDate, setHistoryBulkDate] = useState("");
@@ -4099,7 +4890,23 @@ function App() {
   const [publicationDuplicateTime, setPublicationDuplicateTime] = useState("");
   const [publicationDuplicateCompanyIds, setPublicationDuplicateCompanyIds] = useState<string[]>([]);
   const [creatingPublicationDuplicate, setCreatingPublicationDuplicate] = useState(false);
+  const [activePublicationPreviewJobId, setActivePublicationPreviewJobId] = useState<string | null>(
+    initialPublicationPreviewJobIdFromLocation,
+  );
+  const [publicationPreviewLoading, setPublicationPreviewLoading] = useState(false);
+  const [publicationPreviewSubmitting, setPublicationPreviewSubmitting] = useState(false);
+  const [publicationPreviewInfo, setPublicationPreviewInfo] = useState("");
+  const [publicationPreviewData, setPublicationPreviewData] = useState<PublicationPreviewPayload | null>(null);
+  const [publicationPreviewCommentDraft, setPublicationPreviewCommentDraft] = useState("");
+  const [publicationPreviewReplyParentId, setPublicationPreviewReplyParentId] = useState<string | null>(null);
+  const [publicationPreviewDecisionIntent, setPublicationPreviewDecisionIntent] = useState<PublicationPreviewDecisionIntent | null>(null);
+  const [publicationPreviewMediaIndex, setPublicationPreviewMediaIndex] = useState(0);
+  const [publicationPreviewReactionBusyKey, setPublicationPreviewReactionBusyKey] = useState<string | null>(null);
+  const publicationPreviewSectionRef = useRef<HTMLElement | null>(null);
+  const publicationPreviewTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [activePublicationMediaJobId, setActivePublicationMediaJobId] = useState<string | null>(null);
+  const [activePublicationMediaOverrideTitle, setActivePublicationMediaOverrideTitle] = useState<string | null>(null);
+  const [activePublicationMediaOverridePaths, setActivePublicationMediaOverridePaths] = useState<string[] | null>(null);
   const [activePublicationMediaIndex, setActivePublicationMediaIndex] = useState(0);
   const [schedulerCarouselCanScrollLeft, setSchedulerCarouselCanScrollLeft] = useState(false);
   const [schedulerCarouselCanScrollRight, setSchedulerCarouselCanScrollRight] = useState(false);
@@ -4114,6 +4921,15 @@ function App() {
   const [avisosTotal, setAvisosTotal] = useState(0);
   const [recentAvisos, setRecentAvisos] = useState<Aviso[]>([]);
   const [unreadAvisosCount, setUnreadAvisosCount] = useState(0);
+  const [recentAvisosUnreadCounts, setRecentAvisosUnreadCounts] = useState<{
+    panel: number;
+    feedbacks: number;
+    socialup: number;
+  }>({
+    panel: 0,
+    feedbacks: 0,
+    socialup: 0,
+  });
   const [noticesPopoverOpen, setNoticesPopoverOpen] = useState(false);
   const [noticesPopoverTab, setNoticesPopoverTab] = useState<NoticesPopoverTabKey>("panel");
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
@@ -4155,6 +4971,11 @@ function App() {
   const storyEditorMeasureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const mediaSectionRef = useRef<HTMLElement | null>(null);
   const historySectionRef = useRef<HTMLElement | null>(null);
+  const historySearchInputRef = useRef<HTMLInputElement | null>(null);
+  const historyLegacySearchInputRef = useRef<HTMLInputElement | null>(null);
+  const historyPreviousContentLoadingRef = useRef(false);
+  const historyResultsLoadingFrameRef = useRef<number | null>(null);
+  const historyResultsWaitingForDataRef = useRef(false);
   const historyPublishedSectionRef = useRef<HTMLDivElement | null>(null);
   const historyDraftSectionRef = useRef<HTMLDivElement | null>(null);
   const historyDraftLoadMoreRef = useRef<HTMLDivElement | null>(null);
@@ -4174,29 +4995,41 @@ function App() {
   const profileMenuDesktopRef = useRef<HTMLDivElement | null>(null);
   const profileMenuMobileRef = useRef<HTMLDivElement | null>(null);
   const planEditorSectionRef = useRef<HTMLElement | null>(null);
-  const visibleMockFeedbackNotices = useMemo(
-    () => MOCK_FEEDBACK_NOTICES.filter((notice) => !dismissedPopoverNoticeIds.includes(notice.id)),
-    [dismissedPopoverNoticeIds],
-  );
   const visibleMockSocialUpNotices = useMemo(
     () => MOCK_SOCIALUP_NOTICES.filter((notice) => !dismissedPopoverNoticeIds.includes(notice.id)),
     [dismissedPopoverNoticeIds],
   );
-  const hasUnreadMockFeedbackNotices = useMemo(
-    () =>
-      visibleMockFeedbackNotices.some(
-        (notice) => notice.unread && !locallyReadPopoverNoticeIds.includes(notice.id),
-      ),
-    [locallyReadPopoverNoticeIds, visibleMockFeedbackNotices],
+  const recentFeedbackAvisos = useMemo(
+    () => recentAvisos.filter((aviso) => aviso.kind.trim().toUpperCase() === "FEEDBACK"),
+    [recentAvisos],
   );
-  const hasUnreadMockSocialUpNotices = useMemo(
+  const recentPanelAvisos = useMemo(
     () =>
-      visibleMockSocialUpNotices.some(
+      recentAvisos.filter((aviso) => {
+        const normalizedKind = aviso.kind.trim().toUpperCase();
+        return normalizedKind !== "FEEDBACK" && normalizedKind !== "SYSTEM_BROADCAST";
+      }),
+    [recentAvisos],
+  );
+  const recentSocialUpAvisos = useMemo(
+    () => recentAvisos.filter((aviso) => aviso.kind.trim().toUpperCase() === "SYSTEM_BROADCAST"),
+    [recentAvisos],
+  );
+  const unreadMockSocialUpCount = useMemo(
+    () =>
+      visibleMockSocialUpNotices.filter(
         (notice) => notice.unread && !locallyReadPopoverNoticeIds.includes(notice.id),
-      ),
+      ).length,
     [locallyReadPopoverNoticeIds, visibleMockSocialUpNotices],
   );
+  const hasUnreadMockSocialUpNotices = unreadMockSocialUpCount > 0;
   const isRootUser = authUser?.username === "root";
+  const normalizedAuthUsername = normalizeProfileRouteUsername(authUser?.username);
+  const resolvedProfileRouteUsername = profileRouteUsername || normalizedAuthUsername || null;
+  const resolvedProfilePageTab: ProfilePageTab = activeView === "plan" ? "plan" : profilePageTab;
+  const profileDisplayName = authUser?.name?.trim() || "Minha conta";
+  const profileSecondaryLabel = resolvedProfileRouteUsername ? `@${resolvedProfileRouteUsername}` : "Conta SocialUp";
+  const profileInitials = userInitials(profileDisplayName, resolvedProfileRouteUsername);
   const supportedTimeZones = useMemo(() => listSupportedTimeZones(), []);
   const effectiveUserTimeZone = normalizeTimeZone(authUser?.timeZone || DEFAULT_USER_TIME_ZONE);
   const nowReferenceDate = useMemo(() => new Date(nowTickMs), [nowTickMs]);
@@ -4237,6 +5070,10 @@ function App() {
     : null;
   const availablePaidPlans = useMemo(
     () => billingPlans.filter((plan) => plan.isActive && !plan.isTrial),
+    [billingPlans],
+  );
+  const initialTrialSelectablePlans = useMemo(
+    () => billingPlans.filter((plan) => isPlanEligibleForInitialTrialSelection(plan)),
     [billingPlans],
   );
   const resolvedCurrentBillingPlan = useMemo(() => {
@@ -4282,6 +5119,9 @@ function App() {
   const activeCheckoutPlanId = resolvedCurrentBillingPlan?.id ?? "";
   const activeCheckoutPlan = resolvedCurrentBillingPlan;
   const isBlockedBilling = !isRootUser && Boolean(billingMe?.isBlocked);
+  const currentPlanSupportsWorkspaceInvites = billingMe?.planCapabilities?.supportsWorkspaceInvites ?? false;
+  const currentPlanSupportsClientApproval = billingMe?.planCapabilities?.supportsClientApproval ?? false;
+  const shouldRenderInitialPlanSelection = Boolean(authUser?.needsPlanSelection) && !isRootUser;
   const checkoutTargetPlans = useMemo(
     () => availablePaidPlans.filter((plan) => plan.id !== activeCheckoutPlanId),
     [availablePaidPlans, activeCheckoutPlanId],
@@ -4416,9 +5256,7 @@ function App() {
   );
   const schedulerRequiresMp4Upload = schedulerSelectedPublicationSet.includes("instagram_reel");
   const supportsMultiMediaUpload = supportsMediaUpload && schedulerEffectiveMaxFiles > 1;
-  const supportsFirstComment = schedulerSelectedPublicationSet.some(
-    (entry) => entry === "instagram_post" || entry === "instagram_reel",
-  );
+  const supportsFirstComment = false;
   const supportsHashtags = schedulerSelectedPublicationSet.some(
     (entry) =>
       entry === "instagram_post" ||
@@ -4525,14 +5363,19 @@ function App() {
     }
   }
 
-  function navigateToView(view: ViewKey, options?: { historyFilter?: HistoryFilterKey }) {
+  function navigateToView(view: ViewKey, options?: { historyFilter?: HistoryFilterKey; profileTab?: ProfilePageTab }) {
     if (typeof window === "undefined") {
       return;
     }
 
+    const resolvedView = view === "scheduler" && !hasAnyPublicationManageWorkspace ? "history" : view;
+    const nextProfileTab = options?.profileTab ?? (resolvedView === "plan" ? "plan" : "profile");
+    const isProfileLikeView = resolvedView === "profile" || resolvedView === "plan";
     const nextHistoryFilter =
-      view === "history" ? options?.historyFilter ?? historyFilter : undefined;
-    const nextHref = buildViewHref(view, { historyFilter: nextHistoryFilter });
+      resolvedView === "history" ? options?.historyFilter ?? historyFilter : undefined;
+    const nextHref = isProfileLikeView
+      ? buildProfilePageHref(resolvedProfileRouteUsername || normalizedAuthUsername || profileUsername, nextProfileTab)
+      : buildViewHref(resolvedView, { historyFilter: nextHistoryFilter });
     const currentUrl = new URL(window.location.href);
     const nextUrl = new URL(nextHref, window.location.origin);
     const currentComparable = `${normalizePath(currentUrl.pathname)}${currentUrl.search}`;
@@ -4542,7 +5385,7 @@ function App() {
       window.history.pushState({}, "", `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`);
     }
 
-    if (view === "history") {
+    if (resolvedView === "history") {
       if (nextHistoryFilter) {
         setHistoryFilter(nextHistoryFilter);
       }
@@ -4551,11 +5394,16 @@ function App() {
       setHistoryPage(1);
     }
 
-    if (view === "notices") {
+    if (resolvedView === "notices") {
       setAvisosPage(1);
     }
 
-    if (view !== activeView) {
+    if (isProfileLikeView) {
+      setProfilePageTab(nextProfileTab);
+      setProfileRouteUsername(resolvedProfileRouteUsername || normalizedAuthUsername || normalizeProfileRouteUsername(profileUsername));
+    }
+
+    if (resolvedView !== activeView) {
       setAuthInfo("");
       setSchedulerInfo("");
       setHistoryInfo("");
@@ -4566,11 +5414,12 @@ function App() {
 
       const shouldPrimeContentSkeleton =
         Boolean(authUser) &&
-        view !== "profile" &&
-        view !== "plan" &&
-        view !== "planConfig" &&
-        view !== "notices" &&
-        view !== "beeUpAdmin";
+        resolvedView !== "profile" &&
+        resolvedView !== "plan" &&
+        resolvedView !== "planConfig" &&
+        resolvedView !== "notices" &&
+        resolvedView !== "beeUpAdmin" &&
+        resolvedView !== "historyPreview";
       if (shouldPrimeContentSkeleton) {
         setContentLoading(true);
       }
@@ -4579,7 +5428,20 @@ function App() {
     setNoticesPopoverOpen(false);
     setProfileMenuOpen(false);
     setSidebarOpen(false);
-    setActiveView(view);
+
+    if (resolvedView !== "historyPreview") {
+      setActivePublicationPreviewJobId(null);
+      setPublicationPreviewLoading(false);
+      setPublicationPreviewSubmitting(false);
+      setPublicationPreviewInfo("");
+      setPublicationPreviewData(null);
+      setPublicationPreviewCommentDraft("");
+      setPublicationPreviewReplyParentId(null);
+      setPublicationPreviewMediaIndex(0);
+      setPublicationPreviewReactionBusyKey(null);
+    }
+
+    setActiveView(resolvedView);
 
     window.requestAnimationFrame(() => {
       window.scrollTo({ top: 0, behavior: "smooth" });
@@ -4598,7 +5460,10 @@ function App() {
 
     target.scrollIntoView({ behavior: "smooth", block: "start" });
 
-    const nextUrl = `${buildViewHref("plan")}#${BILLING_PLAN_CHECKOUT_ANCHOR_ID}`;
+    const nextUrl = `${buildProfilePageHref(
+      resolvedProfileRouteUsername || normalizedAuthUsername || profileUsername,
+      "plan",
+    )}#${BILLING_PLAN_CHECKOUT_ANCHOR_ID}`;
     const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
     if (currentUrl !== nextUrl) {
       window.history.replaceState({}, "", nextUrl);
@@ -4607,7 +5472,7 @@ function App() {
 
   function navigateToPlanCheckout(event: ReactMouseEvent<HTMLAnchorElement>) {
     event.preventDefault();
-    navigateToView("plan");
+    navigateToView("plan", { profileTab: "plan" });
     window.setTimeout(() => {
       scrollToBillingCheckoutAnchor();
     }, 120);
@@ -4630,6 +5495,60 @@ function App() {
     () => Object.fromEntries(companies.map((company) => [company.id, company])),
     [companies],
   );
+  const hasAnyPublicationManageWorkspace = useMemo(
+    () => isRootUser || companies.some((company) => company.canManagePublications),
+    [companies, isRootUser],
+  );
+  const canCreateOwnedWorkspace = useMemo(() => {
+    if (isRootUser) {
+      return true;
+    }
+
+    if (shouldRenderInitialPlanSelection || isBlockedBilling) {
+      return false;
+    }
+
+    if ((billingMe?.plan?.workspaceLimit ?? 0) > 0) {
+      return true;
+    }
+
+    return companies.some((company) => company.canManageWorkspace);
+  }, [billingMe?.plan?.workspaceLimit, companies, isBlockedBilling, isRootUser, shouldRenderInitialPlanSelection]);
+  const hasAnyWorkspaceInviteSupport = useMemo(
+    () => isRootUser || companies.some((company) => company.supportsWorkspaceInvites),
+    [companies, isRootUser],
+  );
+  const publicationWriteScopedCompanies = useMemo(
+    () => (selectedCompanyId ? [companyMapById[selectedCompanyId]].filter((company): company is Company => Boolean(company)) : companies),
+    [companies, companyMapById, selectedCompanyId],
+  );
+  const canManageSelectedPublicationScope = useMemo(
+    () =>
+      isRootUser ||
+      (publicationWriteScopedCompanies.length > 0 &&
+        publicationWriteScopedCompanies.some((company) => company.canManagePublications)),
+    [isRootUser, publicationWriteScopedCompanies],
+  );
+  const manageablePublicationJobIdsSet = useMemo(
+    () =>
+      new Set(
+        jobs
+          .filter((job) => isRootUser || Boolean(companyMapById[job.companyId]?.canManagePublications))
+          .map((job) => job.id),
+      ),
+    [companyMapById, isRootUser, jobs],
+  );
+  function canManagePublicationForCompanyId(companyId: string | null | undefined): boolean {
+    if (!companyId) {
+      return false;
+    }
+
+    return isRootUser || Boolean(companyMapById[companyId]?.canManagePublications);
+  }
+
+  function canManagePublicationJob(job: Pick<Job, "companyId"> | null | undefined): boolean {
+    return canManagePublicationForCompanyId(job?.companyId);
+  }
   const activeWorkspaceInviteCompany = useMemo(
     () => (activeWorkspaceInviteCompanyId ? companyMapById[activeWorkspaceInviteCompanyId] ?? null : null),
     [activeWorkspaceInviteCompanyId, companyMapById],
@@ -4919,7 +5838,7 @@ function App() {
   }, [activeView, noticeAdminInfo]);
 
   useEffect(() => {
-    if (activeView !== "plan" && activeView !== "planConfig" && planInfo) {
+    if (activeView !== "profile" && activeView !== "plan" && activeView !== "planConfig" && planInfo) {
       setPlanInfo("");
     }
   }, [activeView, planInfo]);
@@ -4930,6 +5849,7 @@ function App() {
       !normalizedInfo ||
       !(
         normalizedInfo === "Conta adicionada com sucesso." ||
+        normalizedInfo === "Conta conectada com sucesso." ||
         normalizedInfo === "Conta renovada com sucesso." ||
         normalizedInfo === "Conta sincronizada com sucesso." ||
         normalizedInfo === "Conta desconectada com sucesso." ||
@@ -4958,6 +5878,7 @@ function App() {
     const normalizedInfo = authInfo.trim();
     if (
       normalizedInfo !== "Conta adicionada com sucesso." &&
+      normalizedInfo !== "Conta conectada com sucesso." &&
       normalizedInfo !== "Conta renovada com sucesso." &&
       normalizedInfo !== "Conta sincronizada com sucesso." &&
       normalizedInfo !== "Conta desconectada com sucesso." &&
@@ -4992,6 +5913,29 @@ function App() {
       window.clearTimeout(timer);
     };
   }, [activeView, error, transientAgentError]);
+
+  useEffect(() => {
+    if (activeView !== "historyPreview") {
+      return;
+    }
+
+    const normalizedInfo = publicationPreviewInfo.trim();
+    if (!normalizedInfo) {
+      return;
+    }
+
+    window.requestAnimationFrame(() => {
+      scrollPublicationPreviewToTop();
+    });
+
+    const timer = window.setTimeout(() => {
+      setPublicationPreviewInfo((current) => (current === normalizedInfo ? "" : current));
+    }, 4200);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [activeView, publicationPreviewInfo]);
 
   useEffect(() => {
     if (activeView === "planConfig" || !isBillingDiscountModalOpen) {
@@ -5029,6 +5973,11 @@ function App() {
     const handlePointerDown = (event: MouseEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) {
+        return;
+      }
+
+      if (target instanceof Element && target.closest(".notices-backdrop")) {
+        setNoticesPopoverOpen(false);
         return;
       }
 
@@ -5075,6 +6024,11 @@ function App() {
     const handlePointerDown = (event: MouseEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) {
+        return;
+      }
+
+      if (target instanceof Element && target.closest(".profile-menu-backdrop")) {
+        setProfileMenuOpen(false);
         return;
       }
 
@@ -5134,6 +6088,51 @@ function App() {
   }, [openEmojiPickerKey]);
 
   useEffect(() => {
+    const handleGoogleOauthMessage = (event: MessageEvent) => {
+      const payload = parseGoogleOauthWindowMessage(event.data);
+      if (!payload) {
+        return;
+      }
+
+      googleAuthResultReceivedRef.current = true;
+      clearManagedPopupWatch(googleAuthPopupWatchIntervalRef);
+      closeManagedPopupWindow(googleAuthPopupRef.current);
+      googleAuthPopupRef.current = null;
+      setGoogleAuthSubmitting(false);
+
+      if (!payload.success || !payload.sessionToken || !payload.user) {
+        setAuthInfo("");
+        setAuthError(payload.message || "Falha ao entrar com Google.");
+        return;
+      }
+
+      api.setSessionToken(payload.sessionToken, rememberMe);
+      if (rememberMe) {
+        const rememberedIdentifier = payload.user.email?.trim() || payload.user.username;
+        window.localStorage.setItem(REMEMBERED_USERNAME_STORAGE_KEY, rememberedIdentifier);
+      } else {
+        window.localStorage.removeItem(REMEMBERED_USERNAME_STORAGE_KEY);
+      }
+
+      setAuthChecked(true);
+      setAuthUser(payload.user);
+      setLoginIdentifier(payload.user.email || payload.user.username);
+      setLoginPassword("");
+      setProfileName(payload.user.name);
+      setProfileEmail(payload.user.email || "");
+      setProfileUsername(payload.user.username);
+      setProfileTimeZone(payload.user.timeZone || DEFAULT_USER_TIME_ZONE);
+      setAuthError("");
+      setAuthInfo(payload.message || "Login com Google concluído.");
+
+      if (readPendingPostForMeConnectionSync()) {
+        setAuthInfo("Login concluído. Voltando para Conectar contas para finalizar a sincronização.");
+        navigateToView("agents");
+      } else {
+        navigateToView("dashboard");
+      }
+    };
+
     const handleInstagramOauthMessage = (event: MessageEvent) => {
       const payload = parseInstagramOauthWindowMessage(event.data);
       if (!payload) {
@@ -5158,13 +6157,73 @@ function App() {
     };
 
     const handlePostForMeOauthMessage = (event: MessageEvent) => {
+      const previewPayload = parsePostForMeOauthPreviewWindowMessage(event.data);
+      if (previewPayload) {
+        const resolvedConnectionId =
+          previewPayload.connectionId?.trim() ||
+          postForMeAuthPopupConnectionIdRef.current?.trim() ||
+          "";
+        if (!resolvedConnectionId) {
+          return;
+        }
+        primeOptimisticPostForMeConnectionSuccess(resolvedConnectionId, previewPayload.accountId);
+        return;
+      }
+
+      if (isPostForMeOauthCloseWindowMessage(event.data)) {
+        setAgentsConnectionTransitionLoading(true);
+        const previewSignal = readPostForMePreviewSuccessSignal();
+        const trackedConnectionId = postForMeAuthPopupConnectionIdRef.current?.trim() || "";
+        if (previewSignal?.success && trackedConnectionId) {
+          primeOptimisticPostForMeConnectionSuccess(trackedConnectionId, previewSignal.accountIdHint);
+          clearPostForMePreviewSuccessSignal();
+        }
+
+        closeManagedPopupWindow(postForMeAuthPopupRef.current);
+        postForMeAuthPopupRef.current = null;
+        postForMeAuthPopupConnectionIdRef.current = null;
+        clearManagedPopupWatch(postForMeAuthPopupWatchIntervalRef);
+
+        const completed = readCompletedPostForMeConnectionSync();
+        if (completed) {
+          applyCompletedPostForMeConnection({
+            connectionId: completed.connectionId,
+            success: completed.success,
+            message: completed.message,
+            providerAccountIdHint: completed.providerAccountIdHint,
+          });
+        }
+        return;
+      }
+
       const payload = parsePostForMeOauthWindowMessage(event.data);
       if (!payload) {
         return;
       }
 
+      const resolvedConnectionId =
+        payload.connectionId?.trim() ||
+        postForMeAuthPopupConnectionIdRef.current?.trim() ||
+        "";
+      if (!resolvedConnectionId) {
+        return;
+      }
+
+      if (postForMeAuthPopupConnectionIdRef.current === resolvedConnectionId) {
+        closeManagedPopupWindow(postForMeAuthPopupRef.current);
+        postForMeAuthPopupRef.current = null;
+        postForMeAuthPopupConnectionIdRef.current = null;
+        clearManagedPopupWatch(postForMeAuthPopupWatchIntervalRef);
+      }
+
+      try {
+        closeManagedPopupWindow(event.source as Window | null);
+      } catch {
+        // Se o source não for uma janela fechável, seguimos com o fluxo normal.
+      }
+
       applyCompletedPostForMeConnection({
-        connectionId: payload.connectionId,
+        connectionId: resolvedConnectionId,
         success: payload.success !== false,
         message: payload.message,
         providerAccountIdHint: payload.accountId,
@@ -5172,6 +6231,16 @@ function App() {
     };
 
     const handlePostForMeCompletionStorage = (event: StorageEvent) => {
+      if (event.key === POST_FOR_ME_PREVIEW_SUCCESS_STORAGE_KEY) {
+        const previewSignal = readPostForMePreviewSuccessSignal();
+        const trackedConnectionId = postForMeAuthPopupConnectionIdRef.current?.trim() || "";
+        if (previewSignal?.success && trackedConnectionId) {
+          primeOptimisticPostForMeConnectionSuccess(trackedConnectionId, previewSignal.accountIdHint);
+          clearPostForMePreviewSuccessSignal();
+        }
+        return;
+      }
+
       if (event.key !== POST_FOR_ME_COMPLETION_STORAGE_KEY) {
         return;
       }
@@ -5189,15 +6258,17 @@ function App() {
       });
     };
 
+    window.addEventListener("message", handleGoogleOauthMessage);
     window.addEventListener("message", handleInstagramOauthMessage);
     window.addEventListener("message", handlePostForMeOauthMessage);
     window.addEventListener("storage", handlePostForMeCompletionStorage);
     return () => {
+      window.removeEventListener("message", handleGoogleOauthMessage);
       window.removeEventListener("message", handleInstagramOauthMessage);
       window.removeEventListener("message", handlePostForMeOauthMessage);
       window.removeEventListener("storage", handlePostForMeCompletionStorage);
     };
-  }, [selectedCompanyId, isRootUser]);
+  }, [selectedCompanyId, isRootUser, rememberMe]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -5342,6 +6413,22 @@ function App() {
     };
   }, [authUser, activeView, activeQrConnectionId]);
 
+  useEffect(() => {
+    if (activeView !== "agents") {
+      setAgentsConnectionTransitionLoading(false);
+    }
+  }, [activeView]);
+
+  useEffect(() => {
+    if (
+      activeView === "agents" &&
+      agentsConnectionTransitionLoading &&
+      (authInfo.trim() || transientAgentError.trim() || error.trim())
+    ) {
+      setAgentsConnectionTransitionLoading(false);
+    }
+  }, [activeView, agentsConnectionTransitionLoading, authInfo, transientAgentError, error]);
+
   const filteredJobs = useMemo(
     () => jobs.filter((job) => (selectedCompanyId ? job.companyId === selectedCompanyId : true)),
     [jobs, selectedCompanyId],
@@ -5379,6 +6466,20 @@ function App() {
       }
 
       return "all";
+    });
+  }, [companies]);
+
+  useEffect(() => {
+    setSelectedCompanyId((current) => {
+      if (!companies.length) {
+        return "";
+      }
+
+      if (current && companies.some((company) => company.id === current)) {
+        return current;
+      }
+
+      return companies.length === 1 ? companies[0]?.id ?? "" : "";
     });
   }, [companies]);
 
@@ -5583,6 +6684,7 @@ function App() {
     }
 
     return companies
+      .filter((company) => company.canManagePublications)
       .map((company) => {
         const selectedConnections: SchedulerProfileTargetConnection[] = [];
 
@@ -5735,9 +6837,13 @@ function App() {
           return isRootUser;
         }
 
+        if (item.key === "scheduler") {
+          return hasAnyPublicationManageWorkspace;
+        }
+
         return true;
       }),
-    [isRootUser],
+    [hasAnyPublicationManageWorkspace, isRootUser],
   );
 
   const jobsOrderedByCreatedAtDesc = useMemo(
@@ -5751,6 +6857,8 @@ function App() {
     () => jobsOrderedByCreatedAtDesc.filter((job) => !isWhatsappRelinkChildJob(job)),
     [jobsOrderedByCreatedAtDesc],
   );
+
+  const profileAvatarUrl = authUser?.avatarUrl?.trim() || null;
 
   const upcomingJobs = useMemo(() => {
     const eligibleUpcomingJobs = jobsOrderedByCreatedAtDesc.filter(
@@ -5805,27 +6913,65 @@ function App() {
     return grouped;
   }, [jobs]);
 
+  const schedulerCompanyGroupedJobsMap = useMemo(() => {
+    const grouped = new Map<string, Job[]>();
+
+    for (const job of jobs) {
+      if (isWhatsappRelinkChildJob(job)) {
+        continue;
+      }
+
+      const groupKey = resolveJobSchedulerCompanyGroupKey(job);
+      const current = grouped.get(groupKey) ?? [];
+      current.push(job);
+      grouped.set(groupKey, current);
+    }
+
+    for (const [groupKey, groupItems] of grouped.entries()) {
+      const effectiveItems = resolveLatestJobsPerPublicationType(groupItems).sort(
+        (left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime(),
+      );
+      grouped.set(groupKey, effectiveItems);
+    }
+
+    return grouped;
+  }, [jobs]);
+
   const dashboardCalendarJobs = useMemo(
     () => {
-      const representativeJobs = new Map<string, Job>();
+      const grouped = new Map<string, Job[]>();
 
-      for (const job of publicationHistoryJobsOrderedByCreatedAtDesc) {
-        if (job.publicationState !== "PUBLISHED" || isWhatsappRelinkChildJob(job)) {
+      for (const job of filteredJobs) {
+        if (isWhatsappRelinkChildJob(job)) {
           continue;
         }
 
-        const groupKey = resolveJobSchedulerGroupKey(job);
-        const currentRepresentative = representativeJobs.get(groupKey);
-        if (!currentRepresentative || new Date(job.dataPostagem).getTime() < new Date(currentRepresentative.dataPostagem).getTime()) {
-          representativeJobs.set(groupKey, job);
-        }
+        const groupKey = resolveJobSchedulerCompanyGroupKey(job);
+        const current = grouped.get(groupKey) ?? [];
+        current.push(job);
+        grouped.set(groupKey, current);
       }
 
-      return Array.from(representativeJobs.values()).sort(
+      const representativeJobs: Job[] = [];
+
+      for (const groupItems of grouped.values()) {
+        const effectiveItems = resolveLatestJobsPerPublicationType(groupItems).filter(
+          (job) => !isWhatsappRelinkChildJob(job) && job.status !== "CANCELED",
+        );
+
+        if (!effectiveItems.length) {
+          continue;
+        }
+
+        effectiveItems.sort((left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime());
+        representativeJobs.push(effectiveItems[0]);
+      }
+
+      return representativeJobs.sort(
         (left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime(),
       );
     },
-    [publicationHistoryJobsOrderedByCreatedAtDesc],
+    [filteredJobs],
   );
 
   const dashboardCalendarMonthLabel = useMemo(
@@ -5902,6 +7048,16 @@ function App() {
   useEffect(() => {
     setDashboardCalendarPopoverMediaIndex(0);
   }, [dashboardCalendarPopoverJobId]);
+
+  useEffect(() => {
+    if (activeView === "dashboard" || !dashboardCalendarPopoverJobId) {
+      return;
+    }
+
+    setDashboardCalendarPopoverJobId(null);
+    setDashboardCalendarEditingJobId(null);
+    setDashboardCalendarTimeValue("");
+  }, [activeView, dashboardCalendarPopoverJobId]);
 
   const dashboardUpcomingPages = useMemo(() => {
     const chunkSize = 2;
@@ -6083,16 +7239,83 @@ function App() {
     () => (activePublicationDuplicateJobId ? jobs.find((job) => job.id === activePublicationDuplicateJobId) ?? null : null),
     [activePublicationDuplicateJobId, jobs],
   );
+  const activePublicationPreviewJob = useMemo(
+    () => (activePublicationPreviewJobId ? jobs.find((job) => job.id === activePublicationPreviewJobId) ?? null : null),
+    [activePublicationPreviewJobId, jobs],
+  );
   const activePublicationMediaJob = useMemo(
     () => (activePublicationMediaJobId ? jobs.find((job) => job.id === activePublicationMediaJobId) ?? null : null),
     [activePublicationMediaJobId, jobs],
   );
   const activePublicationMediaPaths = useMemo(
-    () => (activePublicationMediaJob ? resolveJobMediaPaths(activePublicationMediaJob) : []),
-    [activePublicationMediaJob],
+    () =>
+      activePublicationMediaOverridePaths && activePublicationMediaOverridePaths.length > 0
+        ? activePublicationMediaOverridePaths
+        : activePublicationMediaJob
+          ? resolveJobMediaPaths(activePublicationMediaJob)
+          : [],
+    [activePublicationMediaJob, activePublicationMediaOverridePaths],
   );
   const activePublicationMediaPath =
     activePublicationMediaPaths[activePublicationMediaIndex] ?? activePublicationMediaPaths[0] ?? null;
+  const publicationPreviewMediaPath =
+    publicationPreviewData?.mediaPaths[publicationPreviewMediaIndex] ??
+    publicationPreviewData?.mediaPaths[0] ??
+    null;
+  const publicationPreviewCommentTree = useMemo(
+    () => buildPublicationPreviewCommentTree(publicationPreviewData?.comments ?? []),
+    [publicationPreviewData?.comments],
+  );
+  const publicationPreviewReplyTargetComment = useMemo(
+    () =>
+      publicationPreviewReplyParentId
+        ? publicationPreviewData?.comments.find((comment) => comment.id === publicationPreviewReplyParentId) ?? null
+        : null,
+    [publicationPreviewData?.comments, publicationPreviewReplyParentId],
+  );
+
+  useEffect(() => {
+    if (!authUser || activeView !== "historyPreview" || !activePublicationPreviewJobId) {
+      return;
+    }
+
+    let cancelled = false;
+    setPublicationPreviewLoading(true);
+    setPublicationPreviewSubmitting(false);
+    setPublicationPreviewInfo("");
+    setPublicationPreviewDecisionIntent(null);
+    setPublicationPreviewReactionBusyKey(null);
+    setError("");
+
+    void api
+      .get<PublicationPreviewPayload>(`/jobs/${activePublicationPreviewJobId}/preview`)
+      .then((preview) => {
+        if (cancelled) {
+          return;
+        }
+        setPublicationPreviewData(preview);
+      })
+      .catch((previewError) => {
+        if (cancelled) {
+          return;
+        }
+        setPublicationPreviewData(null);
+        setError(
+          previewError instanceof Error
+            ? previewError.message
+            : "Falha ao carregar a visualização da publicação.",
+        );
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setPublicationPreviewLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authUser, activePublicationPreviewJobId, activeView]);
 
   const activePublicationDuplicateTargetCompanies = useMemo(() => {
     if (!activePublicationDuplicateJob) {
@@ -6369,6 +7592,30 @@ function App() {
       const previous = previousById.get(connection.id);
       if (!previous) {
         return connection;
+      }
+
+      const previousLastAuthAtMs =
+        previous.lastAuthAt ? new Date(previous.lastAuthAt).getTime() : previous.lastSeenAt ? new Date(previous.lastSeenAt).getTime() : 0;
+      const hasRecentOptimisticPostForMeConnection =
+        previous.provider === "POST_FOR_ME" &&
+        connection.provider === "POST_FOR_ME" &&
+        previous.authStatus === "CONNECTED" &&
+        connection.authStatus !== "CONNECTED" &&
+        previousLastAuthAtMs > 0 &&
+        Date.now() - previousLastAuthAtMs < 20_000;
+
+      if (hasRecentOptimisticPostForMeConnection) {
+        return {
+          ...connection,
+          authStatus: "CONNECTED",
+          authLaunchUrl: null,
+          providerStatus: previous.providerStatus || "connected",
+          providerAccountId: previous.providerAccountId || connection.providerAccountId,
+          loginIdentifier: connection.loginIdentifier || previous.loginIdentifier || null,
+          lastAuthAt: previous.lastAuthAt || connection.lastAuthAt,
+          lastSeenAt: previous.lastSeenAt || connection.lastSeenAt,
+          tokenExpiresAt: previous.tokenExpiresAt,
+        };
       }
 
       if (connection.platform === "instagram" && connection.authStatus === "CONNECTED") {
@@ -6748,9 +7995,24 @@ function App() {
     }
 
     try {
-      const recent = await api.get<{ items: Aviso[]; unreadCount: number }>("/avisos/recent?limit=5");
+      const recent = await api.get<{
+        items: Aviso[];
+        unreadCount: number;
+        unreadCounts?: {
+          panel: number;
+          feedbacks: number;
+          socialup: number;
+        };
+      }>("/avisos/recent?limit=12");
       setRecentAvisos(recent.items);
       setUnreadAvisosCount(recent.unreadCount);
+      setRecentAvisosUnreadCounts(
+        recent.unreadCounts ?? {
+          panel: recent.unreadCount,
+          feedbacks: 0,
+          socialup: 0,
+        },
+      );
       lastUnreadAvisosCountRef.current = Math.max(0, recent.unreadCount);
     } catch (noticesError) {
       if (withLoading) {
@@ -6760,6 +8022,20 @@ function App() {
       if (withLoading) {
         setNoticesPopoverLoading(false);
       }
+    }
+  }
+
+  async function refreshAgentsConnectionsSnapshot(): Promise<void> {
+    try {
+      const [companiesData, connectionsData] = await Promise.all([
+        api.get<Company[]>("/companies"),
+        api.get<SocialConnection[]>("/connections"),
+      ]);
+
+      setCompanies(companiesData);
+      setConnections((current) => mergeConnectionsWithCachedRuntimeData(current, connectionsData));
+    } catch {
+      // Atualização silenciosa: o próximo evento ou refresh manual tenta novamente.
     }
   }
 
@@ -6793,6 +8069,18 @@ function App() {
       scopeSet.has("connections") ||
       scopeSet.has("companies") ||
       (scopeSet.has("logs") && activeView === "logs");
+
+    const shouldRefreshAgentsConnectionsOnly =
+      authUser &&
+      activeView === "agents" &&
+      !scopeSet.has("jobs") &&
+      !scopeSet.has("logs") &&
+      (scopeSet.has("connections") || scopeSet.has("companies"));
+
+    if (shouldRefreshAgentsConnectionsOnly) {
+      await refreshAgentsConnectionsSnapshot();
+      return;
+    }
 
     if (
       shouldRefreshPrimaryViews &&
@@ -6873,6 +8161,44 @@ function App() {
       return "0";
     }
     return String(limit);
+  }
+
+  function isCanonicalBillingPlan(plan: BillingPlan): boolean {
+    return CANONICAL_BILLING_PLAN_CODES.has((plan.code || "").trim().toUpperCase());
+  }
+
+  function isPlanEligibleForInitialTrialSelection(plan: BillingPlan): boolean {
+    return plan.isActive && plan.isPublic && !plan.isTrial && isCanonicalBillingPlan(plan);
+  }
+
+  function resolvePlanFeatureBullets(plan: BillingPlan): string[] {
+    const normalizedCode = (plan.code || "").trim().toUpperCase();
+
+    if (normalizedCode === "AGENCY") {
+      return [
+        `${formatPlanLimitDisplay(plan.workspaceLimit, plan.code)} workspaces de cliente`,
+        `${formatPlanLimitDisplay(plan.agencyBonusWorkspaceLimit, plan.code)} bônus de agência`,
+        `${formatPlanLimitDisplay(plan.maxConnections, plan.code)} contas sociais`,
+        "Convites e colaboração com cliente",
+        "Aprovação e feedback na publicação",
+      ];
+    }
+
+    if (normalizedCode === "TRIAL") {
+      return [
+        `${formatPlanLimitDisplay(plan.workspaceLimit, plan.code)} workspace próprio`,
+        "Até 2 contas de WhatsApp",
+        `${formatPlanLimitDisplay(plan.maxMonthlyPublications, plan.code)} publicações no mês`,
+        "Sem convites e sem aprovação de cliente",
+      ];
+    }
+
+    return [
+      `${formatPlanLimitDisplay(plan.workspaceLimit, plan.code)} workspace próprio`,
+      "Até 2 contas de WhatsApp",
+      `${formatPlanLimitDisplay(plan.maxConnections, plan.code)} contas sociais`,
+      "Sem convites e sem aprovação de cliente",
+    ];
   }
 
   async function loadBillingData(options?: { withSkeleton?: boolean }): Promise<void> {
@@ -7304,6 +8630,7 @@ function App() {
       activeView === "notices" ||
       activeView === "profile" ||
       activeView === "plan" ||
+      activeView === "planStart" ||
       activeView === "planConfig" ||
       activeView === "beeUpAdmin" ||
       activeView === "history"
@@ -7315,12 +8642,62 @@ function App() {
   }, [selectedCompanyId, authUser, activeView]);
 
   useEffect(() => {
-    if (!authUser || (activeView !== "plan" && activeView !== "planConfig")) {
+    if (!authUser || (activeView !== "profile" && activeView !== "plan" && activeView !== "planStart" && activeView !== "planConfig")) {
       return;
     }
 
     void loadBillingData({ withSkeleton: true });
   }, [authUser, activeView, isRootUser]);
+
+  useEffect(() => {
+    if (!authUser?.needsPlanSelection || isRootUser) {
+      return;
+    }
+
+    void loadBillingData({ withSkeleton: true });
+  }, [authUser?.needsPlanSelection, isRootUser]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !authUser?.needsPlanSelection || isRootUser) {
+      return;
+    }
+
+    const nextHref = buildViewHref("planStart");
+    const nextUrl = new URL(nextHref, window.location.origin);
+    const currentUrl = new URL(window.location.href);
+    const currentComparable = `${normalizePath(currentUrl.pathname)}${currentUrl.search}`;
+    const nextComparable = `${normalizePath(nextUrl.pathname)}${nextUrl.search}`;
+
+    if (currentComparable !== nextComparable) {
+      window.history.replaceState({}, "", `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`);
+    }
+
+    if (activeView !== "planStart") {
+      setActiveView("planStart");
+    }
+
+    if (profilePageTab !== "plan") {
+      setProfilePageTab("plan");
+    }
+  }, [activeView, authUser?.needsPlanSelection, isRootUser, profilePageTab]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !authUser || authUser.needsPlanSelection || activeView !== "planStart") {
+      return;
+    }
+
+    const nextHref = buildViewHref("dashboard");
+    const nextUrl = new URL(nextHref, window.location.origin);
+    const currentUrl = new URL(window.location.href);
+    const currentComparable = `${normalizePath(currentUrl.pathname)}${currentUrl.search}`;
+    const nextComparable = `${normalizePath(nextUrl.pathname)}${nextUrl.search}`;
+
+    if (currentComparable !== nextComparable) {
+      window.history.replaceState({}, "", `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`);
+    }
+
+    setActiveView("dashboard");
+  }, [activeView, authUser]);
 
   useEffect(() => {
     if (!isRootUser) {
@@ -7368,6 +8745,24 @@ function App() {
 
     navigateToView("dashboard");
   }, [activeView, authChecked, authUser, isRootUser]);
+
+  useEffect(() => {
+    setHistoryBulkSelectedJobIds((current) => current.filter((jobId) => manageablePublicationJobIdsSet.has(jobId)));
+  }, [manageablePublicationJobIdsSet]);
+
+  useEffect(() => {
+    if (!canManageSelectedPublicationScope && historyBulkAction) {
+      cancelHistoryBulkAction();
+    }
+  }, [canManageSelectedPublicationScope, historyBulkAction]);
+
+  useEffect(() => {
+    if (!authUser || activeView !== "scheduler" || hasAnyPublicationManageWorkspace) {
+      return;
+    }
+
+    navigateToView("history");
+  }, [activeView, authUser, hasAnyPublicationManageWorkspace]);
 
   useEffect(() => {
     if (
@@ -7481,9 +8876,11 @@ function App() {
     }
 
     setProfileName(authUser.name);
+    setProfileEmail(authUser.email || "");
     setProfileUsername(authUser.username);
     setProfilePassword("");
     setProfileTimeZone(normalizeTimeZone(authUser.timeZone));
+    setProfileRouteUsername((current) => current || normalizeProfileRouteUsername(authUser.username));
   }, [authUser]);
 
   useEffect(() => {
@@ -7672,7 +9069,8 @@ function App() {
 
     setWhatsappRelinkConnectionIds((current) => {
       const filtered = current.filter((id) => schedulerWhatsappConnections.some((connection) => connection.id === id));
-      return filtered.length === current.length && filtered.every((id, index) => id === current[index]) ? current : filtered;
+      const deduped = dedupeConnectionIdsByDispatchKey(filtered, schedulerWhatsappConnections);
+      return deduped.length === current.length && deduped.every((id, index) => id === current[index]) ? current : deduped;
     });
   }, [canEnableWhatsappRelink, schedulerWhatsappConnections, whatsappRelinkConnectionIds.length, whatsappRelinkEnabled]);
 
@@ -7854,6 +9252,60 @@ function App() {
   }, [desktopSidebarExpanded]);
 
   useEffect(() => {
+    return () => {
+      clearManagedPopupWatch(googleAuthPopupWatchIntervalRef);
+      closeManagedPopupWindow(googleAuthPopupRef.current);
+      googleAuthPopupRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!googleAuthSubmitting || typeof window === "undefined") {
+      return;
+    }
+
+    let settleTimer: number | null = null;
+
+    const settleQuicklyIfStillPending = () => {
+      if (googleAuthResultReceivedRef.current) {
+        return;
+      }
+
+      if (settleTimer !== null) {
+        window.clearTimeout(settleTimer);
+      }
+
+      settleTimer = window.setTimeout(() => {
+        if (!googleAuthResultReceivedRef.current) {
+          setGoogleAuthSubmitting(false);
+          setAuthInfo("");
+        }
+      }, 180);
+    };
+
+    const handleFocus = () => {
+      settleQuicklyIfStillPending();
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        settleQuicklyIfStillPending();
+      }
+    };
+
+    window.addEventListener("focus", handleFocus);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener("focus", handleFocus);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      if (settleTimer !== null) {
+        window.clearTimeout(settleTimer);
+      }
+    };
+  }, [googleAuthSubmitting]);
+
+  useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
@@ -7861,6 +9313,8 @@ function App() {
     const handlePopState = () => {
       const nextView = initialViewFromLocation();
       const nextHistoryFilter = parseHistoryFilterKey(readSearchParam(HISTORY_FILTER_QUERY_PARAM));
+      const nextProfileTab = parseProfilePageTab(window.location.pathname, window.location.search);
+      const nextProfileUsername = readProfileUsernameFromPathname(window.location.pathname);
 
       const shouldPrimeContentSkeleton =
         Boolean(authUser) &&
@@ -7868,13 +9322,19 @@ function App() {
         nextView !== "plan" &&
         nextView !== "planConfig" &&
         nextView !== "notices" &&
-        nextView !== "beeUpAdmin";
+        nextView !== "beeUpAdmin" &&
+        nextView !== "historyPreview";
       if (shouldPrimeContentSkeleton) {
         setContentLoading(true);
       }
 
       setActiveView(nextView);
+      setProfilePageTab(nextProfileTab);
+      setProfileRouteUsername(nextProfileUsername);
       setHistoryFilter(nextHistoryFilter);
+      setActivePublicationPreviewJobId(
+        nextView === "historyPreview" ? readPublicationPreviewJobIdFromPathname(window.location.pathname) : null,
+      );
 
       if (nextView === "history") {
         setHistoryMonthFilter("all");
@@ -7906,7 +9366,21 @@ function App() {
     }
 
     const url = new URL(window.location.href);
-    url.pathname = VIEW_ROUTE_MAP[activeView] ?? VIEW_ROUTE_MAP.dashboard;
+    const nextProfileHref = buildProfilePageHref(
+      resolvedProfileRouteUsername || normalizedAuthUsername || profileUsername,
+      resolvedProfilePageTab,
+    );
+    const profileUrl = new URL(nextProfileHref, window.location.origin);
+    if (activeView === "historyPreview" && activePublicationPreviewJobId) {
+      url.pathname = buildPublicationPreviewHref(activePublicationPreviewJobId);
+      url.search = "";
+    } else if (activeView === "profile" || activeView === "plan") {
+      url.pathname = profileUrl.pathname;
+      url.search = profileUrl.search;
+    } else {
+      url.pathname = VIEW_ROUTE_MAP[activeView] ?? VIEW_ROUTE_MAP.dashboard;
+      url.search = "";
+    }
     url.searchParams.delete(LEGACY_HISTORY_VIEW_QUERY_PARAM);
 
     if (activeView !== "history" || historyFilter === "all") {
@@ -7920,11 +9394,29 @@ function App() {
     if (nextUrl !== currentUrl) {
       window.history.replaceState({}, "", nextUrl);
     }
-  }, [activeView, historyFilter, authUser]);
+  }, [
+    activePublicationPreviewJobId,
+    activeView,
+    authUser,
+    historyFilter,
+    normalizedAuthUsername,
+    profileUsername,
+    resolvedProfilePageTab,
+    resolvedProfileRouteUsername,
+  ]);
 
   useEffect(() => {
     setHistoryPage(1);
   }, [historyFilter, historyMonthFilter, historySearchQuery, historyYearFilter, selectedCompanyId]);
+
+  useEffect(() => {
+    if (
+      activeView === "history" &&
+      (historyFilter !== "all" || Boolean(historySearchQuery.trim()) || Boolean(selectedCompanyId) || Boolean(historyBulkAction))
+    ) {
+      setHistoryViewMode("list");
+    }
+  }, [activeView, historyBulkAction, historyFilter, historySearchQuery, selectedCompanyId]);
 
   useEffect(() => {
     setHistoryCalendarDayPages({});
@@ -7964,6 +9456,55 @@ function App() {
   useEffect(() => {
     writeCookieValue(HISTORY_COLLAPSED_SECTIONS_COOKIE, JSON.stringify(historyCollapsedSections));
   }, [historyCollapsedSections]);
+
+  useEffect(() => {
+    writeCookieValue(HISTORY_VIEW_MODE_COOKIE, historyViewMode);
+  }, [historyViewMode]);
+
+  useEffect(() => {
+    if (historySearchInputRef.current && historySearchInputRef.current.value !== historySearchQuery) {
+      historySearchInputRef.current.value = historySearchQuery;
+    }
+    if (historyLegacySearchInputRef.current && historyLegacySearchInputRef.current.value !== historySearchQuery) {
+      historyLegacySearchInputRef.current.value = historySearchQuery;
+    }
+  }, [historySearchQuery]);
+
+  useEffect(() => {
+    if (activeView !== "history") {
+      setHistoryHasLoadedOnce(false);
+      setHistorySearchLoading(false);
+      historyResultsWaitingForDataRef.current = false;
+      if (typeof window !== "undefined" && historyResultsLoadingFrameRef.current) {
+        window.cancelAnimationFrame(historyResultsLoadingFrameRef.current);
+        historyResultsLoadingFrameRef.current = null;
+      }
+    }
+  }, [activeView]);
+
+  useEffect(() => {
+    const wasLoading = historyPreviousContentLoadingRef.current;
+
+    if (activeView === "history" && wasLoading && !contentLoading) {
+      if (!historyHasLoadedOnce) {
+        setHistoryHasLoadedOnce(true);
+      }
+      if (historyResultsWaitingForDataRef.current && historySearchLoading) {
+        historyResultsWaitingForDataRef.current = false;
+        setHistorySearchLoading(false);
+      }
+    }
+
+    historyPreviousContentLoadingRef.current = contentLoading;
+  }, [activeView, contentLoading, historyHasLoadedOnce, historySearchLoading]);
+
+  useEffect(() => {
+    return () => {
+      if (typeof window !== "undefined" && historyResultsLoadingFrameRef.current) {
+        window.cancelAnimationFrame(historyResultsLoadingFrameRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     setHistoryDraftJobs([]);
@@ -8361,6 +9902,10 @@ function App() {
   }
 
   function openWorkspaceInviteModal(company: Company) {
+    if (!company.supportsWorkspaceInvites || !company.canManageMembers) {
+      return;
+    }
+
     const availableRoles = availableWorkspaceInviteRoles(company);
     const currentRole = workspaceInviteRoleInputs[company.id];
     const nextRole =
@@ -8388,6 +9933,10 @@ function App() {
   }
 
   function openWorkspaceDetailsModal(company: Company, view: "members" | "invites") {
+    if (view === "invites" && !company.supportsWorkspaceInvites) {
+      return;
+    }
+
     setWorkspaceModalInfo("");
     setWorkspaceModalInfoTone("success");
     setActiveWorkspaceDetailsCompanyId(company.id);
@@ -8478,20 +10027,42 @@ function App() {
       source?: "manual" | "auto";
       intent?: "sync" | "renew";
       providerAccountIdHint?: string;
+      preferRecentPlatformAccount?: boolean;
     },
   ) {
     setSyncingProviderConnectionId(connectionId);
 
     try {
+      const pendingSync = readPendingPostForMeConnectionSync();
+      const matchingPendingSync = pendingSync?.connectionId === connectionId ? pendingSync : null;
       const result = await api.postJson<{
         primaryConnection: SocialConnection;
         importedConnections: SocialConnection[];
         remoteCount: number;
       }>(`/connections/${connectionId}/sync-provider`, {
         providerAccountIdHint: options?.providerAccountIdHint?.trim() || undefined,
+        knownRemoteAccountIds:
+          matchingPendingSync?.knownRemoteAccountIds && matchingPendingSync.knownRemoteAccountIds.length > 0
+            ? matchingPendingSync.knownRemoteAccountIds
+            : undefined,
+        preferRecentPlatformAccount: options?.preferRecentPlatformAccount || undefined,
       });
 
-      await loadAll();
+      setConnections((current) => {
+        const nextById = new Map(current.map((connection) => [connection.id, connection] as const));
+        nextById.set(result.primaryConnection.id, result.primaryConnection);
+        for (const importedConnection of result.importedConnections) {
+          nextById.set(importedConnection.id, importedConnection);
+        }
+
+        const nextConnections = current.map((connection) => nextById.get(connection.id) ?? connection);
+        for (const importedConnection of result.importedConnections) {
+          if (!current.some((connection) => connection.id === importedConnection.id)) {
+            nextConnections.push(importedConnection);
+          }
+        }
+        return nextConnections;
+      });
 
       if (!options?.silent) {
         const effectiveRenewed =
@@ -8516,7 +10087,6 @@ function App() {
 
       return result;
     } catch (error) {
-      await loadAll();
       throw error;
     } finally {
       setSyncingProviderConnectionId((current) => (current === connectionId ? null : current));
@@ -8524,6 +10094,7 @@ function App() {
   }
 
   async function resetCanceledConnectionAuth(connectionId: string) {
+    setAgentsConnectionTransitionLoading(false);
     const currentConnection = connections.find((connection) => connection.id === connectionId) ?? null;
     const shouldPreserveConnectedCard =
       currentConnection?.provider === "POST_FOR_ME" && Boolean(currentConnection.providerAccountId?.trim());
@@ -8558,6 +10129,7 @@ function App() {
 
   function showTransientAgentsError(message: string) {
     const normalizedMessage = message.trim() || "Falha ao concluir a conexão da conta.";
+    setAgentsConnectionTransitionLoading(false);
     setAuthInfo("");
     setTransientAgentError(normalizedMessage);
     setError(normalizedMessage);
@@ -8609,6 +10181,7 @@ function App() {
     message?: string;
     providerAccountIdHint?: string | null;
   }) {
+    setAgentsConnectionTransitionLoading(false);
     const normalizedConnectionId = payload.connectionId.trim();
     if (!normalizedConnectionId) {
       return;
@@ -8635,9 +10208,34 @@ function App() {
         showTransientAgentsError(payload.message || "Falha ao concluir a conexão da conta.");
       }
     } else {
+      const optimisticConnectedAt = new Date().toISOString();
       setError("");
-      setAuthInfo("");
-      startProviderConnectionSyncPolling(normalizedConnectionId, payload.providerAccountIdHint ?? null);
+      setAuthInfo("Conta conectada com sucesso.");
+      setConnections((current) =>
+        current.map((connection) =>
+          connection.id === normalizedConnectionId
+            ? {
+                ...connection,
+                authStatus: "CONNECTED",
+                authLaunchUrl: null,
+                providerStatus: "connected",
+                providerAccountId: payload.providerAccountIdHint?.trim() || connection.providerAccountId,
+                tokenExpiresAt: null,
+                lastSeenAt: optimisticConnectedAt,
+                lastAuthAt: optimisticConnectedAt,
+              }
+            : connection,
+        ),
+      );
+      if (postForMeAuthPopupConnectionIdRef.current === normalizedConnectionId) {
+        closeManagedPopupWindow(postForMeAuthPopupRef.current);
+        postForMeAuthPopupRef.current = null;
+        postForMeAuthPopupConnectionIdRef.current = null;
+      }
+      startProviderConnectionSyncPolling(normalizedConnectionId, {
+        providerAccountIdHint: payload.providerAccountIdHint ?? null,
+        preferRecentPlatformAccount: true,
+      });
     }
 
     window.setTimeout(() => {
@@ -8649,14 +10247,47 @@ function App() {
     }, 30);
   }
 
-  function startProviderConnectionSyncPolling(connectionId: string, providerAccountIdHint?: string | null) {
+  function primeOptimisticPostForMeConnectionSuccess(connectionId: string, providerAccountIdHint?: string | null) {
+    const normalizedConnectionId = connectionId.trim();
+    if (!normalizedConnectionId) {
+      return;
+    }
+
+    const optimisticConnectedAt = new Date().toISOString();
+    setError("");
+    setAuthInfo("Conta conectada com sucesso.");
+    setConnections((current) =>
+      current.map((connection) =>
+        connection.id === normalizedConnectionId
+          ? {
+              ...connection,
+              authStatus: "CONNECTED",
+              authLaunchUrl: null,
+              providerStatus: "connected",
+              providerAccountId: providerAccountIdHint?.trim() || connection.providerAccountId,
+              tokenExpiresAt: null,
+              lastSeenAt: optimisticConnectedAt,
+              lastAuthAt: optimisticConnectedAt,
+            }
+          : connection,
+      ),
+    );
+  }
+
+  function startProviderConnectionSyncPolling(
+    connectionId: string,
+    options?: {
+      providerAccountIdHint?: string | null;
+      preferRecentPlatformAccount?: boolean;
+    },
+  ) {
     if (activePostForMeSyncConnectionIdRef.current === connectionId) {
       return;
     }
 
     activePostForMeSyncConnectionIdRef.current = connectionId;
     const deadlineAt = Date.now() + 15 * 60 * 1000;
-    const retryDelayMs = 5_000;
+    const retryDelayMs = 1_200;
 
     const finish = () => {
       if (activePostForMeSyncConnectionIdRef.current === connectionId) {
@@ -8675,7 +10306,8 @@ function App() {
         const result = await syncProviderConnection(connectionId, {
           silent: true,
           source: "auto",
-          providerAccountIdHint: providerAccountIdHint ?? undefined,
+          providerAccountIdHint: options?.providerAccountIdHint ?? undefined,
+          preferRecentPlatformAccount: options?.preferRecentPlatformAccount,
         });
         const primaryConnectionConnected = result.primaryConnection.authStatus === "CONNECTED";
         const primaryConnectionStillExpired = isConnectionManualRenewalExpired(result.primaryConnection);
@@ -8737,7 +10369,7 @@ function App() {
       finish();
     };
 
-    window.setTimeout(() => void tick(), 2_500);
+    window.setTimeout(() => void tick(), 250);
   }
 
   async function createConnectionForWorkspace(platform: SocialConnection["platform"], workspaceId: string) {
@@ -8791,6 +10423,7 @@ function App() {
     const isPostForMeConnection = connection?.provider === "POST_FOR_ME";
 
     if (isPostForMeConnection) {
+      setAgentsConnectionTransitionLoading(false);
       if (postForMeAuthLaunchLockRef.current) {
         const lockedPopup = postForMeAuthPopupRef.current;
         if (lockedPopup && !lockedPopup.closed) {
@@ -8867,11 +10500,16 @@ function App() {
         clearManagedPopupWatch(postForMeAuthPopupWatchIntervalRef);
       }
 
-      const result = await api.postJson<{ launchUrl?: string }>(
+      const result = await api.postJson<{ launchUrl?: string; knownRemoteAccountIds?: string[]; connection?: SocialConnection }>(
         `/connections/${connectionId}/open-visual-auth`,
         isWhatsappConnection ? {} : { returnToUrl },
       );
       setError("");
+      if (result.connection) {
+        setConnections((current) =>
+          current.map((connection) => (connection.id === connectionId ? result.connection ?? connection : connection)),
+        );
+      }
       if (isWhatsappConnection) {
         setQrModalInfo("");
         setQrModalInfoTone("success");
@@ -8884,7 +10522,7 @@ function App() {
       }
 
       if (isPostForMeConnection) {
-        savePendingPostForMeConnectionSync(connectionId);
+        savePendingPostForMeConnectionSync(connectionId, result.knownRemoteAccountIds ?? []);
         if (!authPopup) {
           setAuthInfo("Seu navegador bloqueou a janela de conexão. Vamos continuar na mesma aba.");
           postForMeAuthPopupRef.current = null;
@@ -8907,7 +10545,6 @@ function App() {
 
         if (authPopup && !authPopup.closed) {
           setAuthInfo("");
-          startProviderConnectionSyncPolling(connectionId);
           authPopup.location.href = result.launchUrl;
           postForMeAuthPopupWatchIntervalRef.current = window.setInterval(() => {
             const trackedPopup = postForMeAuthPopupRef.current;
@@ -8921,9 +10558,20 @@ function App() {
               return;
             }
 
+            setAgentsConnectionTransitionLoading(true);
             clearManagedPopupWatch(postForMeAuthPopupWatchIntervalRef);
             postForMeAuthPopupRef.current = null;
             postForMeAuthPopupConnectionIdRef.current = null;
+
+            const previewSignal = readPostForMePreviewSuccessSignal();
+            if (previewSignal?.success) {
+              primeOptimisticPostForMeConnectionSuccess(connectionId, previewSignal.accountIdHint);
+              clearPostForMePreviewSuccessSignal();
+            }
+
+            if (activePostForMeSyncConnectionIdRef.current === connectionId) {
+              return;
+            }
 
             const completed = readCompletedPostForMeConnectionSync();
             if (completed?.connectionId === connectionId) {
@@ -8936,7 +10584,11 @@ function App() {
                 return;
               }
 
-              void syncProviderConnection(connectionId, { silent: true, source: "auto" })
+              void syncProviderConnection(connectionId, {
+                silent: true,
+                source: "auto",
+                preferRecentPlatformAccount: true,
+              })
                 .then((syncResult) => {
                   const primaryConnectionConnected = syncResult.primaryConnection.authStatus === "CONNECTED";
                   if (syncResult.remoteCount > 0 && primaryConnectionConnected) {
@@ -9067,41 +10719,87 @@ function App() {
 
     const pendingSync = readPendingPostForMeConnectionSync();
     const connectionId = postForMePopupResult.connectionId ?? pendingSync?.connectionId ?? "";
-    if (!connectionId) {
-      return;
-    }
+    let closeRetryIntervalId: number | null = null;
+    const completionMessage = postForMePopupResult.success
+      ? "Conexão concluída. Estamos finalizando a conta no painel."
+      : resolvePostForMePopupFailureMessage(postForMePopupResult.message);
 
-    saveCompletedPostForMeConnectionSync({
-      connectionId,
-      success: postForMePopupResult.success,
-      message: postForMePopupResult.success
-        ? "Conexão concluída. Estamos finalizando a conta no painel."
-        : resolvePostForMePopupFailureMessage(postForMePopupResult.message),
-      providerAccountIdHint: postForMePopupResult.accountId,
-    });
+    const startCloseSequence = () => {
+      try {
+        window.opener?.postMessage(
+          {
+            type: "socialup-postforme-oauth-close",
+          } satisfies PostForMeOauthCloseWindowMessage,
+          window.location.origin,
+        );
+      } catch {
+        // ignore
+      }
 
-    try {
-      window.opener?.postMessage(
-        {
-          type: "socialup-postforme-oauth",
-          connectionId,
-          success: postForMePopupResult.success,
-          message: postForMePopupResult.success
-            ? "Conexão concluída. Estamos finalizando a conta no painel."
-            : resolvePostForMePopupFailureMessage(postForMePopupResult.message),
-          accountId: postForMePopupResult.accountId,
-        } satisfies PostForMeOauthWindowMessage,
-        window.location.origin,
-      );
-    } catch {
-      // O fallback por localStorage continua válido mesmo sem opener.
-    }
-
-    [120, 600, 1800].forEach((delayMs) => {
-      window.setTimeout(() => {
+      closeRetryIntervalId = window.setInterval(() => {
         requestPopupWindowClose();
-      }, delayMs);
-    });
+      }, 250);
+      window.setTimeout(() => {
+        if (closeRetryIntervalId !== null) {
+          window.clearInterval(closeRetryIntervalId);
+        }
+      }, 8_000);
+
+      [60, 180, 600, 1200, 2400, 5000].forEach((delayMs) => {
+        window.setTimeout(() => {
+          requestPopupWindowClose();
+        }, delayMs);
+      });
+    };
+
+    if (postForMePopupResult.success) {
+      try {
+        window.opener?.postMessage(
+          {
+            type: "socialup-postforme-oauth-preview-success",
+            connectionId: connectionId || null,
+            accountId: postForMePopupResult.accountId,
+          } satisfies PostForMeOauthPreviewWindowMessage,
+          window.location.origin,
+        );
+      } catch {
+        // O fluxo principal continua com storage/postMessage completo logo em seguida.
+      }
+    }
+
+    if (connectionId) {
+      saveCompletedPostForMeConnectionSync({
+        connectionId,
+        success: postForMePopupResult.success,
+        message: completionMessage,
+        providerAccountIdHint: postForMePopupResult.accountId,
+      });
+
+      try {
+        window.opener?.postMessage(
+          {
+            type: "socialup-postforme-oauth",
+            connectionId: connectionId || null,
+            success: postForMePopupResult.success,
+            message: completionMessage,
+            accountId: postForMePopupResult.accountId,
+          } satisfies PostForMeOauthWindowMessage,
+          window.location.origin,
+        );
+      } catch {
+        // O fallback por localStorage continua válido mesmo sem opener.
+      }
+    }
+
+    window.setTimeout(() => {
+      startCloseSequence();
+    }, postForMePopupResult.success ? 120 : 0);
+
+    return () => {
+      if (closeRetryIntervalId !== null) {
+        window.clearInterval(closeRetryIntervalId);
+      }
+    };
   }, [postForMePopupResult]);
 
   useEffect(() => {
@@ -9154,13 +10852,16 @@ function App() {
     }
 
     const completedSync = readCompletedPostForMeConnectionSync();
-    if (completedSync?.connectionId === pendingSync.connectionId && !completedSync.success) {
+    if (completedSync?.connectionId !== pendingSync.connectionId || !completedSync.success) {
       return;
     }
 
     setError("");
     setAuthInfo("");
-    startProviderConnectionSyncPolling(pendingSync.connectionId);
+    startProviderConnectionSyncPolling(pendingSync.connectionId, {
+      providerAccountIdHint: completedSync.providerAccountIdHint ?? null,
+      preferRecentPlatformAccount: true,
+    });
   }, [authUser, activeView]);
 
   useEffect(() => {
@@ -9270,6 +10971,8 @@ function App() {
       return;
     }
 
+    setError("");
+    setAuthInfo("Conta desconectada com sucesso.");
     setActiveQrConnectionId((current) => (current === connectionId ? null : current));
     setQrRequestingConnectionId((current) => (current === connectionId ? null : current));
     setQrCancellingConnectionId((current) => (current === connectionId ? null : current));
@@ -9288,10 +10991,30 @@ function App() {
       whatsappOwnerJid: null,
       whatsappProfileName: null,
     });
-    await api.postJson(`/connections/${connectionId}/disconnect`, {});
-    await loadAll();
-    setError("");
-    setAuthInfo("Conta desconectada com sucesso.");
+    setConnections((current) =>
+      current.map((connection) =>
+        connection.id === connectionId
+          ? {
+              ...connection,
+              authStatus: "AUTH_REQUIRED",
+              authLaunchUrl: null,
+              lastSeenAt: null,
+              lastAuthAt: null,
+              tokenExpiresAt: null,
+              providerStatus: "disconnected",
+              providerAccountId: null,
+            }
+          : connection,
+      ),
+    );
+    try {
+      await api.postJson(`/connections/${connectionId}/disconnect`, {});
+      void loadAll({ withSkeleton: false });
+    } catch (error) {
+      await loadAll({ withSkeleton: false });
+      setAuthInfo("");
+      setError(error instanceof Error ? error.message : "Falha ao desconectar a conta.");
+    }
   }
 
   async function uploadSelectedMedia(files: File[]) {
@@ -10595,12 +12318,17 @@ function App() {
       if (current.includes(connectionId)) {
         return current.filter((id) => id !== connectionId);
       }
-      return [...current, connectionId];
+      return dedupeConnectionIdsByDispatchKey([...current, connectionId], schedulerWhatsappConnections);
     });
   }
 
   function selectAllWhatsappRelinkConnections() {
-    setWhatsappRelinkConnectionIds(schedulerWhatsappConnections.map((connection) => connection.id));
+    setWhatsappRelinkConnectionIds(
+      dedupeConnectionIdsByDispatchKey(
+        schedulerWhatsappConnections.map((connection) => connection.id),
+        schedulerWhatsappConnections,
+      ),
+    );
   }
 
   function clearWhatsappRelinkConnections() {
@@ -10622,6 +12350,18 @@ function App() {
     window.scrollTo({ top: targetTop, behavior: "smooth" });
   }
 
+  function showSchedulerValidationMessage(message: string) {
+    setError("");
+    setSchedulerInfo(message);
+    scrollSchedulerToTop();
+  }
+
+  function showSchedulerErrorMessage(message: string) {
+    setSchedulerInfo("");
+    setError(message);
+    scrollSchedulerToTop();
+  }
+
   function selectMetaLocationSuggestion(suggestion: MetaLocationSuggestion) {
     setJobLocationName(suggestion.name);
     setJobLocationId(suggestion.id);
@@ -10634,27 +12374,23 @@ function App() {
     }
 
     if (!publicationState) {
-      setError("");
-      setSchedulerInfo("Selecione um status da publicação.");
+      showSchedulerValidationMessage("Selecione um status da publicação.");
       return;
     }
 
     const normalizedTitle = postTitle.trim();
     if (!normalizedTitle) {
-      setError("");
-      setSchedulerInfo("Preencha o título da postagem.");
+      showSchedulerValidationMessage("Preencha o título da postagem.");
       return;
     }
 
     if (schedulerSelectedTargets.length === 0) {
-      setError("");
-      setSchedulerInfo("Selecione ao menos um workspace com conta conectada para esta postagem.");
+      showSchedulerValidationMessage("Selecione ao menos um workspace com conta conectada para esta postagem.");
       return;
     }
 
     if (requiresMediaUpload && uploadedSchedulerMedia.length === 0) {
-      setError("");
-      setSchedulerInfo("Envie uma mídia antes de agendar este tipo de postagem.");
+      showSchedulerValidationMessage("Envie uma mídia antes de agendar este tipo de postagem.");
       schedulerMediaInputRef.current?.focus({ preventScroll: true });
       return;
     }
@@ -10663,8 +12399,7 @@ function App() {
       supportsMultiMediaUpload &&
       uploadedSchedulerMedia.length > schedulerEffectiveMaxFiles
     ) {
-      setError("");
-      setSchedulerInfo(
+      showSchedulerValidationMessage(
         schedulerRequiresSinglePrimaryVideo
           ? "Essa combinação aceita apenas 1 vídeo por publicação."
           : schedulerEffectiveMaxFiles === 1
@@ -10680,9 +12415,8 @@ function App() {
         ? validateSchedulerMediaSelection(invalidMedia.fileName, invalidMedia.fileSizeBytes)
         : null;
       if (validationMessage) {
-        setError("");
         const invalidMediaIndex = uploadedSchedulerMedia.findIndex((media) => media.filePath === invalidMedia?.filePath);
-        setSchedulerInfo(
+        showSchedulerValidationMessage(
           invalidMediaIndex >= 0 ? `Mídia ${invalidMediaIndex + 1}: ${validationMessage}` : validationMessage,
         );
         schedulerMediaInputRef.current?.focus({ preventScroll: true });
@@ -10691,8 +12425,7 @@ function App() {
 
       const mediaBundleValidationMessage = validateSchedulerMediaBundleSelection(uploadedSchedulerMedia);
       if (mediaBundleValidationMessage) {
-        setError("");
-        setSchedulerInfo(mediaBundleValidationMessage);
+        showSchedulerValidationMessage(mediaBundleValidationMessage);
         return;
       }
     }
@@ -10700,8 +12433,7 @@ function App() {
     if (schedulerRequiresStoryStatusCaptions && uploadedSchedulerMedia.length > 0) {
       const missingCaptionIndex = uploadedSchedulerMedia.findIndex((media) => !(media.caption?.trim() || ""));
       if (missingCaptionIndex >= 0) {
-        setError("");
-        setSchedulerInfo(
+        showSchedulerValidationMessage(
           `Preencha a legenda da mídia ${missingCaptionIndex + 1} para publicar Stories + Status.`,
         );
         return;
@@ -10724,14 +12456,12 @@ function App() {
     }
 
     if (!scheduledDate || !scheduledTime) {
-      setError("");
-      setSchedulerInfo("Preencha data e horário da publicação.");
+      showSchedulerValidationMessage("Preencha data e horário da publicação.");
       return;
     }
 
     if (supportsMetaLocation && !hasForcedInstagramMetaLocation && jobLocationName.trim() && !jobLocationId.trim()) {
-      setError("");
-      setSchedulerInfo("Selecione uma localização da lista para preencher o ID automaticamente.");
+      showSchedulerValidationMessage("Selecione uma localização da lista para preencher o ID automaticamente.");
       return;
     }
 
@@ -10748,8 +12478,7 @@ function App() {
     const scheduledPayload = buildScheduledPayload(scheduledDate, scheduledTime, effectiveUserTimeZone);
     if (!scheduledPayload) {
       setSubmittingJob(false);
-      setError("");
-      setSchedulerInfo("Data/hora inválida para o fuso selecionado.");
+      showSchedulerValidationMessage("Data/hora inválida para o fuso selecionado.");
       return;
     }
     const normalizedLocationId = jobLocationId.trim();
@@ -10766,46 +12495,68 @@ function App() {
       supportsFirstComment && firstCommentEnabled ? firstComment.trim() : "";
     if (supportsFirstComment && firstCommentEnabled && !normalizedFirstComment) {
       setSubmittingJob(false);
-      setError("");
-      setSchedulerInfo("Preencha o primeiro comentário ou desative esta opção.");
+      showSchedulerValidationMessage("Preencha o primeiro comentário ou desative esta opção.");
       return;
     }
     const normalizedWhatsappRelinkConnectionIds = canEnableWhatsappRelink
-      ? whatsappRelinkConnectionIds.filter((id) =>
-        schedulerWhatsappConnections.some((connection) => connection.id === id)
-      )
+      ? dedupeConnectionIdsByDispatchKey(
+          whatsappRelinkConnectionIds.filter((id) =>
+            schedulerWhatsappConnections.some((connection) => connection.id === id)
+          ),
+          schedulerWhatsappConnections,
+        )
       : [];
     if (supportsWhatsappRelink && whatsappRelinkEnabled && whatsappRelinkMediaMessage) {
       setSubmittingJob(false);
-      setError("");
-      setSchedulerInfo(whatsappRelinkMediaMessage);
+      showSchedulerValidationMessage(whatsappRelinkMediaMessage);
       return;
     }
     if (canEnableWhatsappRelink && whatsappRelinkEnabled && normalizedWhatsappRelinkConnectionIds.length === 0) {
       setSubmittingJob(false);
-      setError("");
-      setSchedulerInfo("Selecione ao menos uma conta de WhatsApp para relink.");
+      showSchedulerValidationMessage("Selecione ao menos uma conta de WhatsApp para relink.");
       return;
+    }
+    const xPublicationType = schedulerSelectedPublicationSet.find((entry) => entry === "x_post");
+    if (xPublicationType) {
+      const resolvedXCaption = resolveSchedulerComposedCaptionForPublicationType(
+        xPublicationType,
+        caption,
+        jobHashtags,
+      );
+      if (resolvedXCaption.length > X_POST_MAX_TEXT_LENGTH) {
+        setSubmittingJob(false);
+        showSchedulerValidationMessage(
+          `X aceita até ${X_POST_MAX_TEXT_LENGTH} caracteres na legenda final. Ajuste o texto ou reduza as hashtags antes de enviar.`,
+        );
+        return;
+      }
     }
     const effectiveWhatsappBackgroundColor = whatsappBackgroundColor;
     const editingGroupJobs =
-      editingCurrentJob && editingCurrentJob.schedulerGroupId?.trim()
-        ? (schedulerGroupedJobsMap.get(resolveJobSchedulerGroupKey(editingCurrentJob)) ?? [editingCurrentJob]).filter(
+      editingJobSubsetIds && editingCurrentJob
+        ? editingJobSubsetIds
+            .map((jobId) => jobs.find((job) => job.id === jobId) ?? null)
+            .filter((job): job is Job => Boolean(job) && !isWhatsappRelinkChildJob(job))
+        : editingCurrentJob && editingJobScope === "group" && editingCurrentJob.schedulerGroupId?.trim()
+        ? (schedulerCompanyGroupedJobsMap.get(resolveJobSchedulerCompanyGroupKey(editingCurrentJob)) ?? [editingCurrentJob]).filter(
             (job) => !isWhatsappRelinkChildJob(job),
           )
         : editingCurrentJob
           ? [editingCurrentJob]
           : [];
     const shouldPersistSchedulerGroupId =
-      schedulerSelectedPublicationSet.length > 1 ||
+      editingJobScope === "group" &&
+      !editingJobSubsetIds &&
+      (schedulerSelectedPublicationSet.length > 1 ||
       schedulerSelectedTargets.length > 1 ||
       editingGroupJobs.length > 1 ||
-      Boolean(editingCurrentJob?.schedulerGroupId?.trim());
+      Boolean(editingCurrentJob?.schedulerGroupId?.trim()));
     const schedulerGroupId =
       shouldPersistSchedulerGroupId
         ? editingCurrentJob?.schedulerGroupId?.trim() || createSchedulerGroupId()
         : null;
     const desiredPublicationKeys = new Set<string>();
+    const scheduledDispatchKeys = new Set<string>();
 
     const buildPayloadForPublicationType = (
       selectedType: SchedulerSelectablePublicationType,
@@ -10826,38 +12577,42 @@ function App() {
         whatsappRelinkEnabled;
 
       return {
-        companyId: target.companyId,
-        socialConnectionId: connectionEntry.connection.id,
-        filePath: uploadedFilePath,
-        filePaths: uploadedSchedulerMedia.map((item) => item.filePath),
-        fileCaptions: uploadedSchedulerMedia.map((item) => {
-          const normalizedCaption = item.caption?.trim() || "";
-          return normalizedCaption.length > 0 ? normalizedCaption : null;
-        }),
-        sequential:
-          (selectedType === "instagram_post" || selectedType === "instagram_story") && uploadedMediaCount > 1,
-        title: normalizedTitle,
-        caption: selectedType === "instagram_story" || schedulerRequiresStoryStatusCaptions ? null : caption,
-        firstComment:
-          firstCommentEnabled &&
-          (selectedType === "instagram_post" || selectedType === "instagram_reel")
-            ? normalizedFirstComment || null
-            : null,
-        hashtags: jobHashtags.length > 0 ? jobHashtags : undefined,
-        whatsappBackgroundColor: selectedType === "whatsapp_status_midia" ? effectiveWhatsappBackgroundColor : null,
-        whatsappRelinkEnabled: shouldEnableRelink,
-        whatsappRelinkConnectionIds: shouldEnableRelink ? normalizedWhatsappRelinkConnectionIds : undefined,
-        locationName: supportsMetaLocationPublication(selectedType) ? effectiveLocationName : null,
-        locationId: supportsMetaLocationPublication(selectedType) ? effectiveLocationId : null,
-        publicationType: selectedType,
-        publicationState,
-        schedulerGroupId,
-        ...scheduledPayload,
+        connectionEntry,
+        payload: {
+          companyId: target.companyId,
+          socialConnectionId: connectionEntry.connection.id,
+          filePath: uploadedFilePath,
+          filePaths: uploadedSchedulerMedia.map((item) => item.filePath),
+          fileCaptions: uploadedSchedulerMedia.map((item) => {
+            const normalizedCaption = item.caption?.trim() || "";
+            return normalizedCaption.length > 0 ? normalizedCaption : null;
+          }),
+          sequential:
+            (selectedType === "instagram_post" || selectedType === "instagram_story") && uploadedMediaCount > 1,
+          title: normalizedTitle,
+          caption: selectedType === "instagram_story" || schedulerRequiresStoryStatusCaptions ? null : caption,
+          firstComment:
+            firstCommentEnabled &&
+            (selectedType === "instagram_post" || selectedType === "instagram_reel")
+              ? normalizedFirstComment || null
+              : null,
+          hashtags: jobHashtags.length > 0 ? jobHashtags : undefined,
+          whatsappBackgroundColor: selectedType === "whatsapp_status_midia" ? effectiveWhatsappBackgroundColor : null,
+          whatsappRelinkEnabled: shouldEnableRelink,
+          whatsappRelinkConnectionIds: shouldEnableRelink ? normalizedWhatsappRelinkConnectionIds : undefined,
+          locationName: supportsMetaLocationPublication(selectedType) ? effectiveLocationName : null,
+          locationId: supportsMetaLocationPublication(selectedType) ? effectiveLocationId : null,
+          publicationType: selectedType,
+          publicationState,
+          schedulerGroupId,
+          ...scheduledPayload,
+        },
       };
     };
 
     try {
       let processedTargets = 0;
+      let skippedMirroredTargets = 0;
       const existingJobsByCompanyAndType = new Map(
         editingGroupJobs.map((job) => [`${job.companyId}:${job.publicationType}`, job] as const),
       );
@@ -10865,9 +12620,17 @@ function App() {
       for (const target of schedulerSelectedTargets) {
         for (const selectedType of schedulerSelectedPublicationSet) {
           const desiredKey = `${target.companyId}:${selectedType}`;
-          desiredPublicationKeys.add(desiredKey);
           const existingGroupedJob = editingJobId ? existingJobsByCompanyAndType.get(desiredKey) ?? null : null;
-          const payload = buildPayloadForPublicationType(selectedType, target);
+          const { connectionEntry, payload } = buildPayloadForPublicationType(selectedType, target);
+          const dispatchKey = `${selectedType}:${resolveConnectionDispatchDedupKey(connectionEntry.connection)}`;
+
+          if (scheduledDispatchKeys.has(dispatchKey)) {
+            skippedMirroredTargets += 1;
+            continue;
+          }
+
+          scheduledDispatchKeys.add(dispatchKey);
+          desiredPublicationKeys.add(desiredKey);
 
           if (existingGroupedJob) {
             await api.putJson(`/jobs/${existingGroupedJob.id}`, payload);
@@ -10890,21 +12653,28 @@ function App() {
 
       resetSchedulerForm();
       if (editingJobId) {
-        setSchedulerInfo(
+        const successMessage =
           processedTargets > 1
             ? `Postagens atualizadas em ${processedTargets} destinos.`
-            : "Postagem atualizada com sucesso.",
+            : "Postagem atualizada com sucesso.";
+        setSchedulerInfo(
+          skippedMirroredTargets > 0
+            ? `${successMessage} ${skippedMirroredTargets === 1 ? "1 destino espelhado foi ignorado para evitar duplicidade." : `${skippedMirroredTargets} destinos espelhados foram ignorados para evitar duplicidade.`}`
+            : successMessage,
         );
       } else {
+        const successMessage =
+          processedTargets > 1 ? `Postagens agendadas em ${processedTargets} destinos.` : "Postagem agendada com sucesso.";
         setSchedulerInfo(
-          processedTargets > 1 ? `Postagens agendadas em ${processedTargets} destinos.` : "Postagem agendada com sucesso.",
+          skippedMirroredTargets > 0
+            ? `${successMessage} ${skippedMirroredTargets === 1 ? "1 destino espelhado foi ignorado para evitar duplicidade." : `${skippedMirroredTargets} destinos espelhados foram ignorados para evitar duplicidade.`}`
+            : successMessage,
         );
       }
       await loadAll();
       window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (jobError) {
-      setError(jobError instanceof Error ? jobError.message : "Falha ao agendar postagem.");
-      setSchedulerInfo("");
+      showSchedulerErrorMessage(jobError instanceof Error ? jobError.message : "Falha ao agendar postagem.");
     } finally {
       setSubmittingJob(false);
     }
@@ -10968,15 +12738,23 @@ function App() {
     setPublicationType("");
     setPublicationState("");
     setEditingJobId(null);
+    setEditingJobScope("group");
+    setEditingJobSubsetIds(null);
     if (schedulerMediaInputRef.current) {
       schedulerMediaInputRef.current.value = "";
     }
   }
 
-  function startEditJob(job: Job) {
-    const groupedEditableJobs = job.schedulerGroupId?.trim()
-      ? (schedulerGroupedJobsMap.get(resolveJobSchedulerGroupKey(job)) ?? [job]).filter(
-          (groupJob) => groupJob.companyId === job.companyId && !isWhatsappRelinkChildJob(groupJob),
+  function startEditJob(job: Job, options?: { isolateSinglePublication?: boolean; jobIds?: string[] }) {
+    const isolateSinglePublication = options?.isolateSinglePublication === true;
+    const selectedJobIds = Array.isArray(options?.jobIds) ? options?.jobIds.filter(Boolean) : [];
+    const groupedEditableJobs = selectedJobIds.length > 0
+      ? selectedJobIds
+          .map((jobId) => jobs.find((entry) => entry.id === jobId) ?? null)
+          .filter((entry): entry is Job => Boolean(entry) && !isWhatsappRelinkChildJob(entry))
+      : !isolateSinglePublication && job.schedulerGroupId?.trim()
+      ? (schedulerCompanyGroupedJobsMap.get(resolveJobSchedulerCompanyGroupKey(job)) ?? [job]).filter(
+          (groupJob) => !isWhatsappRelinkChildJob(groupJob),
         )
       : [job];
     const availableGroupedTypes = Array.from(
@@ -10998,6 +12776,8 @@ function App() {
 
     setSchedulerInfo("");
     setEditingJobId(job.id);
+    setEditingJobScope(isolateSinglePublication ? "single" : "group");
+    setEditingJobSubsetIds(selectedJobIds.length > 0 ? selectedJobIds : null);
     setJobCompanyId(job.companyId);
     setJobSocialConnectionId(job.socialConnectionId ?? "");
     setJobSelectedCompanyIds([job.companyId]);
@@ -11089,11 +12869,21 @@ function App() {
     await loadAll();
   }
 
-  function openHistoryJobEditor(job: Job) {
-    startEditJob(job);
+  function openHistoryJobEditor(job: Job, options?: { isolateSinglePublication?: boolean; jobIds?: string[] }) {
+    if (!canManagePublicationJob(job)) {
+      setError("Você tem acesso somente de visualização neste workspace.");
+      return;
+    }
+
+    startEditJob(job, options);
   }
 
   function openHistoryJobReschedule(job: Job) {
+    if (!canManagePublicationJob(job)) {
+      setError("Você tem acesso somente de visualização neste workspace.");
+      return;
+    }
+
     const jobDayKey = toDateLocal(job.dataPostagem, effectiveUserTimeZone);
     if (jobDayKey && isCalendarDayInPast(jobDayKey, historyCalendarTodayKey)) {
       window.alert("Para reagendar postagens em datas passadas, arraste para uma data futura e depois ajuste o horário.");
@@ -11104,6 +12894,11 @@ function App() {
   }
 
   async function duplicateHistoryJob(job: Job) {
+    if (!canManagePublicationJob(job)) {
+      setError("Você tem acesso somente de visualização neste workspace.");
+      return;
+    }
+
     const title = resolveHistoryCalendarTitle(job);
     const confirmed = window.confirm(
       `Deseja duplicar \"${title}\"? A cópia será salva como rascunho.`,
@@ -11130,8 +12925,17 @@ function App() {
   }
 
   function openPublicationDuplicateModal(job: Job) {
+    if (!canManagePublicationJob(job)) {
+      setError("Você tem acesso somente de visualização neste workspace.");
+      return;
+    }
+
     const duplicateTargets = companies.filter((company) => {
       if (company.status !== "ACTIVE") {
+        return false;
+      }
+
+      if (!company.canManagePublications) {
         return false;
       }
 
@@ -11161,18 +12965,30 @@ function App() {
     setPublicationDuplicateCompanyIds([]);
   }
 
-  function openPublicationMediaModal(job: Job, startIndex = 0) {
-    const mediaPaths = resolveJobMediaPaths(job);
+  function openPublicationMediaModal(
+    job: Job,
+    startIndex = 0,
+    options?: {
+      overrideTitle?: string | null;
+      overridePaths?: string[] | null;
+    },
+  ) {
+    const mediaPaths =
+      options?.overridePaths && options.overridePaths.length > 0 ? options.overridePaths : resolveJobMediaPaths(job);
     if (mediaPaths.length === 0) {
       return;
     }
 
     setActivePublicationMediaJobId(job.id);
+    setActivePublicationMediaOverrideTitle(options?.overrideTitle?.trim() || null);
+    setActivePublicationMediaOverridePaths(options?.overridePaths?.length ? options.overridePaths : null);
     setActivePublicationMediaIndex(Math.min(Math.max(startIndex, 0), mediaPaths.length - 1));
   }
 
   function closePublicationMediaModal() {
     setActivePublicationMediaJobId(null);
+    setActivePublicationMediaOverrideTitle(null);
+    setActivePublicationMediaOverridePaths(null);
     setActivePublicationMediaIndex(0);
   }
 
@@ -11196,6 +13012,274 @@ function App() {
     });
   }
 
+  function openPublicationPreviewPage(job: Job) {
+    if (typeof window !== "undefined") {
+      const nextHref = buildPublicationPreviewHref(job.id);
+      const currentUrl = new URL(window.location.href);
+      const nextUrl = new URL(nextHref, window.location.origin);
+      const currentComparable = `${normalizePath(currentUrl.pathname)}${currentUrl.search}`;
+      const nextComparable = `${normalizePath(nextUrl.pathname)}${nextUrl.search}`;
+      if (currentComparable !== nextComparable) {
+        window.history.pushState({}, "", `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`);
+      }
+    }
+
+    setActiveView("historyPreview");
+    setActivePublicationPreviewJobId(job.id);
+    setPublicationPreviewLoading(true);
+    setPublicationPreviewSubmitting(false);
+    setPublicationPreviewInfo("");
+    setPublicationPreviewData(null);
+    setPublicationPreviewCommentDraft("");
+    setPublicationPreviewReplyParentId(null);
+    setPublicationPreviewDecisionIntent(null);
+    setPublicationPreviewMediaIndex(0);
+    setPublicationPreviewReactionBusyKey(null);
+    setError("");
+    setNoticesPopoverOpen(false);
+    setProfileMenuOpen(false);
+    setSidebarOpen(false);
+
+    window.requestAnimationFrame(() => {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+  }
+
+  function closePublicationPreviewPage() {
+    setActivePublicationPreviewJobId(null);
+    setPublicationPreviewLoading(false);
+    setPublicationPreviewSubmitting(false);
+    setPublicationPreviewInfo("");
+    setPublicationPreviewData(null);
+    setPublicationPreviewCommentDraft("");
+    setPublicationPreviewReplyParentId(null);
+    setPublicationPreviewDecisionIntent(null);
+    setPublicationPreviewMediaIndex(0);
+    setPublicationPreviewReactionBusyKey(null);
+    navigateToView("history", { historyFilter });
+  }
+
+  function showPreviousPublicationPreviewMedia() {
+    setPublicationPreviewMediaIndex((current) => {
+      const total = publicationPreviewData?.mediaPaths.length ?? 0;
+      if (total <= 1) {
+        return current;
+      }
+
+      return current === 0 ? total - 1 : current - 1;
+    });
+  }
+
+  function showNextPublicationPreviewMedia() {
+    setPublicationPreviewMediaIndex((current) => {
+      const total = publicationPreviewData?.mediaPaths.length ?? 0;
+      if (total <= 1) {
+        return current;
+      }
+
+      return current === total - 1 ? 0 : current + 1;
+    });
+  }
+
+  function appendPreviewCommentToState(comment: PublicationPreviewComment) {
+    setPublicationPreviewData((current) => {
+      if (!current) {
+        return current;
+      }
+
+      const nextComments = [...current.comments.filter((entry) => entry.id !== comment.id), comment].sort(
+        (left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime(),
+      );
+
+      return {
+        ...current,
+        comments: nextComments,
+      };
+    });
+  }
+
+  function scrollPublicationPreviewToTop() {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const topbarHeight = document.querySelector<HTMLElement>(".topbar")?.offsetHeight ?? 0;
+    const sectionTop =
+      publicationPreviewSectionRef.current != null
+        ? window.scrollY + publicationPreviewSectionRef.current.getBoundingClientRect().top
+        : 0;
+    const targetTop = Math.max(0, sectionTop - topbarHeight - 12);
+
+    window.scrollTo({ top: targetTop, behavior: "auto" });
+    document.documentElement.scrollTop = targetTop;
+    document.body.scrollTop = targetTop;
+  }
+
+  function focusPublicationPreviewTextarea() {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    window.requestAnimationFrame(() => {
+      publicationPreviewTextareaRef.current?.focus();
+    });
+  }
+
+  async function reloadPublicationPreview(jobId: string) {
+    const preview = await api.get<PublicationPreviewPayload>(`/jobs/${jobId}/preview`);
+    setPublicationPreviewData(preview);
+  }
+
+  async function togglePublicationPreviewReaction(commentId: string, emoji: string) {
+    if (!activePublicationPreviewJobId) {
+      return;
+    }
+
+    const busyKey = `${commentId}:${emoji}`;
+    setPublicationPreviewReactionBusyKey(busyKey);
+    setError("");
+
+    try {
+      const result = await api.postJson<{ comment: PublicationPreviewComment }>(
+        `/jobs/${activePublicationPreviewJobId}/preview/comments/${commentId}/reactions`,
+        { emoji },
+      );
+      appendPreviewCommentToState(result.comment);
+    } catch (reactionError) {
+      setError(reactionError instanceof Error ? reactionError.message : "Falha ao atualizar a reação.");
+    } finally {
+      setPublicationPreviewReactionBusyKey((current) => (current === busyKey ? null : current));
+    }
+  }
+
+  async function submitPublicationPreviewComment(event: FormEvent) {
+    event.preventDefault();
+    if (!activePublicationPreviewJobId || !publicationPreviewCommentDraft.trim()) {
+      return;
+    }
+
+    setPublicationPreviewSubmitting(true);
+    setPublicationPreviewInfo("");
+    setError("");
+
+    try {
+      const result = await api.postJson<{
+        comment: PublicationPreviewComment;
+        approval: {
+          id: string;
+          status: PublicationPreviewApprovalStatus;
+          decidedAt: string | null;
+        };
+      }>(`/jobs/${activePublicationPreviewJobId}/preview/comments`, {
+        message: publicationPreviewCommentDraft.trim(),
+        parentCommentId: publicationPreviewReplyParentId,
+      });
+
+      appendPreviewCommentToState(result.comment);
+      setPublicationPreviewCommentDraft("");
+      setPublicationPreviewReplyParentId(null);
+      setPublicationPreviewDecisionIntent(null);
+      setPublicationPreviewInfo("Comentário enviado com sucesso.");
+      scrollPublicationPreviewToTop();
+    } catch (commentError) {
+      setError(commentError instanceof Error ? commentError.message : "Falha ao enviar o comentário.");
+      scrollPublicationPreviewToTop();
+    } finally {
+      setPublicationPreviewSubmitting(false);
+    }
+  }
+
+  async function submitPublicationPreviewDecision(decision: PublicationPreviewApprovalStatus) {
+    if (!activePublicationPreviewJobId || (decision !== "APPROVED" && decision !== "REJECTED")) {
+      return;
+    }
+
+    if (decision === "REJECTED" && !publicationPreviewCommentDraft.trim()) {
+      setError("Escreva um comentário antes de rejeitar a publicação.");
+      setPublicationPreviewInfo("");
+      scrollPublicationPreviewToTop();
+      return;
+    }
+
+    setPublicationPreviewSubmitting(true);
+    setPublicationPreviewInfo("");
+    setError("");
+
+    try {
+      const result = await api.postJson<{
+        approval: PublicationPreviewPayload["approval"];
+        comment: PublicationPreviewComment | null;
+      }>(`/jobs/${activePublicationPreviewJobId}/preview/decision`, {
+        decision,
+        message: publicationPreviewCommentDraft.trim() || null,
+      });
+
+      setPublicationPreviewData((current) =>
+        current
+          ? {
+              ...current,
+              approval: result.approval,
+              comments: result.comment
+                ? [...current.comments.filter((entry) => entry.id !== result.comment!.id), result.comment].sort(
+                    (left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime(),
+                  )
+                : current.comments,
+            }
+          : current,
+      );
+      setPublicationPreviewCommentDraft("");
+      setPublicationPreviewReplyParentId(null);
+      setPublicationPreviewDecisionIntent(null);
+      setPublicationPreviewInfo("Feedback enviado com sucesso.");
+      scrollPublicationPreviewToTop();
+    } catch (decisionError) {
+      setError(decisionError instanceof Error ? decisionError.message : "Falha ao salvar a decisão.");
+      scrollPublicationPreviewToTop();
+    } finally {
+      setPublicationPreviewSubmitting(false);
+    }
+  }
+
+  async function retryPublicationPreviewFailedJobs(jobsToRetry: Job[]) {
+    if (jobsToRetry.length === 0) {
+      return;
+    }
+
+    const anchorJobId = jobsToRetry[0]!.id;
+    setError("");
+    setRetryingJobId(anchorJobId);
+    setPublicationPreviewInfo(
+      jobsToRetry.length > 1
+        ? `Retentando ${jobsToRetry.length} redes com falha...`
+        : "Retentando a rede com falha...",
+    );
+    scrollPublicationPreviewToTop();
+
+    try {
+      for (const job of jobsToRetry) {
+        await api.postJson(`/jobs/${job.id}/retry`, {});
+      }
+
+      await loadAll({ withSkeleton: false });
+      if (activePublicationPreviewJobId) {
+        await reloadPublicationPreview(activePublicationPreviewJobId);
+      }
+
+      setPublicationPreviewInfo(
+        jobsToRetry.length > 1
+          ? `${jobsToRetry.length} redes com falha foram reenfileiradas.`
+          : "A rede com falha foi reenfileirada.",
+      );
+      scrollPublicationPreviewToTop();
+    } catch (retryError) {
+      setPublicationPreviewInfo("");
+      setError(retryError instanceof Error ? retryError.message : "Falha ao reenfileirar a postagem.");
+      scrollPublicationPreviewToTop();
+    } finally {
+      setRetryingJobId(null);
+    }
+  }
+
   function togglePublicationDuplicateCompany(companyId: string) {
     setPublicationDuplicateCompanyIds((current) =>
       current.includes(companyId) ? current.filter((entry) => entry !== companyId) : [...current, companyId],
@@ -11205,6 +13289,11 @@ function App() {
   async function createPublicationDuplicateFromModal(event: FormEvent) {
     event.preventDefault();
     if (!activePublicationDuplicateJob) {
+      return;
+    }
+
+    if (!canManagePublicationJob(activePublicationDuplicateJob)) {
+      setError("Você tem acesso somente de visualização neste workspace.");
       return;
     }
 
@@ -11264,6 +13353,11 @@ function App() {
   }
 
   function savePublicationAsTemplate(job: Job) {
+    if (!canManagePublicationJob(job)) {
+      setError("Você tem acesso somente de visualização neste workspace.");
+      return;
+    }
+
     if (typeof window === "undefined") {
       return;
     }
@@ -11289,6 +13383,11 @@ function App() {
   }
 
   async function deleteHistoryJob(job: Job) {
+    if (!canManagePublicationJob(job)) {
+      setError("Você tem acesso somente de visualização neste workspace.");
+      return;
+    }
+
     const title = resolveHistoryCalendarTitle(job);
     const confirmed = window.confirm(`Deseja excluir \"${title}\"? Essa ação não pode ser desfeita.`);
     if (!confirmed) {
@@ -11468,6 +13567,10 @@ function App() {
   }
 
   function toggleHistoryBulkJobSelection(jobId: string) {
+    if (!manageablePublicationJobIdsSet.has(jobId)) {
+      return;
+    }
+
     setHistoryBulkSelectedJobIds((current) => {
       if (current.includes(jobId)) {
         return current.filter((id) => id !== jobId);
@@ -11480,6 +13583,70 @@ function App() {
     const nextMonth = shiftCalendarMonth(historyCalendarYear, historyCalendarMonth, delta);
     setHistoryCalendarYear(nextMonth.year);
     setHistoryCalendarMonth(nextMonth.month);
+  }
+
+  function navigateHistoryDirectMonth(delta: number) {
+    const nextMonth = shiftCalendarMonth(historyDirectYear, historyDirectMonth, delta);
+    setHistoryDirectYear(nextMonth.year);
+    setHistoryDirectMonth(nextMonth.month);
+    setHistoryPage(1);
+  }
+
+  function updateHistoryDirectYear(year: number) {
+    setHistoryDirectYear(year);
+    setHistoryPage(1);
+  }
+
+  function finishHistoryResultsLoadingSoon() {
+    if (typeof window === "undefined") {
+      setHistorySearchLoading(false);
+      return;
+    }
+
+    if (historyResultsLoadingFrameRef.current) {
+      window.cancelAnimationFrame(historyResultsLoadingFrameRef.current);
+    }
+
+    historyResultsLoadingFrameRef.current = window.requestAnimationFrame(() => {
+      historyResultsLoadingFrameRef.current = window.requestAnimationFrame(() => {
+        setHistorySearchLoading(false);
+        historyResultsLoadingFrameRef.current = null;
+      });
+    });
+  }
+
+  function runHistoryResultsLoading(apply: () => void, options?: { waitForData?: boolean }) {
+    const shouldWaitForData = options?.waitForData === true;
+
+    if (typeof window !== "undefined" && historyResultsLoadingFrameRef.current) {
+      window.cancelAnimationFrame(historyResultsLoadingFrameRef.current);
+      historyResultsLoadingFrameRef.current = null;
+    }
+
+    historyResultsWaitingForDataRef.current = shouldWaitForData;
+    setHistorySearchLoading(true);
+    apply();
+
+    if (!shouldWaitForData) {
+      finishHistoryResultsLoadingSoon();
+    }
+  }
+
+  function applyHistorySearch() {
+    const nextSearchQuery =
+      historySearchInputRef.current?.value ??
+      historyLegacySearchInputRef.current?.value ??
+      historySearchQuery;
+
+    runHistoryResultsLoading(
+      () => {
+        setHistorySearchQuery(nextSearchQuery);
+        setHistoryPage(1);
+        setHistoryCalendarDayPages({});
+        setHistoryViewMode("list");
+      },
+      { waitForData: nextSearchQuery !== historySearchQuery },
+    );
   }
 
   function navigatePublicationBoardSectionMonth(filterKey: HistoryFilterKey, delta: number) {
@@ -12058,6 +14225,11 @@ function App() {
 
   async function applyHistoryBulkEdit(event: FormEvent) {
     event.preventDefault();
+    if (!canManageSelectedPublicationScope) {
+      setError("Você tem acesso somente de visualização neste workspace.");
+      return;
+    }
+
     if (!historyBulkAction) {
       setError("Selecione uma ação em massa.");
       return;
@@ -12118,10 +14290,20 @@ function App() {
     }
     if (historyBulkAction === "SET_COMPANY") {
       if (!historyBulkCompanyId) {
-      setError("Selecione o workspace de destino para alteração em massa.");
+        setError("Selecione o workspace de destino para alteração em massa.");
         return;
       }
       options.companyId = historyBulkCompanyId;
+    }
+    if (historyBulkAction === "SET_CANCEL") {
+      if (
+        historyBulkSelectedJobs.some(
+          (job) => job.status === "CANCELED" || !canToggleJobSchedule(job, isPastScheduledAtForUser),
+        )
+      ) {
+        setError("Para cancelar em massa, selecione apenas publicações agendadas que ainda possam ser canceladas.");
+        return;
+      }
     }
 
     setHistoryBulkApplying(true);
@@ -12131,6 +14313,11 @@ function App() {
     try {
       const results = await Promise.allSettled(
         historyBulkSelectedJobs.map(async (job) => {
+          if (historyBulkAction === "SET_CANCEL") {
+            await api.postJson(`/jobs/${job.id}/cancel`, {});
+            return;
+          }
+
           const payload = buildHistoryBulkUpdatePayload(job, options);
           if (!payload.socialConnectionId) {
             throw new Error(`Job ${job.id} sem conta vinculada compatível no workspace selecionado.`);
@@ -12192,7 +14379,7 @@ function App() {
     setError("");
 
     try {
-      const mockIds = [...MOCK_FEEDBACK_NOTICES, ...MOCK_SOCIALUP_NOTICES].map((item) => item.id);
+      const mockIds = [...MOCK_SOCIALUP_NOTICES].map((item) => item.id);
       setLocallyReadPopoverNoticeIds((current) => Array.from(new Set([...current, ...mockIds])));
 
       if (unreadAvisosCount > 0) {
@@ -12251,6 +14438,39 @@ function App() {
 
   function dismissMockPopoverNotice(noticeId: string) {
     setDismissedPopoverNoticeIds((current) => (current.includes(noticeId) ? current : [...current, noticeId]));
+  }
+
+  function markMockPopoverNoticeAsRead(noticeId: string) {
+    setLocallyReadPopoverNoticeIds((current) => (current.includes(noticeId) ? current : [...current, noticeId]));
+  }
+
+  function renderNoticeReadState(options: {
+    unread: boolean;
+    busy?: boolean;
+    onMarkRead?: () => void;
+    unreadLabel: string;
+    readLabel: string;
+  }): ReactNode {
+    if (options.unread) {
+      return (
+        <button
+          type="button"
+          className="notices-read-indicator-button"
+          onClick={options.onMarkRead}
+          disabled={options.busy}
+          aria-label={options.unreadLabel}
+          title={options.unreadLabel}
+        >
+          <span className="notices-entry-unread-dot" aria-hidden="true" />
+        </button>
+      );
+    }
+
+    return (
+      <span className="notices-read-indicator notices-read-indicator-read" aria-label={options.readLabel} title={options.readLabel}>
+        <FiCheck aria-hidden="true" />
+      </span>
+    );
   }
 
   async function createBroadcastAviso(event: FormEvent) {
@@ -12582,6 +14802,37 @@ function App() {
     }
   }
 
+  async function startInitialTrial(plan: BillingPlan) {
+    if (!authUser) {
+      return;
+    }
+
+    setStartingInitialTrialPlanId(plan.id);
+    setError("");
+    setAuthError("");
+    setPlanInfo("");
+
+    try {
+      const result = await api.postJson<{ user: AuthUser; billing: BillingMe }>("/billing/start-trial", {
+        planId: plan.id,
+      });
+
+      setAuthUser(result.user);
+      setBillingMe(result.billing);
+      setAuthInfo("");
+      setError("");
+      setPlanInfo(`Plano ${plan.name} ativado com sucesso.`);
+      navigateToView("dashboard");
+      if (typeof window !== "undefined") {
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      }
+    } catch (trialError) {
+      setError(trialError instanceof Error ? trialError.message : "Falha ao ativar o plano inicial.");
+    } finally {
+      setStartingInitialTrialPlanId(null);
+    }
+  }
+
   async function startStripeCheckout(event: FormEvent) {
     event.preventDefault();
     if (!checkoutPlanId) {
@@ -12639,6 +14890,38 @@ function App() {
     }
   }
 
+  async function retryGroupedJobs(jobsToRetry: Job[], anchorJobId: string) {
+    if (jobsToRetry.length === 0) {
+      return;
+    }
+
+    setError("");
+    setRetryingJobId(anchorJobId);
+    setHistoryInfo(
+      jobsToRetry.length > 1
+        ? `Reenfileirando ${jobsToRetry.length} redes falhadas...`
+        : "Reenfileirando postagem...",
+    );
+
+    try {
+      for (const job of jobsToRetry) {
+        await api.postJson(`/jobs/${job.id}/retry`, {});
+      }
+      setHistoryInfo(
+        jobsToRetry.length > 1
+          ? `${jobsToRetry.length} redes falhadas foram reenfileiradas para tentativa imediata.`
+          : "Postagem reenfileirada para tentativa imediata.",
+      );
+      await loadAll();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch (retryError) {
+      setHistoryInfo("");
+      setError(retryError instanceof Error ? retryError.message : "Falha ao reenfileirar a postagem.");
+    } finally {
+      setRetryingJobId(null);
+    }
+  }
+
   async function rescheduleFailedMedia(job: Job) {
     const partialMeta = parseStorySequenceFailureMeta(job.lastError);
     const isPartialStoryFailure =
@@ -12685,19 +14968,23 @@ function App() {
 
     try {
       const result = await api.postJson<{ sessionToken: string; user: AuthUser }>("/auth/login", {
-        username: loginUsername,
+        identifier: loginIdentifier,
         password: loginPassword,
       });
 
       api.setSessionToken(result.sessionToken, rememberMe);
       if (rememberMe) {
-        window.localStorage.setItem(REMEMBERED_USERNAME_STORAGE_KEY, loginUsername);
+        window.localStorage.setItem(REMEMBERED_USERNAME_STORAGE_KEY, loginIdentifier);
       } else {
         window.localStorage.removeItem(REMEMBERED_USERNAME_STORAGE_KEY);
       }
       setAuthUser(result.user);
       setLoginPassword("");
       setAuthInfo("");
+      if (result.user.needsPlanSelection) {
+        enterInitialPlanSelectionFlow(result.user);
+        return;
+      }
       if (readPendingPostForMeConnectionSync()) {
         setAuthInfo("Login concluído. Voltando para Conectar contas para finalizar a sincronização.");
         navigateToView("agents");
@@ -12712,12 +14999,97 @@ function App() {
     }
   }
 
+  function enterInitialPlanSelectionFlow(user: AuthUser) {
+    if (typeof window !== "undefined") {
+      const nextHref = buildViewHref("planStart");
+      const nextUrl = new URL(nextHref, window.location.origin);
+      const currentUrl = new URL(window.location.href);
+      const currentComparable = `${normalizePath(currentUrl.pathname)}${currentUrl.search}`;
+      const nextComparable = `${normalizePath(nextUrl.pathname)}${nextUrl.search}`;
+      if (currentComparable !== nextComparable) {
+        window.history.replaceState({}, "", `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`);
+      }
+    }
+
+    setAuthChecked(true);
+    setAuthUser(user);
+    setActiveView("planStart");
+    setProfilePageTab("plan");
+    setAuthError("");
+    setAuthInfo("");
+    setError("");
+    setPlanInfo("");
+    setBillingLoading(true);
+    void loadBillingData({ withSkeleton: true });
+  }
+
+  async function startGoogleLogin() {
+    setAuthError("");
+    setAuthInfo("");
+    googleAuthResultReceivedRef.current = false;
+    setGoogleAuthSubmitting(true);
+
+    try {
+      const { idToken } = await signInWithGoogleViaFirebase();
+      const result = await api.postJson<{ sessionToken: string; user: AuthUser }>("/auth/firebase/google", {
+        idToken,
+      });
+
+      api.setSessionToken(result.sessionToken, rememberMe);
+      if (rememberMe) {
+        const rememberedIdentifier = result.user.email?.trim() || result.user.username;
+        window.localStorage.setItem(REMEMBERED_USERNAME_STORAGE_KEY, rememberedIdentifier);
+      } else {
+        window.localStorage.removeItem(REMEMBERED_USERNAME_STORAGE_KEY);
+      }
+
+      setAuthChecked(true);
+      setLoginIdentifier(result.user.email || result.user.username);
+      setLoginPassword("");
+      setProfileName(result.user.name);
+      setProfileEmail(result.user.email || "");
+      setProfileUsername(result.user.username);
+      setProfileTimeZone(result.user.timeZone || DEFAULT_USER_TIME_ZONE);
+      setAuthError("");
+      setAuthInfo("");
+
+      if (result.user.needsPlanSelection) {
+        enterInitialPlanSelectionFlow(result.user);
+        return;
+      }
+
+      setAuthUser(result.user);
+
+      if (readPendingPostForMeConnectionSync()) {
+        setAuthInfo("Login concluído. Voltando para Conectar contas para finalizar a sincronização.");
+        navigateToView("agents");
+      } else {
+        api.setPopupSessionHandoffToken("");
+        navigateToView("dashboard");
+      }
+    } catch (googleError) {
+      if (isFirebaseGoogleLoginCancelledError(googleError)) {
+        setAuthError("");
+      } else {
+        setAuthError(resolveFirebaseGoogleLoginErrorMessage(googleError));
+      }
+      setAuthInfo("");
+    } finally {
+      setGoogleAuthSubmitting(false);
+    }
+  }
+
   async function logout() {
     try {
       await api.postJson<void>("/auth/logout", {});
     } catch {
       // ignore logout cleanup errors
     } finally {
+      clearManagedPopupWatch(googleAuthPopupWatchIntervalRef);
+      closeManagedPopupWindow(googleAuthPopupRef.current);
+      googleAuthPopupRef.current = null;
+      googleAuthResultReceivedRef.current = false;
+      setGoogleAuthSubmitting(false);
       api.setSessionToken("");
       setAuthUser(null);
       setAuthChecked(true);
@@ -12725,8 +15097,11 @@ function App() {
       setAuthInfo("");
       setAuthError("");
       setProfileTimeZone(DEFAULT_USER_TIME_ZONE);
+      setProfileEmail("");
+      setSetupEmail("");
       setNoticesPopoverOpen(false);
       setProfileMenuOpen(false);
+      setSelectedCompanyId("");
       setActiveView("dashboard");
       contentLoadingCounterRef.current = 0;
       setContentLoading(false);
@@ -12744,6 +15119,7 @@ function App() {
       await api.postJson("/auth/setup-access", {
         key: setupKey,
         name: setupName,
+        email: setupEmail,
         username: setupUsername,
         password: setupPassword,
       });
@@ -12751,9 +15127,10 @@ function App() {
       setSetupInviteValid(false);
       setSetupKey("");
       setSetupName("");
+      setSetupEmail("");
       setSetupPassword("");
       setAuthInfo("Novo usuario criado com sucesso.");
-      setLoginUsername(setupUsername);
+      setLoginIdentifier(setupEmail);
       setSetupUsername("");
 
       const url = new URL(window.location.href);
@@ -12778,6 +15155,7 @@ function App() {
       const result = await api.postJson<{ sessionToken: string; user: AuthUser }>("/auth/workspace-access/setup", {
         key: workspaceInviteKey,
         name: setupName,
+        email: setupEmail,
         username: setupUsername,
         password: setupPassword,
       });
@@ -12787,6 +15165,7 @@ function App() {
       setWorkspaceInvitePreview(null);
       setWorkspaceInviteKey("");
       setSetupName("");
+      setSetupEmail("");
       setSetupUsername("");
       setSetupPassword("");
       setCompanyInfo("Workspace adicionado com sucesso.");
@@ -12809,12 +15188,14 @@ function App() {
     try {
       const result = await api.putJson<{ user: AuthUser }>("/auth/profile", {
         name: profileName,
+        email: profileEmail,
         username: profileUsername,
         password: profilePassword,
         timeZone: profileTimeZone,
       });
 
       setAuthUser(result.user);
+      setProfileRouteUsername(normalizeProfileRouteUsername(result.user.username));
       setProfilePassword("");
       setAuthInfo("Perfil salvo com sucesso.");
     } catch (profileError) {
@@ -12963,10 +15344,21 @@ function App() {
   }
 
   function renderProfileMenu(shellRef: { current: HTMLDivElement | null }, extraClassName = "") {
-    const displayName = authUser?.name?.trim() || "Minha conta";
-    const normalizedUsername = authUser?.username?.trim().replace(/^@+/, "") || "";
-    const secondaryLabel = normalizedUsername ? `@${normalizedUsername}` : "Conta SocialUp";
-    const initials = userInitials(displayName, normalizedUsername);
+    const displayName = profileDisplayName;
+    const secondaryLabel = profileSecondaryLabel;
+    const initials = profileInitials;
+    const renderAvatar = (sizeClass: string) => (
+      <span className={`profile-avatar ${sizeClass}`} aria-hidden="true">
+        <span className="profile-avatar-media">
+          {profileAvatarUrl ? (
+            <img src={profileAvatarUrl} alt="" className="profile-avatar-image" loading="lazy" referrerPolicy="no-referrer" />
+          ) : (
+            <span className="profile-avatar-placeholder">{initials}</span>
+          )}
+        </span>
+        <span className="profile-avatar-status-dot" />
+      </span>
+    );
 
     return (
       <div
@@ -12974,11 +15366,9 @@ function App() {
         className={`profile-menu-shell${profileMenuOpen ? " profile-menu-shell-open" : ""}${extraClassName ? ` ${extraClassName}` : ""}`}
       >
         {profileMenuOpen ? (
-          <button
-            type="button"
+          <div
             className="profile-menu-backdrop"
-            aria-label="Fechar menu da conta"
-            onClick={() => setProfileMenuOpen(false)}
+            aria-hidden="true"
           />
         ) : null}
         <button
@@ -12993,19 +15383,13 @@ function App() {
           aria-haspopup="menu"
           aria-expanded={profileMenuOpen}
         >
-          <span className="profile-avatar profile-avatar-sm" aria-hidden="true">
-            <span className="profile-avatar-placeholder">{initials}</span>
-            <span className="profile-avatar-status-dot" />
-          </span>
+          {renderAvatar("profile-avatar-sm")}
         </button>
 
         {profileMenuOpen ? (
           <section className="profile-menu-dropdown profile-menu-card" role="menu">
             <div className="profile-menu-card-header">
-              <span className="profile-avatar profile-avatar-lg" aria-hidden="true">
-                <span className="profile-avatar-placeholder">{initials}</span>
-                <span className="profile-avatar-status-dot" />
-              </span>
+              {renderAvatar("profile-avatar-lg")}
               <div className="profile-menu-card-copy">
                 <strong>{displayName}</strong>
                 <span>{secondaryLabel}</span>
@@ -13015,25 +15399,14 @@ function App() {
             <div className="profile-menu-card-actions">
               <button
                 type="button"
-                className={`profile-menu-item ${activeView === "profile" ? "profile-menu-item-active" : ""}`}
+                className={`profile-menu-item ${(activeView === "profile" || activeView === "plan") ? "profile-menu-item-active" : ""}`}
                 onClick={() => {
                   setProfileMenuOpen(false);
-                  navigateToView("profile");
+                  navigateToView("profile", { profileTab: "profile" });
                 }}
               >
                 <FiUser aria-hidden="true" />
                 <span>Meu perfil</span>
-              </button>
-              <button
-                type="button"
-                className={`profile-menu-item ${activeView === "plan" ? "profile-menu-item-active" : ""}`}
-                onClick={() => {
-                  setProfileMenuOpen(false);
-                  navigateToView("plan");
-                }}
-              >
-                <FiSettings aria-hidden="true" />
-                <span>Configurações</span>
               </button>
             </div>
 
@@ -13057,12 +15430,19 @@ function App() {
   }
 
   function renderNoticesBell(shellRef: { current: HTMLDivElement | null }, extraClassName = "") {
+    const hasUnreadNotices =
+      unreadAvisosCount > 0 || hasUnreadMockSocialUpNotices;
     const canMarkAllNoticesAsRead =
-      unreadAvisosCount > 0 || hasUnreadMockFeedbackNotices || hasUnreadMockSocialUpNotices;
-    const tabs: Array<{ key: NoticesPopoverTabKey; label: string; count: number; icon: IconType }> = [
-      { key: "panel", label: "Painel", count: recentAvisos.length, icon: FiHome },
-      { key: "feedbacks", label: "Feedbacks", count: visibleMockFeedbackNotices.length, icon: FiMessageCircle },
-      { key: "socialup", label: "SocialUp", count: visibleMockSocialUpNotices.length, icon: FiMessageSquare },
+      hasUnreadNotices;
+    const tabs: Array<{ key: NoticesPopoverTabKey; label: string; unreadCount: number; icon: IconType }> = [
+      { key: "panel", label: "Painel", unreadCount: recentAvisosUnreadCounts.panel, icon: FiHome },
+      { key: "feedbacks", label: "Feedbacks", unreadCount: recentAvisosUnreadCounts.feedbacks, icon: FiMessageCircle },
+      {
+        key: "socialup",
+        label: "SocialUp",
+        unreadCount: recentAvisosUnreadCounts.socialup || unreadMockSocialUpCount,
+        icon: FiMessageSquare,
+      },
     ];
 
     function renderUpdatesTab(): ReactNode {
@@ -13070,7 +15450,7 @@ function App() {
         return <div className="notices-popover-empty">Carregando notificações...</div>;
       }
 
-      if (recentAvisos.length === 0) {
+      if (recentPanelAvisos.length === 0) {
         return (
           <div className="notices-popover-empty">
             <strong>Nada novo no painel</strong>
@@ -13079,8 +15459,9 @@ function App() {
         );
       }
 
-      return recentAvisos.map((aviso) => {
+      return recentPanelAvisos.map((aviso) => {
         const Icon = resolveAvisoPopoverIcon(aviso);
+        const unread = !aviso.readAt;
         return (
           <article key={aviso.id} className="notices-entry-card">
             <span className={`notices-entry-thumb ${resolveAvisoPopoverThumbClass(aviso)}`} aria-hidden="true">
@@ -13094,7 +15475,13 @@ function App() {
               <p>{aviso.message}</p>
             </div>
             <div className="notices-entry-side">
-              {!aviso.readAt ? <span className="notices-entry-unread-dot" aria-hidden="true" /> : <span aria-hidden="true" />}
+              {renderNoticeReadState({
+                unread,
+                busy: markingAvisoReadId === aviso.id,
+                onMarkRead: () => void markAvisoAsRead(aviso.id),
+                unreadLabel: "Marcar notificação como lida",
+                readLabel: "Notificação lida",
+              })}
               <button
                 type="button"
                 className="notices-entry-delete"
@@ -13112,7 +15499,7 @@ function App() {
     }
 
     function renderFeedbackTab(): ReactNode {
-      if (visibleMockFeedbackNotices.length === 0) {
+      if (recentFeedbackAvisos.length === 0) {
         return (
           <div className="notices-popover-empty">
             <strong>Sem feedbacks no momento</strong>
@@ -13121,31 +15508,38 @@ function App() {
         );
       }
 
-      return visibleMockFeedbackNotices.map((notice) => {
-        const unread = notice.unread && !locallyReadPopoverNoticeIds.includes(notice.id);
+      return recentFeedbackAvisos.map((notice) => {
+        const unread = !notice.readAt;
+        const displayName = notice.createdBy?.name?.trim() || "Cliente";
+        const username = notice.createdBy?.username?.trim() || "feedback";
         return (
           <article key={notice.id} className="notices-entry-card">
             <span className="notices-entry-avatar" aria-hidden="true">
-              {userInitials(notice.clientName, notice.clientAvatar)}
+              {userInitials(displayName, username)}
             </span>
             <div className="notices-entry-copy">
               <div className="notices-entry-heading">
-                <strong>{notice.clientName}</strong>
-                <span className="notices-entry-time">{notice.createdAtLabel}</span>
+                <strong>{displayName}</strong>
+                <span className="notices-entry-time">{formatRelativeTime(notice.createdAt, effectiveUserTimeZone)}</span>
               </div>
-              <span className="notices-entry-kicker">
-                {notice.projectName} · {notice.workspaceName}
-              </span>
+              <span className="notices-entry-kicker">{notice.title}</span>
               <p>{notice.message}</p>
             </div>
             <div className="notices-entry-side">
-              {unread ? <span className="notices-entry-unread-dot" aria-hidden="true" /> : <span aria-hidden="true" />}
+              {renderNoticeReadState({
+                unread,
+                busy: markingAvisoReadId === notice.id,
+                onMarkRead: () => void markAvisoAsRead(notice.id),
+                unreadLabel: "Marcar feedback como lido",
+                readLabel: "Feedback lido",
+              })}
               <button
                 type="button"
                 className="notices-entry-delete"
                 aria-label="Excluir feedback"
                 title="Excluir feedback"
-                onClick={() => dismissMockPopoverNotice(notice.id)}
+                onClick={() => void deleteAvisoFromPopover(notice.id)}
+                disabled={deletingAvisoId === notice.id}
               >
                 <FiTrash2 aria-hidden="true" />
               </button>
@@ -13156,13 +15550,53 @@ function App() {
     }
 
     function renderSocialUpTab(): ReactNode {
-      if (visibleMockSocialUpNotices.length === 0) {
+      if (recentSocialUpAvisos.length === 0 && visibleMockSocialUpNotices.length === 0) {
         return (
           <div className="notices-popover-empty">
             <strong>Sem recados da SocialUp</strong>
             <span>Atualizações do produto e avisos gerais ficam reunidos aqui.</span>
           </div>
         );
+      }
+
+      if (recentSocialUpAvisos.length > 0) {
+        return recentSocialUpAvisos.map((notice) => {
+          const unread = !notice.readAt;
+          return (
+            <article key={notice.id} className="notices-entry-card">
+              <span className="notices-entry-thumb notices-entry-thumb-success" aria-hidden="true">
+                <FiMessageSquare />
+              </span>
+              <div className="notices-entry-copy">
+                <div className="notices-entry-heading">
+                  <strong>{notice.title}</strong>
+                  <span className="notices-entry-time">{formatRelativeTime(notice.createdAt, effectiveUserTimeZone)}</span>
+                </div>
+                <span className="notices-entry-kicker">Equipe SocialUp</span>
+                <p>{notice.message}</p>
+              </div>
+              <div className="notices-entry-side">
+                {renderNoticeReadState({
+                  unread,
+                  busy: markingAvisoReadId === notice.id,
+                  onMarkRead: () => void markAvisoAsRead(notice.id),
+                  unreadLabel: "Marcar aviso como lido",
+                  readLabel: "Aviso lido",
+                })}
+                <button
+                  type="button"
+                  className="notices-entry-delete"
+                  aria-label="Excluir aviso"
+                  title="Excluir aviso"
+                  onClick={() => void deleteAvisoFromPopover(notice.id)}
+                  disabled={deletingAvisoId === notice.id}
+                >
+                  <FiTrash2 aria-hidden="true" />
+                </button>
+              </div>
+            </article>
+          );
+        });
       }
 
       return visibleMockSocialUpNotices.map((notice) => {
@@ -13182,7 +15616,12 @@ function App() {
               <p>{notice.message}</p>
             </div>
             <div className="notices-entry-side">
-              {unread ? <span className="notices-entry-unread-dot" aria-hidden="true" /> : <span aria-hidden="true" />}
+              {renderNoticeReadState({
+                unread,
+                onMarkRead: () => markMockPopoverNoticeAsRead(notice.id),
+                unreadLabel: "Marcar aviso como lido",
+                readLabel: "Aviso lido",
+              })}
               <button
                 type="button"
                 className="notices-entry-delete"
@@ -13204,11 +15643,9 @@ function App() {
         className={`notices-shell${noticesPopoverOpen ? " notices-shell-open" : ""}${extraClassName ? ` ${extraClassName}` : ""}`}
       >
         {noticesPopoverOpen ? (
-          <button
-            type="button"
+          <div
             className="notices-backdrop"
-            aria-label="Fechar notificações"
-            onClick={() => setNoticesPopoverOpen(false)}
+            aria-hidden="true"
           />
         ) : null}
         <button
@@ -13218,7 +15655,7 @@ function App() {
           aria-label="Abrir avisos"
         >
           <FiBell />
-          {unreadAvisosCount > 0 ? (
+          {hasUnreadNotices ? (
             <span className="notices-badge-dot" aria-hidden="true" />
           ) : null}
         </button>
@@ -13272,7 +15709,9 @@ function App() {
                 >
                   <tab.icon aria-hidden="true" />
                   <span>{tab.label}</span>
-                  <small>{tab.count}</small>
+                  <small className={`notices-panel-tab-count${tab.unreadCount > 0 ? " notices-panel-tab-count-active" : ""}`}>
+                    {tab.unreadCount}
+                  </small>
                 </button>
               ))}
             </div>
@@ -13294,6 +15733,7 @@ function App() {
     const showSetup = Boolean(setupKey) && setupInviteValid;
     const showWorkspaceInvite = Boolean(workspaceInviteKey) && Boolean(workspaceInvitePreview);
     const showWorkspaceInviteCreate = showWorkspaceInvite && workspaceInviteMode === "create";
+    const authLoginBusy = authSubmitting || googleAuthSubmitting;
 
     return (
       <div className="auth-shell">
@@ -13327,6 +15767,15 @@ function App() {
                   minLength={2}
                   maxLength={80}
                   title="Informe o nome completo do novo usuario."
+                />
+                <input
+                  type="email"
+                  value={setupEmail}
+                  onChange={(event) => setSetupEmail(event.target.value)}
+                  placeholder="Email"
+                  required
+                  maxLength={160}
+                  title="Informe o email principal desta conta."
                 />
                 <input
                   value={setupUsername}
@@ -13378,14 +15827,14 @@ function App() {
 
             <form onSubmit={login} className="form-stack">
                 <input
-                  value={loginUsername}
-                  onChange={(event) => setLoginUsername(event.target.value)}
-                  placeholder="Usuário"
-                  disabled={authSubmitting}
+                  value={loginIdentifier}
+                  onChange={(event) => setLoginIdentifier(event.target.value)}
+                  placeholder="Email ou usuário"
+                  disabled={authLoginBusy}
                   required
                   minLength={3}
-                  maxLength={32}
-                  title="Informe seu usuário."
+                  maxLength={160}
+                  title="Informe seu email ou usuário."
                 />
               <div className="password-field">
                 <input
@@ -13393,7 +15842,7 @@ function App() {
                   value={loginPassword}
                   onChange={(event) => setLoginPassword(event.target.value)}
                   placeholder="Senha"
-                  disabled={authSubmitting}
+                  disabled={authLoginBusy}
                   required
                   minLength={8}
                   maxLength={128}
@@ -13403,7 +15852,7 @@ function App() {
                   type="button"
                   className="password-toggle"
                   onClick={() => setShowLoginPassword((current) => !current)}
-                  disabled={authSubmitting}
+                  disabled={authLoginBusy}
                   aria-label={showLoginPassword ? "Ocultar senha" : "Mostrar senha"}
                 >
                   {showLoginPassword ? <FiEyeOff /> : <FiEye />}
@@ -13414,11 +15863,11 @@ function App() {
                   type="checkbox"
                   checked={rememberMe}
                   onChange={(event) => setRememberMe(event.target.checked)}
-                  disabled={authSubmitting}
+                  disabled={authLoginBusy}
                 />
                 <span>Manter conectado</span>
               </label>
-              <button type="submit" disabled={authSubmitting}>
+              <button type="submit" disabled={authLoginBusy}>
                 {authSubmitting ? (
                   <>
                     <span className="button-spinner" />
@@ -13428,12 +15877,33 @@ function App() {
                   "Entrar"
                 )}
               </button>
+              <div className="auth-provider-divider">
+                <span>ou continue com</span>
+              </div>
+              <button
+                type="button"
+                className="ghost-button auth-social-button"
+                onClick={() => void startGoogleLogin()}
+                disabled={authLoginBusy}
+              >
+                {googleAuthSubmitting ? (
+                  <>
+                    <span className="button-spinner" aria-hidden="true" />
+                    Entrando com Google...
+                  </>
+                ) : (
+                  <>
+                    <GoogleGlyph />
+                    Entrar com Google
+                  </>
+                )}
+              </button>
               {showWorkspaceInvite ? (
                 <button
                   type="button"
                   className="ghost-button"
                   onClick={() => setWorkspaceInviteMode("create")}
-                  disabled={authSubmitting}
+                  disabled={authLoginBusy}
                 >
                   Primeiro acesso? Criar conta
                 </button>
@@ -13441,6 +15911,104 @@ function App() {
             </form>
           </section>
         )}
+      </div>
+    );
+  }
+
+  function renderInitialPlanSelection() {
+    const selectablePlans = initialTrialSelectablePlans;
+
+    return (
+      <div className="trial-onboarding-page">
+        <div className="trial-onboarding-shell">
+          <section className="trial-onboarding-head">
+            <div className="trial-onboarding-hero-copy">
+              <span className="section-kicker trial-onboarding-kicker">início rápido</span>
+              <h1>
+                <span>Escolha como quer </span>
+                <span className="home-welcome-highlight">começar</span>
+              </h1>
+              <p>Defina o formato inicial da sua conta. Pagamento e catálogo a gente ajusta depois com calma.</p>
+            </div>
+          </section>
+
+          {error ? <div className="error-banner">{error}</div> : null}
+          {planInfo ? <div className={`info-banner${isPositivePlanInfo ? " info-banner-success" : ""}`}>{planInfo}</div> : null}
+
+          {billingLoading ? (
+            <section className="trial-onboarding-plan-grid" aria-hidden="true">
+              {Array.from({ length: 2 }, (_, index) => (
+                <article key={`trial-plan-skeleton-${index}`} className="panel-card trial-onboarding-plan-card trial-onboarding-plan-card-skeleton">
+                  <div className="trial-onboarding-plan-head">
+                    <div className="trial-onboarding-plan-title">
+                      <span className="skeleton-line skeleton-line-chip" />
+                      <span className="skeleton-line skeleton-line-title" />
+                      <span className="skeleton-line skeleton-line-body" />
+                    </div>
+                  </div>
+                  <div className="trial-onboarding-plan-features">
+                    {Array.from({ length: 4 }, (_, itemIndex) => (
+                      <span key={`trial-plan-skeleton-feature-${index}-${itemIndex}`} className="skeleton-line skeleton-line-text" />
+                    ))}
+                  </div>
+                  <span className="skeleton-line skeleton-line-button" />
+                </article>
+              ))}
+            </section>
+          ) : selectablePlans.length === 0 ? (
+            <section className="panel-card view-stack">
+              <div className="empty-state">Nenhum plano inicial está disponível agora.</div>
+            </section>
+          ) : (
+            <section className="trial-onboarding-plan-grid">
+              {selectablePlans.map((plan) => {
+                const normalizedCode = (plan.code || "").trim().toUpperCase();
+                const isAgencyPlan = normalizedCode === "AGENCY";
+                const featureBullets = resolvePlanFeatureBullets(plan);
+                const isStartingThisPlan = startingInitialTrialPlanId === plan.id;
+
+                return (
+                  <article
+                    key={plan.id}
+                    className={`panel-card trial-onboarding-plan-card${isAgencyPlan ? " trial-onboarding-plan-card-featured" : ""}`}
+                  >
+                    <div className="trial-onboarding-plan-head">
+                      <div className="trial-onboarding-plan-title">
+                        <strong>{plan.name}</strong>
+                        <p>{plan.description || "Plano inicial do seu workspace."}</p>
+                      </div>
+                    </div>
+
+                    <div className="trial-onboarding-plan-features">
+                      {featureBullets.map((feature) => (
+                        <span key={`${plan.id}-${feature}`} className="trial-onboarding-plan-feature-item">
+                          <FiCheck aria-hidden="true" />
+                          <span>{feature}</span>
+                        </span>
+                      ))}
+                    </div>
+
+                    <button
+                      type="button"
+                      className="primary-button trial-onboarding-plan-button"
+                      onClick={() => void startInitialTrial(plan)}
+                      disabled={Boolean(startingInitialTrialPlanId)}
+                    >
+                      {isStartingThisPlan ? (
+                        <>
+                          <span className="button-spinner" aria-hidden="true" />
+                          Continuando...
+                        </>
+                      ) : (
+                        "Continuar com este plano"
+                      )}
+                    </button>
+                  </article>
+                );
+              })}
+            </section>
+          )}
+        </div>
       </div>
     );
   }
@@ -13454,8 +16022,11 @@ function App() {
     const selectedDashboardPopoverGroupJobs = selectedDashboardPopoverJob
       ? schedulerGroupedJobsMap.get(resolveJobSchedulerGroupKey(selectedDashboardPopoverJob)) ?? [selectedDashboardPopoverJob]
       : [];
+    const selectedDashboardPopoverLatestJobs = resolveLatestJobsPerCompanyPublicationType(selectedDashboardPopoverGroupJobs).sort(
+      (left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime(),
+    );
     const selectedDashboardPopoverParticipantNetworks = selectedDashboardPopoverJob
-      ? resolveJobParticipantNetworks(selectedDashboardPopoverJob, selectedDashboardPopoverGroupJobs)
+      ? resolveJobParticipantNetworks(selectedDashboardPopoverJob, selectedDashboardPopoverLatestJobs)
       : [];
     const selectedDashboardPopoverTitle = selectedDashboardPopoverJob
       ? resolveHistoryCalendarTitle(selectedDashboardPopoverJob)
@@ -13495,23 +16066,34 @@ function App() {
     const selectedDashboardPopoverRunningLike = selectedDashboardPopoverGroupJobs.some((groupJob) =>
       shouldRenderUpcomingAsRunning(groupJob, isPastScheduledAtForUser),
     );
+    const selectedDashboardPopoverFailedJobs = selectedDashboardPopoverLatestJobs.filter((groupJob) => groupJob.status === "FAILED");
+    const selectedDashboardPopoverSuccessfulJobs = selectedDashboardPopoverLatestJobs.filter((groupJob) =>
+      isSuccessfulPublicationJobStatus(groupJob.status),
+    );
+    const selectedDashboardPopoverSuccessfulNetworks = Array.from(
+      new Set(selectedDashboardPopoverSuccessfulJobs.map((groupJob) => publicationTypeNetwork(groupJob.publicationType))),
+    );
+    const selectedDashboardPopoverRetryAnchorJobId = selectedDashboardPopoverFailedJobs[0]?.id ?? null;
     const selectedDashboardPopoverEditingTime = dashboardCalendarEditingJobId === selectedDashboardPopoverJob?.id;
     const selectedDashboardPopoverSavingTime = dashboardCalendarSavingJobId === selectedDashboardPopoverJob?.id;
-    const selectedDashboardPopoverRetryingJob = retryingJobId === selectedDashboardPopoverJob?.id;
+    const selectedDashboardPopoverRetryingJob =
+      selectedDashboardPopoverRetryAnchorJobId !== null && retryingJobId === selectedDashboardPopoverRetryAnchorJobId;
     const selectedDashboardPopoverReactivatingJob = togglingScheduleJobId === selectedDashboardPopoverJob?.id;
+    const selectedDashboardPopoverCanManage =
+      selectedDashboardPopoverJob ? canManagePublicationJob(selectedDashboardPopoverJob) : false;
     const selectedDashboardPopoverCanEditTime = selectedDashboardPopoverJob
-      ? canEditPublicationBoardSchedule(selectedDashboardPopoverJob) &&
+      ? selectedDashboardPopoverCanManage &&
+        canEditPublicationBoardSchedule(selectedDashboardPopoverJob) &&
         !isPastScheduledAtForUser(selectedDashboardPopoverJob.dataPostagem)
       : false;
-    const selectedDashboardPopoverCanRetry = selectedDashboardPopoverJob
-      ? canRetryPublicationBoardJob(selectedDashboardPopoverJob)
-      : false;
+    const selectedDashboardPopoverCanRetry = selectedDashboardPopoverCanManage && selectedDashboardPopoverFailedJobs.length > 0;
     const selectedDashboardPopoverCanReactivate = selectedDashboardPopoverJob
-      ? canReactivatePublicationBoardJob(selectedDashboardPopoverJob)
+      ? selectedDashboardPopoverCanManage && canReactivatePublicationBoardJob(selectedDashboardPopoverJob)
       : false;
-    const selectedDashboardPopoverStatusTone = selectedDashboardPopoverJob
-      ? publicationBoardStatusChipTone(selectedDashboardPopoverJob, isPastScheduledAtForUser)
-      : "neutral";
+    const selectedDashboardPopoverStatusMeta = resolveGroupedPublicationStatusMeta(
+      selectedDashboardPopoverLatestJobs,
+      isPastScheduledAtForUser,
+    );
 
     return (
       <div className="view-stack">
@@ -13523,14 +16105,16 @@ function App() {
               <span className="home-welcome-highlight">{welcomeName}</span>
             </h2>
           </div>
-          <button
-            type="button"
-            className="primary-button publications-primary-action"
-            onClick={() => navigateToView("scheduler")}
-          >
-            <FiPlus aria-hidden="true" />
-            Novo agendamento
-          </button>
+          {hasAnyPublicationManageWorkspace ? (
+            <button
+              type="button"
+              className="primary-button publications-primary-action"
+              onClick={() => navigateToView("scheduler")}
+            >
+              <FiPlus aria-hidden="true" />
+              Novo agendamento
+            </button>
+          ) : null}
         </section>
 
         <section className="panel-card home-calendar-shell">
@@ -13587,7 +16171,8 @@ function App() {
                               <div className="home-calendar-day-events-shell">
                                 <div className="home-calendar-day-events">
                                   {visibleJobs.map((job) => {
-                                    const dashboardJobTitle = resolveHistoryCalendarTitle(job);
+                                    const dashboardJobTitleFull = resolveHistoryCalendarTitle(job);
+                                    const dashboardJobTitle = clampCompactPublicationTitle(dashboardJobTitleFull, 11);
                                     const jobGroupItems = schedulerGroupedJobsMap.get(resolveJobSchedulerGroupKey(job)) ?? [job];
                                     const participantNetworks = resolveJobParticipantNetworks(job, jobGroupItems);
                                     const isRunningLike = jobGroupItems.some((groupJob) =>
@@ -13600,13 +16185,17 @@ function App() {
                                         key={job.id}
                                         className={`home-calendar-entry-wrap${isPopoverOpen ? " home-calendar-entry-wrap-active" : ""}`}
                                       >
-                                        <div className="home-calendar-entry-row">
+                                        <div
+                                          className={`home-calendar-entry-row${
+                                            isRunningLike ? " home-calendar-entry-row-running" : ""
+                                          }`}
+                                        >
                                           <button
                                             type="button"
                                             className={`home-calendar-entry${isPopoverOpen ? " home-calendar-entry-active" : ""}`}
                                             onClick={() => openDashboardCalendarPopover(job)}
-                                            title={dashboardJobTitle}
-                                            aria-label={dashboardJobTitle}
+                                            title={dashboardJobTitleFull}
+                                            aria-label={dashboardJobTitleFull}
                                           >
                                             <span className="home-calendar-entry-copy">
                                               <span className="home-calendar-entry-title-row">
@@ -13753,13 +16342,19 @@ function App() {
                     ) : null}
                   </div>
                 ) : null}
-                <div className="home-calendar-popover-head-main">
+                <div
+                  className={`home-calendar-popover-head-main${
+                    selectedDashboardPopoverRunningLike ? " home-calendar-popover-head-main-running" : ""
+                  }`}
+                >
                   <div className="home-calendar-popover-title">
                     <strong>{selectedDashboardPopoverTitle}</strong>
                   </div>
                   <div className="home-calendar-popover-head-side">
                     <span
-                      className={`publications-job-status-chip publications-job-status-chip-${selectedDashboardPopoverStatusTone} home-calendar-popover-status-chip`}
+                      className={`publications-job-status-chip publications-job-status-chip-${selectedDashboardPopoverStatusMeta.tone} home-calendar-popover-status-chip${
+                        selectedDashboardPopoverRunningLike ? " home-calendar-popover-status-chip-running" : ""
+                      }`}
                     >
                       {selectedDashboardPopoverRunningLike ? (
                         <span className="home-calendar-popover-status-chip-content">
@@ -13767,7 +16362,7 @@ function App() {
                           Executando
                         </span>
                       ) : (
-                        jobStatusDisplayLabel(selectedDashboardPopoverJob)
+                        selectedDashboardPopoverStatusMeta.label
                       )}
                     </span>
                   </div>
@@ -13786,15 +16381,6 @@ function App() {
                   ))}
                 </div>
                 <div className="home-calendar-popover-actions">
-                  <button
-                    type="button"
-                    className="publications-board-action-button publications-board-action-button-edit"
-                    title="Editar publicação"
-                    aria-label="Editar publicação"
-                    onClick={() => openHistoryJobEditor(selectedDashboardPopoverJob)}
-                  >
-                    <FiEdit3 aria-hidden="true" />
-                  </button>
                   {selectedDashboardPopoverCanEditTime ? (
                     <button
                       type="button"
@@ -13807,31 +16393,35 @@ function App() {
                       <FiCalendar aria-hidden="true" />
                     </button>
                   ) : null}
-                  <button
-                    type="button"
-                    className="publications-board-action-button publications-board-action-button-duplicate"
-                    title="Duplicar publicação"
-                    aria-label="Duplicar publicação"
-                    onClick={() => openPublicationDuplicateModal(selectedDashboardPopoverJob)}
-                  >
-                    <FiCopy aria-hidden="true" />
-                  </button>
-                  <button
-                    type="button"
-                    className="publications-board-action-button publications-board-action-button-template"
-                    title="Criar template"
-                    aria-label="Criar template"
-                    onClick={() => savePublicationAsTemplate(selectedDashboardPopoverJob)}
-                  >
-                    <FiFileText aria-hidden="true" />
-                  </button>
+                  {selectedDashboardPopoverCanManage ? (
+                    <>
+                      <button
+                        type="button"
+                        className="publications-board-action-button publications-board-action-button-duplicate"
+                        title="Duplicar publicação"
+                        aria-label="Duplicar publicação"
+                        onClick={() => openPublicationDuplicateModal(selectedDashboardPopoverJob)}
+                      >
+                        <FiCopy aria-hidden="true" />
+                      </button>
+                      <button
+                        type="button"
+                        className="publications-board-action-button publications-board-action-button-template"
+                        title="Criar template"
+                        aria-label="Criar template"
+                        onClick={() => savePublicationAsTemplate(selectedDashboardPopoverJob)}
+                      >
+                        <FiFileText aria-hidden="true" />
+                      </button>
+                    </>
+                  ) : null}
                   {selectedDashboardPopoverCanRetry ? (
                     <button
                       type="button"
                       className="publications-board-action-button publications-board-action-button-retry"
                       title="Tentar novamente"
                       aria-label="Tentar novamente"
-                      onClick={() => void retryJob(selectedDashboardPopoverJob.id)}
+                      onClick={() => void retryGroupedJobs(selectedDashboardPopoverFailedJobs, selectedDashboardPopoverRetryAnchorJobId!)}
                       disabled={selectedDashboardPopoverRetryingJob}
                     >
                       <FiRotateCcw aria-hidden="true" />
@@ -13853,6 +16443,27 @@ function App() {
               </div>
 
               <div className="home-calendar-popover-body">
+                {selectedDashboardPopoverFailedJobs.length > 0 ? (
+                  <div className="home-calendar-popover-summary-block">
+                    <strong>Falhas</strong>
+                    <div className="home-calendar-popover-failed-list">
+                      {selectedDashboardPopoverFailedJobs.map((job) => (
+                        <article key={`home-failed-${job.id}`} className="home-calendar-popover-failed-card">
+                          <div className="home-calendar-popover-failed-card-main">
+                            {renderPublicationTypePill(job.publicationType)}
+                            <small>
+                              {clampPublicationPreviewTargetLabel(
+                                job.loginIdentifier?.trim() || companyNameMap[job.companyId] || "Conta conectada",
+                                15,
+                              )}
+                            </small>
+                          </div>
+                          <span className="publications-job-status-chip publications-job-status-chip-failed">Falhou</span>
+                        </article>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
                 <div className="home-calendar-popover-detail-grid">
                   <span className="home-calendar-popover-detail-card">
                     <strong>Agendada para</strong>
@@ -14127,76 +16738,128 @@ function App() {
     );
   }
 
-  function renderProfile() {
+  function renderProfileInfoTabContent() {
     return (
-      <div className="view-stack">
-        <section className="panel-card view-stack">
-          <div className="section-head">
-            {renderSectionTitleWithIcon("profile", "Meu perfil", "conta")}
+      <form onSubmit={saveProfile} className="view-stack">
+        <div className="account-page-grid">
+          <section className="panel-card view-stack account-page-side-card">
+            <div className="section-head">
+              {renderSectionTitleWithIcon("profile", "Perfil", "username")}
+            </div>
+            <div className="account-avatar-card">
+              <span className="profile-avatar account-page-avatar" aria-hidden="true">
+                <span className="profile-avatar-media">
+                  {profileAvatarUrl ? (
+                    <img src={profileAvatarUrl} alt="" className="profile-avatar-image" loading="lazy" referrerPolicy="no-referrer" />
+                  ) : (
+                    <span className="profile-avatar-placeholder">{profileInitials}</span>
+                  )}
+                </span>
+                <span className="profile-avatar-status-dot" />
+              </span>
+              <div className="account-avatar-card-copy">
+                <strong>{profileDisplayName}</strong>
+                <span>{profileSecondaryLabel}</span>
+              </div>
+            </div>
+          </section>
+
+          <div className="view-stack account-page-main">
+            <section className="panel-card view-stack">
+              <div className="section-head">
+                {renderSectionTitleWithIcon("profile", "Informações do perfil", "conta")}
+              </div>
+              <div className="account-profile-form-grid">
+                <label className="field-label">
+                  <span>Nome</span>
+                  <input
+                    value={profileName}
+                    onChange={(event) => setProfileName(event.target.value)}
+                    placeholder="Nome"
+                    required
+                    minLength={2}
+                    maxLength={80}
+                    title="Informe o seu nome."
+                  />
+                </label>
+                <label className="field-label">
+                  <span>Email</span>
+                  <input
+                    type="email"
+                    value={profileEmail}
+                    onChange={(event) => setProfileEmail(event.target.value)}
+                    placeholder="nome@empresa.com"
+                    required
+                    maxLength={160}
+                    title="Informe o email principal da sua conta."
+                  />
+                </label>
+                <label className="field-label">
+                  <span>Usuário</span>
+                  <input
+                    value={profileUsername}
+                    onChange={(event) => setProfileUsername(event.target.value)}
+                    placeholder="Usuário"
+                    required
+                    minLength={3}
+                    maxLength={32}
+                    pattern="^[a-zA-Z0-9._-]+$"
+                    title="Use apenas letras, números, ponto, traço ou underscore."
+                  />
+                </label>
+                <label className="field-label">
+                  <span>Fuso horário</span>
+                  <select
+                    value={profileTimeZone}
+                    onChange={(event) => setProfileTimeZone(event.target.value)}
+                    required
+                    title="Define o fuso horário usado para hora atual e exibição de datas."
+                  >
+                    {supportedTimeZones.map((timeZone) => (
+                      <option key={timeZone} value={timeZone}>
+                        {timeZone}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <small className="field-hint">O fuso horário define como o painel exibe horários e datas para você.</small>
+            </section>
+
+            <section className="panel-card view-stack">
+              <div className="section-head">
+                {renderSectionTitleWithIcon("profile", "Senha e acesso", "segurança")}
+              </div>
+              <div className="form-stack">
+                <label className="field-label">
+                  <span>Nova senha</span>
+                  <input
+                    type="password"
+                    value={profilePassword}
+                    onChange={(event) => setProfilePassword(event.target.value)}
+                    placeholder="Digite uma nova senha"
+                    minLength={8}
+                    maxLength={128}
+                    title="Preencha apenas se quiser alterar a sua senha."
+                  />
+                </label>
+                <small className="field-hint">
+                  {authUser?.hasPassword
+                    ? "Deixe a senha em branco para manter a atual."
+                    : "Sua conta pode ter vindo de login social. Defina uma senha para também entrar por email manualmente."}
+                </small>
+                <div className="inline-actions">
+                  <button type="submit">Salvar alterações</button>
+                </div>
+              </div>
+            </section>
           </div>
-          <form onSubmit={saveProfile} className="form-stack">
-            <label className="field-label">
-              <span>Fuso horário</span>
-              <select
-                value={profileTimeZone}
-                onChange={(event) => setProfileTimeZone(event.target.value)}
-                required
-                title="Define o fuso horário usado para hora atual e exibição de datas."
-              >
-                {supportedTimeZones.map((timeZone) => (
-                  <option key={timeZone} value={timeZone}>
-                    {timeZone}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <small className="field-hint">Fuso horário do painel (usado para hora atual e datas).</small>
-            <label className="field-label">
-              <span>Nome</span>
-              <input
-                value={profileName}
-                onChange={(event) => setProfileName(event.target.value)}
-                placeholder="Nome"
-                required
-                minLength={2}
-                maxLength={80}
-                title="Informe o seu nome."
-              />
-            </label>
-            <label className="field-label">
-              <span>Usuário</span>
-              <input
-                value={profileUsername}
-                onChange={(event) => setProfileUsername(event.target.value)}
-                placeholder="Usuário"
-                required
-                minLength={3}
-                maxLength={32}
-                pattern="^[a-zA-Z0-9._-]+$"
-                title="Use apenas letras, números, ponto, traço ou underscore."
-              />
-            </label>
-            <label className="field-label">
-              <span>Senha</span>
-              <input
-                type="password"
-                value={profilePassword}
-                onChange={(event) => setProfilePassword(event.target.value)}
-                placeholder="Senha"
-                minLength={8}
-                maxLength={128}
-                title="Preencha apenas se quiser alterar a sua senha."
-              />
-            </label>
-            <small className="field-hint">Deixe a senha em branco para não alterar.</small>
-            <button type="submit">Salvar</button>
-          </form>
-        </section>
-      </div>
+        </div>
+      </form>
     );
   }
 
-  function renderPlan() {
+  function renderProfilePlanTabContent() {
     const activeBillingPlan =
       billingMe?.plan?.id && billingPlans.length > 0
         ? billingPlans.find((plan) => plan.id === billingMe.plan?.id) ?? null
@@ -14222,209 +16885,317 @@ function App() {
     }
 
     return (
-      <div className="view-stack">
-        <section className="panel-card view-stack" aria-label="Meu plano">
-          <div className="section-head">
-            {renderSectionTitleWithIcon("plan", "Meu plano", "assinatura")}
-          </div>
+      <section className="panel-card view-stack" aria-label="Meu plano">
+        <div className="section-head">
+          {renderSectionTitleWithIcon("plan", "Planos e assinatura", "assinatura")}
+        </div>
 
-          {planInfo ? <div className={`info-banner${isPositivePlanInfo ? " info-banner-success" : ""}`}>{planInfo}</div> : null}
+        {planInfo ? <div className={`info-banner${isPositivePlanInfo ? " info-banner-success" : ""}`}>{planInfo}</div> : null}
 
-          {billingMe ? (
-            <div className="table-list">
-              <div className="row-card billing-row-card">
-                <div className="view-stack billing-summary-stack">
-                  <div className="billing-summary-inline">
-                    <strong>{billingMe.plan?.name || "Sem plano ativo"}</strong>
-                    <span className={`status-pill status-${billingStatusTone(billingMe.status)}`}>{`Status: ${billingStatusDisplayLabel(billingMe.status)}`}</span>
-                    <span className="status-pill status-billing-active">{`Valor: ${activeBillingAmountLabel}`}</span>
-                    <span className="unit-pill billing-model-pill">{`Cobrança: ${billingModelDisplayLabel(billingMe.billingModel)}`}</span>
-                    <span className="unit-pill billing-model-pill">{`Tipo: ${billingSubscriptionTypeDisplayLabel(billingMe.billingModel, billingMe.cycle)}`}</span>
-                    {billingMe.canCancelStripeSubscription ? (
-                      <button
-                        type="button"
-                        className="billing-cancel-button"
-                        onClick={() => void cancelStripeSubscription()}
-                        disabled={cancelingStripeSubscription}
-                      >
-                        {cancelingStripeSubscription ? "Cancelando assinatura..." : "Cancelar assinatura"}
-                      </button>
-                    ) : null}
-                  </div>
-                  {billingSummaryMessage ? <span>{billingSummaryMessage}</span> : null}
-                  {billingMe.trialEndsAt ? (
-                    <span>{`Trial até ${formatDate(billingMe.trialEndsAt, effectiveUserTimeZone)}`}</span>
-                  ) : null}
-                  {billingMe.endsAt ? (
-                    <span>{`Vigência até ${formatDate(billingMe.endsAt, effectiveUserTimeZone)}`}</span>
-                  ) : null}
-                  {billingMe.stripeCancelAtPeriodEnd ? (
-                    <span className="billing-plan-note">Assinatura já marcada para cancelamento no fim do ciclo.</span>
-                  ) : null}
-                </div>
-              </div>
-              <div className="row-card billing-row-card">
-                  <div className="billing-usage-inline">
-                    <strong>Uso do ciclo atual</strong>
-                    <div className="meta-pill-row">
-                      <span className="unit-pill unit-pill-plan">{`Workspaces cliente: ${billingMe.usage.workspaceClientUsed}/${formatPlanLimitDisplay(billingMe.plan?.workspaceLimit, billingMe.plan?.code)}`}</span>
-                      <span className="unit-pill unit-pill-plan">{`Bônus agência: ${billingMe.usage.workspaceAgencyBonusUsed}/${formatPlanLimitDisplay(billingMe.plan?.agencyBonusWorkspaceLimit, billingMe.plan?.code)}`}</span>
-                      <span className="unit-pill unit-pill-plan">{`Contas: ${billingMe.usage.connectionsUsed}/${formatPlanLimitDisplay(billingMe.plan?.maxConnections, billingMe.plan?.code)}`}</span>
-                      <span className="unit-pill unit-pill-plan">{`Publicações/mês: ${billingMe.usage.postsUsedThisMonth}/${formatPlanLimitDisplay(
-                        billingMe.plan?.maxMonthlyPublications,
-                        billingMe.plan?.code,
-                      )}`}</span>
-                    </div>
-                  </div>
-              </div>
-              {isRootUser ? (
-                <div id={BILLING_PLAN_CHECKOUT_ANCHOR_ID} className="row-card billing-row-card">
-                  <form onSubmit={assignRootPlan} className="form-stack">
-                    <strong>Selecionar plano (teste root)</strong>
-                    <label className="field-label">
-                      <span>Plano</span>
-                      <select
-                        value={rootAssignPlanId}
-                        onChange={(event) => setRootAssignPlanId(event.target.value)}
-                        required
-                        disabled={rootAssignablePlans.length === 0}
-                      >
-                        <option value="">Selecione um plano</option>
-                        {rootAssignablePlans.map((plan) => (
-                          <option key={plan.id} value={plan.id}>
-                            {`${plan.name} (${plan.code})`}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <button type="submit" disabled={assigningRootPlan || rootAssignablePlans.length === 0}>
-                      {assigningRootPlan ? "Aplicando..." : "Aplicar plano"}
-                    </button>
-                    <small className="field-hint">
-                      Ação de teste para root: troca o plano ativo sem iniciar cobrança Stripe.
-                    </small>
-                  </form>
-                </div>
-              ) : canRecoverBlockedPlanCheckout ? (
-                <div id={BILLING_PLAN_CHECKOUT_ANCHOR_ID} className="row-card billing-row-card">
-                  <div className="form-stack">
-                    <strong>Ativar assinatura</strong>
-                    <small className="field-hint">
-                      {activeCheckoutPlan
-                        ? `Plano pendente: ${activeCheckoutPlan.name}${activeCheckoutPlan.code ? ` (${activeCheckoutPlan.code})` : ""}.`
-                        : "Sua conta está bloqueada e precisa regularizar a assinatura para continuar."}
-                    </small>
-                    {(billingMe?.billingModel === "STRIPE_SUBSCRIPTION" || billingMe?.billingModel === "PIX_MANUAL") ? (
-                      <small className="field-hint">
-                        {`Cobrança: ${billingModelDisplayLabel(billingMe.billingModel)}${billingMe.cycle ? ` • ${billingMe.cycle === "YEARLY" ? "Anual" : "Mensal"}` : ""}`}
-                      </small>
-                    ) : canStartBlockedCheckout ? (
-                      <small className="field-hint">
-                        {`Cobrança: ${billingModelDisplayLabel(blockedCheckoutBillingModel)}${blockedCheckoutCycle ? ` • ${blockedCheckoutCycle === "YEARLY" ? "Anual" : "Mensal"}` : ""}`}
-                      </small>
-                    ) : null}
-                    {activeCheckoutPlan ? (
-                      <strong className="checkout-price-preview">{`Valor: ${blockedCheckoutPriceLabel}`}</strong>
-                    ) : null}
+        {billingMe ? (
+          <div className="table-list">
+            <div className="row-card billing-row-card">
+              <div className="view-stack billing-summary-stack">
+                <div className="billing-summary-inline">
+                  <strong>{billingMe.plan?.name || "Sem plano ativo"}</strong>
+                  <span className={`status-pill status-${billingStatusTone(billingMe.status)}`}>{`Status: ${billingStatusDisplayLabel(billingMe.status)}`}</span>
+                  <span className="status-pill status-billing-active">{`Valor: ${activeBillingAmountLabel}`}</span>
+                  <span className="unit-pill billing-model-pill">{`Cobrança: ${billingModelDisplayLabel(billingMe.billingModel)}`}</span>
+                  <span className="unit-pill billing-model-pill">{`Tipo: ${billingSubscriptionTypeDisplayLabel(billingMe.billingModel, billingMe.cycle)}`}</span>
+                  {billingMe.canCancelStripeSubscription ? (
                     <button
                       type="button"
-                      className="stripe-pay-button"
-                      disabled={startingCheckout || !canStartBlockedCheckout}
-                      onClick={() =>
-                        void startStripeCheckoutRequest({
-                          planId: activeCheckoutPlanId,
-                          billingModel: blockedCheckoutBillingModel,
-                          cycle: blockedCheckoutCycle === "YEARLY" ? "YEARLY" : "MONTHLY",
-                        })
-                      }
+                      className="billing-cancel-button"
+                      onClick={() => void cancelStripeSubscription()}
+                      disabled={cancelingStripeSubscription}
                     >
-                      {startingCheckout
-                        ? "Abrindo checkout..."
-                        : "Ativar assinatura"}
+                      {cancelingStripeSubscription ? "Cancelando assinatura..." : "Cancelar assinatura"}
                     </button>
-                    <small className="field-hint">
-                      {canStartBlockedCheckout
-                        ? "Primeiro quite a assinatura pendente. Depois da regularização, a troca de plano volta a ficar disponível."
-                        : "Esta conta bloqueada está sem dados suficientes para reativação automática. Precisamos conferir o plano salvo dessa assinatura."}
-                    </small>
-                  </div>
+                  ) : null}
                 </div>
-              ) : (
-                <div id={BILLING_PLAN_CHECKOUT_ANCHOR_ID} className="row-card billing-row-card">
-                  <form onSubmit={startStripeCheckout} className="form-stack">
-                    <strong>Pagamento Stripe (teste)</strong>
-                    <label className="field-label">
-                      <span>Plano</span>
-                      <select
-                        value={checkoutPlanId}
-                        onChange={(event) => setCheckoutPlanId(event.target.value)}
-                        required
-                        disabled={availablePaidPlans.length === 0 || checkoutTargetPlans.length === 0}
-                      >
-                        <option value="">
-                          {checkoutTargetPlans.length === 0 ? "Nenhum upgrade disponível" : "Selecione um plano"}
-                        </option>
-                        {availablePaidPlans.map((plan) => (
-                          <option key={plan.id} value={plan.id} disabled={plan.id === activeCheckoutPlanId}>
-                            {`${plan.name} (${plan.code})${plan.id === activeCheckoutPlanId ? " - plano atual" : ""}`}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <small className="field-hint">
-                      {billingMe.plan?.name
-                        ? `Plano atual: ${billingMe.plan.name}${billingMe.plan.code ? ` (${billingMe.plan.code})` : ""}.`
-                        : "Sua conta ainda não tem um plano ativo."}
-                    </small>
-                    <small className="field-hint">Cobrança via Stripe: assinatura recorrente.</small>
-                    <label className="field-label">
-                      <span>Ciclo</span>
-                      <select
-                        value={checkoutCycle}
-                        onChange={(event) =>
-                          setCheckoutCycle(event.target.value === "YEARLY" ? "YEARLY" : event.target.value === "MONTHLY" ? "MONTHLY" : "")
-                        }
-                        required
-                      >
-                        <option value="">Selecione um ciclo</option>
-                        <option value="MONTHLY">Mensal</option>
-                        <option value="YEARLY">Anual</option>
-                      </select>
-                    </label>
-                    <strong className="checkout-price-preview">
-                      {isCheckoutSelectionReady
-                        ? `Valor: ${checkoutSelectedPriceLabel}`
-                        : checkoutTargetPlans.length === 0
-                          ? "Nenhum plano diferente disponível para troca no momento."
-                          : "Selecione plano, cobrança e ciclo para continuar."}
-                    </strong>
-                    <button
-                      type="submit"
-                      className="stripe-pay-button"
-                      disabled={
-                        startingCheckout ||
-                        availablePaidPlans.length === 0 ||
-                        checkoutTargetPlans.length === 0 ||
-                        !isCheckoutSelectionReady
-                      }
-                    >
-                      {startingCheckout ? "Abrindo checkout..." : "Pagar com Stripe"}
-                    </button>
-                    <small className="field-hint">
-                      {isBlockedBilling
-                        ? "Sua conta está sem um plano pago ativo. Escolha um plano para reativar o acesso."
-                        : "O link abre no Checkout oficial do Stripe e volta automaticamente para esta tela."}
-                    </small>
-                  </form>
-                </div>
-              )}
+                {billingSummaryMessage ? <span>{billingSummaryMessage}</span> : null}
+                {billingMe.trialEndsAt ? (
+                  <span>{`Trial até ${formatDate(billingMe.trialEndsAt, effectiveUserTimeZone)}`}</span>
+                ) : null}
+                {billingMe.endsAt ? (
+                  <span>{`Vigência até ${formatDate(billingMe.endsAt, effectiveUserTimeZone)}`}</span>
+                ) : null}
+                {billingMe.stripeCancelAtPeriodEnd ? (
+                  <span className="billing-plan-note">Assinatura já marcada para cancelamento no fim do ciclo.</span>
+                ) : null}
+              </div>
             </div>
-          ) : (
-            <div className="empty-state">Não foi possível carregar os dados do plano.</div>
-          )}
+            <div className="row-card billing-row-card">
+              <div className="billing-usage-inline">
+                <strong>Uso do ciclo atual</strong>
+                <div className="meta-pill-row">
+                  <span className="unit-pill unit-pill-plan">{`Workspaces cliente: ${billingMe.usage.workspaceClientUsed}/${formatPlanLimitDisplay(billingMe.plan?.workspaceLimit, billingMe.plan?.code)}`}</span>
+                  <span className="unit-pill unit-pill-plan">{`Bônus agência: ${billingMe.usage.workspaceAgencyBonusUsed}/${formatPlanLimitDisplay(billingMe.plan?.agencyBonusWorkspaceLimit, billingMe.plan?.code)}`}</span>
+                  <span className="unit-pill unit-pill-plan">{`Contas: ${billingMe.usage.connectionsUsed}/${formatPlanLimitDisplay(billingMe.plan?.maxConnections, billingMe.plan?.code)}`}</span>
+                  <span className="unit-pill unit-pill-plan">{`Publicações/mês: ${billingMe.usage.postsUsedThisMonth}/${formatPlanLimitDisplay(
+                    billingMe.plan?.maxMonthlyPublications,
+                    billingMe.plan?.code,
+                  )}`}</span>
+                </div>
+              </div>
+            </div>
+            {isRootUser ? (
+              <div id={BILLING_PLAN_CHECKOUT_ANCHOR_ID} className="row-card billing-row-card">
+                <form onSubmit={assignRootPlan} className="form-stack">
+                  <strong>Selecionar plano (teste root)</strong>
+                  <label className="field-label">
+                    <span>Plano</span>
+                    <select
+                      value={rootAssignPlanId}
+                      onChange={(event) => setRootAssignPlanId(event.target.value)}
+                      required
+                      disabled={rootAssignablePlans.length === 0}
+                    >
+                      <option value="">Selecione um plano</option>
+                      {rootAssignablePlans.map((plan) => (
+                        <option key={plan.id} value={plan.id}>
+                          {`${plan.name} (${plan.code})`}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <button type="submit" disabled={assigningRootPlan || rootAssignablePlans.length === 0}>
+                    {assigningRootPlan ? "Aplicando..." : "Aplicar plano"}
+                  </button>
+                  <small className="field-hint">
+                    Ação de teste para root: troca o plano ativo sem iniciar cobrança Stripe.
+                  </small>
+                </form>
+              </div>
+            ) : canRecoverBlockedPlanCheckout ? (
+              <div id={BILLING_PLAN_CHECKOUT_ANCHOR_ID} className="row-card billing-row-card">
+                <div className="form-stack">
+                  <strong>Ativar assinatura</strong>
+                  <small className="field-hint">
+                    {activeCheckoutPlan
+                      ? `Plano pendente: ${activeCheckoutPlan.name}${activeCheckoutPlan.code ? ` (${activeCheckoutPlan.code})` : ""}.`
+                      : "Sua conta está bloqueada e precisa regularizar a assinatura para continuar."}
+                  </small>
+                  {(billingMe?.billingModel === "STRIPE_SUBSCRIPTION" || billingMe?.billingModel === "PIX_MANUAL") ? (
+                    <small className="field-hint">
+                      {`Cobrança: ${billingModelDisplayLabel(billingMe.billingModel)}${billingMe.cycle ? ` • ${billingMe.cycle === "YEARLY" ? "Anual" : "Mensal"}` : ""}`}
+                    </small>
+                  ) : canStartBlockedCheckout ? (
+                    <small className="field-hint">
+                      {`Cobrança: ${billingModelDisplayLabel(blockedCheckoutBillingModel)}${blockedCheckoutCycle ? ` • ${blockedCheckoutCycle === "YEARLY" ? "Anual" : "Mensal"}` : ""}`}
+                    </small>
+                  ) : null}
+                  {activeCheckoutPlan ? (
+                    <strong className="checkout-price-preview">{`Valor: ${blockedCheckoutPriceLabel}`}</strong>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="stripe-pay-button"
+                    disabled={startingCheckout || !canStartBlockedCheckout}
+                    onClick={() =>
+                      void startStripeCheckoutRequest({
+                        planId: activeCheckoutPlanId,
+                        billingModel: blockedCheckoutBillingModel,
+                        cycle: blockedCheckoutCycle === "YEARLY" ? "YEARLY" : "MONTHLY",
+                      })
+                    }
+                  >
+                    {startingCheckout
+                      ? "Abrindo checkout..."
+                      : "Ativar assinatura"}
+                  </button>
+                  <small className="field-hint">
+                    {canStartBlockedCheckout
+                      ? "Primeiro quite a assinatura pendente. Depois da regularização, a troca de plano volta a ficar disponível."
+                      : "Esta conta bloqueada está sem dados suficientes para reativação automática. Precisamos conferir o plano salvo dessa assinatura."}
+                  </small>
+                </div>
+              </div>
+            ) : (
+              <div id={BILLING_PLAN_CHECKOUT_ANCHOR_ID} className="row-card billing-row-card">
+                <form onSubmit={startStripeCheckout} className="form-stack">
+                  <strong>Pagamento Stripe (teste)</strong>
+                  <label className="field-label">
+                    <span>Plano</span>
+                    <select
+                      value={checkoutPlanId}
+                      onChange={(event) => setCheckoutPlanId(event.target.value)}
+                      required
+                      disabled={availablePaidPlans.length === 0 || checkoutTargetPlans.length === 0}
+                    >
+                      <option value="">
+                        {checkoutTargetPlans.length === 0 ? "Nenhum upgrade disponível" : "Selecione um plano"}
+                      </option>
+                      {availablePaidPlans.map((plan) => (
+                        <option key={plan.id} value={plan.id} disabled={plan.id === activeCheckoutPlanId}>
+                          {`${plan.name} (${plan.code})${plan.id === activeCheckoutPlanId ? " - plano atual" : ""}`}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <small className="field-hint">
+                    {billingMe.plan?.name
+                      ? `Plano atual: ${billingMe.plan.name}${billingMe.plan.code ? ` (${billingMe.plan.code})` : ""}.`
+                      : "Sua conta ainda não tem um plano ativo."}
+                  </small>
+                  <small className="field-hint">Cobrança via Stripe: assinatura recorrente.</small>
+                  <label className="field-label">
+                    <span>Ciclo</span>
+                    <select
+                      value={checkoutCycle}
+                      onChange={(event) =>
+                        setCheckoutCycle(event.target.value === "YEARLY" ? "YEARLY" : event.target.value === "MONTHLY" ? "MONTHLY" : "")
+                      }
+                      required
+                    >
+                      <option value="">Selecione um ciclo</option>
+                      <option value="MONTHLY">Mensal</option>
+                      <option value="YEARLY">Anual</option>
+                    </select>
+                  </label>
+                  <strong className="checkout-price-preview">
+                    {isCheckoutSelectionReady
+                      ? `Valor: ${checkoutSelectedPriceLabel}`
+                      : checkoutTargetPlans.length === 0
+                        ? "Nenhum plano diferente disponível para troca no momento."
+                        : "Selecione plano, cobrança e ciclo para continuar."}
+                  </strong>
+                  <button
+                    type="submit"
+                    className="stripe-pay-button"
+                    disabled={
+                      startingCheckout ||
+                      availablePaidPlans.length === 0 ||
+                      checkoutTargetPlans.length === 0 ||
+                      !isCheckoutSelectionReady
+                    }
+                  >
+                    {startingCheckout ? "Abrindo checkout..." : "Pagar com Stripe"}
+                  </button>
+                  <small className="field-hint">
+                    {isBlockedBilling
+                      ? "Sua conta está sem um plano pago ativo. Escolha um plano para reativar o acesso."
+                      : "O link abre no Checkout oficial do Stripe e volta automaticamente para esta tela."}
+                  </small>
+                </form>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="empty-state">Não foi possível carregar os dados do plano.</div>
+        )}
+      </section>
+    );
+  }
+
+  function renderProfileDangerTabContent() {
+    return (
+      <div className="view-stack">
+        <section className="panel-card view-stack account-danger-card">
+          <div className="section-head">
+            <div>
+              <span className="section-kicker">segurança</span>
+              <div className="view-title-with-icon">
+                <span className="view-title-icon" aria-hidden="true">
+                  <FiSlash />
+                </span>
+                <h2>Zona de perigo</h2>
+              </div>
+            </div>
+          </div>
+          <div className="account-danger-stack">
+            <div className="account-danger-row">
+              <div className="account-danger-copy">
+                <strong>Sair da conta</strong>
+                <span>Encerre a sessão atual neste dispositivo a qualquer momento.</span>
+              </div>
+              <button type="button" className="ghost-button" onClick={() => void logout()}>
+                Sair agora
+              </button>
+            </div>
+            <div className="account-danger-row account-danger-row-critical">
+              <div className="account-danger-copy">
+                <strong>Excluir conta</strong>
+                <span>Essa ação ainda vai ganhar confirmação e fluxo próprio antes de ser liberada.</span>
+              </div>
+              <button type="button" className="danger-button" disabled title="Em breve">
+                Excluir conta
+              </button>
+            </div>
+          </div>
         </section>
       </div>
     );
+  }
+
+  function renderAccountPage(targetTab: ProfilePageTab) {
+    const currentTab = targetTab;
+    const tabItems: Array<{ key: ProfilePageTab; label: string; icon: IconType }> = [
+      { key: "profile", label: "Informações", icon: FiUser },
+      { key: "plan", label: "Planos", icon: FiCreditCard },
+      { key: "danger", label: "Zona de perigo", icon: FiSlash },
+    ];
+
+    return (
+      <div className="view-stack account-page-shell">
+        <section className="panel-card account-page-hero">
+          <div className="account-page-hero-main">
+            <span className="profile-avatar account-page-hero-avatar" aria-hidden="true">
+              <span className="profile-avatar-media">
+                {profileAvatarUrl ? (
+                  <img src={profileAvatarUrl} alt="" className="profile-avatar-image" loading="lazy" referrerPolicy="no-referrer" />
+                ) : (
+                  <span className="profile-avatar-placeholder">{profileInitials}</span>
+                )}
+              </span>
+              <span className="profile-avatar-status-dot" />
+            </span>
+            <div className="account-page-hero-copy">
+              <span className="section-kicker">Meu perfil</span>
+              <h2>{profileDisplayName}</h2>
+              <div className="account-page-hero-meta">
+                <span>{profileSecondaryLabel}</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <div className="history-anchor-tabs account-page-tabs" role="tablist" aria-label="Abas do perfil">
+          {tabItems.map((tab) => {
+            const isActive = currentTab === tab.key;
+            return (
+              <button
+                key={tab.key}
+                type="button"
+                className={`history-anchor-tab account-page-tab${isActive ? " account-page-tab-active" : ""}`}
+                role="tab"
+                aria-selected={isActive}
+                onClick={() =>
+                  navigateToView(tab.key === "plan" ? "plan" : "profile", { profileTab: tab.key })
+                }
+              >
+                <tab.icon aria-hidden="true" />
+                <span>{tab.label}</span>
+              </button>
+            );
+          })}
+        </div>
+
+        {currentTab === "plan"
+          ? renderProfilePlanTabContent()
+          : currentTab === "danger"
+            ? renderProfileDangerTabContent()
+            : renderProfileInfoTabContent()}
+      </div>
+    );
+  }
+
+  function renderProfile() {
+    return renderAccountPage(resolvedProfilePageTab);
+  }
+
+  function renderPlan() {
+    return renderAccountPage("plan");
   }
 
   function renderBeeUpAdmin() {
@@ -14863,7 +17634,7 @@ function App() {
         tone: "invite",
         icon: FiLink2,
       },
-    ];
+    ].filter((card) => card.key !== "invites" || hasAnyWorkspaceInviteSupport);
 
     return (
       <div className="view-stack workspace-shell">
@@ -14872,14 +17643,16 @@ function App() {
         <section className="panel-card view-stack workspace-panel">
           <div className="section-head publications-section-head">
             {renderSectionTitleWithIcon("companies", "Workspaces", "estrutura")}
-            <button
-              type="button"
-              className="primary-button publications-primary-action"
-              onClick={() => openCreateWorkspaceModal()}
-            >
-              <FiPlus aria-hidden="true" />
-              <span>Novo workspace</span>
-            </button>
+            {canCreateOwnedWorkspace ? (
+              <button
+                type="button"
+                className="primary-button publications-primary-action"
+                onClick={() => openCreateWorkspaceModal()}
+              >
+                <FiPlus aria-hidden="true" />
+                <span>Novo workspace</span>
+              </button>
+            ) : null}
           </div>
 
           <div className="workspace-overview-grid">
@@ -14960,7 +17733,7 @@ function App() {
                             <FiEdit3 aria-hidden="true" />
                           </button>
                         ) : null}
-                        {company.canManageMembers ? (
+                        {company.canManageMembers && company.supportsWorkspaceInvites ? (
                           <button
                             type="button"
                             className="workspace-icon-action workspace-icon-action-invite"
@@ -15022,25 +17795,27 @@ function App() {
                       </button>
                     </div>
 
-                    <div className="workspace-inline-summary-item workspace-inline-summary-item-card">
-                      <span className="workspace-inline-summary-meta">
-                        <span className="workspace-inline-summary-icon" aria-hidden="true">
-                          <FiLink2 />
+                    {company.supportsWorkspaceInvites ? (
+                      <div className="workspace-inline-summary-item workspace-inline-summary-item-card">
+                        <span className="workspace-inline-summary-meta">
+                          <span className="workspace-inline-summary-icon" aria-hidden="true">
+                            <FiLink2 />
+                          </span>
+                          <strong className="workspace-inline-summary-value">
+                            {company.invites.filter((invite) => !invite.revokedAt).length}
+                          </strong>
                         </span>
-                        <strong className="workspace-inline-summary-value">
-                          {company.invites.filter((invite) => !invite.revokedAt).length}
-                        </strong>
-                      </span>
-                      <button
-                        type="button"
-                        className="workspace-icon-action workspace-inline-summary-more"
-                        onClick={() => openWorkspaceDetailsModal(company, "invites")}
-                        title="Ver convites"
-                        aria-label="Ver convites"
-                      >
-                        <FiPlus aria-hidden="true" />
-                      </button>
-                    </div>
+                        <button
+                          type="button"
+                          className="workspace-icon-action workspace-inline-summary-more"
+                          onClick={() => openWorkspaceDetailsModal(company, "invites")}
+                          title="Ver convites"
+                          aria-label="Ver convites"
+                        >
+                          <FiPlus aria-hidden="true" />
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
                 </article>
                   );
@@ -15541,6 +18316,19 @@ function App() {
     const activeStoryEditorTarget =
       storyEditorMediaIndex !== null ? uploadedSchedulerMedia[storyEditorMediaIndex] ?? null : null;
     const canOpenStoryEditor = schedulerSelectedPublicationSet.includes("instagram_story");
+
+    if (!hasAnyPublicationManageWorkspace) {
+      return (
+        <section ref={schedulerSectionRef} className="panel-card view-stack">
+          <div className="section-head">
+            {renderSectionTitleWithIcon("scheduler", "Agendar Postagem", "agenda")}
+          </div>
+          <div className="empty-state">
+            Você tem acesso somente de visualização nas publicações disponíveis para esta conta.
+          </div>
+        </section>
+      );
+    }
 
     return (
       <section ref={schedulerSectionRef} className="panel-card view-stack">
@@ -16116,13 +18904,7 @@ function App() {
               <small className="scheduler-whatsapp-relink-hint">
                 {schedulerRelinkOwnerPublicationType === "instagram_story" && !canEnableWhatsappRelink
                   ? "Relink no momento está disponível apenas para story único"
-                  : schedulerRelinkOwnerPublicationType === "threads_post"
-                    ? "Após publicar no Threads, cria um status com a primeira mídia e o link do conteúdo para as contas selecionadas."
-                    : schedulerRelinkOwnerPublicationType === "x_post"
-                      ? "Após publicar no X, cria um status com a primeira mídia e o link do conteúdo para as contas selecionadas."
-                      : schedulerRelinkOwnerPublicationType === "tiktok_post"
-                        ? "Após publicar no TikTok, cria um status com o vídeo e o link da postagem na legenda para as contas selecionadas."
-                        : "Após publicar no Instagram, cria um status com a primeira mídia e o link do conteúdo para as contas selecionadas."}
+                  : "Cria um status com a mídia principal e o link do conteúdo para as contas selecionadas."}
               </small>
               {whatsappRelinkEnabled && canEnableWhatsappRelink ? (
                 <div className="scheduler-whatsapp-relink-shell">
@@ -16988,20 +19770,20 @@ function App() {
           <div className="history-bulk-top">
             <label className="field-label history-bulk-search-field">
               <span>Buscar postagem</span>
-              <div className="history-search-input-row">
-                <input
-                  type="search"
-                  value={historySearchQuery}
-                  onChange={(event) => setHistorySearchQuery(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault();
-                      setHistoryCalendarDayPages({});
-                    }
-                  }}
-                  placeholder="Título ou legenda"
-                  maxLength={120}
-                  disabled={historyBulkApplying}
+                <div className="history-search-input-row">
+                  <input
+                    ref={historyLegacySearchInputRef}
+                    type="search"
+                    defaultValue={historySearchQuery}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        applyHistorySearch();
+                      }
+                    }}
+                    placeholder="Título ou legenda"
+                    maxLength={120}
+                    disabled={historyBulkApplying}
                 />
                 <button
                   type="button"
@@ -17021,10 +19803,10 @@ function App() {
                 disabled={historyBulkApplying}
               >
                 <option value="">Selecione uma ação</option>
-                <option value="SET_PUBLISHED">Marcar como Publicado</option>
-                <option value="SET_DRAFT">Marcar como Rascunho</option>
                 <option value="SET_SCHEDULE">Alterar data e horário</option>
-                <option value="SET_COMPANY">Alterar workspace</option>
+                <option value="SET_DRAFT">Alterar para rascunho</option>
+                <option value="SET_PUBLISHED">Alterar para publicado</option>
+                <option value="SET_CANCEL">Cancelar publicação agendada</option>
               </select>
             </label>
           </div>
@@ -17034,13 +19816,35 @@ function App() {
                 <>
                   <label className="field-label">
                     <span>Nova data</span>
-                    <input
-                      type="date"
-                      value={historyBulkDate}
-                      onChange={(event) => setHistoryBulkDate(event.target.value)}
-                      disabled={historyBulkApplying}
-                      required
-                    />
+                    <div className="publications-toolbar-date-control">
+                      <button
+                        type="button"
+                        className="publications-toolbar-date-nav"
+                        onClick={() => setHistoryBulkDate((current) => shiftDateInputValue(current, -1))}
+                        disabled={historyBulkApplying || !historyBulkDate}
+                        aria-label="Dia anterior"
+                        title="Dia anterior"
+                      >
+                        <FiChevronLeft aria-hidden="true" />
+                      </button>
+                      <input
+                        type="date"
+                        value={historyBulkDate}
+                        onChange={(event) => setHistoryBulkDate(event.target.value)}
+                        disabled={historyBulkApplying}
+                        required
+                      />
+                      <button
+                        type="button"
+                        className="publications-toolbar-date-nav"
+                        onClick={() => setHistoryBulkDate((current) => shiftDateInputValue(current, 1))}
+                        disabled={historyBulkApplying || !historyBulkDate}
+                        aria-label="Próximo dia"
+                        title="Próximo dia"
+                      >
+                        <FiChevronRight aria-hidden="true" />
+                      </button>
+                    </div>
                   </label>
                   <label className="field-label">
                     <span>Novo horário</span>
@@ -17427,6 +20231,7 @@ function App() {
   }
 
   function renderHistory() {
+    type PublicationBoardTone = "scheduled" | "published" | "canceled" | "waiting" | "failed" | "draft";
     const activePublicationBoardFilter: HistoryFilterKey = historyFilter === "published" ? "sent" : historyFilter;
     const normalizedSearchQuery = historySearchQuery.trim().toLocaleLowerCase("pt-BR");
     const defaultPublicationBoardPeriod = getYearMonthInTimeZone(nowReferenceDate, effectiveUserTimeZone);
@@ -17462,6 +20267,129 @@ function App() {
     ];
     const visibleWorkspaceCount = selectedCompanyId ? 1 : companies.length;
     const shouldShowWorkspaceColumn = visibleWorkspaceCount > 1;
+    const publicationBoardEntryGroups = new Map<string, Job[]>();
+
+    for (const job of publicationBoardBaseJobs) {
+      const groupKey = resolveJobSchedulerCompanyGroupKey(job);
+      const current = publicationBoardEntryGroups.get(groupKey) ?? [];
+      current.push(job);
+      publicationBoardEntryGroups.set(groupKey, current);
+    }
+
+    type PublicationBoardPreviewItem = {
+      id: string;
+      title: string;
+      caption: string;
+      workspaceLabel: string;
+      dateLabel: string;
+      timeLabel: string;
+      publicationType: Job["publicationType"];
+      statusLabel: string;
+      day: number;
+      span: number;
+      job: Job;
+      participantNetworks: Array<"instagram" | "facebook" | "threads" | "tiktok" | "x" | "whatsapp">;
+      groupedJobs: Job[];
+      isolateSinglePublicationEdit: boolean;
+    };
+
+    type PublicationBoardDirectItem = PublicationBoardPreviewItem & {
+      filterKey: Exclude<HistoryFilterKey, "all" | "published">;
+      tone: PublicationBoardTone;
+      filterLabel: string;
+    };
+
+    const buildPublicationBoardPreviewItem = (
+      primaryJob: Job,
+      relevantJobs: Job[],
+      input?: { isolateSinglePublicationEdit?: boolean },
+    ): PublicationBoardPreviewItem => {
+      const jobDateLabel = toDateLocal(primaryJob.dataPostagem, effectiveUserTimeZone);
+      const jobDay = Number.parseInt(jobDateLabel.slice(-2), 10) || 1;
+      return {
+        id: input?.isolateSinglePublicationEdit ? primaryJob.id : resolveJobSchedulerCompanyGroupKey(primaryJob),
+        title: resolveJobDisplayTitle(primaryJob),
+        caption: (primaryJob.caption?.trim() || "Sem legenda").slice(0, 120),
+        workspaceLabel: companyNameMap[primaryJob.companyId] || "Workspace removido",
+        dateLabel: jobDateLabel,
+        timeLabel: toTimeLocal(primaryJob.dataPostagem, effectiveUserTimeZone),
+        publicationType: primaryJob.publicationType,
+        statusLabel: jobStatusDisplayLabel(primaryJob),
+        day: jobDay,
+        span: 1,
+        job: primaryJob,
+        participantNetworks: resolveJobParticipantNetworks(primaryJob, relevantJobs),
+        groupedJobs: relevantJobs,
+        isolateSinglePublicationEdit: input?.isolateSinglePublicationEdit === true,
+      };
+    };
+
+    const publicationBoardPreviewItemsByFilter = {
+      upcoming: [] as PublicationBoardPreviewItem[],
+      sent: [] as PublicationBoardPreviewItem[],
+      canceled: [] as PublicationBoardPreviewItem[],
+      waiting_login: [] as PublicationBoardPreviewItem[],
+      failed: [] as PublicationBoardPreviewItem[],
+      draft: [] as PublicationBoardPreviewItem[],
+    };
+
+    for (const groupedJobs of publicationBoardEntryGroups.values()) {
+      const effectiveGroupJobs = resolveLatestJobsPerPublicationType(groupedJobs).sort(
+        (left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime(),
+      );
+
+      const successfulJobs = effectiveGroupJobs.filter(
+        (job) => job.status === "COMPLETED" || job.status === "SENT_UNCONFIRMED",
+      );
+      const upcomingJobs = effectiveGroupJobs.filter((job) =>
+        matchesHistoryFilterKey(job, "upcoming", isPastScheduledAtForUser),
+      );
+      const canceledJobs = effectiveGroupJobs.filter((job) => job.status === "CANCELED");
+      const waitingLoginJobs = effectiveGroupJobs.filter((job) => job.status === "WAITING_LOGIN");
+      const failedJobs = effectiveGroupJobs.filter((job) => job.status === "FAILED");
+      const draftJobs = effectiveGroupJobs.filter((job) => job.publicationState === "DRAFT");
+
+      if (upcomingJobs.length > 0) {
+        const primaryJob = upcomingJobs[0]!;
+        publicationBoardPreviewItemsByFilter.upcoming.push(buildPublicationBoardPreviewItem(primaryJob, upcomingJobs));
+      }
+
+      if (successfulJobs.length > 0) {
+        const primaryJob = successfulJobs[0]!;
+        publicationBoardPreviewItemsByFilter.sent.push(buildPublicationBoardPreviewItem(primaryJob, successfulJobs));
+      }
+
+      if (canceledJobs.length > 0) {
+        const primaryJob = canceledJobs[0]!;
+        publicationBoardPreviewItemsByFilter.canceled.push(buildPublicationBoardPreviewItem(primaryJob, canceledJobs));
+      }
+
+      if (waitingLoginJobs.length > 0) {
+        const primaryJob = waitingLoginJobs[0]!;
+        publicationBoardPreviewItemsByFilter.waiting_login.push(
+          buildPublicationBoardPreviewItem(primaryJob, waitingLoginJobs),
+        );
+      }
+
+      if (draftJobs.length > 0) {
+        const primaryJob = draftJobs[0]!;
+        publicationBoardPreviewItemsByFilter.draft.push(buildPublicationBoardPreviewItem(primaryJob, draftJobs));
+      }
+
+      if (failedJobs.length > 0) {
+        const primaryJob = failedJobs[0]!;
+        publicationBoardPreviewItemsByFilter.failed.push(
+          buildPublicationBoardPreviewItem(primaryJob, failedJobs, {
+            isolateSinglePublicationEdit: false,
+          }),
+        );
+      }
+    }
+
+    Object.values(publicationBoardPreviewItemsByFilter).forEach((items) => {
+      items.sort((left, right) => new Date(right.job.createdAt).getTime() - new Date(left.job.createdAt).getTime());
+    });
+
     const publicationBoardGroups = [
       {
         filterKey: "upcoming" as const,
@@ -17506,43 +20434,22 @@ function App() {
         tone: "draft",
       },
     ].map((group) => {
-      const matchingGroupJobs = publicationBoardBaseJobs.filter((job) =>
-        matchesHistoryFilterKey(job, group.filterKey, isPastScheduledAtForUser),
-      );
-      const totalMatchingCount = matchingGroupJobs.length;
-      const latestGroupJob = matchingGroupJobs[0] ?? null;
+      const matchingPreviewItems = publicationBoardPreviewItemsByFilter[group.filterKey];
+      const totalMatchingCount = matchingPreviewItems.length;
+      const latestGroupJob = matchingPreviewItems[0]?.job ?? null;
       const sectionPeriod =
         publicationBoardPeriodByFilter[group.filterKey] ??
         (latestGroupJob
           ? getYearMonthInTimeZone(new Date(latestGroupJob.dataPostagem), effectiveUserTimeZone)
           : defaultPublicationBoardPeriod);
-      const sectionMonthJobs = matchingGroupJobs.filter((job) => {
-        const yearMonth = getYearMonthInTimeZone(new Date(job.dataPostagem), effectiveUserTimeZone);
+      const previewItems = matchingPreviewItems.filter((item) => {
+        const yearMonth = getYearMonthInTimeZone(new Date(item.job.dataPostagem), effectiveUserTimeZone);
         return yearMonth.year === sectionPeriod.year && yearMonth.month === sectionPeriod.month;
-      });
-      const jobs = sectionMonthJobs;
-      const previewItems = jobs.map((job) => {
-        const jobDateLabel = toDateLocal(job.dataPostagem, effectiveUserTimeZone);
-        const jobDay = Number.parseInt(jobDateLabel.slice(-2), 10) || 1;
-        return {
-          id: job.id,
-          title: resolveJobDisplayTitle(job),
-          caption: (job.caption?.trim() || "Sem legenda").slice(0, 120),
-          workspaceLabel: companyNameMap[job.companyId] || "Workspace removido",
-          dateLabel: jobDateLabel,
-          timeLabel: toTimeLocal(job.dataPostagem, effectiveUserTimeZone),
-          publicationType: job.publicationType,
-          statusLabel: jobStatusDisplayLabel(job),
-          day: jobDay,
-          span: 1,
-          job,
-        };
       });
       return {
         ...group,
-        jobs,
         previewItems,
-        count: jobs.length,
+        count: previewItems.length,
         totalCount: totalMatchingCount,
         displayCount: totalMatchingCount,
         sectionPeriod,
@@ -17562,15 +20469,137 @@ function App() {
       visiblePublicationSections.find((group) => group.count > 0)?.filterKey ?? visiblePublicationSections[0]?.filterKey ?? null;
     const selectedJobsCount = historyBulkSelectedJobIds.length;
     const visiblePublicationJobsCount = visiblePublicationSections.reduce((total, group) => total + group.count, 0);
+    const shouldForceListHistoryView =
+      Boolean(historySearchQuery.trim()) ||
+      activePublicationBoardFilter !== "all" ||
+      Boolean(selectedCompanyId) ||
+      Boolean(historyBulkAction);
+    const effectiveHistoryViewMode: HistoryViewMode = shouldForceListHistoryView ? "list" : historyViewMode;
+    const publicationBoardGroupMetaByFilter = new Map(
+      publicationBoardGroups.map((group) => [
+        group.filterKey,
+        {
+          label: group.label,
+          tone: group.tone as PublicationBoardTone,
+        },
+      ]),
+    );
+    const publicationDirectItemsSource = (
+      activePublicationBoardFilter === "all"
+        ? (Object.entries(publicationBoardPreviewItemsByFilter) as Array<
+            [Exclude<HistoryFilterKey, "all" | "published">, PublicationBoardPreviewItem[]]
+          >)
+        : [[activePublicationBoardFilter as Exclude<HistoryFilterKey, "all" | "published">, publicationBoardPreviewItemsByFilter[activePublicationBoardFilter as keyof typeof publicationBoardPreviewItemsByFilter] ?? []]]
+    )
+      .flatMap(([filterKey, items]) => {
+        const metadata = publicationBoardGroupMetaByFilter.get(filterKey);
+        if (!metadata) {
+          return [];
+        }
+
+        return items.map(
+          (item): PublicationBoardDirectItem => ({
+            ...item,
+            filterKey,
+            tone: metadata.tone,
+            filterLabel: metadata.label,
+          }),
+        );
+      });
+    const publicationDirectItems = publicationDirectItemsSource
+      .filter((item) => {
+        const yearMonth = getYearMonthInTimeZone(new Date(item.job.dataPostagem), effectiveUserTimeZone);
+        return yearMonth.year === historyDirectYear && yearMonth.month === historyDirectMonth;
+      })
+      .sort((left, right) => {
+        const scheduledDiff = new Date(right.job.dataPostagem).getTime() - new Date(left.job.dataPostagem).getTime();
+        if (scheduledDiff !== 0) {
+          return scheduledDiff;
+        }
+        return new Date(right.job.createdAt).getTime() - new Date(left.job.createdAt).getTime();
+      });
+    const publicationDirectMonthLabel = formatHistoryCalendarMonthLabel(historyDirectYear, historyDirectMonth);
+    const historyDirectPageSize = 5;
+    const historyDirectPageCount = Math.max(1, Math.ceil(publicationDirectItems.length / historyDirectPageSize));
+    const currentHistoryDirectPage = Math.min(Math.max(historyPage, 1), historyDirectPageCount);
+    const paginatedPublicationDirectItems = publicationDirectItems.slice(
+      (currentHistoryDirectPage - 1) * historyDirectPageSize,
+      currentHistoryDirectPage * historyDirectPageSize,
+    );
+    const paginatedPublicationDirectItemIds = Array.from(
+      new Set(
+        paginatedPublicationDirectItems.flatMap((item) => item.groupedJobs.map((job) => job.id)),
+      ),
+    );
+    const bulkSelectablePublicationDirectItemIds = paginatedPublicationDirectItemIds.filter((jobId) =>
+      manageablePublicationJobIdsSet.has(jobId),
+    );
+    const areAllPaginatedPublicationDirectItemsSelected =
+      bulkSelectablePublicationDirectItemIds.length > 0 &&
+      bulkSelectablePublicationDirectItemIds.every((jobId) => historyBulkSelectedJobIdsSet.has(jobId));
+    const areSomePaginatedPublicationDirectItemsSelected =
+      bulkSelectablePublicationDirectItemIds.some((jobId) => historyBulkSelectedJobIdsSet.has(jobId)) &&
+      !areAllPaginatedPublicationDirectItemsSelected;
+
+    const toggleHistoryBulkGroupedSelection = (jobIds: string[]) => {
+      const uniqueJobIds = Array.from(new Set(jobIds)).filter((jobId) => manageablePublicationJobIdsSet.has(jobId));
+      if (uniqueJobIds.length === 0) {
+        return;
+      }
+
+      setHistoryBulkSelectedJobIds((current) => {
+        const allSelected = uniqueJobIds.every((jobId) => current.includes(jobId));
+        if (allSelected) {
+          return current.filter((jobId) => !uniqueJobIds.includes(jobId));
+        }
+        return Array.from(new Set([...current, ...uniqueJobIds]));
+      });
+    };
+
+    const togglePaginatedPublicationDirectSelection = () => {
+      if (bulkSelectablePublicationDirectItemIds.length === 0) {
+        return;
+      }
+
+      setHistoryBulkSelectedJobIds((current) => {
+        if (areAllPaginatedPublicationDirectItemsSelected) {
+          return current.filter((jobId) => !bulkSelectablePublicationDirectItemIds.includes(jobId));
+        }
+        return Array.from(new Set([...current, ...bulkSelectablePublicationDirectItemIds]));
+      });
+    };
+
+    const hasActiveHistoryFilters =
+      Boolean(historySearchQuery.trim()) || activePublicationBoardFilter !== "all" || Boolean(selectedCompanyId);
+    const resetHistoryFilters = () => {
+      runHistoryResultsLoading(() => {
+        setHistorySearchQuery("");
+        setHistoryFilter("all");
+        setSelectedCompanyId("");
+        setHistoryPage(1);
+        setHistoryCalendarDayPages({});
+        if (historySearchInputRef.current) {
+          historySearchInputRef.current.value = "";
+        }
+        if (historyLegacySearchInputRef.current) {
+          historyLegacySearchInputRef.current.value = "";
+        }
+      });
+    };
+
+    const visiblePublicationsCountLabel =
+      effectiveHistoryViewMode === "list" ? publicationDirectItems.length : visiblePublicationJobsCount;
 
     return (
       <section ref={historySectionRef} className="panel-card view-stack publications-shell">
         <div className="section-head publications-section-head">
           {renderSectionTitleWithIcon("history", "Publicações", "timeline")}
-          <button type="button" className="primary-button publications-primary-action" onClick={() => navigateToView("scheduler")}>
-            <FiPlus aria-hidden="true" />
-            <span>Nova publicação</span>
-          </button>
+          {hasAnyPublicationManageWorkspace ? (
+            <button type="button" className="primary-button publications-primary-action" onClick={() => navigateToView("scheduler")}>
+              <FiPlus aria-hidden="true" />
+              <span>Nova publicação</span>
+            </button>
+          ) : null}
         </div>
 
         <div className="publications-overview-grid">
@@ -17596,34 +20625,71 @@ function App() {
 
         <form onSubmit={applyHistoryBulkEdit} className="publications-toolbar-shell">
           <div className="publications-toolbar-row">
-            <div className="publications-toolbar-right">
-              <label className="field-label publications-toolbar-field publications-toolbar-field-search">
-                <span>Buscar publicação</span>
-                <div className="history-search-input-row publications-search-input-row">
-                  <input
-                    type="search"
-                    value={historySearchQuery}
-                    onChange={(event) => setHistorySearchQuery(event.target.value)}
-                    placeholder="Título, legenda, workspace ou status"
-                    maxLength={120}
-                    disabled={historyBulkApplying}
-                  />
-                  <button
-                    type="button"
-                    className="ghost-button history-search-submit-button"
-                    onClick={() => {
-                      setHistoryPage(1);
-                      setHistoryCalendarDayPages({});
+            <div className="publications-toolbar-left">
+              {canManageSelectedPublicationScope ? (
+                <label className="field-label publications-toolbar-field publications-toolbar-field-compact">
+                  <span>Ação em massa</span>
+                  <select
+                    value={historyBulkAction}
+                    onChange={(event) => {
+                      setHistoryBulkAction(event.target.value as HistoryBulkAction);
+                      setHistoryViewMode("list");
                     }}
                     disabled={historyBulkApplying}
                   >
-                    Buscar
-                  </button>
+                    <option value="">Selecione uma ação</option>
+                    <option value="SET_SCHEDULE">Alterar data de publicação</option>
+                    <option value="SET_DRAFT">Alterar para rascunho</option>
+                    <option value="SET_PUBLISHED">Alterar para publicado</option>
+                    <option value="SET_CANCEL">Cancelar publicação agendada</option>
+                  </select>
+                </label>
+              ) : null}
+            </div>
+            <div className="publications-toolbar-right">
+              <div className="publications-toolbar-search-shell">
+                <div className="publications-toolbar-search-head">
+                  <span>Buscar publicação</span>
                 </div>
-              </label>
+                <label className="field-label publications-toolbar-field publications-toolbar-field-search">
+                  <div className="history-search-input-row publications-search-input-row">
+                    <input
+                      ref={historySearchInputRef}
+                      type="search"
+                      defaultValue={historySearchQuery}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          applyHistorySearch();
+                        }
+                      }}
+                      placeholder="Título, legenda, workspace ou status"
+                      maxLength={120}
+                      disabled={historyBulkApplying}
+                    />
+                    <button
+                      type="button"
+                      className="ghost-button history-search-submit-button"
+                      onClick={applyHistorySearch}
+                      disabled={historyBulkApplying}
+                    >
+                      Buscar
+                    </button>
+                  </div>
+                </label>
+              </div>
               <label className="field-label publications-toolbar-field publications-toolbar-field-compact">
-                <span>Filtrar</span>
-                <select value={activePublicationBoardFilter} onChange={(event) => setHistoryFilter(event.target.value as HistoryFilterKey)}>
+                <span>Status</span>
+                <select
+                  value={activePublicationBoardFilter}
+                  onChange={(event) => {
+                    const nextFilter = event.target.value as HistoryFilterKey;
+                    runHistoryResultsLoading(() => {
+                      setHistoryFilter(nextFilter);
+                      setHistoryViewMode("list");
+                    });
+                  }}
+                >
                   {publicationFilterOptions.map((option) => (
                     <option key={option.value} value={option.value}>
                       {option.label}
@@ -17634,7 +20700,16 @@ function App() {
               {companies.length > 1 ? (
                 <label className="field-label publications-toolbar-field publications-toolbar-field-compact">
                   <span>Cliente</span>
-                  <select value={selectedCompanyId} onChange={(event) => setSelectedCompanyId(event.target.value)}>
+                  <select
+                    value={selectedCompanyId}
+                    onChange={(event) => {
+                      const nextCompanyId = event.target.value;
+                      runHistoryResultsLoading(() => {
+                        setSelectedCompanyId(nextCompanyId);
+                        setHistoryViewMode("list");
+                      });
+                    }}
+                  >
                     <option value="">Todos os clientes</option>
                     {companies.map((company) => (
                       <option key={company.id} value={company.id}>
@@ -17644,23 +20719,58 @@ function App() {
                   </select>
                 </label>
               ) : null}
+              {hasActiveHistoryFilters ? (
+                <div className="publications-toolbar-reset-slot">
+                  <button
+                    type="button"
+                    className="publications-toolbar-reset-link publications-toolbar-reset-link-inline"
+                    onClick={resetHistoryFilters}
+                    disabled={historyBulkApplying}
+                  >
+                    <FiRotateCcw aria-hidden="true" />
+                    <span>Limpar filtros</span>
+                  </button>
+                </div>
+              ) : null}
             </div>
           </div>
 
-          {historyBulkAction ? (
+          {canManageSelectedPublicationScope && historyBulkAction ? (
             <div className="publications-toolbar-expanded">
               <div className="history-bulk-fields publications-toolbar-expanded-fields">
                 {historyBulkAction === "SET_SCHEDULE" || historyBulkAction === "SET_PUBLISHED" ? (
                   <>
                     <label className="field-label">
                       <span>Nova data</span>
-                      <input
-                        type="date"
-                        value={historyBulkDate}
-                        onChange={(event) => setHistoryBulkDate(event.target.value)}
-                        disabled={historyBulkApplying}
-                        required
-                      />
+                      <div className="publications-toolbar-date-control">
+                        <button
+                          type="button"
+                          className="publications-toolbar-date-nav"
+                          onClick={() => setHistoryBulkDate((current) => shiftDateInputValue(current, -1))}
+                          disabled={historyBulkApplying || !historyBulkDate}
+                          aria-label="Dia anterior"
+                          title="Dia anterior"
+                        >
+                          <FiChevronLeft aria-hidden="true" />
+                        </button>
+                        <input
+                          type="date"
+                          value={historyBulkDate}
+                          onChange={(event) => setHistoryBulkDate(event.target.value)}
+                          disabled={historyBulkApplying}
+                          required
+                        />
+                        <button
+                          type="button"
+                          className="publications-toolbar-date-nav"
+                          onClick={() => setHistoryBulkDate((current) => shiftDateInputValue(current, 1))}
+                          disabled={historyBulkApplying || !historyBulkDate}
+                          aria-label="Próximo dia"
+                          title="Próximo dia"
+                        >
+                          <FiChevronRight aria-hidden="true" />
+                        </button>
+                      </div>
                     </label>
                     <label className="field-label">
                       <span>Novo horário</span>
@@ -17715,10 +20825,71 @@ function App() {
         <div className="publications-period-toolbar">
           <div className="publications-period-meta">
             <span className="count-pill">{`Horário: ${formatHistoryCalendarTimeZoneLabel(effectiveUserTimeZone)}`}</span>
-            <span className="count-pill">{`${visiblePublicationJobsCount} publicação(ões) no período`}</span>
-            <span className="count-pill">{`${selectedJobsCount} selecionada(s)`}</span>
+            <span className="count-pill">{`${visiblePublicationsCountLabel} publicação(ões) no período`}</span>
+            {canManageSelectedPublicationScope ? <span className="count-pill">{`${selectedJobsCount} selecionada(s)`}</span> : null}
           </div>
           <div className="publications-period-controls">
+            {effectiveHistoryViewMode === "list" ? (
+              <div className="publications-direct-period-switcher" aria-label="Navegação do período">
+                <button
+                  type="button"
+                  className="publications-board-timeline-monthbar-nav"
+                  onClick={() => runHistoryResultsLoading(() => navigateHistoryDirectMonth(-1))}
+                  aria-label="Mês anterior"
+                >
+                  <FiChevronLeft />
+                </button>
+                <strong className="publications-direct-period-label">{publicationDirectMonthLabel}</strong>
+                <select
+                  value={historyDirectYear}
+                  onChange={(event) =>
+                    runHistoryResultsLoading(() => updateHistoryDirectYear(Number(event.target.value)))
+                  }
+                  className="publications-board-timeline-monthbar-year publications-direct-period-year"
+                  aria-label="Ano da lista"
+                >
+                  {historyCalendarYearOptions.map((year) => (
+                    <option key={year} value={year}>
+                      {year}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="publications-board-timeline-monthbar-nav"
+                  onClick={() => runHistoryResultsLoading(() => navigateHistoryDirectMonth(1))}
+                  aria-label="Próximo mês"
+                >
+                  <FiChevronRight />
+                </button>
+              </div>
+            ) : null}
+            <div className="publications-view-toggle" role="group" aria-label="Tipo de visualização">
+              <button
+                type="button"
+                className={`publications-view-toggle-button${
+                  effectiveHistoryViewMode === "board" ? " publications-view-toggle-button-active" : ""
+                }`}
+                title="Visualização principal"
+                aria-label="Visualização principal"
+                onClick={() => setHistoryViewMode("board")}
+                disabled={historyBulkApplying || shouldForceListHistoryView}
+              >
+                <FiGrid aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                className={`publications-view-toggle-button${
+                  effectiveHistoryViewMode === "list" ? " publications-view-toggle-button-active" : ""
+                }`}
+                title="Visualização direta"
+                aria-label="Visualização direta"
+                onClick={() => setHistoryViewMode("list")}
+                disabled={historyBulkApplying}
+              >
+                <FiList aria-hidden="true" />
+              </button>
+            </div>
             <button
               type="button"
               className="ghost-button publications-toolbar-button"
@@ -17738,15 +20909,340 @@ function App() {
           </div>
         ) : null}
 
-        <div className="publications-board-stack">
-          {visiblePublicationSections.length === 0 ? (
-            <div className="publications-board-empty-global">Nenhuma publicação encontrada com os filtros atuais.</div>
+        <div className="publications-results-shell">
+          {historySearchLoading ? (
+            <div className="publications-results-loading-overlay" aria-hidden="true">
+              <span className="spinner" />
+            </div>
           ) : null}
-          {visiblePublicationSections.map((group) => {
+          <div
+            className={`publications-board-stack${historySearchLoading ? " publications-board-stack-loading" : ""}`}
+          >
+            {effectiveHistoryViewMode === "list" ? (
+              publicationDirectItems.length === 0 ? (
+                <div className="publications-board-empty-global">Nenhuma publicação encontrada com os filtros atuais.</div>
+              ) : (
+                <div className="publications-direct-shell">
+                <div
+                  className={`publications-direct-table${
+                    shouldShowWorkspaceColumn ? " publications-direct-table-with-workspace" : ""
+                  }`}
+                >
+                  <div
+                    className={`publications-direct-head${
+                      shouldShowWorkspaceColumn ? " publications-direct-head-with-workspace" : ""
+                    }`}
+                  >
+                    {canManageSelectedPublicationScope ? (
+                      <button
+                        type="button"
+                        className={`publications-direct-select-button${
+                          areAllPaginatedPublicationDirectItemsSelected
+                            ? " publications-direct-select-button-active"
+                            : areSomePaginatedPublicationDirectItemsSelected
+                              ? " publications-direct-select-button-partial"
+                              : ""
+                        }`}
+                        title={
+                          areAllPaginatedPublicationDirectItemsSelected
+                            ? "Desmarcar publicações desta página"
+                            : "Selecionar publicações desta página"
+                        }
+                        aria-label={
+                          areAllPaginatedPublicationDirectItemsSelected
+                            ? "Desmarcar publicações desta página"
+                            : "Selecionar publicações desta página"
+                        }
+                        onClick={togglePaginatedPublicationDirectSelection}
+                        disabled={historyBulkApplying}
+                      >
+                        <FiCheck aria-hidden="true" />
+                      </button>
+                    ) : (
+                      <span className="publications-direct-select-button publications-direct-select-button-placeholder" aria-hidden="true" />
+                    )}
+                    <span>Publicação</span>
+                    {shouldShowWorkspaceColumn ? <span>Workspace</span> : null}
+                    <span>Agendada para</span>
+                    <span>Redes</span>
+                    <span>Status</span>
+                    <span>Ações</span>
+                  </div>
+                  <div className="publications-direct-body">
+                    {paginatedPublicationDirectItems.map((item) => {
+                      const rowJobIds = item.groupedJobs.map((entry) => entry.id);
+                      const canManageItemActions = item.job ? canManagePublicationJob(item.job) : false;
+                      const selectableRowJobIds = rowJobIds.filter((jobId) => manageablePublicationJobIdsSet.has(jobId));
+                      const isRowSelected =
+                        selectableRowJobIds.length > 0 &&
+                        selectableRowJobIds.every((jobId) => historyBulkSelectedJobIdsSet.has(jobId));
+                      const isRowPartiallySelected =
+                        selectableRowJobIds.some((jobId) => historyBulkSelectedJobIdsSet.has(jobId)) && !isRowSelected;
+                      const isEditingSchedule = item.job ? historyInlineTimeJobId === item.job.id : false;
+                      const canEditSchedule = item.job ? canManageItemActions && canEditPublicationBoardSchedule(item.job) : false;
+                      const canRetry = item.job ? canManageItemActions && canRetryPublicationBoardJob(item.job) : false;
+                      const canReactivate = item.job ? canManageItemActions && canReactivatePublicationBoardJob(item.job) : false;
+                      const isSavingRow = item.job ? historyInlineSavingJobId === item.job.id : false;
+                      const isRetryingRow = item.job ? retryingJobId === item.job.id : false;
+                      const isReactivatingRow = item.job ? togglingScheduleJobId === item.job.id : false;
+                      const mediaPreviewPaths = item.job ? resolveJobMediaPaths(item.job) : [];
+                      const firstMediaPreviewPath = mediaPreviewPaths[0] ?? null;
+                      const hasMediaPreview = mediaPreviewPaths.length > 0;
+                      const publicationParticipantNetworks = item.participantNetworks;
+
+                      return (
+                        <div
+                          key={`direct-${item.filterKey}-${item.id}`}
+                          className={`publications-direct-row${
+                            shouldShowWorkspaceColumn ? " publications-direct-row-with-workspace" : ""
+                          }${isRowSelected ? " publications-direct-row-selected" : ""}`}
+                        >
+                          {canManageSelectedPublicationScope ? (
+                            <button
+                              type="button"
+                              className={`publications-direct-select-button${
+                                isRowSelected
+                                  ? " publications-direct-select-button-active"
+                                  : isRowPartiallySelected
+                                    ? " publications-direct-select-button-partial"
+                                    : ""
+                              }`}
+                              title={isRowSelected ? "Desmarcar publicação" : "Selecionar publicação"}
+                              aria-label={isRowSelected ? "Desmarcar publicação" : "Selecionar publicação"}
+                              onClick={() => toggleHistoryBulkGroupedSelection(rowJobIds)}
+                              disabled={historyBulkApplying || selectableRowJobIds.length === 0}
+                            >
+                              <FiCheck aria-hidden="true" />
+                            </button>
+                          ) : (
+                            <span className="publications-direct-select-button publications-direct-select-button-placeholder" aria-hidden="true" />
+                          )}
+                          <div className="publications-direct-main">
+                            {hasMediaPreview && item.job ? (
+                              <button
+                                type="button"
+                                className="publications-board-list-preview-button publications-direct-preview-button"
+                                title="Ver mídias da publicação"
+                                aria-label="Ver mídias da publicação"
+                                onClick={() => openPublicationMediaModal(item.job!)}
+                              >
+                                {firstMediaPreviewPath && isVideoPath(firstMediaPreviewPath) ? (
+                                  <video
+                                    src={`${api.baseUrl}${firstMediaPreviewPath}`}
+                                    muted
+                                    playsInline
+                                    preload="metadata"
+                                    aria-hidden="true"
+                                  />
+                                ) : firstMediaPreviewPath ? (
+                                  <img
+                                    src={`${api.baseUrl}${firstMediaPreviewPath}`}
+                                    alt={`Prévia da publicação ${item.title}`}
+                                  />
+                                ) : null}
+                              </button>
+                            ) : (
+                              <span
+                                className="publications-board-list-preview-placeholder publications-direct-preview-button"
+                                aria-hidden="true"
+                              >
+                                <FiImage />
+                              </span>
+                            )}
+                            <div className="publications-direct-main-copy">
+                              <strong title={item.title}>{item.title}</strong>
+                              <small title={item.caption}>{item.caption}</small>
+                            </div>
+                          </div>
+                          {shouldShowWorkspaceColumn ? (
+                            <span className="publications-direct-workspace">{item.workspaceLabel}</span>
+                          ) : null}
+                          <div className="publications-direct-date">
+                            {isEditingSchedule && item.job ? (
+                              <div className="publications-board-inline-schedule-editor">
+                                <input
+                                  type="date"
+                                  value={historyInlineDateValue}
+                                  onChange={(event) => setHistoryInlineDateValue(event.target.value)}
+                                  disabled={isSavingRow}
+                                />
+                                <input
+                                  type="time"
+                                  value={historyInlineTimeValue}
+                                  onChange={(event) => setHistoryInlineTimeValue(event.target.value)}
+                                  disabled={isSavingRow}
+                                />
+                                <div className="publications-board-inline-schedule-actions">
+                                  <button
+                                    type="button"
+                                    className="publications-board-inline-schedule-save"
+                                    title="Salvar agendamento"
+                                    aria-label="Salvar agendamento"
+                                    onClick={() =>
+                                      void updateHistoryCalendarJobSchedule(
+                                        item.job!,
+                                        historyInlineDateValue,
+                                        historyInlineTimeValue,
+                                      )
+                                    }
+                                    disabled={isSavingRow}
+                                  >
+                                    <FiCheck aria-hidden="true" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="publications-board-inline-schedule-cancel"
+                                    title="Cancelar edição"
+                                    aria-label="Cancelar edição"
+                                    onClick={cancelHistoryInlineTimeEdit}
+                                    disabled={isSavingRow}
+                                  >
+                                    <FiX aria-hidden="true" />
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              <>
+                                <strong>{item.dateLabel}</strong>
+                                <small>{item.timeLabel}</small>
+                              </>
+                            )}
+                          </div>
+                          <span className="publications-direct-networks">
+                            {publicationParticipantNetworks.length > 0
+                              ? renderPublicationNetworkPillList(publicationParticipantNetworks)
+                              : renderPublicationTypePill(item.publicationType)}
+                          </span>
+                          <span className="publications-direct-status">
+                            <span className={`publications-job-status-chip publications-job-status-chip-${item.tone}`}>
+                              {item.statusLabel}
+                            </span>
+                          </span>
+                          <div className="publications-direct-actions">
+                            {item.job ? (
+                              <button
+                                type="button"
+                                className="publications-board-action-button publications-board-action-button-view"
+                                title="Visualizar publicação"
+                                aria-label="Visualizar publicação"
+                                onClick={() => openPublicationPreviewPage(item.job!)}
+                              >
+                                <FiEye aria-hidden="true" />
+                              </button>
+                            ) : null}
+                            {item.job && canManageItemActions ? (
+                              <button
+                                type="button"
+                                className="publications-board-action-button publications-board-action-button-edit"
+                                title="Editar publicação"
+                                aria-label="Editar publicação"
+                                onClick={() =>
+                                  openHistoryJobEditor(item.job!, {
+                                    isolateSinglePublication: item.isolateSinglePublicationEdit,
+                                    jobIds: item.groupedJobs.map((entry) => entry.id),
+                                  })
+                                }
+                              >
+                                <FiEdit3 aria-hidden="true" />
+                              </button>
+                            ) : null}
+                            {canEditSchedule && item.job ? (
+                              <button
+                                type="button"
+                                className="publications-board-action-button publications-board-action-button-schedule"
+                                title="Editar agendamento"
+                                aria-label="Editar agendamento"
+                                onClick={() => startHistoryInlineTimeEdit(item.job!)}
+                                disabled={isSavingRow}
+                              >
+                                <FiCalendar aria-hidden="true" />
+                              </button>
+                            ) : null}
+                            {item.job && canManageItemActions ? (
+                              <button
+                                type="button"
+                                className="publications-board-action-button publications-board-action-button-duplicate"
+                                title="Duplicar publicação"
+                                aria-label="Duplicar publicação"
+                                onClick={() => openPublicationDuplicateModal(item.job!)}
+                              >
+                                <FiCopy aria-hidden="true" />
+                              </button>
+                            ) : null}
+                            {item.job && canManageItemActions ? (
+                              <button
+                                type="button"
+                                className="publications-board-action-button publications-board-action-button-template"
+                                title="Criar template"
+                                aria-label="Criar template"
+                                onClick={() => savePublicationAsTemplate(item.job!)}
+                              >
+                                <FiFileText aria-hidden="true" />
+                              </button>
+                            ) : null}
+                            {canRetry && item.job ? (
+                              <button
+                                type="button"
+                                className="publications-board-action-button publications-board-action-button-retry"
+                                title="Tentar novamente"
+                                aria-label="Tentar novamente"
+                                onClick={() => void retryGroupedJobs(item.groupedJobs, item.job!.id)}
+                                disabled={isRetryingRow}
+                              >
+                                <FiRotateCcw aria-hidden="true" />
+                              </button>
+                            ) : null}
+                            {canReactivate && item.job ? (
+                              <button
+                                type="button"
+                                className="publications-board-action-button publications-board-action-button-reactivate"
+                                title="Reativar publicação"
+                                aria-label="Reativar publicação"
+                                onClick={() => void toggleJobSchedule(item.job!)}
+                                disabled={isReactivatingRow}
+                              >
+                                <FiCheckCircle aria-hidden="true" />
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+                {historyDirectPageCount > 1 ? (
+                  <div className="publications-direct-pagination">
+                    <button
+                      type="button"
+                      className="ghost-button publications-toolbar-button"
+                      onClick={() => setHistoryPage((current) => Math.max(1, current - 1))}
+                      disabled={currentHistoryDirectPage <= 1}
+                    >
+                      <FiChevronLeft aria-hidden="true" />
+                    </button>
+                    <span className="count-pill">{`${currentHistoryDirectPage}/${historyDirectPageCount}`}</span>
+                    <button
+                      type="button"
+                      className="ghost-button publications-toolbar-button"
+                      onClick={() => setHistoryPage((current) => Math.min(historyDirectPageCount, current + 1))}
+                      disabled={currentHistoryDirectPage >= historyDirectPageCount}
+                    >
+                      <FiChevronRight aria-hidden="true" />
+                    </button>
+                  </div>
+                ) : null}
+                </div>
+              )
+            ) : (
+              <>
+                {visiblePublicationSections.length === 0 ? (
+                  <div className="publications-board-empty-global">Nenhuma publicação encontrada com os filtros atuais.</div>
+                ) : null}
+                {visiblePublicationSections.map((group) => {
               const Icon = group.icon;
-              const pageCount = Math.max(1, Math.ceil(group.previewItems.length / 2));
+              const pageCount = Math.max(1, Math.ceil(group.previewItems.length / 5));
               const currentPage = Math.min(historyBoardPageByFilter[group.filterKey] ?? 0, pageCount - 1);
-              const pagedItems = pageCount > 1 ? group.previewItems.slice(currentPage * 2, currentPage * 2 + 2) : group.previewItems;
+              const pagedItems = pageCount > 1 ? group.previewItems.slice(currentPage * 5, currentPage * 5 + 5) : group.previewItems;
               const isCollapsed = allVisibleSectionsCollapsed
                 ? group.filterKey !== preferredExpandedPublicationFilter
                 : Boolean(historyCollapsedSections[group.filterKey]);
@@ -17847,22 +21343,18 @@ function App() {
                         <div className="publications-board-list-body">
                           {pagedItems.length > 0 ? (
                             pagedItems.map((item) => {
+                              const canManageItemActions = item.job ? canManagePublicationJob(item.job) : false;
                               const isEditingSchedule = item.job ? historyInlineTimeJobId === item.job.id : false;
-                              const canEditSchedule = item.job ? canEditPublicationBoardSchedule(item.job) : false;
-                              const canRetry = item.job ? canRetryPublicationBoardJob(item.job) : false;
-                              const canReactivate = item.job ? canReactivatePublicationBoardJob(item.job) : false;
+                              const canEditSchedule = item.job ? canManageItemActions && canEditPublicationBoardSchedule(item.job) : false;
+                              const canRetry = item.job ? canManageItemActions && canRetryPublicationBoardJob(item.job) : false;
+                              const canReactivate = item.job ? canManageItemActions && canReactivatePublicationBoardJob(item.job) : false;
                               const isSavingRow = item.job ? historyInlineSavingJobId === item.job.id : false;
                               const isRetryingRow = item.job ? retryingJobId === item.job.id : false;
                               const isReactivatingRow = item.job ? togglingScheduleJobId === item.job.id : false;
                               const mediaPreviewPaths = item.job ? resolveJobMediaPaths(item.job) : [];
                               const firstMediaPreviewPath = mediaPreviewPaths[0] ?? null;
                               const hasMediaPreview = mediaPreviewPaths.length > 0;
-                              const groupedPublicationJobs = item.job
-                                ? schedulerGroupedJobsMap.get(resolveJobSchedulerGroupKey(item.job)) ?? [item.job]
-                                : [];
-                              const publicationParticipantNetworks = item.job
-                                ? resolveJobParticipantNetworks(item.job, groupedPublicationJobs)
-                                : [];
+                              const publicationParticipantNetworks = item.participantNetworks;
 
                               return (
                                 <div
@@ -17964,10 +21456,26 @@ function App() {
                                     {item.job ? (
                                       <button
                                         type="button"
+                                        className="publications-board-action-button publications-board-action-button-view"
+                                        title="Visualizar publicação"
+                                        aria-label="Visualizar publicação"
+                                        onClick={() => openPublicationPreviewPage(item.job!)}
+                                      >
+                                        <FiEye aria-hidden="true" />
+                                      </button>
+                                    ) : null}
+                                    {item.job && canManageItemActions ? (
+                                      <button
+                                        type="button"
                                         className="publications-board-action-button publications-board-action-button-edit"
                                         title="Editar publicação"
                                         aria-label="Editar publicação"
-                                        onClick={() => openHistoryJobEditor(item.job!)}
+                                        onClick={() =>
+                                          openHistoryJobEditor(item.job!, {
+                                            isolateSinglePublication: item.isolateSinglePublicationEdit,
+                                            jobIds: item.groupedJobs.map((entry) => entry.id),
+                                          })
+                                        }
                                       >
                                         <FiEdit3 aria-hidden="true" />
                                       </button>
@@ -17984,7 +21492,7 @@ function App() {
                                         <FiCalendar aria-hidden="true" />
                                       </button>
                                     ) : null}
-                                    {item.job ? (
+                                    {item.job && canManageItemActions ? (
                                       <button
                                         type="button"
                                         className="publications-board-action-button publications-board-action-button-duplicate"
@@ -17995,7 +21503,7 @@ function App() {
                                         <FiCopy aria-hidden="true" />
                                       </button>
                                     ) : null}
-                                    {item.job ? (
+                                    {item.job && canManageItemActions ? (
                                       <button
                                         type="button"
                                         className="publications-board-action-button publications-board-action-button-template"
@@ -18012,7 +21520,7 @@ function App() {
                                         className="publications-board-action-button publications-board-action-button-retry"
                                         title="Tentar novamente"
                                         aria-label="Tentar novamente"
-                                        onClick={() => void retryJob(item.job!.id)}
+                                        onClick={() => void retryGroupedJobs(item.groupedJobs, item.job!.id)}
                                         disabled={isRetryingRow}
                                       >
                                         <FiRotateCcw aria-hidden="true" />
@@ -18084,6 +21592,9 @@ function App() {
                 </section>
               );
             })}
+              </>
+            )}
+          </div>
         </div>
       </section>
     );
@@ -18153,6 +21664,7 @@ function App() {
         <div className="table-list">
           {avisos.map((aviso) => {
             const Icon = resolveAvisoPopoverIcon(aviso);
+            const unread = !aviso.readAt;
             return (
               <div key={aviso.id} className={`row-card notice-row ${avisoToneClass(aviso)}`}>
                 <div className="notice-row-body">
@@ -18166,23 +21678,13 @@ function App() {
                   </div>
                 </div>
                 <div className="inline-actions">
-                  <button
-                    type="button"
-                    className="notices-entry-delete"
-                    aria-label={aviso.readAt ? "Notificação já lida" : "Marcar notificação como lida"}
-                    title={aviso.readAt ? "Notificação já lida" : "Marcar notificação como lida"}
-                    onClick={() => {
-                      if (!aviso.readAt) {
-                        void markAvisoAsRead(aviso.id);
-                      }
-                    }}
-                    disabled={Boolean(aviso.readAt) || markingAvisoReadId === aviso.id}
-                  >
-                    <span className="notices-double-check" aria-hidden="true">
-                      <FiCheck />
-                      <FiCheck />
-                    </span>
-                  </button>
+                  {renderNoticeReadState({
+                    unread,
+                    busy: markingAvisoReadId === aviso.id,
+                    onMarkRead: () => void markAvisoAsRead(aviso.id),
+                    unreadLabel: "Marcar notificação como lida",
+                    readLabel: "Notificação lida",
+                  })}
                   <button
                     type="button"
                     className="notices-entry-delete"
@@ -18201,6 +21703,714 @@ function App() {
         </div>
 
         {renderNumericPagination("avisos-bottom", avisosPage, avisosTotalPages, setAvisosPage, avisosSectionRef)}
+      </section>
+    );
+  }
+
+  function renderPublicationPreviewCommentNode(
+    comment: PublicationPreviewCommentTreeNode,
+    depth = 0,
+  ): ReactNode {
+    const isReplyTarget = publicationPreviewReplyParentId === comment.id;
+    const sortedReactions = [...comment.reactions].sort((left, right) => {
+      if (left.reactedByCurrentUser !== right.reactedByCurrentUser) {
+        return left.reactedByCurrentUser ? -1 : 1;
+      }
+      if (right.count !== left.count) {
+        return right.count - left.count;
+      }
+      return left.emoji.localeCompare(right.emoji);
+    });
+
+    return (
+      <article
+        key={comment.id}
+        className={`publication-preview-comment${isReplyTarget ? " publication-preview-comment-reply-target" : ""}`}
+        style={{ "--publication-preview-comment-depth": depth } as CSSProperties}
+      >
+        <div className="publication-preview-comment-head">
+          <span className="publication-preview-comment-avatar" aria-hidden="true">
+            {userInitials(comment.author.name, comment.author.username)}
+          </span>
+          <div className="publication-preview-comment-copy">
+            <div className="publication-preview-comment-meta">
+              <strong>{comment.author.name}</strong>
+              <span>{`@${comment.author.username}`}</span>
+              <small>{formatRelativeTime(comment.createdAt, effectiveUserTimeZone)}</small>
+            </div>
+            <p>{comment.message}</p>
+            {sortedReactions.length > 0 ? (
+              <div className="publication-preview-comment-reaction-row">
+                <div className="publication-preview-comment-reaction-strip">
+                  {sortedReactions.map((reaction) => (
+                    <button
+                      key={`${comment.id}-${reaction.emoji}`}
+                      type="button"
+                      className={`publication-preview-comment-reaction-chip${
+                        reaction.reactedByCurrentUser ? " publication-preview-comment-reaction-chip-active" : ""
+                      }`}
+                      onClick={() => void togglePublicationPreviewReaction(comment.id, reaction.emoji)}
+                      disabled={publicationPreviewReactionBusyKey === `${comment.id}:${reaction.emoji}`}
+                    >
+                      <span aria-hidden="true">{reaction.emoji}</span>
+                      <span>{reaction.count}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            <div className="publication-preview-comment-actions">
+              <button
+                type="button"
+                className={`publication-preview-comment-action${
+                  isReplyTarget ? " publication-preview-comment-action-reply-active" : ""
+                }`}
+                onClick={() => {
+                  setPublicationPreviewDecisionIntent(null);
+                  setPublicationPreviewReplyParentId((current) => (current === comment.id ? null : comment.id));
+                }}
+              >
+                <FiMessageSquare aria-hidden="true" />
+                <span>{isReplyTarget ? "Cancelar resposta" : "Responder"}</span>
+              </button>
+              <div className="publication-preview-comment-reaction-entry">
+                <button
+                  type="button"
+                  className="publication-preview-comment-action publication-preview-comment-action-emoji-trigger"
+                  disabled={Boolean(publicationPreviewReactionBusyKey)}
+                  aria-label="Adicionar reação"
+                  title="Adicionar reação"
+                >
+                  <FiSmile aria-hidden="true" />
+                  <span>Reagir</span>
+                </button>
+                <div className="publication-preview-comment-reaction-hoverbar">
+                  {publicationPreviewQuickReactionEmojis.map((emoji) => (
+                    <button
+                      key={`${comment.id}-${emoji}-quick`}
+                      type="button"
+                      className="publication-preview-comment-quick-emoji"
+                      onClick={() => void togglePublicationPreviewReaction(comment.id, emoji)}
+                      disabled={publicationPreviewReactionBusyKey === `${comment.id}:${emoji}`}
+                      aria-label={`Reagir com ${emoji}`}
+                      title={`Reagir com ${emoji}`}
+                    >
+                      <span aria-hidden="true">{emoji}</span>
+                    </button>
+                  ))}
+                  {renderQuickEmojiPicker({
+                    pickerKey: `preview-comment-reaction-${comment.id}`,
+                    disabled: Boolean(publicationPreviewReactionBusyKey),
+                    onPick: (emoji) => void togglePublicationPreviewReaction(comment.id, emoji),
+                    label: "Escolher outro emoji",
+                    className: "publication-preview-comment-picker publication-preview-comment-picker-reaction",
+                  })}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        {comment.replies.length > 0 ? (
+          <div className="publication-preview-comment-replies">
+            {comment.replies.map((reply) => renderPublicationPreviewCommentNode(reply, depth + 1))}
+          </div>
+        ) : null}
+      </article>
+    );
+  }
+
+  function renderPublicationPreviewSkeleton() {
+    return (
+      <div className="publication-preview-body publication-preview-body-skeleton" aria-hidden="true">
+        <div className="publication-preview-main">
+          <div className="publication-preview-stage-shell publication-preview-stage-shell-skeleton">
+            <div className="publication-preview-stage-head">
+              <div>
+                <span className="skeleton-line publication-preview-caption-skeleton" />
+              </div>
+              <div className="publication-preview-stage-nav">
+                <span className="skeleton-line publication-preview-icon-button-skeleton" />
+                <span className="skeleton-line publication-preview-counter-skeleton" />
+                <span className="skeleton-line publication-preview-icon-button-skeleton" />
+              </div>
+            </div>
+            <span className="skeleton-line publication-preview-stage-skeleton" />
+          </div>
+
+          <div className="publication-preview-comments-panel publication-preview-comments-panel-skeleton">
+            <div className="publication-preview-panel-head">
+              <div>
+                <span className="skeleton-line publication-preview-heading-skeleton" />
+                <span className="skeleton-line publication-preview-caption-skeleton" />
+              </div>
+            </div>
+            <div className="publication-preview-comments-list publication-preview-comments-list-skeleton">
+              {Array.from({ length: 3 }, (_, index) => (
+                <article key={`preview-comment-skeleton-${index}`} className="publication-preview-comment publication-preview-comment-skeleton">
+                  <div className="publication-preview-comment-head">
+                    <span className="skeleton-line publication-preview-avatar-skeleton" />
+                    <div className="publication-preview-comment-copy">
+                      <div className="publication-preview-comment-meta">
+                        <span className="skeleton-line publication-preview-author-skeleton" />
+                        <span className="skeleton-line publication-preview-time-skeleton" />
+                      </div>
+                      <span className="skeleton-line publication-preview-line-skeleton" />
+                      <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
+                    </div>
+                  </div>
+                </article>
+              ))}
+            </div>
+            <div className="publication-preview-comment-form publication-preview-comment-form-skeleton">
+              <div className="field-head-with-action publication-preview-comment-field-head">
+                <span className="skeleton-line publication-preview-heading-skeleton" />
+                <span className="skeleton-line publication-preview-icon-button-skeleton" />
+              </div>
+              <span className="skeleton-line publication-preview-textarea-skeleton" />
+              <div className="publication-preview-comment-form-actions">
+                <div className="publication-preview-comment-submit">
+                  <span className="skeleton-line publication-preview-button-skeleton" />
+                  <span className="skeleton-line publication-preview-button-skeleton" />
+                  <span className="skeleton-line publication-preview-button-skeleton publication-preview-button-skeleton-wide" />
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <aside className="publication-preview-side">
+          {Array.from({ length: 2 }, (_, index) => (
+            <div key={`preview-side-skeleton-${index}`} className="publication-preview-side-card publication-preview-side-card-skeleton">
+              <div className="publication-preview-side-head">
+                <span className="skeleton-line publication-preview-heading-skeleton" />
+                <span className="skeleton-line publication-preview-meta-skeleton" />
+              </div>
+              {index === 0 ? (
+                <div className="publication-preview-side-grid">
+                  <div>
+                    <span className="skeleton-line publication-preview-line-skeleton" />
+                    <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
+                  </div>
+                  <div>
+                    <span className="skeleton-line publication-preview-line-skeleton" />
+                    <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
+                  </div>
+                  <div>
+                    <span className="skeleton-line publication-preview-line-skeleton" />
+                    <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
+                  </div>
+                  <div>
+                    <span className="skeleton-line publication-preview-line-skeleton" />
+                    <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <span className="skeleton-line publication-preview-line-skeleton" />
+                  <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
+                  <span className="skeleton-line publication-preview-line-skeleton" />
+                </>
+              )}
+            </div>
+          ))}
+        </aside>
+      </div>
+    );
+  }
+
+  function renderPublicationPreviewPage() {
+    if (!activePublicationPreviewJobId) {
+      return (
+        <section ref={publicationPreviewSectionRef} className="panel-card view-stack publication-preview-page-shell">
+          <div className="publication-preview-page-empty">
+            <strong>Nenhuma publicação selecionada.</strong>
+            <button type="button" className="ghost-button" onClick={() => navigateToView("history", { historyFilter })}>
+              Voltar para Publicações
+            </button>
+          </div>
+        </section>
+      );
+    }
+
+    const preview = publicationPreviewData;
+    const collaborationEnabled = Boolean(preview?.collaborationEnabled);
+    const canDecide = collaborationEnabled && preview?.currentUserRole === "CLIENT";
+    const approvalStatus = preview?.approval.status ?? "PENDING";
+    const approvalStatusLabel =
+      approvalStatus === "APPROVED"
+        ? "Aprovada"
+        : approvalStatus === "REJECTED"
+          ? "Rejeitada"
+          : "Pendente";
+    const approvalTone =
+      approvalStatus === "APPROVED"
+        ? "published"
+        : approvalStatus === "REJECTED"
+          ? "failed"
+          : "waiting";
+    const isReplyComposer = Boolean(publicationPreviewReplyParentId);
+    const hasChosenDecisionIntent =
+      publicationPreviewDecisionIntent === "APPROVED" || publicationPreviewDecisionIntent === "REJECTED";
+    const canSubmitDecision = canDecide && !isReplyComposer && approvalStatus !== "APPROVED";
+    const canChooseInitialDecision = canDecide && !isReplyComposer && approvalStatus === "PENDING";
+    const canApproveAfterRejection = canDecide && !isReplyComposer && approvalStatus === "REJECTED";
+    const usesDecisionComposer = canSubmitDecision && hasChosenDecisionIntent;
+    const isDecisionSelectionState = canChooseInitialDecision && !hasChosenDecisionIntent;
+    const previewScheduledTime = preview?.scheduledAt ? toTimeLocal(preview.scheduledAt, effectiveUserTimeZone) : "";
+    const previewScheduledDate = preview?.scheduledAt ? formatDateOnly(preview.scheduledAt, effectiveUserTimeZone) : "";
+    const previewSuccessfulJobs = preview?.jobs.filter((job) => isSuccessfulPublicationJobStatus(job.status)) ?? [];
+    const previewFailedJobs = preview?.jobs.filter((job) => job.status === "FAILED") ?? [];
+    const previewSuccessfulNetworks = Array.from(
+      new Set(previewSuccessfulJobs.map((job) => publicationTypeNetwork(job.publicationType))),
+    );
+    const previewHasPublishedSuccess = previewSuccessfulJobs.length > 0;
+    const previewRetryAnchorJobId = previewFailedJobs[0]?.id ?? null;
+    const isRetryingPreviewFailures = previewRetryAnchorJobId !== null && retryingJobId === previewRetryAnchorJobId;
+    const canRetryPreviewFailures =
+      preview?.currentUserRole !== "CLIENT" && previewFailedJobs.length > 0 && !publicationPreviewSubmitting;
+    return (
+      <section ref={publicationPreviewSectionRef} className="panel-card view-stack publication-preview-page-shell">
+        <div className="publication-preview-page-topbar">
+          <div className="publication-preview-page-heading">
+            <span className="publication-preview-page-eyebrow">Visualização da publicação</span>
+            <strong>{preview?.title?.trim() || activePublicationPreviewJob?.title?.trim() || "Prévia da publicação"}</strong>
+            <small>
+              {preview?.company.name || companies.find((company) => company.id === activePublicationPreviewJob?.companyId)?.name || "Workspace"}
+              {previewScheduledTime ? ` · às ${previewScheduledTime}` : ""}
+            </small>
+          </div>
+
+          <div className="publication-preview-page-head-actions">
+            <button
+              type="button"
+              className="ghost-button publication-preview-back-button"
+              onClick={closePublicationPreviewPage}
+            >
+              <FiChevronLeft aria-hidden="true" />
+              <span>Publicações</span>
+            </button>
+          </div>
+        </div>
+
+        {publicationPreviewInfo ? (
+          <div className="info-banner info-banner-success">{publicationPreviewInfo}</div>
+        ) : null}
+
+        {publicationPreviewLoading ? (
+          renderPublicationPreviewSkeleton()
+        ) : preview ? (
+          <div className="publication-preview-body publication-preview-page-layout">
+            <div className="publication-preview-main">
+              <div className="publication-preview-stage-shell">
+                <div className="publication-preview-stage-head">
+                  <div>
+                    <span>Clique na mídia para ampliar e navegar pelas peças.</span>
+                  </div>
+                  {preview.mediaPaths.length > 1 ? (
+                    <div className="publication-preview-stage-nav">
+                      <button type="button" className="ghost-button publication-media-modal-nav-button" onClick={showPreviousPublicationPreviewMedia}>
+                        <FiChevronLeft aria-hidden="true" />
+                      </button>
+                      <span className="publication-preview-stage-counter">{`${publicationPreviewMediaIndex + 1}/${preview.mediaPaths.length}`}</span>
+                      <button type="button" className="ghost-button publication-media-modal-nav-button" onClick={showNextPublicationPreviewMedia}>
+                        <FiChevronRight aria-hidden="true" />
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+
+                <div className="publication-preview-stage">
+                  {publicationPreviewMediaPath ? (
+                    isVideoPath(publicationPreviewMediaPath) ? (
+                      <video
+                        className="publication-preview-stage-media"
+                        src={`${api.baseUrl}${publicationPreviewMediaPath}`}
+                        muted
+                        playsInline
+                        preload="metadata"
+                        onClick={() => {
+                          if (activePublicationPreviewJob) {
+                            openPublicationMediaModal(activePublicationPreviewJob, publicationPreviewMediaIndex, {
+                              overrideTitle:
+                                preview.title?.trim() || activePublicationPreviewJob.title?.trim() || "Mídias da publicação",
+                              overridePaths: preview.mediaPaths,
+                            });
+                          }
+                        }}
+                      />
+                    ) : (
+                      <img
+                        className="publication-preview-stage-media"
+                        src={`${api.baseUrl}${publicationPreviewMediaPath}`}
+                        alt={`Mídia ${publicationPreviewMediaIndex + 1} da publicação`}
+                        onClick={() => {
+                          if (activePublicationPreviewJob) {
+                            openPublicationMediaModal(activePublicationPreviewJob, publicationPreviewMediaIndex, {
+                              overrideTitle:
+                                preview.title?.trim() || activePublicationPreviewJob.title?.trim() || "Mídias da publicação",
+                              overridePaths: preview.mediaPaths,
+                            });
+                          }
+                        }}
+                      />
+                    )
+                  ) : (
+                    <span className="publication-preview-stage-empty">
+                      <FiImage aria-hidden="true" />
+                    </span>
+                  )}
+                </div>
+
+                {preview.mediaCaptions[publicationPreviewMediaIndex] ? (
+                  <p className="publication-preview-media-caption">{preview.mediaCaptions[publicationPreviewMediaIndex]}</p>
+                ) : null}
+              </div>
+
+              {collaborationEnabled ? (
+                <div className="publication-preview-comments-panel">
+                  <div className="publication-preview-panel-head">
+                    <div>
+                      <strong>Discussão e feedbacks</strong>
+                      <span>{`${preview.comments.length} interação(ões)`}</span>
+                    </div>
+                  </div>
+
+                  <form
+                    className="publication-preview-comment-form"
+                    onSubmit={(event) => {
+                      if (usesDecisionComposer && hasChosenDecisionIntent) {
+                        event.preventDefault();
+                        void submitPublicationPreviewDecision(publicationPreviewDecisionIntent);
+                        return;
+                      }
+                      void submitPublicationPreviewComment(event);
+                    }}
+                  >
+                    {publicationPreviewReplyParentId ? (
+                      <div className="publication-preview-reply-context">
+                        <div className="publication-preview-reply-context-copy">
+                          <FiMessageCircle aria-hidden="true" />
+                          <span>
+                            {publicationPreviewReplyTargetComment
+                              ? `Respondendo @${publicationPreviewReplyTargetComment.author.username}`
+                              : "Respondendo um comentário"}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          className="publication-preview-reply-context-clear"
+                          onClick={() => {
+                            setPublicationPreviewReplyParentId(null);
+                            setPublicationPreviewDecisionIntent(null);
+                          }}
+                        >
+                          <FiRotateCcw aria-hidden="true" />
+                          <span>Cancelar resposta</span>
+                        </button>
+                      </div>
+                    ) : null}
+                    {canChooseInitialDecision ? (
+                      <div className="publication-preview-decision-choice-grid">
+                        <button
+                          type="button"
+                          className="ghost-button publication-preview-decision-choice publication-preview-decision-choice-approve"
+                          onClick={() => {
+                            setPublicationPreviewDecisionIntent("APPROVED");
+                            setPublicationPreviewCommentDraft("");
+                            focusPublicationPreviewTextarea();
+                          }}
+                          disabled={publicationPreviewSubmitting || !canChooseDecision}
+                        >
+                          <FiThumbsUp aria-hidden="true" />
+                          <span>Aprovar</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost-button publication-preview-decision-choice publication-preview-decision-choice-reject"
+                          onClick={() => {
+                            setPublicationPreviewDecisionIntent("REJECTED");
+                            setPublicationPreviewCommentDraft("");
+                            focusPublicationPreviewTextarea();
+                          }}
+                          disabled={publicationPreviewSubmitting || !canChooseDecision}
+                        >
+                          <FiThumbsDown aria-hidden="true" />
+                          <span>Rejeitar</span>
+                        </button>
+                      </div>
+                    ) : null}
+                    {canApproveAfterRejection && !hasChosenDecisionIntent ? (
+                      <div className="publication-preview-decision-choice-grid publication-preview-decision-choice-grid-single">
+                        <button
+                          type="button"
+                          className="ghost-button publication-preview-decision-choice publication-preview-decision-choice-approve"
+                          onClick={() => {
+                            setPublicationPreviewDecisionIntent("APPROVED");
+                            focusPublicationPreviewTextarea();
+                          }}
+                          disabled={publicationPreviewSubmitting}
+                        >
+                          <FiThumbsUp aria-hidden="true" />
+                          <span>Aprovar</span>
+                        </button>
+                      </div>
+                    ) : null}
+                    {!isDecisionSelectionState ? (
+                      <>
+                        <div className="field-head-with-action publication-preview-comment-field-head">
+                          <span>
+                            {publicationPreviewReplyParentId
+                              ? "Resposta"
+                              : usesDecisionComposer
+                                ? publicationPreviewDecisionIntent === "APPROVED"
+                                  ? "Feedback da aprovação (opcional)"
+                                  : "Motivo da rejeição (obrigatório)"
+                                : "Comentário"}
+                          </span>
+                          <div className="publication-preview-comment-field-head-actions">
+                            {usesDecisionComposer ? (
+                              <button
+                                type="button"
+                                className="publication-preview-comment-field-head-reset"
+                                onClick={() => {
+                                  setPublicationPreviewDecisionIntent(null);
+                                  setPublicationPreviewCommentDraft("");
+                                }}
+                                disabled={publicationPreviewSubmitting}
+                              >
+                                Trocar decisão
+                              </button>
+                            ) : null}
+                            {renderQuickEmojiPicker({
+                              pickerKey: "publication-preview-comment",
+                              disabled: publicationPreviewSubmitting,
+                              onPick: (emoji) =>
+                                setPublicationPreviewCommentDraft((current) => `${current}${current ? " " : ""}${emoji}`),
+                              label: publicationPreviewReplyParentId
+                                ? "Emojis da resposta"
+                                : usesDecisionComposer
+                                  ? publicationPreviewDecisionIntent === "APPROVED"
+                                    ? "Emojis do feedback"
+                                    : "Emojis da rejeição"
+                                  : "Emojis do comentário",
+                              className: "emoji-picker-shell-right",
+                            })}
+                          </div>
+                        </div>
+                        {usesDecisionComposer ? (
+                          <small className="publication-preview-comment-field-helper">
+                            {publicationPreviewDecisionIntent === "APPROVED"
+                              ? "Feedback opcional para contextualizar a aprovação."
+                              : "Mensagem obrigatória para orientar a rejeição."}
+                          </small>
+                        ) : null}
+                        <textarea
+                          ref={publicationPreviewTextareaRef}
+                          value={publicationPreviewCommentDraft}
+                          onChange={(event) => setPublicationPreviewCommentDraft(event.target.value)}
+                          placeholder={
+                            publicationPreviewReplyParentId
+                              ? "Escreva sua resposta"
+                              : usesDecisionComposer
+                                ? publicationPreviewDecisionIntent === "APPROVED"
+                                  ? "Explique o feedback da aprovação, se quiser."
+                                  : "Explique o motivo da rejeição para orientar os ajustes."
+                                : "Escreva uma observação ou resposta contextual sobre esta publicação"
+                          }
+                          rows={5}
+                          maxLength={2000}
+                          required={usesDecisionComposer && publicationPreviewDecisionIntent === "REJECTED"}
+                          disabled={publicationPreviewSubmitting}
+                        />
+                      </>
+                    ) : null}
+                    <div className="publication-preview-comment-form-actions">
+                      <div className="publication-preview-comment-submit">
+                        {isDecisionSelectionState ? null : (
+                          <button
+                            type="submit"
+                            className="publication-preview-submit-button"
+                            disabled={
+                              publicationPreviewSubmitting ||
+                              (usesDecisionComposer
+                                ? publicationPreviewDecisionIntent === "REJECTED"
+                                  ? false
+                                  : false
+                                : !publicationPreviewCommentDraft.trim())
+                            }
+                          >
+                            {publicationPreviewSubmitting ? (
+                              <span className="button-spinner" aria-hidden="true" />
+                            ) : (
+                              <FiSend aria-hidden="true" />
+                            )}
+                            <span>
+                              {publicationPreviewSubmitting
+                                ? usesDecisionComposer
+                                  ? "Enviando feedback..."
+                                  : publicationPreviewReplyParentId
+                                    ? "Enviando resposta..."
+                                    : "Enviando comentário..."
+                                : usesDecisionComposer
+                                  ? "Enviar feedback"
+                                  : publicationPreviewReplyParentId
+                                    ? "Enviar resposta"
+                                    : "Enviar comentário"}
+                            </span>
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </form>
+
+                  <div className="publication-preview-comments-list">
+                    {publicationPreviewCommentTree.length > 0 ? (
+                      publicationPreviewCommentTree.map((comment) => renderPublicationPreviewCommentNode(comment))
+                    ) : (
+                      <div className="publication-preview-empty-comments">
+                        Ainda não existem comentários nesta publicação.
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
+            <aside className="publication-preview-side">
+              <div className="publication-preview-side-card">
+                <div className="publication-preview-side-head">
+                  <strong>Resumo</strong>
+                  {collaborationEnabled ? (
+                    <span
+                      className={`publications-job-status-chip publications-job-status-chip-${approvalTone}${
+                        approvalStatus === "PENDING" ? " publication-preview-approval-chip-pending" : ""
+                      }`}
+                    >
+                      {approvalStatusLabel}
+                    </span>
+                  ) : null}
+                </div>
+                <div className="publication-preview-side-grid">
+                  <div className="publication-preview-side-grid-item publication-preview-side-grid-item-scheduled">
+                    <span>Agendada para</span>
+                    <strong>{`${previewScheduledDate} · ${previewScheduledTime}`}</strong>
+                  </div>
+                  <div className="publication-preview-side-grid-item publication-preview-side-grid-item-workspace">
+                    <span>Workspace</span>
+                    <strong>{preview.company.name}</strong>
+                  </div>
+                  <div
+                    className={`publication-preview-side-grid-item publication-preview-side-grid-item-state publication-preview-side-grid-item-state-${
+                      preview.publicationState === "DRAFT" ? "draft" : "published"
+                    }`}
+                  >
+                    <span>Estado</span>
+                    <strong>{preview.publicationState === "DRAFT" ? "Rascunho" : "Publicado"}</strong>
+                  </div>
+                  <div className="publication-preview-side-grid-item publication-preview-side-grid-item-volume">
+                    <span>Volume</span>
+                    <strong>{`${preview.jobs.length} destino(s)`}</strong>
+                  </div>
+                </div>
+                {preview.caption ? <p className="publication-preview-caption">{preview.caption}</p> : null}
+              </div>
+
+              <div className="publication-preview-side-card">
+                <div className="publication-preview-side-head">
+                  <strong>Redes e destinos</strong>
+                  <span>{`${preview.jobs.length} destino(s)`}</span>
+                </div>
+                {previewSuccessfulNetworks.length > 0 ? (
+                  <div className="publication-preview-target-summary">
+                    <div className="publication-preview-target-summary-copy">
+                      <strong>Publicado</strong>
+                      <div className="publication-preview-target-summary-icons" aria-label="Redes publicadas com sucesso">
+                        {previewSuccessfulNetworks.map((network) => (
+                          <span key={`preview-success-${preview.schedulerGroupKey}-${network}`}>
+                            {renderPublicationNetworkPill(network)}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+                {previewFailedJobs.length > 0 ? (
+                  <div className="publication-preview-target-summary publication-preview-target-summary-failed">
+                    <div className="publication-preview-target-summary-copy">
+                      <strong>Falhas</strong>
+                      <div className="publication-preview-target-summary-failed-list">
+                        {previewFailedJobs.map((job) => (
+                          <article key={`preview-failed-${job.id}`} className="publication-preview-target-item">
+                            <div className="publication-preview-target-main">
+                              {renderPublicationTypePill(job.publicationType)}
+                              <div className="publication-preview-target-copy">
+                                <span>
+                                  {clampPublicationPreviewTargetLabel(
+                                    job.connectionLoginIdentifier?.trim() || job.connectionLabel?.trim() || "Conta conectada",
+                                  )}
+                                </span>
+                              </div>
+                            </div>
+                            <span className="publications-job-status-chip publications-job-status-chip-failed">Falhou</span>
+                          </article>
+                        ))}
+                      </div>
+                    </div>
+                    {canRetryPreviewFailures ? (
+                      <button
+                        type="button"
+                        className="publications-board-action-button publications-board-action-button-retry publication-preview-target-summary-retry"
+                        onClick={() => void retryPublicationPreviewFailedJobs(previewFailedJobs)}
+                        disabled={isRetryingPreviewFailures}
+                      >
+                        {isRetryingPreviewFailures ? <span className="button-spinner" aria-hidden="true" /> : <FiRotateCcw aria-hidden="true" />}
+                        <span>{isRetryingPreviewFailures ? "Retentando..." : "Retentar falhas"}</span>
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+                <div className="publication-preview-target-list">
+                  {preview.jobs.map((job) => {
+                    const targetStatusLabel = jobStatusDisplayLabel(job);
+                    const showTargetStatusChip = targetStatusLabel !== "Rascunho";
+                    return (
+                      <article key={job.id} className="publication-preview-target-item">
+                        <div className="publication-preview-target-main">
+                          {renderPublicationTypePill(job.publicationType)}
+                          <div className="publication-preview-target-copy">
+                            <span>
+                              {clampPublicationPreviewTargetLabel(
+                                job.connectionLoginIdentifier?.trim() || job.connectionLabel?.trim() || "Conta conectada",
+                              )}
+                            </span>
+                          </div>
+                        </div>
+                        {showTargetStatusChip ? (
+                          <span
+                            className={`publications-job-status-chip publications-job-status-chip-${publicationBoardStatusChipTone(
+                              job,
+                              isPastScheduledAtForUser,
+                            )}`}
+                          >
+                            {targetStatusLabel}
+                          </span>
+                        ) : null}
+                      </article>
+                    );
+                  })}
+                </div>
+              </div>
+
+            </aside>
+          </div>
+        ) : (
+          <div className="publication-preview-page-empty">
+            <strong>Não foi possível carregar esta publicação agora.</strong>
+            <button type="button" className="ghost-button" onClick={closePublicationPreviewPage}>
+              Voltar para Publicações
+            </button>
+          </div>
+        )}
       </section>
     );
   }
@@ -18743,60 +22953,49 @@ function App() {
     );
   }
 
-  function renderProfileSkeleton() {
+  function renderAccountPageSkeleton() {
     return (
       <div className="view-stack skeleton-shell" aria-busy="true">
-        <section className="panel-card view-stack">
-          <span className="skeleton-line skeleton-line-heading" />
-          <div className="form-stack" aria-hidden="true">
+        <section className="panel-card account-page-hero">
+          <div className="account-page-hero-main">
+            <span className="skeleton-line publication-preview-avatar-skeleton" />
+            <div className="view-stack" style={{ gap: "8px", flex: 1 }}>
+              <span className="skeleton-line skeleton-line-kicker" />
+              <span className="skeleton-line skeleton-line-heading" />
+              <span className="skeleton-line skeleton-line-text" />
+            </div>
+          </div>
+        </section>
+        <div className="history-anchor-tabs account-page-tabs" aria-hidden="true">
+          <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
+          <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
+          <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
+        </div>
+        <div className="account-page-grid" aria-hidden="true">
+          <section className="panel-card view-stack">
+            <span className="skeleton-line skeleton-line-heading" />
+            <span className="skeleton-line publication-preview-avatar-skeleton" />
+            <span className="skeleton-line skeleton-line-text" />
+            <span className="skeleton-line skeleton-line-text-short" />
+          </section>
+          <section className="panel-card view-stack">
+            <span className="skeleton-line skeleton-line-heading" />
             <span className="skeleton-line skeleton-line-input" />
             <span className="skeleton-line skeleton-line-input" />
             <span className="skeleton-line skeleton-line-input" />
             <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" />
-          </div>
-        </section>
+          </section>
+        </div>
       </div>
     );
   }
 
+  function renderProfileSkeleton() {
+    return renderAccountPageSkeleton();
+  }
+
   function renderPlanSkeleton() {
-    return (
-      <div className="view-stack skeleton-shell" aria-busy="true">
-        <section className="panel-card view-stack">
-          {renderSkeletonSectionHead()}
-          <div className="table-list" aria-hidden="true">
-            <div className="row-card">
-              <div className="skeleton-row-main">
-                <span className="skeleton-line skeleton-line-title" />
-                <div className="meta-pill-row">
-                  <span className="skeleton-line skeleton-line-pill" />
-                  <span className="skeleton-line skeleton-line-pill" />
-                  <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
-                </div>
-              </div>
-            </div>
-            <div className="row-card">
-              <div className="skeleton-row-main">
-                <span className="skeleton-line skeleton-line-title" />
-                <div className="meta-pill-row">
-                  <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
-                  <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
-                  <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
-                </div>
-              </div>
-            </div>
-            <div className="row-card">
-              <div className="form-stack">
-                <span className="skeleton-line skeleton-line-input" />
-                <span className="skeleton-line skeleton-line-input" />
-                <span className="skeleton-line skeleton-line-input" />
-                <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" />
-              </div>
-            </div>
-          </div>
-        </section>
-      </div>
-    );
+    return renderAccountPageSkeleton();
   }
 
   function renderContentSkeleton() {
@@ -18813,6 +23012,8 @@ function App() {
         return renderMediaSkeleton();
       case "history":
         return renderHistorySkeleton();
+      case "historyPreview":
+        return renderPublicationPreviewSkeleton();
       case "logs":
         return renderLogsSkeleton();
       case "notices":
@@ -18822,6 +23023,7 @@ function App() {
       case "profile":
         return renderProfileSkeleton();
       case "plan":
+      case "planStart":
       case "planConfig":
       case "beeUpAdmin":
         return renderPlanSkeleton();
@@ -18831,7 +23033,11 @@ function App() {
   }
 
   function renderContent() {
-    if (contentLoading) {
+    if (activeView === "agents" && agentsConnectionTransitionLoading) {
+      return renderAgentsSkeleton();
+    }
+
+    if (contentLoading && (activeView !== "history" || !historyHasLoadedOnce)) {
       return renderContentSkeleton();
     }
 
@@ -18840,6 +23046,8 @@ function App() {
         return renderProfile();
       case "plan":
         return renderPlan();
+      case "planStart":
+        return shouldRenderInitialPlanSelection ? renderInitialPlanSelection() : renderDashboard();
       case "planConfig":
         return renderPlanConfig();
       case "beeUpAdmin":
@@ -18854,6 +23062,8 @@ function App() {
         return renderMedia();
       case "history":
         return renderHistory();
+      case "historyPreview":
+        return renderPublicationPreviewPage();
       case "notices":
         return renderNotices();
       case "noticeAdmin":
@@ -18870,23 +23080,21 @@ function App() {
     if (isPopupWindowContext() && postForMePopupResult) {
       return (
         <div className="auth-boot-loading" role="status" aria-live="polite" aria-label="Finalizando conexão">
-          <div
-            className="view-stack panel-card"
-            style={{ maxWidth: 420, margin: "0 auto", textAlign: "center", display: "grid", justifyItems: "center" }}
-          >
-            {postForMePopupResult.success ? <span className="auth-boot-spinner" aria-hidden="true" /> : null}
-            <strong style={postForMePopupResult.success ? undefined : { color: "#b42318" }}>
-              {postForMePopupResult.success
-                ? "Conexão concluída"
-                : resolvePostForMePopupFailureMessage(postForMePopupResult.message)}
-            </strong>
-            {postForMePopupResult.success ? (
-              <span className="field-hint">Esta janela deve fechar automaticamente em instantes.</span>
-            ) : null}
-            <button type="button" className="ghost-button" onClick={() => requestPopupWindowClose()}>
-              Fechar janela
-            </button>
-          </div>
+          {postForMePopupResult.success ? (
+            <span className="auth-boot-spinner" aria-hidden="true" />
+          ) : (
+            <div
+              className="view-stack panel-card"
+              style={{ maxWidth: 420, margin: "0 auto", textAlign: "center", display: "grid", justifyItems: "center" }}
+            >
+              <strong style={{ color: "#b42318" }}>
+                {resolvePostForMePopupFailureMessage(postForMePopupResult.message)}
+              </strong>
+              <button type="button" className="ghost-button" onClick={() => requestPopupWindowClose()}>
+                Fechar janela
+              </button>
+            </div>
+          )}
         </div>
       );
     }
@@ -18902,28 +23110,30 @@ function App() {
     if (isPopupWindowContext() && postForMePopupResult) {
       return (
         <div className="auth-boot-loading" role="status" aria-live="polite" aria-label="Finalizando conexão">
-          <div
-            className="view-stack panel-card"
-            style={{ maxWidth: 420, margin: "0 auto", textAlign: "center", display: "grid", justifyItems: "center" }}
-          >
-            {postForMePopupResult.success ? <span className="auth-boot-spinner" aria-hidden="true" /> : null}
-            <strong style={postForMePopupResult.success ? undefined : { color: "#b42318" }}>
-              {postForMePopupResult.success
-                ? "Conexão concluída"
-                : resolvePostForMePopupFailureMessage(postForMePopupResult.message)}
-            </strong>
-            {postForMePopupResult.success ? (
-              <span className="field-hint">Esta janela deve fechar automaticamente em instantes.</span>
-            ) : null}
-            <button type="button" className="ghost-button" onClick={() => requestPopupWindowClose()}>
-              Fechar janela
-            </button>
-          </div>
+          {postForMePopupResult.success ? (
+            <span className="auth-boot-spinner" aria-hidden="true" />
+          ) : (
+            <div
+              className="view-stack panel-card"
+              style={{ maxWidth: 420, margin: "0 auto", textAlign: "center", display: "grid", justifyItems: "center" }}
+            >
+              <strong style={{ color: "#b42318" }}>
+                {resolvePostForMePopupFailureMessage(postForMePopupResult.message)}
+              </strong>
+              <button type="button" className="ghost-button" onClick={() => requestPopupWindowClose()}>
+                Fechar janela
+              </button>
+            </div>
+          )}
         </div>
       );
     }
 
     return renderAuthScreen();
+  }
+
+  if (shouldRenderInitialPlanSelection) {
+    return renderInitialPlanSelection();
   }
 
   return (
@@ -19014,7 +23224,10 @@ function App() {
             <span>{billingWarningMessage}</span>
             {!isRootUser ? (
               <a
-                href={`${buildViewHref("plan")}#${BILLING_PLAN_CHECKOUT_ANCHOR_ID}`}
+                href={`${buildProfilePageHref(
+                  resolvedProfileRouteUsername || normalizedAuthUsername || profileUsername,
+                  "plan",
+                )}#${BILLING_PLAN_CHECKOUT_ANCHOR_ID}`}
                 className="billing-warning-link"
                 onClick={navigateToPlanCheckout}
               >
@@ -19025,7 +23238,6 @@ function App() {
         ) : null}
 
         {renderContent()}
-
         {isCreateWorkspaceModalOpen ? (
           <button
             type="button"
@@ -19243,7 +23455,9 @@ function App() {
               <div className="connection-create-modal-header">
                 <div>
                   <strong>Mídias da publicação</strong>
-                  <small className="field-hint">{resolveHistoryCalendarTitle(activePublicationMediaJob)}</small>
+                  <small className="field-hint">
+                    {activePublicationMediaOverrideTitle || resolveHistoryCalendarTitle(activePublicationMediaJob)}
+                  </small>
                 </div>
                 <button
                   type="button"

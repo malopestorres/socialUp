@@ -595,7 +595,7 @@ export type {
 
 export async function createPostForMeSocialAccountAuthUrl(input: {
   platform: PostForMePlatform;
-  externalId: string;
+  externalId?: string | null;
 }): Promise<string> {
   const platformData =
     input.platform === "instagram"
@@ -610,7 +610,7 @@ export async function createPostForMeSocialAccountAuthUrl(input: {
     method: "POST",
     jsonBody: {
       platform: input.platform,
-      external_id: input.externalId,
+      ...(parseString(input.externalId) ? { external_id: parseString(input.externalId) } : {}),
       ...(platformData ? { platform_data: platformData } : {}),
     },
   });

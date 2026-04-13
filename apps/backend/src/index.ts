@@ -30,6 +30,13 @@ import {
   searchInstagramLocationsForConnection,
 } from "./instagram-graph-api.js";
 import {
+  consumeGoogleOAuthState,
+  createGoogleOAuthLaunchUrl,
+  exchangeGoogleOAuthCodeForProfile,
+  resolveGoogleOAuthRedirectUri,
+} from "./google-oauth.js";
+import { isFirebaseAdminConfigured, verifyFirebaseGoogleIdToken } from "./firebase-admin.js";
+import {
   consumeThreadsOAuthState,
   createThreadsOAuthLaunchUrl,
   exchangeThreadsOAuthCodeForConnection,
@@ -92,6 +99,7 @@ const META_LOCATION_STORAGE_PREFIX = "__IGLOC__";
 const JOB_MEDIA_BUNDLE_STORAGE_PREFIX = "__JOB_MEDIA_BUNDLE__";
 const INSTAGRAM_MULTI_MEDIA_MAX_FILES = 10;
 const THREADS_MULTI_MEDIA_MAX_FILES = 20;
+const X_POST_MAX_TEXT_LENGTH = 280;
 const INSTAGRAM_FORCED_LOCATION_ID_RAW = (process.env.INSTAGRAM_FORCED_LOCATION_ID || "").trim();
 const INSTAGRAM_FORCED_LOCATION_ID = /^\d+$/.test(INSTAGRAM_FORCED_LOCATION_ID_RAW)
   ? INSTAGRAM_FORCED_LOCATION_ID_RAW
@@ -199,7 +207,10 @@ const BILLING_SETTING_ROOT_DISPLAY_PLAN_ID = "billing.rootDisplayPlanId";
 const BILLING_SETTING_POST_FOR_ME_WEBHOOK_ID = "postForMe.webhookId";
 const BILLING_SETTING_POST_FOR_ME_WEBHOOK_URL = "postForMe.webhookUrl";
 const BILLING_SETTING_POST_FOR_ME_WEBHOOK_SECRET = "postForMe.webhookSecret";
-const BILLING_TRIAL_PLAN_CODE = "FREE_TRIAL";
+const BILLING_TRIAL_PLAN_CODE = "TRIAL";
+const LEGACY_BILLING_TRIAL_PLAN_CODE = "FREE_TRIAL";
+const BILLING_SINGLE_PLAN_CODE = "SINGLE";
+const BILLING_AGENCY_PLAN_CODE = "AGENCY";
 const BILLING_TRIAL_REFERENCE_DAYS = 30;
 const DEFAULT_AUTO_TRIAL_ENABLED = true;
 const DEFAULT_AUTO_TRIAL_DAYS = 10;
@@ -223,9 +234,9 @@ type DefaultPlanSeed = {
 };
 
 const DEFAULT_BILLING_TRIAL_PLAN: DefaultPlanSeed = {
-  code: "FREE_TRIAL",
-  name: "Free Trial",
-  description: "Teste por 10 dias com limites reduzidos.",
+  code: BILLING_TRIAL_PLAN_CODE,
+  name: "Trial",
+  description: "Entrada inicial com limites reduzidos para conhecer o painel.",
   isTrial: true,
   maxProfiles: 1,
   workspaceLimit: 1,
@@ -236,6 +247,38 @@ const DEFAULT_BILLING_TRIAL_PLAN: DefaultPlanSeed = {
   yearlyPriceCents: null,
   isPublic: false,
   displayOrder: 0,
+};
+
+const DEFAULT_BILLING_SINGLE_PLAN: DefaultPlanSeed = {
+  code: BILLING_SINGLE_PLAN_CODE,
+  name: "Single",
+  description: "Plano individual para operar 1 workspace próprio sem recursos colaborativos.",
+  isTrial: false,
+  maxProfiles: 1,
+  workspaceLimit: 1,
+  agencyBonusWorkspaceLimit: 0,
+  maxConnections: 12,
+  maxMonthlyPublications: 300,
+  monthlyPriceCents: null,
+  yearlyPriceCents: null,
+  isPublic: true,
+  displayOrder: 1,
+};
+
+const DEFAULT_BILLING_AGENCY_PLAN: DefaultPlanSeed = {
+  code: BILLING_AGENCY_PLAN_CODE,
+  name: "Agency",
+  description: "Plano com múltiplos workspaces e fluxo colaborativo com cliente.",
+  isTrial: false,
+  maxProfiles: 5,
+  workspaceLimit: 5,
+  agencyBonusWorkspaceLimit: 5,
+  maxConnections: 60,
+  maxMonthlyPublications: 3000,
+  monthlyPriceCents: null,
+  yearlyPriceCents: null,
+  isPublic: true,
+  displayOrder: 2,
 };
 
 const WORKSPACE_KIND_VALUES = ["CLIENT", "AGENCY_BONUS"] as const;
@@ -303,6 +346,289 @@ function normalizeUserTimeZone(value: string | null | undefined): string {
   }
 
   return isValidIanaTimeZone(normalized) ? normalized : DEFAULT_USER_TIME_ZONE;
+}
+
+function normalizeEmail(value: string | null | undefined): string | null {
+  const normalized = (value || "").trim().toLowerCase();
+  return normalized.length > 0 ? normalized : null;
+}
+
+async function findUserByLoginIdentifier(identifier: string): Promise<{
+  id: string;
+  name: string;
+  username: string;
+  email: string | null;
+  passwordHash: string | null;
+  timeZone: string;
+  role: string;
+} | null> {
+  const normalizedIdentifier = identifier.trim();
+  if (!normalizedIdentifier) {
+    return null;
+  }
+
+  const normalizedEmail = normalizeEmail(normalizedIdentifier);
+  return prisma.user.findFirst({
+    where: {
+      OR: [
+        { username: normalizedIdentifier },
+        ...(normalizedEmail ? [{ email: normalizedEmail }] : []),
+      ],
+    },
+    select: {
+      id: true,
+      name: true,
+      username: true,
+      email: true,
+      passwordHash: true,
+      timeZone: true,
+      role: true,
+    },
+  });
+}
+
+function normalizeUsernameCandidate(value: string | null | undefined): string {
+  const normalized = (value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9._-]+/g, "")
+    .toLowerCase();
+
+  if (!normalized) {
+    return "usuario";
+  }
+
+  if (normalized.length >= 3) {
+    return normalized.slice(0, 24);
+  }
+
+  return `${normalized}user`.slice(0, 24);
+}
+
+function deriveDisplayNameFromGoogleProfile(input: {
+  displayName: string | null;
+  email: string;
+}): string {
+  const explicitDisplayName = input.displayName?.trim();
+  if (explicitDisplayName) {
+    return explicitDisplayName.slice(0, 80);
+  }
+
+  const localPart = input.email.split("@")[0]?.trim() || "Usuario";
+  const friendlyName = localPart
+    .replace(/[._-]+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+
+  return (friendlyName || "Usuario").slice(0, 80);
+}
+
+type AuthUserRepository = Pick<Prisma.TransactionClient, "user">;
+
+async function resolveAvailableUsername(
+  repository: AuthUserRepository,
+  seed: string,
+): Promise<string> {
+  const base = normalizeUsernameCandidate(seed);
+
+  for (let suffix = 0; suffix < 200; suffix += 1) {
+    const candidate =
+      suffix === 0
+        ? base
+        : `${base.slice(0, Math.max(3, 24 - String(suffix).length))}${suffix}`;
+    const existing = await repository.user.findUnique({
+      where: { username: candidate },
+      select: { id: true },
+    });
+    if (!existing) {
+      return candidate;
+    }
+  }
+
+  return `${base.slice(0, 16)}${Date.now().toString().slice(-8)}`;
+}
+
+async function createInitialBillingSubscriptionForUser(
+  transaction: Prisma.TransactionClient,
+  userId: string,
+  _billingSettings: BillingSettingsSnapshot,
+): Promise<void> {
+  const now = new Date();
+
+  await transaction.userPlanSubscription.create({
+    data: {
+      userId,
+      planId: null,
+      status: "PAYMENT_REQUIRED",
+      billingModel: "NONE",
+      startsAt: now,
+      trialEndsAt: null,
+      endsAt: null,
+      blockedReason: "Escolha um plano para iniciar seu trial.",
+    },
+  });
+}
+
+async function resolveOrCreateGoogleAuthUser(input: {
+  providerUserId: string;
+  email: string;
+  emailVerified: boolean;
+  displayName: string | null;
+  avatarUrl: string | null;
+  metadata: Prisma.InputJsonValue;
+}): Promise<{
+  id: string;
+  name: string;
+  username: string;
+  email: string | null;
+  timeZone: string;
+  role: string;
+}> {
+  const existingProvider = await prisma.userAuthProvider.findUnique({
+    where: {
+      provider_providerUserId: {
+        provider: "GOOGLE",
+        providerUserId: input.providerUserId,
+      },
+    },
+    include: {
+      user: {
+        select: {
+          id: true,
+          name: true,
+          username: true,
+          email: true,
+          timeZone: true,
+          role: true,
+        },
+      },
+    },
+  });
+
+  if (existingProvider?.user) {
+    await prisma.userAuthProvider.update({
+      where: { id: existingProvider.id },
+      data: {
+        email: input.email,
+        emailVerified: input.emailVerified,
+        displayName: input.displayName,
+        avatarUrl: input.avatarUrl,
+        metadata: input.metadata,
+      },
+    });
+    return existingProvider.user;
+  }
+
+  const normalizedEmail = normalizeEmail(input.email);
+  if (!normalizedEmail || !input.emailVerified) {
+    throw new Error("GOOGLE_EMAIL_NOT_VERIFIED");
+  }
+
+  const existingUserByEmail = await prisma.user.findUnique({
+    where: { email: normalizedEmail },
+    select: {
+      id: true,
+      name: true,
+      username: true,
+      email: true,
+      timeZone: true,
+      role: true,
+    },
+  });
+
+  if (existingUserByEmail) {
+    const existingGoogleProvider = await prisma.userAuthProvider.findUnique({
+      where: {
+        userId_provider: {
+          userId: existingUserByEmail.id,
+          provider: "GOOGLE",
+        },
+      },
+      select: {
+        id: true,
+        providerUserId: true,
+      },
+    });
+
+    if (existingGoogleProvider && existingGoogleProvider.providerUserId !== input.providerUserId) {
+      throw new Error("GOOGLE_ACCOUNT_ALREADY_LINKED");
+    }
+
+    if (existingGoogleProvider) {
+      await prisma.userAuthProvider.update({
+        where: { id: existingGoogleProvider.id },
+        data: {
+          email: normalizedEmail,
+          emailVerified: true,
+          displayName: input.displayName,
+          avatarUrl: input.avatarUrl,
+          metadata: input.metadata,
+        },
+      });
+    } else {
+      await prisma.userAuthProvider.create({
+        data: {
+          userId: existingUserByEmail.id,
+          provider: "GOOGLE",
+          providerUserId: input.providerUserId,
+          email: normalizedEmail,
+          emailVerified: true,
+          displayName: input.displayName,
+          avatarUrl: input.avatarUrl,
+          metadata: input.metadata,
+        },
+      });
+    }
+
+    return existingUserByEmail;
+  }
+
+  const billingSettings = await getBillingSettingsSnapshot();
+  const createdUser = await prisma.$transaction(async (transaction) => {
+    const usernameSeed = normalizeUsernameCandidate(
+      normalizedEmail.split("@")[0] || input.displayName || "usuario",
+    );
+    const username = await resolveAvailableUsername(transaction, usernameSeed);
+    const user = await transaction.user.create({
+      data: {
+        name: deriveDisplayNameFromGoogleProfile({
+          displayName: input.displayName,
+          email: normalizedEmail,
+        }),
+        email: normalizedEmail,
+        username,
+        passwordHash: null,
+        needsPlanSelection: true,
+        role: "ADMIN",
+      },
+      select: {
+        id: true,
+        name: true,
+        username: true,
+        email: true,
+        timeZone: true,
+        role: true,
+      },
+    });
+
+    await createInitialBillingSubscriptionForUser(transaction, user.id, billingSettings);
+    await transaction.userAuthProvider.create({
+      data: {
+        userId: user.id,
+        provider: "GOOGLE",
+        providerUserId: input.providerUserId,
+        email: normalizedEmail,
+        emailVerified: true,
+        displayName: input.displayName,
+        avatarUrl: input.avatarUrl,
+        metadata: input.metadata,
+      },
+    });
+
+    return user;
+  });
+
+  return createdUser;
 }
 
 function getTimeZoneOffsetMinutes(date: Date, timeZone: string): number {
@@ -1003,15 +1329,23 @@ const setConnectionAgencyRefreshSchema = z.object({
 
 const syncProviderConnectionSchema = z.object({
   providerAccountIdHint: z.string().trim().min(1).max(255).optional(),
+  knownRemoteAccountIds: z.array(z.string().trim().min(1).max(255)).max(100).optional(),
+  preferRecentPlatformAccount: z.boolean().optional(),
 });
 
 const openVisualAuthSchema = z.object({
   returnToUrl: z.string().trim().url().max(2000).optional().nullable(),
 });
 
+const authEmailSchema = z.string().trim().email().max(160);
+
 const loginSchema = z.object({
-  username: z.string().min(1),
+  identifier: z.string().trim().min(1),
   password: z.string().min(1),
+});
+
+const firebaseGoogleLoginSchema = z.object({
+  idToken: z.string().trim().min(1),
 });
 
 const setupInviteQuerySchema = z.object({
@@ -1021,6 +1355,7 @@ const setupInviteQuerySchema = z.object({
 const createUserFromInviteSchema = z.object({
   key: z.string().min(1),
   name: z.string().min(2).max(80),
+  email: authEmailSchema,
   username: z.string().min(3).max(32).regex(/^[a-z0-9._-]+$/i),
   password: z.string().min(8).max(128),
 });
@@ -1028,12 +1363,14 @@ const createUserFromInviteSchema = z.object({
 const createUserFromWorkspaceInviteSchema = z.object({
   key: z.string().min(1),
   name: z.string().min(2).max(80),
+  email: authEmailSchema,
   username: z.string().min(3).max(32).regex(/^[a-z0-9._-]+$/i),
   password: z.string().min(8).max(128),
 });
 
 const updateProfileSchema = z.object({
   name: z.string().min(2).max(80),
+  email: authEmailSchema,
   username: z.string().min(3).max(32).regex(/^[a-z0-9._-]+$/i),
   password: z.string().min(8).max(128).optional().or(z.literal("")),
   timeZone: z.string().trim().min(1).max(80).optional().nullable(),
@@ -1138,12 +1475,26 @@ const historyDraftsQuerySchema = z.object({
 });
 
 const avisoRecentQuerySchema = z.object({
-  limit: z.coerce.number().int().min(1).max(10).default(5),
+  limit: z.coerce.number().int().min(1).max(24).default(12),
 });
 
 const createBroadcastAvisoSchema = z.object({
   title: z.string().trim().min(2).max(120),
   message: z.string().trim().min(2).max(2000),
+});
+
+const publicationPreviewCommentSchema = z.object({
+  message: z.string().trim().min(1, "Escreva uma mensagem.").max(2000),
+  parentCommentId: z.string().trim().min(1).max(191).optional().nullable(),
+});
+
+const publicationPreviewDecisionSchema = z.object({
+  decision: z.enum(["APPROVED", "REJECTED"]),
+  message: z.string().trim().max(2000).optional().nullable(),
+});
+
+const publicationPreviewReactionSchema = z.object({
+  emoji: z.string().trim().min(1).max(16),
 });
 
 const createPlanSchema = z.object({
@@ -1183,6 +1534,10 @@ const assignUserPlanSchema = z.object({
   billingModel: z.enum(["TRIAL", "STRIPE_SUBSCRIPTION", "PIX_MANUAL", "MANUAL"]).optional().default("MANUAL"),
   cycle: z.enum(["MONTHLY", "YEARLY"]).optional().nullable(),
   endsAt: z.string().datetime().optional().nullable(),
+});
+
+const startInitialTrialSchema = z.object({
+  planId: z.string().trim().min(1),
 });
 
 const startStripeCheckoutSchema = z.object({
@@ -1800,6 +2155,37 @@ function resolveStoredJobCaptionForPublication(job: {
   return appendHashtagsToCaption(job.caption, hashtags);
 }
 
+function validateCaptionForPublication(
+  publicationType: PublicationType,
+  caption: string | null,
+  hashtags: string[],
+): void {
+  if (publicationType !== "x_post") {
+    return;
+  }
+
+  const resolvedCaption = resolveStoredJobCaptionForPublication({
+    caption,
+    hashtags,
+    publicationType,
+    postStory: false,
+    postReel: false,
+    postWhatsapp: false,
+  })?.trim() || "";
+
+  if (resolvedCaption.length <= X_POST_MAX_TEXT_LENGTH) {
+    return;
+  }
+
+  throw new z.ZodError([
+    {
+      code: "custom",
+      path: ["caption"],
+      message: `X aceita até ${X_POST_MAX_TEXT_LENGTH} caracteres na legenda final. Ajuste o texto ou reduza as hashtags antes de enviar.`,
+    },
+  ]);
+}
+
 function resolvePostForMeCaptionForPublication(job: {
   caption: string | null;
   hashtags?: unknown;
@@ -2177,6 +2563,94 @@ function serializeJobForClient(job: Prisma.JobGetPayload<Record<string, never>>)
   };
 }
 
+function resolveJobPreviewGroupKey(job: Pick<Prisma.JobGetPayload<Record<string, never>>, "id" | "locationName">): string {
+  const schedulerGroupId = decodeMetaLocationStorage(job.locationName).schedulerGroupId?.trim() || "";
+  return schedulerGroupId || job.id;
+}
+
+function buildPublicationPreviewSubject(job: Pick<Prisma.JobGetPayload<Record<string, never>>, "id" | "title" | "caption">): string {
+  const titleSnippet = compactAvisoText(job.title, 90);
+  const captionSnippet = compactAvisoText(job.caption, 90);
+  return titleSnippet || captionSnippet ? `"${titleSnippet || captionSnippet}"` : `Postagem ${job.id}`;
+}
+
+function serializePublicationPreviewJob(
+  job: Prisma.JobGetPayload<{
+    include: {
+      socialConnection: {
+        select: {
+          id: true;
+          displayName: true;
+          loginIdentifier: true;
+        };
+      };
+    };
+  }>,
+) {
+  return {
+    ...serializeJobForClient(job),
+    connectionLabel: job.socialConnection?.displayName ?? null,
+    connectionLoginIdentifier: job.socialConnection?.loginIdentifier ?? null,
+  };
+}
+
+function serializePublicationApprovalComment(
+  comment: Prisma.PublicationApprovalCommentGetPayload<{
+    include: {
+      user: {
+        select: {
+          id: true;
+          name: true;
+          username: true;
+        };
+      };
+      reactions: {
+        select: {
+          emoji: true;
+          userId: true;
+        };
+      };
+    };
+  }>,
+  currentUserId?: string | null,
+) {
+  const reactionBuckets = new Map<
+    string,
+    {
+      emoji: string;
+      count: number;
+      reactedByCurrentUser: boolean;
+    }
+  >();
+
+  comment.reactions.forEach((reaction) => {
+    const current = reactionBuckets.get(reaction.emoji) ?? {
+      emoji: reaction.emoji,
+      count: 0,
+      reactedByCurrentUser: false,
+    };
+    current.count += 1;
+    if (currentUserId && reaction.userId === currentUserId) {
+      current.reactedByCurrentUser = true;
+    }
+    reactionBuckets.set(reaction.emoji, current);
+  });
+
+  return {
+    id: comment.id,
+    parentCommentId: comment.parentCommentId,
+    message: comment.message,
+    createdAt: comment.createdAt,
+    updatedAt: comment.updatedAt,
+    author: {
+      id: comment.user.id,
+      name: comment.user.name,
+      username: comment.user.username,
+    },
+    reactions: Array.from(reactionBuckets.values()).sort((left, right) => right.count - left.count),
+  };
+}
+
 function companyVisibilityWhere(
   request: Request & { adminUser?: AdminUserAuth },
   companyId?: string,
@@ -2295,6 +2769,36 @@ function hasActiveClientWorkspaceMember(workspace: Pick<WorkspacePermissionConte
   return workspace.members.some((member) => normalizeWorkspaceMemberRole(member.role) === "CLIENT");
 }
 
+async function resolveWorkspaceOwnerPlanCapabilities(
+  workspace: Pick<WorkspacePermissionContext, "createdByUserId">,
+  cache?: Map<string, BillingPlanCapabilities>,
+): Promise<BillingPlanCapabilities> {
+  const ownerUserId = workspace.createdByUserId?.trim() || "";
+  if (!ownerUserId) {
+    return resolveBillingPlanCapabilities(null);
+  }
+
+  if (cache?.has(ownerUserId)) {
+    return cache.get(ownerUserId)!;
+  }
+
+  const owner = await prisma.user.findUnique({
+    where: { id: ownerUserId },
+    select: { username: true },
+  });
+
+  const capabilities = owner?.username === "root"
+    ? {
+        supportsWorkspaceInvites: true,
+        supportsClientApproval: true,
+        maxWhatsappConnections: null,
+      }
+    : resolveBillingPlanCapabilities((await resolveUserBillingAccess(ownerUserId)).plan?.code);
+
+  cache?.set(ownerUserId, capabilities);
+  return capabilities;
+}
+
 function canCurrentUserManageWorkspace(
   request: Request & { adminUser?: AdminUserAuth },
   workspace: WorkspacePermissionContext,
@@ -2345,6 +2849,23 @@ function canCurrentUserConnectWorkspaceAccounts(
   }
 
   return currentRole === "CENTRAL" && !hasActiveClientWorkspaceMember(workspace);
+}
+
+function canCurrentUserManageWorkspacePublications(
+  request: Request & { adminUser?: AdminUserAuth },
+  workspace: WorkspacePermissionContext,
+): boolean {
+  if (isRootUser(request)) {
+    return true;
+  }
+
+  const userId = request.adminUser?.id;
+  if (!userId) {
+    return false;
+  }
+
+  const currentRole = resolveCurrentWorkspaceRole(workspace, userId);
+  return currentRole === "CENTRAL" || currentRole === "AGENCY";
 }
 
 function canCurrentUserRenewConnectionAccess(
@@ -2601,13 +3122,14 @@ function buildWorkspaceInviteUrl(inviteKey: string): string {
   return `${publicBaseUrl}/?workspaceInviteKey=${encodeURIComponent(inviteKey)}`;
 }
 
-function mapWorkspaceForClient(
+async function mapWorkspaceForClient(
   request: Request & { adminUser?: AdminUserAuth },
   workspace: WorkspacePermissionContext,
 ) {
   const currentUserId = request.adminUser?.id ?? "";
   const currentUserRole = currentUserId ? resolveCurrentWorkspaceRole(workspace, currentUserId) : null;
   const hasClientMember = hasActiveClientWorkspaceMember(workspace);
+  const ownerPlanCapabilities = await resolveWorkspaceOwnerPlanCapabilities(workspace);
 
   return {
     id: workspace.id,
@@ -2619,8 +3141,11 @@ function mapWorkspaceForClient(
     currentUserRole,
     hasClientMember,
     canManageWorkspace: canCurrentUserManageWorkspace(request, workspace),
-    canManageMembers: canCurrentUserManageWorkspaceMembers(request, workspace),
+    canManageMembers: canCurrentUserManageWorkspaceMembers(request, workspace) && ownerPlanCapabilities.supportsWorkspaceInvites,
     canConnectAccounts: canCurrentUserConnectWorkspaceAccounts(request, workspace),
+    canManagePublications: canCurrentUserManageWorkspacePublications(request, workspace),
+    supportsWorkspaceInvites: ownerPlanCapabilities.supportsWorkspaceInvites,
+    supportsClientApproval: ownerPlanCapabilities.supportsClientApproval,
     members: workspace.members.map((member) => ({
       id: member.id,
       userId: member.userId,
@@ -3315,6 +3840,42 @@ type BillingAccessSnapshot = {
   trialEndsAt: Date | null;
 };
 
+type BillingPlanCapabilities = {
+  supportsWorkspaceInvites: boolean;
+  supportsClientApproval: boolean;
+  maxWhatsappConnections: number | null;
+};
+
+function normalizeResolvedPlanCode(value: string | null | undefined): string {
+  return (value || "").trim().toUpperCase();
+}
+
+function resolveBillingPlanCapabilities(planCode: string | null | undefined): BillingPlanCapabilities {
+  const normalizedPlanCode = normalizeResolvedPlanCode(planCode);
+
+  if (normalizedPlanCode === BILLING_AGENCY_PLAN_CODE) {
+    return {
+      supportsWorkspaceInvites: true,
+      supportsClientApproval: true,
+      maxWhatsappConnections: null,
+    };
+  }
+
+  return {
+    supportsWorkspaceInvites: false,
+    supportsClientApproval: false,
+    maxWhatsappConnections: 2,
+  };
+}
+
+function canStartInitialPlanTrial(access: BillingAccessSnapshot | null): boolean {
+  if (!access) {
+    return false;
+  }
+
+  return access.billingModel === "NONE" && !access.plan;
+}
+
 async function getBillingSettingsSnapshot(): Promise<BillingSettingsSnapshot> {
   const [autoTrialEnabledSetting, autoTrialDaysSetting, rootDisplayPlanIdSetting] = await Promise.all([
     prisma.appSetting.findUnique({ where: { key: BILLING_SETTING_AUTO_TRIAL_ENABLED } }),
@@ -3508,27 +4069,7 @@ async function backfillLegacyWorkspaceMembers(): Promise<void> {
 }
 
 async function ensureBillingBootstrap(): Promise<void> {
-  const trial = DEFAULT_BILLING_TRIAL_PLAN;
-  await prisma.plan.upsert({
-    where: { code: trial.code },
-    update: {},
-    create: {
-      code: trial.code,
-      name: trial.name,
-      description: trial.description,
-      isActive: true,
-      isPublic: trial.isPublic ?? false,
-      isTrial: true,
-      maxProfiles: trial.maxProfiles,
-      workspaceLimit: trial.workspaceLimit,
-      agencyBonusWorkspaceLimit: trial.agencyBonusWorkspaceLimit,
-      maxConnections: trial.maxConnections,
-      maxMonthlyPublications: trial.maxMonthlyPublications,
-      displayOrder: trial.displayOrder ?? 0,
-      monthlyPriceCents: null,
-      yearlyPriceCents: null,
-    },
-  });
+  await ensureCanonicalBillingPlans();
 
   await Promise.all([
     prisma.appSetting.upsert({
@@ -3561,6 +4102,139 @@ async function ensureBillingBootstrap(): Promise<void> {
   await backfillLegacyPlanWorkspaceConfig();
   await backfillLegacyWorkspaceMembers();
   await syncTrialPlanLimitsFromSettings(settings.autoTrialDays);
+}
+
+async function ensureCanonicalBillingPlans(): Promise<void> {
+  const existingTrial = await prisma.plan.findUnique({
+    where: { code: BILLING_TRIAL_PLAN_CODE },
+    select: { id: true },
+  });
+  const legacyTrial = await prisma.plan.findUnique({
+    where: { code: LEGACY_BILLING_TRIAL_PLAN_CODE },
+    select: { id: true },
+  });
+
+  if (legacyTrial && !existingTrial) {
+    await prisma.plan.update({
+      where: { id: legacyTrial.id },
+      data: {
+        code: BILLING_TRIAL_PLAN_CODE,
+        name: DEFAULT_BILLING_TRIAL_PLAN.name,
+        description: DEFAULT_BILLING_TRIAL_PLAN.description,
+        isActive: true,
+        isPublic: DEFAULT_BILLING_TRIAL_PLAN.isPublic ?? false,
+        isTrial: true,
+        maxProfiles: DEFAULT_BILLING_TRIAL_PLAN.maxProfiles,
+        workspaceLimit: DEFAULT_BILLING_TRIAL_PLAN.workspaceLimit,
+        agencyBonusWorkspaceLimit: DEFAULT_BILLING_TRIAL_PLAN.agencyBonusWorkspaceLimit,
+        maxConnections: DEFAULT_BILLING_TRIAL_PLAN.maxConnections,
+        maxMonthlyPublications: DEFAULT_BILLING_TRIAL_PLAN.maxMonthlyPublications,
+        displayOrder: DEFAULT_BILLING_TRIAL_PLAN.displayOrder ?? 0,
+      },
+    });
+  }
+
+  for (const planSeed of [DEFAULT_BILLING_TRIAL_PLAN, DEFAULT_BILLING_SINGLE_PLAN, DEFAULT_BILLING_AGENCY_PLAN]) {
+    await prisma.plan.upsert({
+      where: { code: planSeed.code },
+      update: {
+        name: planSeed.name,
+        description: planSeed.description,
+        isActive: true,
+        isPublic: planSeed.isPublic ?? false,
+        isTrial: planSeed.isTrial,
+        maxProfiles: planSeed.maxProfiles,
+        workspaceLimit: planSeed.workspaceLimit,
+        agencyBonusWorkspaceLimit: planSeed.agencyBonusWorkspaceLimit,
+        maxConnections: planSeed.maxConnections,
+        maxMonthlyPublications: planSeed.maxMonthlyPublications,
+        displayOrder: planSeed.displayOrder ?? 0,
+      },
+      create: {
+        code: planSeed.code,
+        name: planSeed.name,
+        description: planSeed.description,
+        isActive: true,
+        isPublic: planSeed.isPublic ?? false,
+        isTrial: planSeed.isTrial,
+        maxProfiles: planSeed.maxProfiles,
+        workspaceLimit: planSeed.workspaceLimit,
+        agencyBonusWorkspaceLimit: planSeed.agencyBonusWorkspaceLimit,
+        maxConnections: planSeed.maxConnections,
+        maxMonthlyPublications: planSeed.maxMonthlyPublications,
+        displayOrder: planSeed.displayOrder ?? 0,
+        monthlyPriceCents: planSeed.monthlyPriceCents,
+        yearlyPriceCents: planSeed.yearlyPriceCents,
+      },
+    });
+  }
+
+  const [trialPlan, agencyPlan, rootDisplayPlanSetting, legacyPlans] = await Promise.all([
+    prisma.plan.findUnique({
+      where: { code: BILLING_TRIAL_PLAN_CODE },
+      select: { id: true },
+    }),
+    prisma.plan.findUnique({
+      where: { code: BILLING_AGENCY_PLAN_CODE },
+      select: { id: true },
+    }),
+    prisma.appSetting.findUnique({
+      where: { key: BILLING_SETTING_ROOT_DISPLAY_PLAN_ID },
+      select: { key: true, value: true },
+    }),
+    prisma.plan.findMany({
+      where: {
+        NOT: {
+          code: {
+            in: [BILLING_TRIAL_PLAN_CODE, BILLING_SINGLE_PLAN_CODE, BILLING_AGENCY_PLAN_CODE],
+          },
+        },
+      },
+      select: {
+        id: true,
+        code: true,
+        name: true,
+      },
+    }),
+  ]);
+
+  for (const legacyPlan of legacyPlans) {
+    const migrateToTrial = legacyPlan.code === LEGACY_BILLING_TRIAL_PLAN_CODE && trialPlan;
+    const targetPlanId = migrateToTrial ? trialPlan?.id : agencyPlan?.id;
+
+    if (targetPlanId && legacyPlan.id !== targetPlanId) {
+      await prisma.userPlanSubscription.updateMany({
+        where: { planId: legacyPlan.id },
+        data: { planId: targetPlanId },
+      });
+
+      if (rootDisplayPlanSetting?.key && rootDisplayPlanSetting.value === legacyPlan.id) {
+        await prisma.appSetting.update({
+          where: { key: rootDisplayPlanSetting.key },
+          data: { value: targetPlanId },
+        });
+      }
+    }
+
+    const legacyLabel = migrateToTrial ? "Trial legado" : "Plano legado";
+    const legacyDescription = migrateToTrial
+      ? "Plano legado desativado e realocado para Trial."
+      : "Plano legado desativado e realocado para Agency.";
+
+    await prisma.plan.delete({
+      where: { id: legacyPlan.id },
+    }).catch(async () => {
+      await prisma.plan.update({
+        where: { id: legacyPlan.id },
+        data: {
+          isActive: false,
+          isPublic: false,
+          name: `${legacyLabel}: ${legacyPlan.name}`,
+          description: legacyDescription,
+        },
+      });
+    });
+  }
 }
 
 async function getBestActivePlanForDisplay() {
@@ -3989,14 +4663,20 @@ async function buildAuthUserPayload(user: {
   id: string;
   name: string;
   username: string;
+  email?: string | null;
   timeZone: string;
   role: string;
 }): Promise<{
   id: string;
   name: string;
   username: string;
+  email: string | null;
+  avatarUrl: string | null;
   timeZone: string;
   role: string;
+  needsPlanSelection: boolean;
+  hasPassword: boolean;
+  authProviders: Array<{ provider: string; email: string | null }>;
   billingStatus: string;
   billingPlanName: string | null;
   billingPlanCode: string | null;
@@ -4005,10 +4685,45 @@ async function buildAuthUserPayload(user: {
   billingEndsAt: Date | null;
   billingTrialEndsAt: Date | null;
 }> {
+  const [billing, authProviders, passwordOwner] = await Promise.all([
+    user.username === "root"
+      ? Promise.resolve(null)
+      : resolveUserBillingAccess(user.id),
+    prisma.userAuthProvider.findMany({
+      where: { userId: user.id },
+      orderBy: [{ createdAt: "asc" }],
+      select: {
+        provider: true,
+        email: true,
+        avatarUrl: true,
+      },
+    }),
+    prisma.user.findUnique({
+      where: { id: user.id },
+      select: {
+        id: true,
+        passwordHash: true,
+        email: true,
+        needsPlanSelection: true,
+      },
+    }),
+  ]);
+
   if (user.username === "root") {
     const bestPlan = await getRootDisplayPlanForDisplay();
     return {
       ...user,
+      email: passwordOwner?.email ?? user.email ?? null,
+      avatarUrl:
+        authProviders.find((provider) => provider.provider === "GOOGLE" && provider.avatarUrl?.trim())?.avatarUrl?.trim() ||
+        authProviders.find((provider) => provider.avatarUrl?.trim())?.avatarUrl?.trim() ||
+        null,
+      needsPlanSelection: false,
+      hasPassword: Boolean(passwordOwner?.passwordHash),
+      authProviders: authProviders.map((provider) => ({
+        provider: provider.provider,
+        email: provider.email,
+      })),
       billingStatus: "ACTIVE",
       billingPlanName: bestPlan?.name ?? "Root",
       billingPlanCode: bestPlan?.code ?? "ROOT",
@@ -4019,9 +4734,23 @@ async function buildAuthUserPayload(user: {
     };
   }
 
-  const billing = await resolveUserBillingAccess(user.id);
+  if (!billing) {
+    throw new Error("BILLING_SNAPSHOT_MISSING");
+  }
+
   return {
     ...user,
+    email: passwordOwner?.email ?? user.email ?? null,
+    avatarUrl:
+      authProviders.find((provider) => provider.provider === "GOOGLE" && provider.avatarUrl?.trim())?.avatarUrl?.trim() ||
+      authProviders.find((provider) => provider.avatarUrl?.trim())?.avatarUrl?.trim() ||
+      null,
+    needsPlanSelection: Boolean(passwordOwner?.needsPlanSelection),
+    hasPassword: Boolean(passwordOwner?.passwordHash),
+    authProviders: authProviders.map((provider) => ({
+      provider: provider.provider,
+      email: provider.email,
+    })),
     billingStatus: billing.status,
     billingPlanName: billing.plan?.name ?? null,
     billingPlanCode: billing.plan?.code ?? null,
@@ -4197,6 +4926,134 @@ function resolveOauthPublicBaseUrl(request: Request): string | null {
   const forwardedProto = request.get("x-forwarded-proto")?.split(",")[0]?.trim();
   const protocol = forwardedProto || request.protocol || "https";
   return `${protocol}://${host}`;
+}
+
+function renderGoogleOAuthCallbackHtml(input: {
+  success: boolean;
+  message: string;
+  sessionToken?: string | null;
+  user?: Awaited<ReturnType<typeof buildAuthUserPayload>> | null;
+}): string {
+  const title = input.success ? "Conta Google conectada" : "Falha no login com Google";
+  const payload = JSON.stringify({
+    type: "socialup-google-oauth",
+    success: input.success,
+    message: input.message,
+    sessionToken: input.sessionToken ?? null,
+    user: input.user ?? null,
+  });
+  const toneColor = input.success ? "#166534" : "#9f1239";
+  const toneBackground = input.success ? "#ecfdf3" : "#fff1f2";
+  const toneBorder = input.success ? "#86efac" : "#fecdd3";
+
+  return `<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escapeHtml(title)}</title>
+    <style>
+      :root { color-scheme: light; }
+      body {
+        font-family: "K2D", "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: #ffffff;
+        color: #111827;
+        padding: 24px;
+        box-sizing: border-box;
+      }
+      .card {
+        width: min(100%, 480px);
+        background: #ffffff;
+        border: 1px solid #dce3ee;
+        border-radius: 24px;
+        padding: 24px;
+        box-shadow: 0 18px 42px rgba(15, 23, 42, 0.08);
+      }
+      h1 {
+        margin: 0;
+        font-size: 26px;
+        line-height: 1.15;
+        font-weight: 500;
+      }
+      .status {
+        margin-top: 14px;
+        border-radius: 14px;
+        padding: 13px 14px;
+        font-size: 15px;
+        line-height: 1.45;
+        color: ${toneColor};
+        background: ${toneBackground};
+        border: 1px solid ${toneBorder};
+      }
+      .hint {
+        margin-top: 14px;
+        color: #64748b;
+        font-size: 13px;
+      }
+      .action-row {
+        margin-top: 18px;
+        display: flex;
+        justify-content: flex-end;
+      }
+      button {
+        font-family: inherit;
+        appearance: none;
+        border: 1px solid #dce3ee;
+        background: #f8fafc;
+        color: #334155;
+        border-radius: 12px;
+        padding: 10px 14px;
+        font-size: 14px;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <h1>${escapeHtml(title)}</h1>
+      <div class="status">${escapeHtml(input.message)}</div>
+      <div class="hint">Esta janela será fechada automaticamente.</div>
+      <div class="action-row">
+        <button type="button" id="google-oauth-close">Fechar janela</button>
+      </div>
+    </main>
+    <script>
+      (function () {
+        var payload = ${payload};
+
+        function notifyOpener() {
+          try {
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage(payload, "*");
+            }
+          } catch (_) {}
+        }
+
+        function closeWindow() {
+          try { window.close(); } catch (_) {}
+          try {
+            window.open("about:blank", "_self");
+            window.close();
+          } catch (_) {}
+          try {
+            window.location.replace("about:blank");
+          } catch (_) {}
+        }
+
+        notifyOpener();
+        var closeButton = document.getElementById("google-oauth-close");
+        if (closeButton) {
+          closeButton.addEventListener("click", closeWindow);
+        }
+        window.setTimeout(closeWindow, 180);
+      })();
+    </script>
+  </body>
+</html>`;
 }
 
 function buildInstagramOAuthReturnUrl(input: {
@@ -4895,6 +5752,8 @@ async function syncPostForMeConnectionsForBase(input: {
   baseConnectionId: string;
   actorUserId: string;
   providerAccountIdHint?: string | null;
+  knownRemoteAccountIds?: string[] | null;
+  preferRecentPlatformAccount?: boolean;
 }): Promise<{
   primaryConnection: Prisma.SocialConnectionGetPayload<Record<string, never>>;
   importedConnections: Prisma.SocialConnectionGetPayload<Record<string, never>>[];
@@ -4927,7 +5786,15 @@ async function syncPostForMeConnectionsForBase(input: {
     externalId,
   });
   const normalizedProviderAccountIdHint = input.providerAccountIdHint?.trim() || "";
+  const normalizedKnownRemoteAccountIds = Array.from(
+    new Set(
+      (input.knownRemoteAccountIds ?? [])
+        .map((entry) => entry.trim())
+        .filter((entry): entry is string => Boolean(entry)),
+    ),
+  );
   let remoteAccounts = remoteAccountsByExternalId;
+  let fallbackPrimaryRemoteAccount: PostForMeSocialAccountRecord | null = null;
 
   if (
     normalizedProviderAccountIdHint &&
@@ -4941,15 +5808,34 @@ async function syncPostForMeConnectionsForBase(input: {
     );
 
     if (hintedRemoteAccount) {
-      const mergedRemoteAccounts = [
-        hintedRemoteAccount,
-        ...remoteAccounts.filter((account) => account.id !== hintedRemoteAccount.id),
-      ];
-      remoteAccounts = mergedRemoteAccounts;
+      fallbackPrimaryRemoteAccount = hintedRemoteAccount;
     }
+  } else if (
+    remoteAccounts.length === 0 &&
+    input.preferRecentPlatformAccount &&
+    !baseConnection.providerAccountId?.trim()
+  ) {
+    const remoteAccountsByPlatform = await listPostForMeSocialAccounts({
+      platform: baseConnection.platform,
+    });
+    const newRemoteAccounts =
+      normalizedKnownRemoteAccountIds.length > 0
+        ? remoteAccountsByPlatform.filter((account) => !normalizedKnownRemoteAccountIds.includes(account.id))
+        : [];
+    const orderedFallbackCandidates = (newRemoteAccounts.length > 0 ? newRemoteAccounts : remoteAccountsByPlatform).sort(
+      (left, right) => resolvePostForMeAccountSyncTimestamp(right) - resolvePostForMeAccountSyncTimestamp(left),
+    );
+    fallbackPrimaryRemoteAccount = orderedFallbackCandidates[0] ?? null;
   }
 
-  if (remoteAccounts.length === 0) {
+  if (fallbackPrimaryRemoteAccount) {
+    remoteAccounts = [
+      fallbackPrimaryRemoteAccount,
+      ...remoteAccounts.filter((account) => account.id !== fallbackPrimaryRemoteAccount?.id),
+    ];
+  }
+
+  if (remoteAccounts.length === 0 && !fallbackPrimaryRemoteAccount) {
     const refreshedBaseConnection = await prisma.socialConnection.update({
       where: { id: baseConnection.id },
       data: {
@@ -4979,6 +5865,7 @@ async function syncPostForMeConnectionsForBase(input: {
       : orderedRemoteAccounts;
   const primaryRemoteAccount =
     hintedPrimaryRemoteAccount ??
+    fallbackPrimaryRemoteAccount ??
     replacementCandidates[0] ??
     orderedRemoteAccounts[0] ??
     null;
@@ -5093,12 +5980,20 @@ async function syncConnectionRuntimeState(connection: {
   const overlayQrStatus = typeof overlay.qrStatus === "string" ? overlay.qrStatus : null;
   const overlayWorkerLastSeenAt =
     overlay.workerLastSeenAt instanceof Date ? overlay.workerLastSeenAt : null;
+  const hasRecentQrOverlayActivity =
+    overlayWorkerLastSeenAt !== null &&
+    now.getTime() - overlayWorkerLastSeenAt.getTime() < 2 * 60 * 1000 &&
+    (overlayQrStatus === "PREPARING" || overlayQrStatus === "WAITING_QR_SCAN");
   const hasRecentConnectedOverlay =
     overlayQrStatus === "CONNECTED" &&
     overlayWorkerLastSeenAt !== null &&
     now.getTime() - overlayWorkerLastSeenAt.getTime() < 2 * 60 * 1000;
   const hasRecentLastAuthAt =
     connection.lastAuthAt instanceof Date && now.getTime() - connection.lastAuthAt.getTime() < 2 * 60 * 1000;
+  const hasRecentAuthInProgressSeenAt =
+    connection.authStatus === "AUTH_IN_PROGRESS" &&
+    connection.lastSeenAt instanceof Date &&
+    now.getTime() - connection.lastSeenAt.getTime() < 2 * 60 * 1000;
 
   let runtimeAuthStatus: "CONNECTED" | "AUTH_IN_PROGRESS" | "AUTH_REQUIRED" | null = null;
   try {
@@ -5130,6 +6025,14 @@ async function syncConnectionRuntimeState(connection: {
     connection.authStatus === "CONNECTED" &&
     runtimeAuthStatus !== "CONNECTED" &&
     (hasRecentConnectedOverlay || hasRecentLastAuthAt)
+  ) {
+    return connection;
+  }
+
+  if (
+    connection.authStatus === "AUTH_IN_PROGRESS" &&
+    runtimeAuthStatus === "AUTH_REQUIRED" &&
+    (hasRecentQrOverlayActivity || hasRecentAuthInProgressSeenAt)
   ) {
     return connection;
   }
@@ -5426,6 +6329,11 @@ function mapAviso(aviso: {
   message: string;
   readAt: Date | null;
   createdAt: Date;
+  createdBy?: {
+    id: string;
+    name: string;
+    username: string;
+  } | null;
 }): Record<string, unknown> {
   return {
     id: aviso.id,
@@ -5434,6 +6342,13 @@ function mapAviso(aviso: {
     message: aviso.message,
     readAt: aviso.readAt,
     createdAt: aviso.createdAt,
+    createdBy: aviso.createdBy
+      ? {
+          id: aviso.createdBy.id,
+          name: aviso.createdBy.name,
+          username: aviso.createdBy.username,
+        }
+      : null,
   };
 }
 
@@ -5724,6 +6639,47 @@ async function appendWorkspaceAvisoSafely(input: {
   }
 }
 
+async function appendWorkspaceAvisoForOtherUsers(input: {
+  companyId: string;
+  title: string;
+  message: string;
+  kind?: string;
+  createdByUserId?: string | null;
+  excludeUserId?: string | null;
+}): Promise<{ createdCount: number }> {
+  try {
+    const userIds = await resolveLiveUpdateRecipientUserIdsForWorkspace(input.companyId);
+    const targetUserIds = Array.from(
+      new Set(
+        userIds
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+          .filter((userId) => userId !== (input.excludeUserId?.trim() || "")),
+      ),
+    );
+
+    if (targetUserIds.length === 0) {
+      return { createdCount: 0 };
+    }
+
+    await prisma.aviso.createMany({
+      data: targetUserIds.map((userId) => ({
+        userId,
+        title: input.title,
+        message: input.message,
+        kind: input.kind ?? "SYSTEM",
+        createdByUserId: input.createdByUserId ?? null,
+      })),
+    });
+
+    notifyLiveUpdateForUsers(targetUserIds, ["avisos"], input.companyId);
+    return { createdCount: targetUserIds.length };
+  } catch (error) {
+    console.error("Failed to append workspace aviso for other users", error);
+    return { createdCount: 0 };
+  }
+}
+
 async function appendBillingAvisoSafely(input: {
   userId: string;
   title: string;
@@ -5740,6 +6696,396 @@ async function appendBillingAvisoSafely(input: {
   } catch (error) {
     console.error("Failed to append billing aviso", error);
   }
+}
+
+function isAggregatedSchedulerJobAvisoKind(kind?: string): boolean {
+  const normalizedKind = kind?.trim().toUpperCase() || "";
+  return (
+    normalizedKind === "JOB_SENT" ||
+    normalizedKind === "JOB_SENT_UNCONFIRMED" ||
+    normalizedKind === "JOB_FAILED" ||
+    normalizedKind === "JOB_WAITING_LOGIN"
+  );
+}
+
+function isGroupedJobSuccessfulStatus(status: string): boolean {
+  return status === "COMPLETED" || status === "SENT_UNCONFIRMED";
+}
+
+function isGroupedJobFailureStatus(status: string): boolean {
+  return status === "FAILED" || status === "WAITING_LOGIN" || status === "CANCELED";
+}
+
+function isGroupedJobTerminalStatus(status: string): boolean {
+  return isGroupedJobSuccessfulStatus(status) || isGroupedJobFailureStatus(status);
+}
+
+function groupedNoticeNetworkLabelForPublicationType(publicationType: PublicationType): string {
+  switch (publicationType) {
+    case "facebook_post":
+      return "Facebook";
+    case "threads_post":
+      return "Threads";
+    case "tiktok_post":
+      return "TikTok";
+    case "x_post":
+      return "X";
+    case "whatsapp_status_midia":
+    case "whatsapp_status_texto":
+      return "WhatsApp Status";
+    case "instagram_story":
+    case "instagram_reel":
+    case "instagram_post":
+    default:
+      return "Instagram";
+  }
+}
+
+function formatGroupedNoticeNetworkList(labels: string[]): string {
+  if (labels.length === 0) {
+    return "";
+  }
+
+  if (labels.length === 1) {
+    return labels[0]!;
+  }
+
+  if (labels.length === 2) {
+    return `${labels[0]} e ${labels[1]}`;
+  }
+
+  return `${labels.slice(0, -1).join(", ")} e ${labels[labels.length - 1]}`;
+}
+
+function resolveLatestJobsPerPublicationType<T extends { publicationType: string; createdAt: Date }>(jobs: T[]): T[] {
+  const latestByPublicationType = new Map<string, T>();
+
+  jobs.forEach((job) => {
+    const current = latestByPublicationType.get(job.publicationType);
+    if (!current || job.createdAt.getTime() > current.createdAt.getTime()) {
+      latestByPublicationType.set(job.publicationType, job);
+    }
+  });
+
+  return Array.from(latestByPublicationType.values());
+}
+
+function buildGroupedJobAvisoSubject(job: {
+  id: string;
+  title?: string | null;
+  caption: string | null;
+}): string {
+  const titleSnippet = compactAvisoText(job.title, 90);
+  const captionSnippet = compactAvisoText(job.caption, 90);
+  return titleSnippet || captionSnippet ? `"${titleSnippet || captionSnippet}"` : `Job ${job.id}`;
+}
+
+async function appendAvisoOnce(input: {
+  userId: string;
+  title: string;
+  message: string;
+  kind: string;
+  dedupeWindowMs?: number;
+}): Promise<void> {
+  const dedupeWindowMs = input.dedupeWindowMs ?? 72 * 60 * 60 * 1000;
+  const existing = await prisma.aviso.findFirst({
+    where: {
+      userId: input.userId,
+      title: input.title,
+      message: input.message,
+      kind: input.kind,
+      createdAt: {
+        gte: new Date(Date.now() - dedupeWindowMs),
+      },
+    },
+    select: {
+      id: true,
+    },
+  });
+
+  if (existing) {
+    return;
+  }
+
+  await appendAviso({
+    userId: input.userId,
+    title: input.title,
+    message: input.message,
+    kind: input.kind,
+  });
+}
+
+async function appendGroupedJobOutcomeAvisosIfReady(jobId: string): Promise<boolean> {
+  const currentJob = await prisma.job.findUnique({
+    where: { id: jobId },
+    select: {
+      id: true,
+      companyId: true,
+      createdByUserId: true,
+      title: true,
+      caption: true,
+      publicationType: true,
+      locationName: true,
+      status: true,
+      createdAt: true,
+      publicationState: true,
+    },
+  });
+
+  if (!currentJob?.createdByUserId || normalizePublicationState(currentJob.publicationState) !== "PUBLISHED") {
+    return false;
+  }
+
+  const schedulerGroupId = decodeMetaLocationStorage(currentJob.locationName).schedulerGroupId?.trim() || "";
+  if (!schedulerGroupId) {
+    return false;
+  }
+
+  const candidateJobs = await prisma.job.findMany({
+    where: {
+      companyId: currentJob.companyId,
+      createdByUserId: currentJob.createdByUserId,
+      publicationState: "PUBLISHED",
+    },
+    select: {
+      id: true,
+      companyId: true,
+      createdByUserId: true,
+      title: true,
+      caption: true,
+      publicationType: true,
+      locationName: true,
+      status: true,
+      createdAt: true,
+    },
+  });
+
+  const groupedJobs = resolveLatestJobsPerPublicationType(
+    candidateJobs.filter((entry) => {
+      if (parseWhatsappRelinkParentMarker(entry.locationName)) {
+        return false;
+      }
+
+      return decodeMetaLocationStorage(entry.locationName).schedulerGroupId?.trim() === schedulerGroupId;
+    }),
+  );
+
+  if (groupedJobs.length < 2) {
+    return false;
+  }
+
+  if (!groupedJobs.every((entry) => isGroupedJobTerminalStatus(entry.status))) {
+    return true;
+  }
+
+  const successLabels = Array.from(
+    new Set(
+      groupedJobs
+        .filter((entry) => isGroupedJobSuccessfulStatus(entry.status))
+        .map((entry) => groupedNoticeNetworkLabelForPublicationType(normalizePublicationType(entry))),
+    ),
+  );
+  const failureLabels = Array.from(
+    new Set(
+      groupedJobs
+        .filter((entry) => isGroupedJobFailureStatus(entry.status))
+        .map((entry) => groupedNoticeNetworkLabelForPublicationType(normalizePublicationType(entry))),
+    ),
+  );
+
+  const subject = buildGroupedJobAvisoSubject(currentJob);
+
+  if (successLabels.length > 0) {
+    await appendAvisoOnce({
+      userId: currentJob.createdByUserId,
+      title: "Postagem publicada",
+      kind: "JOB_SENT",
+      message: `${subject}. Publicação concluída com sucesso em ${formatGroupedNoticeNetworkList(successLabels)}.`,
+    });
+  }
+
+  if (failureLabels.length > 0) {
+    await appendAvisoOnce({
+      userId: currentJob.createdByUserId,
+      title: "Falha na postagem",
+      kind: "JOB_FAILED",
+      message: `${subject}. Não foi possível publicar em ${formatGroupedNoticeNetworkList(failureLabels)}.`,
+    });
+  }
+
+  return true;
+}
+
+async function findPublicationPreviewContext(
+  request: Request & { adminUser?: AdminUserAuth },
+  jobId: string,
+) {
+  const baseJob = await prisma.job.findUnique({
+    where: { id: jobId },
+    include: {
+      company: {
+        select: {
+          id: true,
+          name: true,
+          color: true,
+          createdByUserId: true,
+          kind: true,
+          status: true,
+          createdAt: true,
+          members: {
+            orderBy: [{ createdAt: "asc" }],
+            select: {
+              id: true,
+              userId: true,
+              role: true,
+              createdAt: true,
+              user: {
+                select: {
+                  id: true,
+                  name: true,
+                  username: true,
+                },
+              },
+            },
+          },
+          invites: {
+            where: {
+              revokedAt: null,
+            },
+            orderBy: [{ createdAt: "desc" }],
+            select: {
+              id: true,
+              inviteKey: true,
+              role: true,
+              usedAt: true,
+              revokedAt: true,
+              createdAt: true,
+              acceptedByUserId: true,
+            },
+          },
+        },
+      },
+      socialConnection: {
+        select: {
+          id: true,
+          displayName: true,
+          loginIdentifier: true,
+        },
+      },
+    },
+  });
+
+  if (!baseJob) {
+    throw new Error("JOB_NOT_FOUND");
+  }
+
+  const workspace = baseJob.company as WorkspacePermissionContext;
+  if (!canCurrentUserAccessWorkspace(request, workspace)) {
+    throw new Error("WORKSPACE_FORBIDDEN");
+  }
+
+  const schedulerGroupKey = resolveJobPreviewGroupKey(baseJob);
+  const candidateJobs = schedulerGroupKey === baseJob.id
+    ? [baseJob]
+    : await prisma.job.findMany({
+        where: {
+          companyId: baseJob.companyId,
+          NOT: {
+            publicationType: "whatsapp_status_texto",
+          },
+        },
+        include: {
+          socialConnection: {
+            select: {
+              id: true,
+              displayName: true,
+              loginIdentifier: true,
+            },
+          },
+        },
+        orderBy: [{ criadoEm: "asc" }],
+      });
+
+  const groupedJobs = resolveLatestJobsPerPublicationType(
+    candidateJobs.filter((entry) => {
+      if (parseWhatsappRelinkParentMarker(entry.locationName)) {
+        return false;
+      }
+
+      return resolveJobPreviewGroupKey(entry) === schedulerGroupKey;
+    }),
+  ).sort((left, right) => new Date(left.dataPostagem).getTime() - new Date(right.dataPostagem).getTime());
+
+  const previewJobs = groupedJobs.length > 0 ? groupedJobs : [baseJob];
+  const approval = await prisma.publicationApproval.findUnique({
+    where: {
+      companyId_schedulerGroupKey: {
+        companyId: baseJob.companyId,
+        schedulerGroupKey,
+      },
+    },
+    include: {
+      decidedBy: {
+        select: {
+          id: true,
+          name: true,
+          username: true,
+        },
+      },
+      comments: {
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+              username: true,
+            },
+          },
+          reactions: {
+            select: {
+              emoji: true,
+              userId: true,
+            },
+          },
+        },
+        orderBy: [{ createdAt: "asc" }],
+      },
+    },
+  });
+
+  return {
+    baseJob,
+    previewJobs,
+    schedulerGroupKey,
+    workspace,
+    currentUserRole: request.adminUser?.id
+      ? resolveCurrentWorkspaceRole(workspace, request.adminUser.id)
+      : null,
+    approval,
+  };
+}
+
+async function ensurePublicationApprovalRecord(input: {
+  companyId: string;
+  schedulerGroupKey: string;
+  titleSnapshot?: string | null;
+}) {
+  return prisma.publicationApproval.upsert({
+    where: {
+      companyId_schedulerGroupKey: {
+        companyId: input.companyId,
+        schedulerGroupKey: input.schedulerGroupKey,
+      },
+    },
+    update: {
+      titleSnapshot: input.titleSnapshot ?? undefined,
+    },
+    create: {
+      companyId: input.companyId,
+      schedulerGroupKey: input.schedulerGroupKey,
+      titleSnapshot: input.titleSnapshot ?? null,
+    },
+  });
 }
 
 async function appendJobAvisoSafely(
@@ -5762,6 +7108,14 @@ async function appendJobAvisoSafely(
   },
 ): Promise<void> {
   if (!job.createdByUserId) {
+    return;
+  }
+
+  if (isAggregatedSchedulerJobAvisoKind(input.kind) && (await appendGroupedJobOutcomeAvisosIfReady(job.id))) {
+    const companyId = job.companyId?.trim() || "";
+    if (companyId) {
+      notifyLiveUpdateForWorkspace(companyId, ["jobs", "dashboard", "avisos"]);
+    }
     return;
   }
 
@@ -6005,6 +7359,16 @@ function normalizeAutomationErrorCode(message: string): string {
 
 function summarizeFailureMessageForAviso(publicationType: PublicationType, rawMessage: string): string {
   const normalized = rawMessage.trim().toLowerCase();
+
+  if (
+    normalized.includes("invalid or expired token") ||
+    normalized.includes("missing user identifier") ||
+    normalized.includes("social account") && normalized.includes("disconnect") ||
+    normalized.includes("social account") && normalized.includes("not connected") ||
+    normalized.includes("social account") && normalized.includes("revoked")
+  ) {
+    return "A conta conectada precisa de renovação para continuar publicando. Renove o acesso e tente novamente.";
+  }
 
   if (publicationType === "instagram_post" || publicationType === "instagram_reel" || publicationType === "instagram_story") {
     if (normalized.includes("story_sequence_step_failed")) {
@@ -10184,6 +11548,7 @@ app.get("/auth/setup-access", async (request, response) => {
 app.post("/auth/setup-access", async (request, response) => {
   const payload = createUserFromInviteSchema.parse(request.body);
   const billingSettings = await getBillingSettingsSnapshot();
+  const normalizedEmail = normalizeEmail(payload.email);
 
   const invite = await prisma.setupInvite.findFirst({
     where: {
@@ -10206,65 +11571,39 @@ app.post("/auth/setup-access", async (request, response) => {
     return;
   }
 
-  const user = await prisma.$transaction(async (transaction) => {
-    const now = new Date();
-    const trialPlan = billingSettings.autoTrialEnabled
-      ? await transaction.plan.findFirst({
-          where: {
-            isActive: true,
-            isTrial: true,
-          },
-          orderBy: {
-            createdAt: "asc",
-          },
-        })
-      : null;
-    const fallbackPaidPlan = !trialPlan
-      ? await transaction.plan.findFirst({
-          where: {
-            isActive: true,
-            isTrial: false,
-          },
-          orderBy: {
-            createdAt: "asc",
-          },
-        })
-      : null;
+  const existingEmailOwner = normalizedEmail
+    ? await prisma.user.findUnique({
+        where: { email: normalizedEmail },
+        select: { id: true },
+      })
+    : null;
+  if (existingEmailOwner) {
+    response.status(409).json({ error: "Ja existe uma conta com esse email." });
+    return;
+  }
 
+  const user = await prisma.$transaction(async (transaction) => {
     const createdUser = await transaction.user.create({
       data: {
         name: payload.name,
+        email: normalizedEmail,
         username: payload.username,
         passwordHash: hashPassword(payload.password),
+        needsPlanSelection: true,
         role: "ADMIN",
       },
       select: {
         id: true,
         name: true,
         username: true,
+        email: true,
         role: true,
         timeZone: true,
         createdAt: true,
       },
     });
 
-    const hasAutoTrial = billingSettings.autoTrialEnabled && billingSettings.autoTrialDays > 0 && trialPlan;
-    const trialEndsAt = hasAutoTrial
-      ? new Date(now.getTime() + billingSettings.autoTrialDays * 24 * 60 * 60 * 1000)
-      : null;
-
-    await transaction.userPlanSubscription.create({
-      data: {
-        userId: createdUser.id,
-        planId: hasAutoTrial ? trialPlan.id : fallbackPaidPlan?.id ?? null,
-        status: hasAutoTrial ? "TRIALING" : "PAYMENT_REQUIRED",
-        billingModel: hasAutoTrial ? "TRIAL" : "NONE",
-        startsAt: now,
-        trialEndsAt,
-        endsAt: trialEndsAt,
-        blockedReason: hasAutoTrial ? null : "Aguardando pagamento inicial.",
-      },
-    });
+    await createInitialBillingSubscriptionForUser(transaction, createdUser.id, billingSettings);
 
     await transaction.setupInvite.update({
       where: { id: invite.id },
@@ -10325,7 +11664,7 @@ app.post("/auth/workspace-access/accept", adminAuthMiddleware, async (request, r
     }
 
     response.status(201).json({
-      workspace: mapWorkspaceForClient(authRequest, workspace),
+      workspace: await mapWorkspaceForClient(authRequest, workspace),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "WORKSPACE_INVITE_INVALID";
@@ -10340,6 +11679,7 @@ app.post("/auth/workspace-access/accept", adminAuthMiddleware, async (request, r
 
 app.post("/auth/workspace-access/setup", async (request, response) => {
   const payload = createUserFromWorkspaceInviteSchema.parse(request.body);
+  const normalizedEmail = normalizeEmail(payload.email);
   const existingInvite = await prisma.companyInvite.findFirst({
     where: {
       inviteKey: payload.key,
@@ -10365,11 +11705,23 @@ app.post("/auth/workspace-access/setup", async (request, response) => {
     return;
   }
 
+  const existingEmailOwner = normalizedEmail
+    ? await prisma.user.findUnique({
+        where: { email: normalizedEmail },
+        select: { id: true },
+      })
+    : null;
+  if (existingEmailOwner) {
+    response.status(409).json({ error: "Ja existe uma conta com esse email." });
+    return;
+  }
+
   try {
     const createdUser = await prisma.$transaction(async (transaction) => {
       const user = await transaction.user.create({
         data: {
           name: payload.name,
+          email: normalizedEmail,
           username: payload.username,
           passwordHash: hashPassword(payload.password),
           role: "ADMIN",
@@ -10378,6 +11730,7 @@ app.post("/auth/workspace-access/setup", async (request, response) => {
           id: true,
           name: true,
           username: true,
+          email: true,
           timeZone: true,
           role: true,
         },
@@ -10420,12 +11773,10 @@ app.post("/auth/workspace-access/setup", async (request, response) => {
 
 app.post("/auth/login", async (request, response) => {
   const payload = loginSchema.parse(request.body);
-  const user = await prisma.user.findUnique({
-    where: { username: payload.username },
-  });
+  const user = await findUserByLoginIdentifier(payload.identifier);
 
   if (!user || !verifyPassword(payload.password, user.passwordHash)) {
-    response.status(401).json({ error: "Username ou senha invalidos." });
+    response.status(401).json({ error: "Email, usuario ou senha invalidos." });
     return;
   }
 
@@ -10440,6 +11791,7 @@ app.post("/auth/login", async (request, response) => {
       id: true,
       name: true,
       username: true,
+      email: true,
       timeZone: true,
       role: true,
     },
@@ -10451,6 +11803,52 @@ app.post("/auth/login", async (request, response) => {
     sessionToken,
     user: authUserPayload,
   });
+});
+
+app.post("/auth/firebase/google", async (request, response) => {
+  const payload = firebaseGoogleLoginSchema.parse(request.body);
+
+  try {
+    if (!isFirebaseAdminConfigured()) {
+      response.status(500).json({ error: "O login com Google ainda não está configurado no backend." });
+      return;
+    }
+
+    const profile = await verifyFirebaseGoogleIdToken(payload.idToken);
+    const resolvedUser = await resolveOrCreateGoogleAuthUser({
+      providerUserId: profile.providerUserId,
+      email: profile.email,
+      emailVerified: profile.emailVerified,
+      displayName: profile.displayName,
+      avatarUrl: profile.avatarUrl,
+      metadata: profile.metadata as Prisma.InputJsonValue,
+    });
+
+    const sessionToken = createRandomToken();
+    const authenticatedUser = await prisma.user.update({
+      where: { id: resolvedUser.id },
+      data: {
+        sessionToken,
+        sessionIssuedAt: new Date(),
+      },
+      select: {
+        id: true,
+        name: true,
+        username: true,
+        email: true,
+        timeZone: true,
+        role: true,
+      },
+    });
+
+    const authUserPayload = await buildAuthUserPayload(authenticatedUser);
+    response.json({
+      sessionToken,
+      user: authUserPayload,
+    });
+  } catch (error) {
+    response.status(400).json({ error: resolveFirebaseGoogleAuthFailureMessage(error) });
+  }
 });
 
 app.get("/auth/me", adminAuthMiddleware, async (request, response) => {
@@ -10475,10 +11873,24 @@ app.put("/auth/profile", adminAuthMiddleware, async (request, response) => {
     return;
   }
 
+  const normalizedEmail = normalizeEmail(payload.email);
+  const emailOwner = normalizedEmail
+    ? await prisma.user.findUnique({
+        where: { email: normalizedEmail },
+        select: { id: true },
+      })
+    : null;
+
+  if (emailOwner && emailOwner.id !== user.id) {
+    response.status(409).json({ error: "Ja existe uma conta com esse email." });
+    return;
+  }
+
   const updatedUser = await prisma.user.update({
     where: { id: user.id },
     data: {
       name: payload.name,
+      email: normalizedEmail,
       username: payload.username,
       passwordHash: payload.password ? hashPassword(payload.password) : undefined,
       timeZone:
@@ -10490,6 +11902,7 @@ app.put("/auth/profile", adminAuthMiddleware, async (request, response) => {
       id: true,
       name: true,
       username: true,
+      email: true,
       timeZone: true,
       role: true,
     },
@@ -10509,6 +11922,214 @@ app.post("/auth/logout", adminAuthMiddleware, async (request, response) => {
     },
   });
   response.status(204).send();
+});
+
+function resolveGoogleAuthFailureMessage(error: unknown): string {
+  const rawMessage = error instanceof Error ? error.message.trim() : "";
+
+  if (rawMessage.startsWith("GOOGLE_CONFIG_MISSING")) {
+    return "O login com Google ainda não foi configurado neste ambiente.";
+  }
+
+  if (rawMessage === "GOOGLE_EMAIL_NOT_VERIFIED") {
+    return "Sua conta do Google precisa ter um email verificado para entrar na SocialUp.";
+  }
+
+  if (rawMessage === "GOOGLE_ACCOUNT_ALREADY_LINKED") {
+    return "Este email já está vinculado a outro login do Google.";
+  }
+
+  if (rawMessage.startsWith("GOOGLE_PROFILE_INVALID")) {
+    return "Não foi possível identificar os dados essenciais da sua conta do Google.";
+  }
+
+  if (rawMessage.startsWith("GOOGLE_TOKEN_EXCHANGE_FAILED")) {
+    return "Falha ao validar o retorno do Google. Tente entrar novamente.";
+  }
+
+  if (rawMessage.startsWith("GOOGLE_USERINFO_FAILED")) {
+    return "Falha ao ler os dados da sua conta do Google. Tente novamente.";
+  }
+
+  return "Falha ao entrar com Google.";
+}
+
+function resolveFirebaseGoogleAuthFailureMessage(error: unknown): string {
+  const rawMessage = error instanceof Error ? error.message.trim() : "";
+
+  if (!rawMessage) {
+    return "Falha ao entrar com Google.";
+  }
+
+  if (rawMessage === "FIREBASE_ADMIN_NOT_CONFIGURED") {
+    return "O login com Google ainda não está configurado no backend.";
+  }
+
+  if (
+    rawMessage === "FIREBASE_ID_TOKEN_MISSING" ||
+    rawMessage === "FIREBASE_GOOGLE_EMAIL_MISSING" ||
+    rawMessage === "FIREBASE_GOOGLE_SUB_MISSING"
+  ) {
+    return "Não foi possível identificar os dados essenciais da sua conta Google.";
+  }
+
+  if (rawMessage === "FIREBASE_GOOGLE_EMAIL_NOT_VERIFIED") {
+    return "O email da sua conta Google precisa estar verificado para continuar.";
+  }
+
+  if (rawMessage === "FIREBASE_GOOGLE_PROVIDER_REQUIRED") {
+    return "O token recebido não pertence a um login do Google.";
+  }
+
+  if (
+    rawMessage.includes("Firebase ID token has expired") ||
+    rawMessage.includes("verifyIdToken() expects an ID token") ||
+    rawMessage.includes("argument-error")
+  ) {
+    return "O login do Google expirou antes de chegar ao backend. Tente novamente.";
+  }
+
+  if (rawMessage === "GOOGLE_ACCOUNT_ALREADY_LINKED") {
+    return "Este email já está vinculado a outro login do Google.";
+  }
+
+  if (rawMessage === "GOOGLE_EMAIL_NOT_VERIFIED") {
+    return "O email da sua conta Google precisa estar verificado para continuar.";
+  }
+
+  return "Falha ao entrar com Google.";
+}
+
+app.get("/auth/google/launch", async (request, response) => {
+  try {
+    const redirectUri = resolveGoogleOAuthRedirectUri(resolveOauthPublicBaseUrl(request));
+    if (!redirectUri) {
+      response.status(500).json({ error: "Não foi possível determinar a URL de retorno do Google." });
+      return;
+    }
+
+    const launchUrl = createGoogleOAuthLaunchUrl({ redirectUri });
+    response.json({ launchUrl });
+  } catch (error) {
+    response.status(400).json({ error: resolveGoogleAuthFailureMessage(error) });
+  }
+});
+
+app.get("/auth/google/callback", async (request, response) => {
+  const state = typeof request.query.state === "string" ? request.query.state.trim() : "";
+  const code = typeof request.query.code === "string" ? request.query.code.trim() : "";
+  const oauthError = typeof request.query.error === "string" ? request.query.error.trim() : "";
+  const oauthErrorDescription =
+    typeof request.query.error_description === "string" ? request.query.error_description.trim() : "";
+
+  const redirectUri = resolveGoogleOAuthRedirectUri(resolveOauthPublicBaseUrl(request));
+  if (!redirectUri) {
+    response
+      .status(500)
+      .setHeader("Content-Type", "text/html; charset=utf-8")
+      .send(
+        renderGoogleOAuthCallbackHtml({
+          success: false,
+          message: "O login com Google não está configurado corretamente neste ambiente.",
+        }),
+      );
+    return;
+  }
+
+  if (!state || !consumeGoogleOAuthState(state)) {
+    response
+      .status(400)
+      .setHeader("Content-Type", "text/html; charset=utf-8")
+      .send(
+        renderGoogleOAuthCallbackHtml({
+          success: false,
+          message: "A autorização do Google expirou ou não é mais válida. Gere um novo login no painel.",
+        }),
+      );
+    return;
+  }
+
+  if (oauthError) {
+    response
+      .status(400)
+      .setHeader("Content-Type", "text/html; charset=utf-8")
+      .send(
+        renderGoogleOAuthCallbackHtml({
+          success: false,
+          message: oauthErrorDescription || oauthError,
+        }),
+      );
+    return;
+  }
+
+  if (!code) {
+    response
+      .status(400)
+      .setHeader("Content-Type", "text/html; charset=utf-8")
+      .send(
+        renderGoogleOAuthCallbackHtml({
+          success: false,
+          message: "O Google não retornou um código de autorização válido.",
+        }),
+      );
+    return;
+  }
+
+  try {
+    const profile = await exchangeGoogleOAuthCodeForProfile({
+      code,
+      redirectUri,
+    });
+
+    const resolvedUser = await resolveOrCreateGoogleAuthUser({
+      providerUserId: profile.providerUserId,
+      email: profile.email,
+      emailVerified: profile.emailVerified,
+      displayName: profile.displayName,
+      avatarUrl: profile.avatarUrl,
+      metadata: profile.metadata as Prisma.InputJsonValue,
+    });
+
+    const sessionToken = createRandomToken();
+    const authenticatedUser = await prisma.user.update({
+      where: { id: resolvedUser.id },
+      data: {
+        sessionToken,
+        sessionIssuedAt: new Date(),
+      },
+      select: {
+        id: true,
+        name: true,
+        username: true,
+        email: true,
+        timeZone: true,
+        role: true,
+      },
+    });
+
+    const authUserPayload = await buildAuthUserPayload(authenticatedUser);
+    response
+      .status(200)
+      .setHeader("Content-Type", "text/html; charset=utf-8")
+      .send(
+        renderGoogleOAuthCallbackHtml({
+          success: true,
+          message: "Login com Google concluído.",
+          sessionToken,
+          user: authUserPayload,
+        }),
+      );
+  } catch (error) {
+    response
+      .status(400)
+      .setHeader("Content-Type", "text/html; charset=utf-8")
+      .send(
+        renderGoogleOAuthCallbackHtml({
+          success: false,
+          message: resolveGoogleAuthFailureMessage(error),
+        }),
+      );
+  }
 });
 
 app.get("/oauth/instagram/callback", async (request, response) => {
@@ -11204,6 +12825,28 @@ app.post("/connections", async (request, response) => {
     return;
   }
 
+  const maxWhatsappConnections = resolveBillingPlanCapabilities(billingAccess?.plan?.code).maxWhatsappConnections;
+  if (payload.platform === "whatsapp" && maxWhatsappConnections !== null) {
+    const ownerUserId = company.createdByUserId?.trim() || "";
+    const existingWhatsappConnections = ownerUserId
+      ? await prisma.socialConnection.count({
+          where: {
+            platform: "whatsapp",
+            company: {
+              createdByUserId: ownerUserId,
+            },
+          },
+        })
+      : 0;
+
+    if (existingWhatsappConnections >= maxWhatsappConnections) {
+      response.status(409).json({
+        error: `Seu plano permite até ${maxWhatsappConnections} conta(s) de WhatsApp conectada(s).`,
+      });
+      return;
+    }
+  }
+
   const existingConnectionForPlatform = await prisma.socialConnection.findFirst({
     where: {
       companyId: payload.companyId,
@@ -11356,11 +12999,20 @@ app.post("/connections/:id/open-visual-auth", async (request, response) => {
 
   if (isPostForMeProviderConnection(connection)) {
     const connectionExternalId = resolvePostForMeStoredExternalId(connection);
+    const shouldAttachExternalIdAtLaunch = Boolean(connection.providerAccountId?.trim());
+    let knownRemoteAccountIds: string[] = [];
     let launchUrl: string;
     try {
+      knownRemoteAccountIds = (
+        await listPostForMeSocialAccounts({
+          platform: connection.platform,
+        }).catch(() => [])
+      )
+        .map((account) => account.id.trim())
+        .filter((accountId): accountId is string => Boolean(accountId));
       launchUrl = await createPostForMeSocialAccountAuthUrl({
         platform: connection.platform,
-        externalId: connectionExternalId,
+        externalId: shouldAttachExternalIdAtLaunch ? connectionExternalId : null,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "POST_FOR_ME_CONFIG_MISSING";
@@ -11396,6 +13048,7 @@ app.post("/connections/:id/open-visual-auth", async (request, response) => {
     response.json({
       connection: mapConnection(updatedConnection),
       launchUrl,
+      knownRemoteAccountIds,
     });
     return;
   }
@@ -11531,6 +13184,8 @@ app.post("/connections/:id/sync-provider", async (request, response) => {
       baseConnectionId: connection.id,
       actorUserId: authRequest.adminUser!.id,
       providerAccountIdHint: payload.providerAccountIdHint ?? null,
+      knownRemoteAccountIds: payload.knownRemoteAccountIds ?? [],
+      preferRecentPlatformAccount: Boolean(payload.preferRecentPlatformAccount),
     });
 
     response.json({
@@ -11953,7 +13608,7 @@ app.get("/companies", async (request, response) => {
       },
     },
   });
-  response.json(companies.map((company) => mapWorkspaceForClient(authRequest, company)));
+  response.json(await Promise.all(companies.map((company) => mapWorkspaceForClient(authRequest, company))));
 });
 
 app.post("/companies", async (request, response) => {
@@ -12017,7 +13672,7 @@ app.post("/companies", async (request, response) => {
   });
 
   const workspace = await findWorkspaceContextById(company.id);
-  response.status(201).json(mapWorkspaceForClient(authRequest, workspace!));
+  response.status(201).json(await mapWorkspaceForClient(authRequest, workspace!));
 });
 
 app.put("/companies/:id", async (request, response) => {
@@ -12049,7 +13704,7 @@ app.put("/companies/:id", async (request, response) => {
   });
 
   const refreshedWorkspace = await findWorkspaceContextById(updated.id);
-  response.json(mapWorkspaceForClient(authRequest, refreshedWorkspace!));
+  response.json(await mapWorkspaceForClient(authRequest, refreshedWorkspace!));
 });
 
 app.post("/companies/:id/invites", async (request, response) => {
@@ -12068,6 +13723,12 @@ app.post("/companies/:id/invites", async (request, response) => {
 
   if (!canCurrentUserManageWorkspaceMembers(authRequest, workspace)) {
     response.status(403).json({ error: "Você não pode convidar membros para este workspace." });
+    return;
+  }
+
+  const workspacePlanCapabilities = await resolveWorkspaceOwnerPlanCapabilities(workspace);
+  if (!workspacePlanCapabilities.supportsWorkspaceInvites) {
+    response.status(403).json({ error: "Este plano não permite convites ou colaboração entre membros." });
     return;
   }
 
@@ -12126,6 +13787,12 @@ app.delete("/companies/:id/invites/:inviteId", async (request, response) => {
     return;
   }
 
+  const workspacePlanCapabilities = await resolveWorkspaceOwnerPlanCapabilities(workspace);
+  if (!workspacePlanCapabilities.supportsWorkspaceInvites) {
+    response.status(403).json({ error: "Este plano não permite convites ou colaboração entre membros." });
+    return;
+  }
+
   const invite = await prisma.companyInvite.findFirst({
     where: {
       id: request.params.inviteId,
@@ -12173,6 +13840,12 @@ app.delete("/companies/:id/members/:memberId", async (request, response) => {
 
   if (!canCurrentUserManageWorkspaceMembers(authRequest, workspace)) {
     response.status(403).json({ error: "Você não pode remover membros deste workspace." });
+    return;
+  }
+
+  const workspacePlanCapabilities = await resolveWorkspaceOwnerPlanCapabilities(workspace);
+  if (!workspacePlanCapabilities.supportsWorkspaceInvites) {
+    response.status(403).json({ error: "Este plano não permite convites ou colaboração entre membros." });
     return;
   }
 
@@ -12577,6 +14250,419 @@ app.get("/jobs", async (request, response) => {
   );
 });
 
+app.get("/jobs/:id/preview", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+
+  try {
+    const previewContext = await findPublicationPreviewContext(authRequest, request.params.id);
+    const workspacePlanCapabilities = await resolveWorkspaceOwnerPlanCapabilities(previewContext.workspace);
+    const serializedJobs = previewContext.previewJobs.map(serializePublicationPreviewJob);
+    const mediaPaths: string[] = [];
+    const mediaCaptions: Array<string | null> = [];
+    const seenMediaPaths = new Set<string>();
+
+    serializedJobs.forEach((job) => {
+      const paths = job.filePaths && job.filePaths.length > 0 ? job.filePaths : [job.filePath];
+      const captions = job.fileCaptions && job.fileCaptions.length > 0 ? job.fileCaptions : [];
+
+      paths.forEach((filePath, index) => {
+        if (seenMediaPaths.has(filePath)) {
+          return;
+        }
+
+        seenMediaPaths.add(filePath);
+        mediaPaths.push(filePath);
+        mediaCaptions.push(captions[index] ?? null);
+      });
+    });
+
+    const subject = buildPublicationPreviewSubject(previewContext.baseJob);
+    const approval = previewContext.approval;
+
+    response.json({
+      schedulerGroupKey: previewContext.schedulerGroupKey,
+      subject,
+      company: {
+        id: previewContext.workspace.id,
+        name: previewContext.workspace.name,
+        color: previewContext.workspace.color,
+      },
+      currentUserRole: previewContext.currentUserRole,
+      collaborationEnabled: workspacePlanCapabilities.supportsClientApproval,
+      title: previewContext.baseJob.title?.trim() || null,
+      caption: previewContext.baseJob.caption ?? null,
+      publicationState: normalizePublicationState(previewContext.baseJob.publicationState),
+      scheduledAt: previewContext.baseJob.dataPostagem,
+      mediaPaths,
+      mediaCaptions,
+      jobs: serializedJobs,
+      approval: {
+        id: approval?.id ?? null,
+        status: workspacePlanCapabilities.supportsClientApproval ? approval?.status ?? "PENDING" : "PENDING",
+        decidedAt: approval?.decidedAt ?? null,
+        decidedBy: approval?.decidedBy
+          ? {
+              id: approval.decidedBy.id,
+              name: approval.decidedBy.name,
+              username: approval.decidedBy.username,
+            }
+          : null,
+      },
+      comments:
+        workspacePlanCapabilities.supportsClientApproval
+          ? (approval?.comments.map((comment) => serializePublicationApprovalComment(comment, authRequest.adminUser?.id)) ?? [])
+          : [],
+    });
+  } catch (previewError) {
+    const message = previewError instanceof Error ? previewError.message : "PREVIEW_ERROR";
+    if (message === "JOB_NOT_FOUND") {
+      response.status(404).json({ error: "Postagem não encontrada." });
+      return;
+    }
+
+    if (message === "WORKSPACE_FORBIDDEN") {
+      response.status(403).json({ error: "Você não pode visualizar esta publicação." });
+      return;
+    }
+
+    console.error("Failed to load publication preview", previewError);
+    response.status(500).json({ error: "Falha ao carregar a visualização da publicação." });
+  }
+});
+
+app.post("/jobs/:id/preview/comments", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  const payload = publicationPreviewCommentSchema.parse(request.body);
+
+  try {
+    const previewContext = await findPublicationPreviewContext(authRequest, request.params.id);
+    const workspacePlanCapabilities = await resolveWorkspaceOwnerPlanCapabilities(previewContext.workspace);
+    if (!workspacePlanCapabilities.supportsClientApproval) {
+      response.status(403).json({ error: "Este plano não permite feedback colaborativo nesta publicação." });
+      return;
+    }
+    const approval = await ensurePublicationApprovalRecord({
+      companyId: previewContext.baseJob.companyId,
+      schedulerGroupKey: previewContext.schedulerGroupKey,
+      titleSnapshot: previewContext.baseJob.title ?? previewContext.baseJob.caption ?? null,
+    });
+
+    if (payload.parentCommentId) {
+      const parentComment = await prisma.publicationApprovalComment.findFirst({
+        where: {
+          id: payload.parentCommentId,
+          approvalId: approval.id,
+        },
+        select: {
+          id: true,
+        },
+      });
+
+      if (!parentComment) {
+        response.status(404).json({ error: "Comentário de resposta não encontrado." });
+        return;
+      }
+    }
+
+    const comment = await prisma.publicationApprovalComment.create({
+      data: {
+        approvalId: approval.id,
+        userId: authRequest.adminUser!.id,
+        parentCommentId: payload.parentCommentId ?? null,
+        message: payload.message,
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            username: true,
+          },
+        },
+        reactions: {
+          select: {
+            emoji: true,
+            userId: true,
+          },
+        },
+      },
+    });
+
+    const actorName = authRequest.adminUser?.name?.trim() || authRequest.adminUser?.username || "Alguém";
+    const subject = buildPublicationPreviewSubject(previewContext.baseJob);
+    const feedbackSnippet = compactAvisoText(payload.message, 160) || "Abriu uma nova observação na publicação.";
+    await appendWorkspaceAvisoForOtherUsers({
+      companyId: previewContext.baseJob.companyId,
+      createdByUserId: authRequest.adminUser?.id ?? null,
+      excludeUserId: authRequest.adminUser?.id ?? null,
+      kind: "FEEDBACK",
+      title: payload.parentCommentId ? "Nova resposta na publicação" : "Novo feedback na publicação",
+      message: `${actorName} comentou em ${subject}: ${feedbackSnippet}`,
+    });
+
+    response.status(201).json({
+      comment: serializePublicationApprovalComment(comment, authRequest.adminUser?.id),
+      approval: {
+        id: approval.id,
+        status: approval.status,
+        decidedAt: approval.decidedAt,
+      },
+    });
+  } catch (commentError) {
+    const message = commentError instanceof Error ? commentError.message : "COMMENT_ERROR";
+    if (message === "JOB_NOT_FOUND") {
+      response.status(404).json({ error: "Postagem não encontrada." });
+      return;
+    }
+
+    if (message === "WORKSPACE_FORBIDDEN") {
+      response.status(403).json({ error: "Você não pode comentar nesta publicação." });
+      return;
+    }
+
+    console.error("Failed to create publication preview comment", commentError);
+    response.status(500).json({ error: "Falha ao salvar o comentário." });
+  }
+});
+
+app.post("/jobs/:id/preview/comments/:commentId/reactions", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  const payload = publicationPreviewReactionSchema.parse(request.body);
+
+  try {
+    const previewContext = await findPublicationPreviewContext(authRequest, request.params.id);
+    const workspacePlanCapabilities = await resolveWorkspaceOwnerPlanCapabilities(previewContext.workspace);
+    if (!workspacePlanCapabilities.supportsClientApproval) {
+      response.status(403).json({ error: "Este plano não permite feedback colaborativo nesta publicação." });
+      return;
+    }
+    const approval = await ensurePublicationApprovalRecord({
+      companyId: previewContext.baseJob.companyId,
+      schedulerGroupKey: previewContext.schedulerGroupKey,
+      titleSnapshot: previewContext.baseJob.title ?? previewContext.baseJob.caption ?? null,
+    });
+
+    const comment = await prisma.publicationApprovalComment.findFirst({
+      where: {
+        id: request.params.commentId,
+        approvalId: approval.id,
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            username: true,
+          },
+        },
+        reactions: {
+          select: {
+            id: true,
+            emoji: true,
+            userId: true,
+          },
+        },
+      },
+    });
+
+    if (!comment) {
+      response.status(404).json({ error: "Comentário não encontrado." });
+      return;
+    }
+
+    const normalizedEmoji = payload.emoji.trim();
+    const existingReaction = comment.reactions.find(
+      (reaction) => reaction.userId === authRequest.adminUser!.id && reaction.emoji === normalizedEmoji,
+    );
+
+    if (existingReaction) {
+      await prisma.publicationApprovalCommentReaction.delete({
+        where: { id: existingReaction.id },
+      });
+    } else {
+      await prisma.publicationApprovalCommentReaction.create({
+        data: {
+          commentId: comment.id,
+          userId: authRequest.adminUser!.id,
+          emoji: normalizedEmoji,
+        },
+      });
+    }
+
+    const refreshedComment = await prisma.publicationApprovalComment.findUnique({
+      where: { id: comment.id },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            username: true,
+          },
+        },
+        reactions: {
+          select: {
+            emoji: true,
+            userId: true,
+          },
+        },
+      },
+    });
+
+    response.json({
+      comment: refreshedComment
+        ? serializePublicationApprovalComment(refreshedComment, authRequest.adminUser?.id)
+        : serializePublicationApprovalComment(comment, authRequest.adminUser?.id),
+    });
+  } catch (reactionError) {
+    const message = reactionError instanceof Error ? reactionError.message : "REACTION_ERROR";
+    if (message === "JOB_NOT_FOUND") {
+      response.status(404).json({ error: "Postagem não encontrada." });
+      return;
+    }
+
+    if (message === "WORKSPACE_FORBIDDEN") {
+      response.status(403).json({ error: "Você não pode reagir nesta publicação." });
+      return;
+    }
+
+    console.error("Failed to toggle publication comment reaction", reactionError);
+    response.status(500).json({ error: "Falha ao atualizar a reação do comentário." });
+  }
+});
+
+app.post("/jobs/:id/preview/decision", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  const payload = publicationPreviewDecisionSchema.parse(request.body);
+
+  try {
+    const previewContext = await findPublicationPreviewContext(authRequest, request.params.id);
+    const workspacePlanCapabilities = await resolveWorkspaceOwnerPlanCapabilities(previewContext.workspace);
+    if (!workspacePlanCapabilities.supportsClientApproval) {
+      response.status(403).json({ error: "Este plano não permite aprovação de cliente nesta publicação." });
+      return;
+    }
+    const currentRole = previewContext.currentUserRole;
+    if (currentRole !== "CLIENT") {
+      response.status(403).json({ error: "Somente o cliente pode aprovar ou rejeitar esta publicação." });
+      return;
+    }
+
+    const approval = await prisma.publicationApproval.upsert({
+      where: {
+        companyId_schedulerGroupKey: {
+          companyId: previewContext.baseJob.companyId,
+          schedulerGroupKey: previewContext.schedulerGroupKey,
+        },
+      },
+      update: {
+        status: payload.decision,
+        decidedByUserId: authRequest.adminUser!.id,
+        decidedAt: new Date(),
+        titleSnapshot: previewContext.baseJob.title ?? previewContext.baseJob.caption ?? null,
+      },
+      create: {
+        companyId: previewContext.baseJob.companyId,
+        schedulerGroupKey: previewContext.schedulerGroupKey,
+        titleSnapshot: previewContext.baseJob.title ?? previewContext.baseJob.caption ?? null,
+        status: payload.decision,
+        decidedByUserId: authRequest.adminUser!.id,
+        decidedAt: new Date(),
+      },
+      include: {
+        decidedBy: {
+          select: {
+            id: true,
+            name: true,
+            username: true,
+          },
+        },
+      },
+    });
+
+    let createdComment: ReturnType<typeof serializePublicationApprovalComment> | null = null;
+    const normalizedMessage = payload.message?.trim() || "";
+    if (normalizedMessage) {
+      const comment = await prisma.publicationApprovalComment.create({
+        data: {
+          approvalId: approval.id,
+          userId: authRequest.adminUser!.id,
+          message: normalizedMessage,
+        },
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+              username: true,
+            },
+          },
+          reactions: {
+            select: {
+              emoji: true,
+              userId: true,
+            },
+          },
+        },
+      });
+      createdComment = serializePublicationApprovalComment(comment, authRequest.adminUser?.id);
+    }
+
+    const actorName = authRequest.adminUser?.name?.trim() || authRequest.adminUser?.username || "Alguém";
+    const subject = buildPublicationPreviewSubject(previewContext.baseJob);
+    const decisionVerb = payload.decision === "APPROVED" ? "aprovou" : "não aprovou";
+    await appendWorkspaceAvisoForOtherUsers({
+      companyId: previewContext.baseJob.companyId,
+      createdByUserId: authRequest.adminUser?.id ?? null,
+      excludeUserId: authRequest.adminUser?.id ?? null,
+      kind: "APPROVAL_DECISION",
+      title: payload.decision === "APPROVED" ? "Projeto aprovado" : "Projeto não aprovado",
+      message: `${actorName} ${decisionVerb} ${subject} no workspace ${previewContext.workspace.name}.`,
+    });
+
+    if (normalizedMessage) {
+      const feedbackSnippet = compactAvisoText(normalizedMessage, 160) || "Confira a observação deixada na publicação.";
+      await appendWorkspaceAvisoForOtherUsers({
+        companyId: previewContext.baseJob.companyId,
+        createdByUserId: authRequest.adminUser?.id ?? null,
+        excludeUserId: authRequest.adminUser?.id ?? null,
+        kind: "FEEDBACK",
+        title: "Comentário",
+        message: `${actorName}: ${feedbackSnippet}`,
+      });
+    }
+
+    response.json({
+      approval: {
+        id: approval.id,
+        status: approval.status,
+        decidedAt: approval.decidedAt,
+        decidedBy: approval.decidedBy
+          ? {
+              id: approval.decidedBy.id,
+              name: approval.decidedBy.name,
+              username: approval.decidedBy.username,
+            }
+          : null,
+      },
+      comment: createdComment,
+    });
+  } catch (decisionError) {
+    const message = decisionError instanceof Error ? decisionError.message : "DECISION_ERROR";
+    if (message === "JOB_NOT_FOUND") {
+      response.status(404).json({ error: "Postagem não encontrada." });
+      return;
+    }
+
+    if (message === "WORKSPACE_FORBIDDEN") {
+      response.status(403).json({ error: "Você não pode interagir com esta publicação." });
+      return;
+    }
+
+    console.error("Failed to persist publication decision", decisionError);
+    response.status(500).json({ error: "Falha ao salvar a aprovação da publicação." });
+  }
+});
+
 app.post("/jobs", async (request, response) => {
   const payload = createJobSchema.parse(request.body);
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
@@ -12586,6 +14672,10 @@ app.post("/jobs", async (request, response) => {
     ...payload,
   });
   const workspace = await assertWorkspaceVisibleForRequest(authRequest, payload.companyId);
+  if (!canCurrentUserManageWorkspacePublications(authRequest, workspace)) {
+    response.status(403).json({ error: "Você tem acesso somente de visualização neste workspace." });
+    return;
+  }
   if (workspace.status !== "ACTIVE") {
     response.status(409).json({ error: "Este workspace está inativo e não aceita novas publicações." });
     return;
@@ -12626,6 +14716,7 @@ app.post("/jobs", async (request, response) => {
     payload.schedulerGroupId,
   );
   const firstComment = normalizeFirstComment(payload.publicationType, payload.firstComment);
+  validateCaptionForPublication(payload.publicationType, metadata.caption, hashtags);
   const relinkOptions = await resolveWhatsappRelinkOptions({
     request: authRequest,
     publicationType: payload.publicationType,
@@ -12708,7 +14799,7 @@ app.put("/jobs/:id", async (request, response) => {
   }
 
   const workspace = existingJob.company as WorkspacePermissionContext;
-  if (!canCurrentUserAccessWorkspace(authRequest, workspace)) {
+  if (!canCurrentUserManageWorkspacePublications(authRequest, workspace)) {
     response.status(403).json({ error: "Voce nao pode editar esta postagem." });
     return;
   }
@@ -12742,6 +14833,7 @@ app.put("/jobs/:id", async (request, response) => {
     payload.schedulerGroupId ?? decodeMetaLocationStorage(existingJob.locationName).schedulerGroupId,
   );
   const firstComment = normalizeFirstComment(payload.publicationType, payload.firstComment);
+  validateCaptionForPublication(payload.publicationType, metadata.caption, hashtags);
   const normalizedTitle = normalizeJobTitle(payload.title);
 
   const existingRelinkConnectionIds = parseStoredWhatsappRelinkConnectionIds(existingJob.whatsappRelinkConnectionIds);
@@ -12862,7 +14954,7 @@ app.post("/jobs/:id/retry", async (request, response) => {
     return;
   }
 
-  if (!canCurrentUserAccessWorkspace(authRequest, existingJob.company as WorkspacePermissionContext)) {
+  if (!canCurrentUserManageWorkspacePublications(authRequest, existingJob.company as WorkspacePermissionContext)) {
     response.status(403).json({ error: "Voce nao pode reenfileirar esta postagem." });
     return;
   }
@@ -12922,7 +15014,7 @@ app.post("/jobs/:id/reschedule-failed-media", async (request, response) => {
     return;
   }
 
-  if (!canCurrentUserAccessWorkspace(authRequest, existingJob.company as WorkspacePermissionContext)) {
+  if (!canCurrentUserManageWorkspacePublications(authRequest, existingJob.company as WorkspacePermissionContext)) {
     response.status(403).json({ error: "Voce nao pode reagendar esta postagem." });
     return;
   }
@@ -13004,7 +15096,7 @@ app.post("/jobs/:id/duplicate-draft", async (request, response) => {
     return;
   }
 
-  if (!canCurrentUserAccessWorkspace(authRequest, existingJob.company as WorkspacePermissionContext)) {
+  if (!canCurrentUserManageWorkspacePublications(authRequest, existingJob.company as WorkspacePermissionContext)) {
     response.status(403).json({ error: "Você não pode duplicar esta postagem." });
     return;
   }
@@ -13067,7 +15159,7 @@ app.post("/jobs/:id/cancel", async (request, response) => {
     return;
   }
 
-  if (!canCurrentUserAccessWorkspace(authRequest, existingJob.company as WorkspacePermissionContext)) {
+  if (!canCurrentUserManageWorkspacePublications(authRequest, existingJob.company as WorkspacePermissionContext)) {
     response.status(403).json({ error: "Voce nao pode cancelar este agendamento." });
     return;
   }
@@ -13122,7 +15214,7 @@ app.post("/jobs/:id/publish", async (request, response) => {
   }
 
   const workspace = existingJob.company as WorkspacePermissionContext;
-  if (!canCurrentUserAccessWorkspace(authRequest, workspace)) {
+  if (!canCurrentUserManageWorkspacePublications(authRequest, workspace)) {
     response.status(403).json({ error: "Voce nao pode publicar este rascunho." });
     return;
   }
@@ -13187,7 +15279,7 @@ app.post("/jobs/:id/activate", async (request, response) => {
     return;
   }
 
-  if (!canCurrentUserAccessWorkspace(authRequest, existingJob.company as WorkspacePermissionContext)) {
+  if (!canCurrentUserManageWorkspacePublications(authRequest, existingJob.company as WorkspacePermissionContext)) {
     response.status(403).json({ error: "Voce nao pode ativar este agendamento." });
     return;
   }
@@ -13252,7 +15344,7 @@ app.delete("/jobs/:id", async (request, response) => {
     return;
   }
 
-  if (!canCurrentUserAccessWorkspace(authRequest, existingJob.company as WorkspacePermissionContext)) {
+  if (!canCurrentUserManageWorkspacePublications(authRequest, existingJob.company as WorkspacePermissionContext)) {
     response.status(403).json({ error: "Voce nao pode excluir esta postagem." });
     return;
   }
@@ -13370,11 +15462,17 @@ app.get("/billing/me", async (request, response) => {
       canCancelStripeSubscription: false,
       stripeCancelAtPeriodEnd: false,
       stripePixAvailable,
+      requiresInitialPlanSelection: false,
+      planCapabilities: resolveBillingPlanCapabilities(bestPlan?.code ?? "ROOT"),
     });
     return;
   }
 
   const billing = await resolveUserBillingAccess(userId);
+  const authUser = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { needsPlanSelection: true },
+  });
   response.json({
     status: billing.status,
     billingModel: billing.billingModel,
@@ -13390,6 +15488,124 @@ app.get("/billing/me", async (request, response) => {
       billing.billingModel === "STRIPE_SUBSCRIPTION" && !billing.stripeCancelAtPeriodEnd,
     stripeCancelAtPeriodEnd: billing.stripeCancelAtPeriodEnd,
     stripePixAvailable,
+    requiresInitialPlanSelection: Boolean(authUser?.needsPlanSelection && canStartInitialPlanTrial(billing)),
+    planCapabilities: resolveBillingPlanCapabilities(billing.plan?.code),
+  });
+});
+
+app.post("/billing/start-trial", adminAuthMiddleware, async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  if (isRootUser(authRequest)) {
+    response.status(409).json({ error: "Conta root não inicia trial por esta tela." });
+    return;
+  }
+
+  const payload = startInitialTrialSchema.parse(request.body);
+  const userId = authRequest.adminUser!.id;
+  const [billingSettings, currentBilling, plan, currentUser] = await Promise.all([
+    getBillingSettingsSnapshot(),
+    resolveUserBillingAccess(userId),
+    prisma.plan.findUnique({
+      where: { id: payload.planId },
+      select: {
+        id: true,
+        code: true,
+        name: true,
+        isActive: true,
+        isPublic: true,
+      },
+    }),
+    prisma.user.findUnique({
+      where: { id: userId },
+      select: { needsPlanSelection: true },
+    }),
+  ]);
+
+  if (!billingSettings.autoTrialEnabled || billingSettings.autoTrialDays <= 0) {
+    response.status(409).json({ error: "O trial inicial está desativado neste ambiente." });
+    return;
+  }
+
+  if (!currentUser?.needsPlanSelection || !canStartInitialPlanTrial(currentBilling)) {
+    response.status(409).json({ error: "Sua conta já concluiu a seleção inicial de plano." });
+    return;
+  }
+
+  if (!plan || !plan.isActive || !plan.isPublic) {
+    response.status(404).json({ error: "Plano indisponível para iniciar trial." });
+    return;
+  }
+
+  const now = new Date();
+  const trialEndsAt = new Date(now.getTime() + billingSettings.autoTrialDays * 24 * 60 * 60 * 1000);
+
+  await prisma.$transaction(async (transaction) => {
+    await transaction.userPlanSubscription.upsert({
+      where: { userId },
+      update: {
+        planId: plan.id,
+        status: "TRIALING",
+        billingModel: "TRIAL",
+        cycle: null,
+        startsAt: now,
+        endsAt: trialEndsAt,
+        trialEndsAt,
+        blockedReason: null,
+      },
+      create: {
+        userId,
+        planId: plan.id,
+        status: "TRIALING",
+        billingModel: "TRIAL",
+        cycle: null,
+        startsAt: now,
+        endsAt: trialEndsAt,
+        trialEndsAt,
+        blockedReason: null,
+      },
+    });
+
+    await transaction.user.update({
+      where: { id: userId },
+      data: { needsPlanSelection: false },
+    });
+  });
+
+  const refreshedUser = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true,
+      name: true,
+      username: true,
+      email: true,
+      timeZone: true,
+      role: true,
+    },
+  });
+
+  const billing = await resolveUserBillingAccess(userId);
+  const authUserPayload = await buildAuthUserPayload(refreshedUser!);
+
+  response.json({
+    user: authUserPayload,
+    billing: {
+      status: billing.status,
+      billingModel: billing.billingModel,
+      cycle: billing.cycle,
+      isBlocked: billing.isBlocked,
+      blockMessage: billing.blockMessage,
+      startsAt: billing.startsAt,
+      endsAt: billing.endsAt,
+      trialEndsAt: billing.trialEndsAt,
+      plan: billing.plan,
+      usage: billing.usage,
+      canCancelStripeSubscription:
+        billing.billingModel === "STRIPE_SUBSCRIPTION" && !billing.stripeCancelAtPeriodEnd,
+      stripeCancelAtPeriodEnd: billing.stripeCancelAtPeriodEnd,
+      stripePixAvailable: await resolveStripePixAvailability().catch(() => false),
+      requiresInitialPlanSelection: false,
+      planCapabilities: resolveBillingPlanCapabilities(billing.plan?.code),
+    },
   });
 });
 
@@ -14525,6 +16741,11 @@ app.post("/billing/assign-user-plan", async (request, response) => {
     },
   });
 
+  await prisma.user.update({
+    where: { id: payload.userId },
+    data: { needsPlanSelection: false },
+  });
+
   response.json(subscription);
 });
 
@@ -14576,10 +16797,19 @@ app.get("/avisos/recent", async (request, response) => {
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
   const query = avisoRecentQuerySchema.parse(request.query);
 
-  const [items, unreadCount] = await Promise.all([
+  const [items, unreadCount, unreadFeedbacksCount, unreadSocialUpCount] = await Promise.all([
     prisma.aviso.findMany({
       where: {
         userId: authRequest.adminUser!.id,
+      },
+      include: {
+        createdBy: {
+          select: {
+            id: true,
+            name: true,
+            username: true,
+          },
+        },
       },
       orderBy: {
         createdAt: "desc",
@@ -14592,11 +16822,30 @@ app.get("/avisos/recent", async (request, response) => {
         readAt: null,
       },
     }),
+    prisma.aviso.count({
+      where: {
+        userId: authRequest.adminUser!.id,
+        readAt: null,
+        kind: "FEEDBACK",
+      },
+    }),
+    prisma.aviso.count({
+      where: {
+        userId: authRequest.adminUser!.id,
+        readAt: null,
+        kind: "SYSTEM_BROADCAST",
+      },
+    }),
   ]);
 
   response.json({
     items: items.map((aviso) => mapAviso(aviso)),
     unreadCount,
+    unreadCounts: {
+      feedbacks: unreadFeedbacksCount,
+      socialup: unreadSocialUpCount,
+      panel: Math.max(0, unreadCount - unreadFeedbacksCount - unreadSocialUpCount),
+    },
   });
 });
 
@@ -14687,6 +16936,15 @@ app.get("/avisos", async (request, response) => {
     prisma.aviso.findMany({
       where: {
         userId: authRequest.adminUser!.id,
+      },
+      include: {
+        createdBy: {
+          select: {
+            id: true,
+            name: true,
+            username: true,
+          },
+        },
       },
       orderBy: {
         createdAt: "desc",

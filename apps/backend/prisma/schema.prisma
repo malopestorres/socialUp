@@ -11,7 +11,9 @@ model User {
   id             String   @id @default(cuid())
   name           String
   username       String   @unique
-  passwordHash   String
+  email          String?  @unique
+  passwordHash   String?
+  needsPlanSelection Boolean @default(false)
   timeZone       String   @default("America/Sao_Paulo")
   role           String   @default("ADMIN")
   billingDiscountEnabled Boolean @default(false)
@@ -34,6 +36,29 @@ model User {
   workspaceMemberships CompanyMember[]
   sentWorkspaceInvites CompanyInvite[] @relation("WorkspaceInviteSender")
   acceptedWorkspaceInvites CompanyInvite[] @relation("WorkspaceInviteAcceptor")
+  decidedPublicationApprovals PublicationApproval[] @relation("PublicationApprovalDecider")
+  publicationApprovalComments PublicationApprovalComment[] @relation("PublicationApprovalCommentAuthor")
+  publicationApprovalCommentReactions PublicationApprovalCommentReaction[] @relation("PublicationApprovalCommentReactionAuthor")
+  authProviders  UserAuthProvider[]
+}
+
+model UserAuthProvider {
+  id            String   @id @default(cuid())
+  userId        String
+  provider      String
+  providerUserId String
+  email         String?
+  emailVerified Boolean  @default(false)
+  displayName   String?
+  avatarUrl     String?
+  metadata      Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerUserId])
+  @@unique([userId, provider])
+  @@index([email])
 }
 
 model SetupInvite {
@@ -58,6 +83,7 @@ model Company {
   legacyAgents   Agent[]
   members        CompanyMember[]
   invites        CompanyInvite[]
+  publicationApprovals PublicationApproval[]
 }
 
 model CompanyMember {
@@ -255,6 +281,57 @@ model Aviso {
   @@index([userId, readAt])
   @@index([userId, createdAt])
   @@map("avisos")
+}
+
+model PublicationApproval {
+  id                String   @id @default(cuid())
+  companyId         String
+  schedulerGroupKey String
+  titleSnapshot     String?
+  status            String   @default("PENDING")
+  decidedByUserId   String?
+  decidedAt         DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  company           Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  decidedBy         User?    @relation("PublicationApprovalDecider", fields: [decidedByUserId], references: [id], onDelete: SetNull)
+  comments          PublicationApprovalComment[]
+
+  @@unique([companyId, schedulerGroupKey])
+  @@index([companyId, status])
+}
+
+model PublicationApprovalComment {
+  id              String   @id @default(cuid())
+  approvalId      String
+  userId          String
+  parentCommentId String?
+  message         String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  approval        PublicationApproval @relation(fields: [approvalId], references: [id], onDelete: Cascade)
+  user            User     @relation("PublicationApprovalCommentAuthor", fields: [userId], references: [id], onDelete: Cascade)
+  parentComment   PublicationApprovalComment?  @relation("PublicationApprovalCommentReplies", fields: [parentCommentId], references: [id], onDelete: SetNull)
+  replies         PublicationApprovalComment[] @relation("PublicationApprovalCommentReplies")
+  reactions       PublicationApprovalCommentReaction[]
+
+  @@index([approvalId, createdAt])
+  @@index([userId, createdAt])
+  @@index([parentCommentId])
+}
+
+model PublicationApprovalCommentReaction {
+  id        String   @id @default(cuid())
+  commentId String
+  userId    String
+  emoji     String
+  createdAt DateTime @default(now())
+  comment   PublicationApprovalComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  user      User     @relation("PublicationApprovalCommentReactionAuthor", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([commentId, userId, emoji])
+  @@index([commentId, createdAt])
+  @@index([userId, createdAt])
 }
 
 model AiKnowledgeDocument {
