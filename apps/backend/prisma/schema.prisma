@@ -217,6 +217,8 @@ model Plan {
   code                       String   @unique
   name                       String
   description                String?
+  subtitle                   String?
+  highlights                 Json?
   isActive                   Boolean  @default(true)
   isPublic                   Boolean  @default(true)
   isTrial                    Boolean  @default(false)
@@ -224,7 +226,10 @@ model Plan {
   workspaceLimit             Int      @default(1)
   agencyBonusWorkspaceLimit  Int      @default(0)
   maxConnections             Int
+  maxWhatsappConnections     Int?     @default(2)
   maxMonthlyPublications     Int
+  supportsWorkspaceInvites   Boolean  @default(false)
+  supportsClientApproval     Boolean  @default(false)
   displayOrder               Int      @default(0)
   monthlyPriceCents          Int?
   yearlyPriceCents           Int?
@@ -270,16 +275,20 @@ model Aviso {
   id              String    @id @default(cuid())
   userId          String
   createdByUserId String?
+  broadcastKey    String?
   kind            String    @default("SYSTEM")
+  iconKey         String?
   title           String
   message         String
   readAt          DateTime?
   createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
   user            User      @relation("AvisoRecipient", fields: [userId], references: [id], onDelete: Cascade)
   createdBy       User?     @relation("AvisoCreator", fields: [createdByUserId], references: [id], onDelete: SetNull)
 
   @@index([userId, readAt])
   @@index([userId, createdAt])
+  @@index([kind, broadcastKey])
   @@map("avisos")
 }
 

@@ -1,0 +1,7 @@
+ALTER TABLE "avisos"
+ADD COLUMN IF NOT EXISTS "broadcastKey" TEXT,
+ADD COLUMN IF NOT EXISTS "iconKey" TEXT,
+ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP;
+
+CREATE INDEX IF NOT EXISTS "avisos_kind_broadcastKey_idx"
+ON "avisos"("kind", "broadcastKey");

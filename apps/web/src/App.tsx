@@ -66,6 +66,8 @@ import {
   FiEye,
   FiEyeOff,
   FiPlus,
+  FiSettings,
+  FiSliders,
   FiTrendingUp,
 } from "react-icons/fi";
 import { FaFacebookF, FaInstagram, FaThreads, FaTiktok, FaWhatsapp, FaXTwitter } from "react-icons/fa6";
@@ -102,6 +104,7 @@ type ThemeMode = "light" | "dark";
 type HistoryFilterKey = "all" | "upcoming" | "canceled" | "sent" | "failed" | "waiting_login" | "draft" | "published";
 type HistoryViewMode = "board" | "list";
 type ProfilePageTab = "profile" | "plan" | "danger";
+type RootConfigTab = "settings" | "webhook" | "createPlan" | "plans";
 type HistoryBulkAction = "" | "SET_PUBLISHED" | "SET_DRAFT" | "SET_SCHEDULE" | "SET_COMPANY" | "SET_CANCEL";
 type PublicationState = "PUBLISHED" | "DRAFT";
 type SchedulerPublicationState = PublicationState | "";
@@ -326,6 +329,7 @@ type SchedulerProfileTarget = {
 };
 
 const DEFAULT_WHATSAPP_BACKGROUND_COLOR = "#202C33";
+const WHATSAPP_QR_REUSE_WINDOW_MS = 45_000;
 
 const schedulerPublicationTypeChoices: Array<{
   value: SchedulerSelectablePublicationType;
@@ -472,11 +476,14 @@ type MediaEntry = {
 
 type Aviso = {
   id: string;
+  broadcastKey: string | null;
   kind: string;
+  iconKey: string | null;
   title: string;
   message: string;
   readAt: string | null;
   createdAt: string;
+  updatedAt: string;
   createdBy?: {
     id: string;
     name: string;
@@ -485,6 +492,17 @@ type Aviso = {
 };
 
 type NoticesPopoverTabKey = "panel" | "feedbacks" | "socialup";
+type NoticeAdminTab = "create" | "edit";
+type NoticeAdminBroadcastItem = {
+  broadcastKey: string;
+  title: string;
+  message: string;
+  iconKey: string | null;
+  createdAt: string;
+  updatedAt: string;
+  recipientsCount: number;
+  unreadCount: number;
+};
 
 type PublicationPreviewApprovalStatus = "PENDING" | "APPROVED" | "REJECTED";
 type PublicationPreviewDecisionIntent = Extract<PublicationPreviewApprovalStatus, "APPROVED" | "REJECTED">;
@@ -542,15 +560,6 @@ type PublicationPreviewPayload = {
   comments: PublicationPreviewComment[];
 };
 
-type MockSocialUpNotice = {
-  id: string;
-  title: string;
-  message: string;
-  createdAtLabel: string;
-  unread: boolean;
-  icon: IconType;
-};
-
 type LiveUpdateScope = "jobs" | "dashboard" | "avisos" | "connections" | "companies" | "logs";
 
 type LiveEventMessage = {
@@ -585,6 +594,8 @@ type BillingPlan = {
   code: string;
   name: string;
   description: string | null;
+  subtitle: string | null;
+  highlights: string[];
   isActive: boolean;
   isPublic: boolean;
   isTrial: boolean;
@@ -592,7 +603,10 @@ type BillingPlan = {
   workspaceLimit: number;
   agencyBonusWorkspaceLimit: number;
   maxConnections: number;
+  maxWhatsappConnections: number | null;
   maxMonthlyPublications: number;
+  supportsWorkspaceInvites: boolean;
+  supportsClientApproval: boolean;
   displayOrder: number;
   monthlyPriceCents: number | null;
   yearlyPriceCents: number | null;
@@ -778,23 +792,34 @@ const initialDashboard: Dashboard = {
 const navItems: Array<{ key: ViewKey; label: string; eyebrow?: string; icon: IconType }> = [
   { key: "dashboard", label: "Dashboard", icon: FiHome },
   { key: "companies", label: "Workspaces", icon: FiUsers },
-  { key: "planConfig", label: "Configurar planos", icon: FiCreditCard },
+  { key: "planConfig", label: "Configurações", icon: FiSettings },
   { key: "beeUpAdmin", label: "Assistente Bee Up", icon: FiMessageSquare },
   { key: "agents", label: "Conectar contas", icon: FiLink2 },
   { key: "scheduler", label: "Agendar", icon: FiCalendar },
   { key: "history", label: "Publicações", icon: FiClock },
   { key: "media", label: "Midias", icon: FiImage },
-  { key: "noticeAdmin", label: "Cadastrar avisos", icon: FiBell },
+  { key: "noticeAdmin", label: "Avisos", icon: FiBell },
   { key: "logs", label: "Logs", icon: FiFileText },
 ];
 
 const DASHBOARD_CALENDAR_WEEKDAY_LABELS = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sab", "Dom"];
+const NOTICE_ICON_OPTIONS = [
+  { key: "message-square", label: "Recado", icon: FiMessageSquare },
+  { key: "calendar", label: "Agenda", icon: FiCalendar },
+  { key: "alert-circle", label: "Alerta", icon: FiAlertCircle },
+  { key: "trending-up", label: "Atualização", icon: FiTrendingUp },
+  { key: "check-circle", label: "Confirmação", icon: FiCheckCircle },
+  { key: "wifi", label: "Integrações", icon: FiWifi },
+  { key: "credit-card", label: "Pagamento", icon: FiCreditCard },
+  { key: "bell", label: "Geral", icon: FiBell },
+] as const;
+type NoticeIconKey = (typeof NOTICE_ICON_OPTIONS)[number]["key"];
 
 const viewHeadingIconByView: Partial<Record<ViewKey, IconType>> = {
   dashboard: FiHome,
   profile: FiUser,
   plan: FiCreditCard,
-  planConfig: FiCreditCard,
+  planConfig: FiSettings,
   beeUpAdmin: FiMessageSquare,
   agents: FiLink2,
   scheduler: FiCalendar,
@@ -960,7 +985,7 @@ const VIEW_ROUTE_MAP: Record<ViewKey, string> = {
   profile: "/perfil",
   plan: "/meu-plano",
   planStart: "/selecionar-plano",
-  planConfig: "/configurar-planos",
+  planConfig: "/configuracoes",
   beeUpAdmin: "/assistente-bee-up",
   companies: "/workspaces",
   agents: "/conectar-contas",
@@ -978,7 +1003,7 @@ const beeUpViewLabelByView: Record<ViewKey, string> = {
   profile: "Meu perfil",
   plan: "Meu plano",
   planStart: "Selecionar plano",
-  planConfig: "Configurar planos",
+  planConfig: "Configurações",
   beeUpAdmin: "Assistente Bee Up",
   companies: "Workspaces",
   agents: "Conectar contas",
@@ -988,7 +1013,7 @@ const beeUpViewLabelByView: Record<ViewKey, string> = {
   historyPreview: "Visualização da publicação",
   logs: "Logs",
   notices: "Avisos",
-  noticeAdmin: "Cadastrar avisos",
+  noticeAdmin: "Avisos",
 };
 
 function readPublicationPreviewJobIdFromPathname(pathname: string): string | null {
@@ -1010,12 +1035,39 @@ function readPublicationPreviewJobIdFromPathname(pathname: string): string | nul
   }
 }
 
+function readSchedulerEditJobIdFromPathname(pathname: string): string | null {
+  const normalizedPath = normalizePath(pathname);
+  const editPrefix = `${VIEW_ROUTE_MAP.history}/editar/`;
+  if (!normalizedPath.startsWith(editPrefix)) {
+    return null;
+  }
+
+  const rawJobId = normalizedPath.slice(editPrefix.length).trim();
+  if (!rawJobId) {
+    return null;
+  }
+
+  try {
+    return decodeURIComponent(rawJobId);
+  } catch {
+    return rawJobId;
+  }
+}
+
 function buildPublicationPreviewHref(jobId: string): string {
   const normalizedJobId = jobId.trim();
   if (!normalizedJobId) {
     return VIEW_ROUTE_MAP.history;
   }
   return `${VIEW_ROUTE_MAP.historyPreview}/${encodeURIComponent(normalizedJobId)}`;
+}
+
+function buildSchedulerEditHref(jobId: string): string {
+  const normalizedJobId = jobId.trim();
+  if (!normalizedJobId) {
+    return VIEW_ROUTE_MAP.scheduler;
+  }
+  return `${VIEW_ROUTE_MAP.history}/editar/${encodeURIComponent(normalizedJobId)}`;
 }
 
 function parseHistoryFilterKey(value: string | null | undefined): HistoryFilterKey {
@@ -1293,8 +1345,14 @@ function viewFromPathname(pathname: string): ViewKey | null {
   if (normalizedPath === "/historico") {
     return "history";
   }
+  if (normalizedPath === "/configurar-planos") {
+    return "planConfig";
+  }
   if (readPublicationPreviewJobIdFromPathname(normalizedPath)) {
     return "historyPreview";
+  }
+  if (readSchedulerEditJobIdFromPathname(normalizedPath)) {
+    return "scheduler";
   }
   if (readProfileUsernameFromPathname(normalizedPath)) {
     return "profile";
@@ -1319,6 +1377,9 @@ function readProfileUsernameFromPathname(pathname: string): string | null {
   if (readPublicationPreviewJobIdFromPathname(normalizedPath)) {
     return null;
   }
+  if (readSchedulerEditJobIdFromPathname(normalizedPath)) {
+    return null;
+  }
 
   const rawPath = normalizedPath.replace(/^\/+|\/+$/g, "");
   if (!rawPath || rawPath.includes("/")) {
@@ -1333,6 +1394,7 @@ function readProfileUsernameFromPathname(pathname: string): string | null {
       "perfis",
       "historico",
       "plano",
+      "configurar-planos",
     ].filter(Boolean),
   );
   if (reservedSegments.has(rawPath.toLowerCase())) {
@@ -1422,6 +1484,14 @@ function initialPublicationPreviewJobIdFromLocation(): string | null {
   }
 
   return readPublicationPreviewJobIdFromPathname(window.location.pathname);
+}
+
+function initialSchedulerEditJobIdFromLocation(): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  return readSchedulerEditJobIdFromPathname(window.location.pathname);
 }
 
 const fullEmojiList = [
@@ -1647,7 +1717,21 @@ function avisoToneClass(aviso: Pick<Aviso, "kind" | "title" | "message">): strin
   return `notice-tone-${avisoTone(aviso)}`;
 }
 
-function resolveAvisoPopoverIcon(aviso: Pick<Aviso, "kind" | "title" | "message">): IconType {
+function resolveNoticeIconByKey(iconKey: string | null | undefined): IconType | null {
+  const normalized = typeof iconKey === "string" ? iconKey.trim() : "";
+  if (!normalized) {
+    return null;
+  }
+
+  const option = NOTICE_ICON_OPTIONS.find((entry) => entry.key === normalized);
+  return option?.icon ?? null;
+}
+
+function resolveAvisoPopoverIcon(aviso: Pick<Aviso, "kind" | "title" | "message" | "iconKey">): IconType {
+  const customIcon = resolveNoticeIconByKey(aviso.iconKey);
+  if (customIcon) {
+    return customIcon;
+  }
   if (isApprovalNegativeAviso(aviso)) {
     return FiSlash;
   }
@@ -3454,7 +3538,7 @@ function resolveGroupedPublicationStatusMeta(
   if (jobs.some((job) => job.status === "FAILED")) {
     return {
       tone: "failed",
-      label: "Falhou",
+      label: "Postagem falhada",
     };
   }
 
@@ -4201,33 +4285,6 @@ const TEMP_DISABLE_BACKGROUND_POLLING = true;
 const LIVE_EVENT_REFRESH_DEBOUNCE_MS = 180;
 const LIVE_EVENT_RECONNECT_DELAY_MS = 1500;
 
-const MOCK_SOCIALUP_NOTICES: MockSocialUpNotice[] = [
-  {
-    id: "socialup-update-feed",
-    title: "Novo visual do calendário",
-    message: "A Home ganhou um calendário mais interativo para acompanhar seus agendamentos do mês.",
-    createdAtLabel: "há 1 h",
-    unread: true,
-    icon: FiTrendingUp,
-  },
-  {
-    id: "socialup-holiday-easter",
-    title: "Lembrete de feriado",
-    message: "Feriados podem afetar o engajamento. Vale revisar seus melhores horários antes de publicar.",
-    createdAtLabel: "há 4 h",
-    unread: false,
-    icon: FiCalendar,
-  },
-  {
-    id: "socialup-status-check",
-    title: "Acompanhamento de integrações",
-    message: "Se alguma conta pedir renovação, você vai receber o aviso aqui e também no sino do topo.",
-    createdAtLabel: "ontem",
-    unread: true,
-    icon: FiAlertCircle,
-  },
-];
-
 function initialThemeMode(): ThemeMode {
   return "light";
 }
@@ -4639,6 +4696,7 @@ function App() {
   const [nowTickMs, setNowTickMs] = useState(() => Date.now());
   const [activeView, setActiveView] = useState<ViewKey>(initialViewFromLocation);
   const [profilePageTab, setProfilePageTab] = useState<ProfilePageTab>(initialProfileTabFromLocation);
+  const [rootConfigTab, setRootConfigTab] = useState<RootConfigTab>("settings");
   const [profileRouteUsername, setProfileRouteUsername] = useState<string | null>(initialProfileRouteUsernameFromLocation);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isDesktopViewport, setIsDesktopViewport] = useState(() => {
@@ -4798,6 +4856,8 @@ function App() {
   const [planCodeInput, setPlanCodeInput] = useState("");
   const [planNameInput, setPlanNameInput] = useState("");
   const [planDescriptionInput, setPlanDescriptionInput] = useState("");
+  const [planSubtitleInput, setPlanSubtitleInput] = useState("");
+  const [planHighlightsInput, setPlanHighlightsInput] = useState<string[]>([""]);
   const [planIsTrialInput, setPlanIsTrialInput] = useState(false);
   const [planIsActiveInput, setPlanIsActiveInput] = useState(true);
   const [planIsPublicInput, setPlanIsPublicInput] = useState(true);
@@ -4806,6 +4866,8 @@ function App() {
   const [planAgencyBonusWorkspaceLimitInput, setPlanAgencyBonusWorkspaceLimitInput] = useState("0");
   const [planMaxConnectionsInput, setPlanMaxConnectionsInput] = useState("2");
   const [planMaxMonthlyPublicationsInput, setPlanMaxMonthlyPublicationsInput] = useState("60");
+  const [planSupportsWorkspaceInvitesInput, setPlanSupportsWorkspaceInvitesInput] = useState(false);
+  const [planSupportsClientApprovalInput, setPlanSupportsClientApprovalInput] = useState(false);
   const [planDisplayOrderInput, setPlanDisplayOrderInput] = useState("1");
   const [planStripeProductIdInput, setPlanStripeProductIdInput] = useState("");
   const [stripeCatalogProducts, setStripeCatalogProducts] = useState<StripeCatalogProduct[]>([]);
@@ -4885,13 +4947,18 @@ function App() {
   const [historyInlineTimeValue, setHistoryInlineTimeValue] = useState("");
   const [historyInlineSavingJobId, setHistoryInlineSavingJobId] = useState<string | null>(null);
   const [activePublicationDuplicateJobId, setActivePublicationDuplicateJobId] = useState<string | null>(null);
+  const [activePublicationDuplicateSourceJobIds, setActivePublicationDuplicateSourceJobIds] = useState<string[]>([]);
   const [publicationDuplicateTitle, setPublicationDuplicateTitle] = useState("");
+  const [publicationDuplicateTitleError, setPublicationDuplicateTitleError] = useState("");
   const [publicationDuplicateDate, setPublicationDuplicateDate] = useState("");
   const [publicationDuplicateTime, setPublicationDuplicateTime] = useState("");
   const [publicationDuplicateCompanyIds, setPublicationDuplicateCompanyIds] = useState<string[]>([]);
   const [creatingPublicationDuplicate, setCreatingPublicationDuplicate] = useState(false);
   const [activePublicationPreviewJobId, setActivePublicationPreviewJobId] = useState<string | null>(
     initialPublicationPreviewJobIdFromLocation,
+  );
+  const [activeSchedulerEditJobId, setActiveSchedulerEditJobId] = useState<string | null>(
+    initialSchedulerEditJobIdFromLocation,
   );
   const [publicationPreviewLoading, setPublicationPreviewLoading] = useState(false);
   const [publicationPreviewSubmitting, setPublicationPreviewSubmitting] = useState(false);
@@ -4938,11 +5005,15 @@ function App() {
   const [markingAllAvisosRead, setMarkingAllAvisosRead] = useState(false);
   const [deletingAvisoId, setDeletingAvisoId] = useState<string | null>(null);
   const [markingAvisoReadId, setMarkingAvisoReadId] = useState<string | null>(null);
-  const [dismissedPopoverNoticeIds, setDismissedPopoverNoticeIds] = useState<string[]>([]);
-  const [locallyReadPopoverNoticeIds, setLocallyReadPopoverNoticeIds] = useState<string[]>([]);
+  const [noticeAdminTab, setNoticeAdminTab] = useState<NoticeAdminTab>("create");
   const [broadcastAvisoTitle, setBroadcastAvisoTitle] = useState("");
   const [broadcastAvisoMessage, setBroadcastAvisoMessage] = useState("");
+  const [broadcastAvisoIconKey, setBroadcastAvisoIconKey] = useState<NoticeIconKey>("message-square");
   const [broadcastAvisoSubmitting, setBroadcastAvisoSubmitting] = useState(false);
+  const [noticeAdminBroadcastsLoading, setNoticeAdminBroadcastsLoading] = useState(false);
+  const [noticeAdminBroadcasts, setNoticeAdminBroadcasts] = useState<NoticeAdminBroadcastItem[]>([]);
+  const [editingNoticeBroadcastKey, setEditingNoticeBroadcastKey] = useState<string | null>(null);
+  const [deletingNoticeBroadcastKey, setDeletingNoticeBroadcastKey] = useState<string | null>(null);
   const [contentLoading, setContentLoading] = useState(false);
   const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
   const [reschedulingFailedMediaJobId, setReschedulingFailedMediaJobId] = useState<string | null>(null);
@@ -4990,15 +5061,12 @@ function App() {
   const liveEventsFlushTimeoutRef = useRef<number | null>(null);
   const liveEventsPendingScopesRef = useRef<Set<LiveUpdateScope>>(new Set());
   const liveEventsRefreshInFlightRef = useRef(false);
+  const whatsappQrFlowVersionRef = useRef<Map<string, number>>(new Map());
   const noticesBellDesktopRef = useRef<HTMLDivElement | null>(null);
   const noticesBellMobileRef = useRef<HTMLDivElement | null>(null);
   const profileMenuDesktopRef = useRef<HTMLDivElement | null>(null);
   const profileMenuMobileRef = useRef<HTMLDivElement | null>(null);
   const planEditorSectionRef = useRef<HTMLElement | null>(null);
-  const visibleMockSocialUpNotices = useMemo(
-    () => MOCK_SOCIALUP_NOTICES.filter((notice) => !dismissedPopoverNoticeIds.includes(notice.id)),
-    [dismissedPopoverNoticeIds],
-  );
   const recentFeedbackAvisos = useMemo(
     () => recentAvisos.filter((aviso) => aviso.kind.trim().toUpperCase() === "FEEDBACK"),
     [recentAvisos],
@@ -5015,14 +5083,7 @@ function App() {
     () => recentAvisos.filter((aviso) => aviso.kind.trim().toUpperCase() === "SYSTEM_BROADCAST"),
     [recentAvisos],
   );
-  const unreadMockSocialUpCount = useMemo(
-    () =>
-      visibleMockSocialUpNotices.filter(
-        (notice) => notice.unread && !locallyReadPopoverNoticeIds.includes(notice.id),
-      ).length,
-    [locallyReadPopoverNoticeIds, visibleMockSocialUpNotices],
-  );
-  const hasUnreadMockSocialUpNotices = unreadMockSocialUpCount > 0;
+  const isEditingBroadcastAviso = Boolean(editingNoticeBroadcastKey);
   const isRootUser = authUser?.username === "root";
   const normalizedAuthUsername = normalizeProfileRouteUsername(authUser?.username);
   const resolvedProfileRouteUsername = profileRouteUsername || normalizedAuthUsername || null;
@@ -5178,6 +5239,8 @@ function App() {
     historyInfo === "Agendamento cancelado com sucesso." ||
     historyInfo === "Agendamento ativado com sucesso." ||
     historyInfo === "Rascunho publicado com sucesso." ||
+    historyInfo === "Cópia criada como rascunho com sucesso." ||
+    historyInfo.endsWith("cópias foram criadas como rascunho.") ||
     historyInfo.startsWith("Edição em massa aplicada");
   const isTransientHistoryInfo =
     historyInfo === "Atualizando agendamento..." ||
@@ -5187,7 +5250,10 @@ function App() {
   const isPositiveMediaInfo = mediaInfo === "Mídia excluída com sucesso.";
   const isTransientMediaInfo = isPositiveMediaInfo;
   const isPositiveAvisosInfo = avisosInfo === "Avisos atualizados.";
-  const isPositiveNoticeAdminInfo = noticeAdminInfo === "Aviso enviado com sucesso.";
+  const isPositiveNoticeAdminInfo =
+    noticeAdminInfo === "Aviso enviado com sucesso." ||
+    noticeAdminInfo === "Aviso atualizado com sucesso." ||
+    noticeAdminInfo === "Aviso excluído com sucesso.";
   const isPositivePlanInfo =
     planInfo === "Plano criado com sucesso." ||
     planInfo === "Plano atualizado com sucesso." ||
@@ -5398,6 +5464,8 @@ function App() {
       setAvisosPage(1);
     }
 
+    const nextSchedulerEditJobId = resolvedView === "scheduler" ? readSchedulerEditJobIdFromPathname(nextUrl.pathname) : null;
+
     if (isProfileLikeView) {
       setProfilePageTab(nextProfileTab);
       setProfileRouteUsername(resolvedProfileRouteUsername || normalizedAuthUsername || normalizeProfileRouteUsername(profileUsername));
@@ -5428,6 +5496,18 @@ function App() {
     setNoticesPopoverOpen(false);
     setProfileMenuOpen(false);
     setSidebarOpen(false);
+
+    if (resolvedView !== "scheduler") {
+      if (activeSchedulerEditJobId) {
+        resetSchedulerForm();
+      }
+      setActiveSchedulerEditJobId(null);
+    } else if (!nextSchedulerEditJobId) {
+      setActiveSchedulerEditJobId(null);
+      if (editingJobId) {
+        resetSchedulerForm();
+      }
+    }
 
     if (resolvedView !== "historyPreview") {
       setActivePublicationPreviewJobId(null);
@@ -5574,6 +5654,23 @@ function App() {
 
   const activeQrState = activeQrConnection?.qrStatus ?? (activeQrConnectionId ? "PREPARING" : "IDLE");
   const hasQrModalError = qrModalInfoTone === "error" && qrModalInfo.trim().length > 0;
+
+  function hasReusableWhatsappQr(connection: SocialConnection | null | undefined): boolean {
+    if (!connection || connection.platform !== "whatsapp") {
+      return false;
+    }
+
+    const generatedAtMs = connection.qrGeneratedAt ? new Date(connection.qrGeneratedAt).getTime() : Number.NaN;
+    if (!Number.isFinite(generatedAtMs) || Date.now() - generatedAtMs > WHATSAPP_QR_REUSE_WINDOW_MS) {
+      return false;
+    }
+
+    if (connection.qrStatus === "WAITING_QR_SCAN") {
+      return Boolean(connection.qrImageDataUrl || connection.qrMessage?.trim());
+    }
+
+    return connection.qrStatus === "PREPARING";
+  }
 
   const activeQrHeading =
     hasQrModalError
@@ -5838,6 +5935,18 @@ function App() {
   }, [activeView, noticeAdminInfo]);
 
   useEffect(() => {
+    if (activeView === "noticeAdmin") {
+      return;
+    }
+
+    setNoticeAdminTab("create");
+    setEditingNoticeBroadcastKey(null);
+    setBroadcastAvisoTitle("");
+    setBroadcastAvisoMessage("");
+    setBroadcastAvisoIconKey("message-square");
+  }, [activeView]);
+
+  useEffect(() => {
     if (activeView !== "profile" && activeView !== "plan" && activeView !== "planConfig" && planInfo) {
       setPlanInfo("");
     }
@@ -5850,6 +5959,7 @@ function App() {
       !(
         normalizedInfo === "Conta adicionada com sucesso." ||
         normalizedInfo === "Conta conectada com sucesso." ||
+        normalizedInfo === "Conta WhatsApp conectada com sucesso." ||
         normalizedInfo === "Conta renovada com sucesso." ||
         normalizedInfo === "Conta sincronizada com sucesso." ||
         normalizedInfo === "Conta desconectada com sucesso." ||
@@ -5879,6 +5989,7 @@ function App() {
     if (
       normalizedInfo !== "Conta adicionada com sucesso." &&
       normalizedInfo !== "Conta conectada com sucesso." &&
+      normalizedInfo !== "Conta WhatsApp conectada com sucesso." &&
       normalizedInfo !== "Conta renovada com sucesso." &&
       normalizedInfo !== "Conta sincronizada com sucesso." &&
       normalizedInfo !== "Conta desconectada com sucesso." &&
@@ -6401,11 +6512,11 @@ function App() {
       if (cancelled || document.visibilityState !== "visible") {
         return;
       }
-      void loadAll({ withSkeleton: false });
+      void refreshAgentsConnectionsSnapshot();
     };
 
     void tick();
-    const intervalId = window.setInterval(tick, 500);
+    const intervalId = window.setInterval(tick, 1200);
 
     return () => {
       cancelled = true;
@@ -6543,6 +6654,15 @@ function App() {
     [dismissedAgentAuthConnectionIds],
   );
 
+  useEffect(() => {
+    setDismissedAgentAuthConnectionIds((current) =>
+      current.filter((connectionId) => {
+        const connection = connections.find((entry) => entry.id === connectionId);
+        return connection?.authStatus !== "CONNECTED";
+      }),
+    );
+  }, [connections]);
+
   function resolveEffectiveAgentConnectionAuthStatus(
     connection: SocialConnection | null | undefined,
   ): SocialConnection["authStatus"] | null {
@@ -6552,6 +6672,14 @@ function App() {
 
     if (dismissedAgentAuthConnectionIdSet.has(connection.id)) {
       return "AUTH_REQUIRED";
+    }
+
+    if (
+      connection.platform === "whatsapp" &&
+      activeQrConnectionId === connection.id &&
+      (connection.qrStatus === "PREPARING" || connection.qrStatus === "WAITING_QR_SCAN" || connection.qrStatus === "QR_EXPIRED")
+    ) {
+      return "AUTH_IN_PROGRESS";
     }
 
     return connection.authStatus;
@@ -7239,6 +7367,21 @@ function App() {
     () => (activePublicationDuplicateJobId ? jobs.find((job) => job.id === activePublicationDuplicateJobId) ?? null : null),
     [activePublicationDuplicateJobId, jobs],
   );
+  const activePublicationDuplicateSourceJobs = useMemo(() => {
+    if (!activePublicationDuplicateJob) {
+      return [];
+    }
+
+    const explicitSourceJobs = activePublicationDuplicateSourceJobIds
+      .map((jobId) => jobs.find((job) => job.id === jobId) ?? null)
+      .filter((job): job is Job => Boolean(job));
+
+    if (explicitSourceJobs.length > 0) {
+      return explicitSourceJobs;
+    }
+
+    return schedulerGroupedJobsMap.get(resolveJobSchedulerGroupKey(activePublicationDuplicateJob)) ?? [activePublicationDuplicateJob];
+  }, [activePublicationDuplicateJob, activePublicationDuplicateSourceJobIds, jobs, schedulerGroupedJobsMap]);
   const activePublicationPreviewJob = useMemo(
     () => (activePublicationPreviewJobId ? jobs.find((job) => job.id === activePublicationPreviewJobId) ?? null : null),
     [activePublicationPreviewJobId, jobs],
@@ -7317,25 +7460,47 @@ function App() {
     };
   }, [authUser, activePublicationPreviewJobId, activeView]);
 
+  useEffect(() => {
+    if (!authUser || activeView !== "scheduler" || !activeSchedulerEditJobId) {
+      return;
+    }
+
+    if (editingJobId === activeSchedulerEditJobId) {
+      return;
+    }
+
+    const job = jobs.find((entry) => entry.id === activeSchedulerEditJobId);
+    if (!job) {
+      return;
+    }
+
+    startEditJob(job);
+  }, [activeSchedulerEditJobId, activeView, authUser, editingJobId, jobs]);
+
   const activePublicationDuplicateTargetCompanies = useMemo(() => {
-    if (!activePublicationDuplicateJob) {
+    if (!activePublicationDuplicateJob || activePublicationDuplicateSourceJobs.length === 0) {
       return [];
     }
 
-    const targetPlatform = publicationTypeNetwork(activePublicationDuplicateJob.publicationType);
+    const targetPlatforms = Array.from(
+      new Set(activePublicationDuplicateSourceJobs.map((job) => publicationTypeNetwork(job.publicationType))),
+    );
+
     return companies.filter((company) => {
       if (company.status !== "ACTIVE") {
         return false;
       }
 
-      return connections.some(
-        (connection) =>
-          connection.companyId === company.id &&
-          connection.platform === targetPlatform &&
-          connection.authStatus === "CONNECTED",
+      return targetPlatforms.every((platform) =>
+        connections.some(
+          (connection) =>
+            connection.companyId === company.id &&
+            connection.platform === platform &&
+            connection.authStatus === "CONNECTED",
+        ),
       );
     });
-  }, [activePublicationDuplicateJob, companies, connections]);
+  }, [activePublicationDuplicateJob, activePublicationDuplicateSourceJobs, companies, connections]);
 
   const mediaAvailableYears = useMemo(
     () =>
@@ -8025,6 +8190,31 @@ function App() {
     }
   }
 
+  async function loadNoticeAdminBroadcasts(options?: { withLoading?: boolean }): Promise<void> {
+    if (!isRootUser) {
+      return;
+    }
+
+    const withLoading = options?.withLoading ?? true;
+    if (withLoading) {
+      setNoticeAdminBroadcastsLoading(true);
+    }
+
+    try {
+      const result = await api.get<{
+        items: NoticeAdminBroadcastItem[];
+      }>("/avisos/broadcasts");
+      setNoticeAdminBroadcasts(result.items);
+      setError("");
+    } catch (loadBroadcastsError) {
+      setError(loadBroadcastsError instanceof Error ? loadBroadcastsError.message : "Falha ao carregar avisos globais.");
+    } finally {
+      if (withLoading) {
+        setNoticeAdminBroadcastsLoading(false);
+      }
+    }
+  }
+
   async function refreshAgentsConnectionsSnapshot(): Promise<void> {
     try {
       const [companiesData, connectionsData] = await Promise.all([
@@ -8046,6 +8236,9 @@ function App() {
       await refreshRecentAvisosSnapshot();
       if (activeView === "notices") {
         await loadAvisosPage(avisosPage, { withSkeleton: false });
+      }
+      if (activeView === "noticeAdmin" && isRootUser) {
+        await loadNoticeAdminBroadcasts({ withLoading: false });
       }
     }
 
@@ -8172,32 +8365,18 @@ function App() {
   }
 
   function resolvePlanFeatureBullets(plan: BillingPlan): string[] {
-    const normalizedCode = (plan.code || "").trim().toUpperCase();
-
-    if (normalizedCode === "AGENCY") {
-      return [
-        `${formatPlanLimitDisplay(plan.workspaceLimit, plan.code)} workspaces de cliente`,
-        `${formatPlanLimitDisplay(plan.agencyBonusWorkspaceLimit, plan.code)} bônus de agência`,
-        `${formatPlanLimitDisplay(plan.maxConnections, plan.code)} contas sociais`,
-        "Convites e colaboração com cliente",
-        "Aprovação e feedback na publicação",
-      ];
-    }
-
-    if (normalizedCode === "TRIAL") {
-      return [
-        `${formatPlanLimitDisplay(plan.workspaceLimit, plan.code)} workspace próprio`,
-        "Até 2 contas de WhatsApp",
-        `${formatPlanLimitDisplay(plan.maxMonthlyPublications, plan.code)} publicações no mês`,
-        "Sem convites e sem aprovação de cliente",
-      ];
-    }
+    const workspaceLabel =
+      plan.workspaceLimit === 1
+        ? "1 workspace próprio"
+        : `${formatPlanLimitDisplay(plan.workspaceLimit, plan.code)} workspaces próprios`;
+    const inviteLabel = plan.supportsWorkspaceInvites ? "Convites e colaboração habilitados" : "Sem convites";
+    const approvalLabel = plan.supportsClientApproval ? "Feedback e aprovação com cliente" : "Sem aprovação de cliente";
 
     return [
-      `${formatPlanLimitDisplay(plan.workspaceLimit, plan.code)} workspace próprio`,
-      "Até 2 contas de WhatsApp",
+      workspaceLabel,
       `${formatPlanLimitDisplay(plan.maxConnections, plan.code)} contas sociais`,
-      "Sem convites e sem aprovação de cliente",
+      inviteLabel,
+      approvalLabel,
     ];
   }
 
@@ -8718,6 +8897,30 @@ function App() {
   }, [isRootUser, rootAssignPlanId, rootAssignablePlans, billingMe?.plan?.id]);
 
   useEffect(() => {
+    if (activeView === "planConfig") {
+      return;
+    }
+
+    if (rootConfigTab !== "settings") {
+      setRootConfigTab("settings");
+    }
+
+    if (editingPlanId) {
+      resetBillingPlanForm();
+    }
+  }, [activeView, editingPlanId, rootConfigTab]);
+
+  useEffect(() => {
+    if (activeView !== "planConfig") {
+      return;
+    }
+
+    if (rootConfigTab !== "createPlan" && editingPlanId) {
+      resetBillingPlanForm();
+    }
+  }, [activeView, rootConfigTab, editingPlanId]);
+
+  useEffect(() => {
     if (!isRootUser || !isBillingDiscountModalOpen) {
       return;
     }
@@ -8961,6 +9164,25 @@ function App() {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [activeView, avisosPage, authUser]);
+
+  useEffect(() => {
+    if (!authUser || !isRootUser || activeView !== "noticeAdmin") {
+      return;
+    }
+
+    let cancelled = false;
+    setNoticeAdminBroadcastsLoading(true);
+
+    void loadNoticeAdminBroadcasts({ withLoading: true }).finally(() => {
+      if (cancelled) {
+        return;
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeView, authUser, isRootUser]);
 
   useEffect(() => {
     setJobSelectedCompanyIds((current) => {
@@ -9315,6 +9537,7 @@ function App() {
       const nextHistoryFilter = parseHistoryFilterKey(readSearchParam(HISTORY_FILTER_QUERY_PARAM));
       const nextProfileTab = parseProfilePageTab(window.location.pathname, window.location.search);
       const nextProfileUsername = readProfileUsernameFromPathname(window.location.pathname);
+      const nextSchedulerEditJobId = nextView === "scheduler" ? readSchedulerEditJobIdFromPathname(window.location.pathname) : null;
 
       const shouldPrimeContentSkeleton =
         Boolean(authUser) &&
@@ -9332,9 +9555,14 @@ function App() {
       setProfilePageTab(nextProfileTab);
       setProfileRouteUsername(nextProfileUsername);
       setHistoryFilter(nextHistoryFilter);
+      setActiveSchedulerEditJobId(nextSchedulerEditJobId);
       setActivePublicationPreviewJobId(
         nextView === "historyPreview" ? readPublicationPreviewJobIdFromPathname(window.location.pathname) : null,
       );
+
+      if (nextView === "scheduler" && !nextSchedulerEditJobId && editingJobId) {
+        resetSchedulerForm();
+      }
 
       if (nextView === "history") {
         setHistoryMonthFilter("all");
@@ -9374,6 +9602,9 @@ function App() {
     if (activeView === "historyPreview" && activePublicationPreviewJobId) {
       url.pathname = buildPublicationPreviewHref(activePublicationPreviewJobId);
       url.search = "";
+    } else if (activeView === "scheduler" && activeSchedulerEditJobId) {
+      url.pathname = buildSchedulerEditHref(activeSchedulerEditJobId);
+      url.search = "";
     } else if (activeView === "profile" || activeView === "plan") {
       url.pathname = profileUrl.pathname;
       url.search = profileUrl.search;
@@ -9396,6 +9627,7 @@ function App() {
     }
   }, [
     activePublicationPreviewJobId,
+    activeSchedulerEditJobId,
     activeView,
     authUser,
     historyFilter,
@@ -10160,6 +10392,8 @@ function App() {
   }
 
   function primeWhatsappQrGeneration(connectionId: string) {
+    whatsappQrFlowVersionRef.current.set(connectionId, (whatsappQrFlowVersionRef.current.get(connectionId) ?? 0) + 1);
+    setDismissedAgentAuthConnectionIds((current) => current.filter((id) => id !== connectionId));
     applyQrConnectionRuntimeState(connectionId, {
       authStatus: "AUTH_IN_PROGRESS",
       authLaunchUrl: null,
@@ -10173,6 +10407,57 @@ function App() {
       whatsappOwnerJid: null,
       whatsappProfileName: null,
     });
+  }
+
+  function getWhatsappQrFlowVersion(connectionId: string): number {
+    return whatsappQrFlowVersionRef.current.get(connectionId) ?? 0;
+  }
+
+  function resetWhatsappQrConnectionState(connectionId: string) {
+    setDismissedAgentAuthConnectionIds((current) => (current.includes(connectionId) ? current : [...current, connectionId]));
+    setConnections((current) =>
+      current.map((connection) =>
+        connection.id === connectionId
+          ? {
+              ...connection,
+              authStatus: "AUTH_REQUIRED",
+              authLaunchUrl: null,
+              lastSeenAt: null,
+              lastAuthAt: null,
+              qrStatus: "IDLE",
+              qrImageDataUrl: null,
+              qrGeneratedAt: null,
+              workerLastSeenAt: null,
+              qrMessage: null,
+              whatsappOwnerJid: null,
+              whatsappProfileName: null,
+            }
+          : connection,
+      ),
+    );
+  }
+
+  function markWhatsappQrConnectionConnected(connectionId: string) {
+    const optimisticConnectedAt = new Date().toISOString();
+    setDismissedAgentAuthConnectionIds((current) => current.filter((id) => id !== connectionId));
+    setConnections((current) =>
+      current.map((connection) =>
+        connection.id === connectionId
+          ? {
+              ...connection,
+              authStatus: "CONNECTED",
+              authLaunchUrl: null,
+              lastSeenAt: optimisticConnectedAt,
+              lastAuthAt: optimisticConnectedAt,
+              qrStatus: "CONNECTED",
+              qrImageDataUrl: null,
+              qrGeneratedAt: null,
+              workerLastSeenAt: null,
+              qrMessage: null,
+            }
+          : connection,
+      ),
+    );
   }
 
   function applyCompletedPostForMeConnection(payload: {
@@ -10421,6 +10706,17 @@ function App() {
     const connection = connectionOverride ?? connections.find((entry) => entry.id === connectionId);
     const isWhatsappConnection = connection?.platform === "whatsapp";
     const isPostForMeConnection = connection?.provider === "POST_FOR_ME";
+
+    if (isWhatsappConnection && hasReusableWhatsappQr(connection ?? null)) {
+      setActiveQrConnectionId(connectionId);
+      setQrRequestingConnectionId(null);
+      setQrCancellingConnectionId(null);
+      setQrModalInfo("");
+      setQrModalInfoTone("success");
+      setError("");
+      setAuthInfo("");
+      return;
+    }
 
     if (isPostForMeConnection) {
       setAgentsConnectionTransitionLoading(false);
@@ -10949,18 +11245,57 @@ function App() {
   }
 
   async function cancelConnectionQr(connectionId: string) {
-    setQrCancellingConnectionId(connectionId);
+    const connectionSnapshot = connections.find((connection) => connection.id === connectionId) ?? null;
+    const shouldOptimisticallyMarkConnected =
+      connectionSnapshot?.platform === "whatsapp" &&
+      (connectionSnapshot.qrStatus === "CONNECTED" || connectionSnapshot.authStatus === "CONNECTED");
+    const shouldKeepReusableQr = hasReusableWhatsappQr(connectionSnapshot);
+
     setActiveQrConnectionId((current) => (current === connectionId ? null : current));
     setQrRequestingConnectionId((current) => (current === connectionId ? null : current));
     setQrModalInfo("");
     setQrModalInfoTone("success");
+    setError("");
+
+    if (shouldOptimisticallyMarkConnected) {
+      markWhatsappQrConnectionConnected(connectionId);
+      setAuthInfo("Conta WhatsApp conectada com sucesso.");
+      void refreshAgentsConnectionsSnapshot();
+      return;
+    }
+
+    if (shouldKeepReusableQr) {
+      setDismissedAgentAuthConnectionIds((current) => (current.includes(connectionId) ? current : [...current, connectionId]));
+      setAuthInfo("");
+      window.setTimeout(() => {
+        void refreshAgentsConnectionsSnapshot();
+      }, 1800);
+      return;
+    }
+
+    setQrCancellingConnectionId(connectionId);
+    resetWhatsappQrConnectionState(connectionId);
+    setAuthInfo("");
+
     try {
-      const result = await api.postJson<SocialConnection>(`/connections/${connectionId}/dismiss-qr`, {});
-      await loadAll();
-      setError("");
-      if (result.authStatus === "CONNECTED") {
-        setAuthInfo("Conta WhatsApp conectada com sucesso.");
+      const cancelFlowVersion = getWhatsappQrFlowVersion(connectionId);
+      const result = await api.postJson<SocialConnection>(`/connections/${connectionId}/dismiss-qr`, {
+        requestSeenAt: connectionSnapshot?.lastSeenAt ?? null,
+      });
+      if (getWhatsappQrFlowVersion(connectionId) !== cancelFlowVersion) {
+        return;
       }
+      if (result.authStatus === "CONNECTED") {
+        markWhatsappQrConnectionConnected(connectionId);
+        setAuthInfo("Conta WhatsApp conectada com sucesso.");
+      } else {
+        resetWhatsappQrConnectionState(connectionId);
+      }
+      void refreshAgentsConnectionsSnapshot();
+    } catch (error) {
+      await refreshAgentsConnectionsSnapshot();
+      setAuthInfo("");
+      setError(error instanceof Error ? error.message : "Falha ao encerrar o QR do WhatsApp.");
     } finally {
       setQrCancellingConnectionId((current) => (current === connectionId ? null : current));
     }
@@ -10971,6 +11306,7 @@ function App() {
       return;
     }
 
+    whatsappQrFlowVersionRef.current.set(connectionId, (whatsappQrFlowVersionRef.current.get(connectionId) ?? 0) + 1);
     setError("");
     setAuthInfo("Conta desconectada com sucesso.");
     setActiveQrConnectionId((current) => (current === connectionId ? null : current));
@@ -11009,9 +11345,9 @@ function App() {
     );
     try {
       await api.postJson(`/connections/${connectionId}/disconnect`, {});
-      void loadAll({ withSkeleton: false });
+      void refreshAgentsConnectionsSnapshot();
     } catch (error) {
-      await loadAll({ withSkeleton: false });
+      await refreshAgentsConnectionsSnapshot();
       setAuthInfo("");
       setError(error instanceof Error ? error.message : "Falha ao desconectar a conta.");
     }
@@ -12740,6 +13076,13 @@ function App() {
     setEditingJobId(null);
     setEditingJobScope("group");
     setEditingJobSubsetIds(null);
+    setActiveSchedulerEditJobId(null);
+    if (typeof window !== "undefined" && readSchedulerEditJobIdFromPathname(window.location.pathname)) {
+      const nextUrl = new URL(window.location.href);
+      nextUrl.pathname = VIEW_ROUTE_MAP.scheduler;
+      nextUrl.search = "";
+      window.history.replaceState({}, "", `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`);
+    }
     if (schedulerMediaInputRef.current) {
       schedulerMediaInputRef.current.value = "";
     }
@@ -12859,14 +13202,24 @@ function App() {
     setScheduledDate(toDateLocal(sourceJob.dataPostagem, effectiveUserTimeZone));
     setScheduledTime(toTimeLocal(sourceJob.dataPostagem, effectiveUserTimeZone));
     setActiveView("scheduler");
+
+    if (typeof window !== "undefined") {
+      window.requestAnimationFrame(() => {
+        window.scrollTo({ top: 0, behavior: "auto" });
+        document.documentElement.scrollTop = 0;
+        document.body.scrollTop = 0;
+      });
+    }
   }
 
-  async function deleteJob(jobId: string) {
+  async function deleteJob(jobId: string, options?: { reload?: boolean }) {
     await api.delete(`/jobs/${jobId}`);
     if (editingJobId === jobId) {
       resetSchedulerForm();
     }
-    await loadAll();
+    if (options?.reload !== false) {
+      await loadAll();
+    }
   }
 
   function openHistoryJobEditor(job: Job, options?: { isolateSinglePublication?: boolean; jobIds?: string[] }) {
@@ -12875,6 +13228,18 @@ function App() {
       return;
     }
 
+    if (typeof window !== "undefined") {
+      const nextHref = buildSchedulerEditHref(job.id);
+      const currentUrl = new URL(window.location.href);
+      const nextUrl = new URL(nextHref, window.location.origin);
+      const currentComparable = `${normalizePath(currentUrl.pathname)}${currentUrl.search}`;
+      const nextComparable = `${normalizePath(nextUrl.pathname)}${nextUrl.search}`;
+      if (currentComparable !== nextComparable) {
+        window.history.pushState({}, "", `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`);
+      }
+    }
+
+    setActiveSchedulerEditJobId(job.id);
     startEditJob(job, options);
   }
 
@@ -12924,11 +13289,17 @@ function App() {
     }
   }
 
-  function openPublicationDuplicateModal(job: Job) {
+  function openPublicationDuplicateModal(job: Job, options?: { sourceJobs?: Job[] }) {
     if (!canManagePublicationJob(job)) {
       setError("Você tem acesso somente de visualização neste workspace.");
       return;
     }
+
+    setError("");
+    setHistoryInfo("");
+
+    const sourceJobs = options?.sourceJobs?.length ? options.sourceJobs : schedulerGroupedJobsMap.get(resolveJobSchedulerGroupKey(job)) ?? [job];
+    const sourcePlatforms = Array.from(new Set(sourceJobs.map((entry) => publicationTypeNetwork(entry.publicationType))));
 
     const duplicateTargets = companies.filter((company) => {
       if (company.status !== "ACTIVE") {
@@ -12939,17 +13310,20 @@ function App() {
         return false;
       }
 
-      const platform = publicationTypeNetwork(job.publicationType);
-      return connections.some(
-        (connection) =>
-          connection.companyId === company.id &&
-          connection.platform === platform &&
-          connection.authStatus === "CONNECTED",
+      return sourcePlatforms.every((platform) =>
+        connections.some(
+          (connection) =>
+            connection.companyId === company.id &&
+            connection.platform === platform &&
+            connection.authStatus === "CONNECTED",
+        ),
       );
     });
 
     setActivePublicationDuplicateJobId(job.id);
+    setActivePublicationDuplicateSourceJobIds(sourceJobs.map((entry) => entry.id));
     setPublicationDuplicateTitle(resolveHistoryCalendarTitle(job));
+    setPublicationDuplicateTitleError("");
     setPublicationDuplicateDate(toDateLocal(job.dataPostagem, effectiveUserTimeZone) || "");
     setPublicationDuplicateTime(toTimeLocal(job.dataPostagem, effectiveUserTimeZone) || getCurrentTimeValue(effectiveUserTimeZone));
     setPublicationDuplicateCompanyIds(
@@ -12959,7 +13333,9 @@ function App() {
 
   function closePublicationDuplicateModal() {
     setActivePublicationDuplicateJobId(null);
+    setActivePublicationDuplicateSourceJobIds([]);
     setPublicationDuplicateTitle("");
+    setPublicationDuplicateTitleError("");
     setPublicationDuplicateDate("");
     setPublicationDuplicateTime("");
     setPublicationDuplicateCompanyIds([]);
@@ -13286,16 +13662,47 @@ function App() {
     );
   }
 
+  function normalizePublicationDuplicateTitleValue(value: string) {
+    return value.trim().replace(/\s+/g, " ").toLocaleLowerCase("pt-BR");
+  }
+
+  function getPublicationDuplicateTitleValidationMessage(title: string, sourceTitle: string) {
+    if (!title.trim()) {
+      return "Informe um título para a cópia.";
+    }
+
+    if (normalizePublicationDuplicateTitleValue(title) === normalizePublicationDuplicateTitleValue(sourceTitle)) {
+      return "Escolha um título diferente da publicação original.";
+    }
+
+    return "";
+  }
+
   async function createPublicationDuplicateFromModal(event: FormEvent) {
     event.preventDefault();
-    if (!activePublicationDuplicateJob) {
+    if (!activePublicationDuplicateJob || activePublicationDuplicateSourceJobs.length === 0) {
       return;
     }
+
+    setHistoryInfo("");
+    setError("");
 
     if (!canManagePublicationJob(activePublicationDuplicateJob)) {
       setError("Você tem acesso somente de visualização neste workspace.");
       return;
     }
+
+    const duplicateTitleValidationMessage = getPublicationDuplicateTitleValidationMessage(
+      publicationDuplicateTitle,
+      resolveHistoryCalendarTitle(activePublicationDuplicateJob),
+    );
+
+    if (duplicateTitleValidationMessage) {
+      setPublicationDuplicateTitleError(duplicateTitleValidationMessage);
+      return;
+    }
+
+    setPublicationDuplicateTitleError("");
 
     if (publicationDuplicateCompanyIds.length === 0) {
       setError("Selecione ao menos um workspace para duplicar a publicação.");
@@ -13315,30 +13722,43 @@ function App() {
 
     setCreatingPublicationDuplicate(true);
     setError("");
-    setHistoryInfo("Criando cópias da publicação...");
 
     try {
-      const results = await Promise.all(
-        publicationDuplicateCompanyIds.map(async (companyId) => {
-          const payload = buildHistoryBulkUpdatePayload(activePublicationDuplicateJob, {
+      const duplicateSchedulerGroupId = createSchedulerGroupId();
+      const duplicatePayloads = publicationDuplicateCompanyIds.flatMap((companyId) =>
+        activePublicationDuplicateSourceJobs.map((sourceJob) => ({
+          job: sourceJob,
+          payload: buildHistoryBulkUpdatePayload(sourceJob, {
             companyId,
             publicationState: "DRAFT",
             dataPostagem: scheduledPayload.dataPostagem,
-          });
+            schedulerGroupId: duplicateSchedulerGroupId,
+          }),
+        })),
+      );
 
-          return api.postJson<Job>("/jobs", {
+      if (duplicatePayloads.some((entry) => !entry.payload.socialConnectionId)) {
+        setCreatingPublicationDuplicate(false);
+        setHistoryInfo("");
+        setError("Alguma rede desta publicação está sem conta conectada no workspace escolhido.");
+        return;
+      }
+
+      await Promise.all(
+        duplicatePayloads.map(async ({ payload }) =>
+          api.postJson<Job>("/jobs", {
             ...payload,
             scheduledDateLocal: scheduledPayload.scheduledDateLocal,
             scheduledTimeLocal: scheduledPayload.scheduledTimeLocal,
             timeZone: scheduledPayload.timeZone,
             title: publicationDuplicateTitle.trim() || resolveHistoryCalendarTitle(activePublicationDuplicateJob),
-          });
-        }),
+          }),
+        ),
       );
 
       setHistoryInfo(
-        results.length > 1
-          ? `${results.length} cópias foram criadas como rascunho.`
+        publicationDuplicateCompanyIds.length > 1
+          ? `${publicationDuplicateCompanyIds.length} cópias foram criadas como rascunho.`
           : "Cópia criada como rascunho com sucesso.",
       );
       closePublicationDuplicateModal();
@@ -13397,6 +13817,36 @@ function App() {
     try {
       setError("");
       await deleteJob(job.id);
+      window.alert("Postagem excluída com sucesso.");
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : "Falha ao excluir a postagem.");
+    }
+  }
+
+  async function deleteGroupedHistoryJobs(jobsToDelete: Job[]) {
+    const uniqueJobs = Array.from(new Map(jobsToDelete.map((job) => [job.id, job])).values());
+    if (uniqueJobs.length === 0) {
+      return;
+    }
+
+    const anchorJob = uniqueJobs[0]!;
+    if (!canManagePublicationJob(anchorJob)) {
+      setError("Você tem acesso somente de visualização neste workspace.");
+      return;
+    }
+
+    const title = resolveHistoryCalendarTitle(anchorJob);
+    const confirmed = window.confirm(`Deseja excluir "${title}"? Essa ação não pode ser desfeita.`);
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      setError("");
+      for (const job of uniqueJobs) {
+        await deleteJob(job.id, { reload: false });
+      }
+      await loadAll();
       window.alert("Postagem excluída com sucesso.");
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : "Falha ao excluir a postagem.");
@@ -14172,6 +14622,7 @@ function App() {
       scheduledTimeLocal?: string;
       timeZone?: string;
       companyId?: string;
+      schedulerGroupId?: string;
     },
   ) {
     const selectedFilePaths = decodeJobMediaPaths(job)
@@ -14214,6 +14665,7 @@ function App() {
       whatsappRelinkConnectionIds: job.whatsappRelinkConnectionIds ?? [],
       locationName: job.locationName ?? "",
       locationId: job.locationId ?? "",
+      schedulerGroupId: options.schedulerGroupId,
       publicationType: job.publicationType,
       publicationState: options.publicationState ?? job.publicationState,
       dataPostagem: options.dataPostagem === undefined ? job.dataPostagem : options.dataPostagem,
@@ -14379,9 +14831,6 @@ function App() {
     setError("");
 
     try {
-      const mockIds = [...MOCK_SOCIALUP_NOTICES].map((item) => item.id);
-      setLocallyReadPopoverNoticeIds((current) => Array.from(new Set([...current, ...mockIds])));
-
       if (unreadAvisosCount > 0) {
         await api.postJson<{ updated: number }>("/avisos/mark-all-read", {});
         await refreshRecentAvisosSnapshot();
@@ -14436,14 +14885,6 @@ function App() {
     }
   }
 
-  function dismissMockPopoverNotice(noticeId: string) {
-    setDismissedPopoverNoticeIds((current) => (current.includes(noticeId) ? current : [...current, noticeId]));
-  }
-
-  function markMockPopoverNoticeAsRead(noticeId: string) {
-    setLocallyReadPopoverNoticeIds((current) => (current.includes(noticeId) ? current : [...current, noticeId]));
-  }
-
   function renderNoticeReadState(options: {
     unread: boolean;
     busy?: boolean;
@@ -14473,7 +14914,58 @@ function App() {
     );
   }
 
-  async function createBroadcastAviso(event: FormEvent) {
+  function resetBroadcastAvisoForm() {
+    setEditingNoticeBroadcastKey(null);
+    setBroadcastAvisoTitle("");
+    setBroadcastAvisoMessage("");
+    setBroadcastAvisoIconKey("message-square");
+  }
+
+  function openBroadcastAvisoEditor(item: NoticeAdminBroadcastItem) {
+    setNoticeAdminTab("edit");
+    setEditingNoticeBroadcastKey(item.broadcastKey);
+    setBroadcastAvisoTitle(item.title);
+    setBroadcastAvisoMessage(item.message);
+    setBroadcastAvisoIconKey((item.iconKey as NoticeIconKey | null) ?? "message-square");
+  }
+
+  function cancelBroadcastAvisoEditing() {
+    resetBroadcastAvisoForm();
+  }
+
+  async function deleteBroadcastAviso(item: NoticeAdminBroadcastItem) {
+    const confirmed = window.confirm("Deseja excluir este aviso global?");
+    if (!confirmed) {
+      return;
+    }
+
+    setDeletingNoticeBroadcastKey(item.broadcastKey);
+    setError("");
+    setNoticeAdminInfo("");
+
+    try {
+      await api.delete(`/avisos/broadcasts/${item.broadcastKey}`);
+      if (editingNoticeBroadcastKey === item.broadcastKey) {
+        resetBroadcastAvisoForm();
+      }
+      setNoticeAdminInfo("Aviso excluído com sucesso.");
+      await loadNoticeAdminBroadcasts({ withLoading: false });
+      if (activeView === "notices") {
+        await loadAvisosPage(avisosPage, { withSkeleton: false });
+      }
+      try {
+        await refreshRecentAvisosSnapshot();
+      } catch {
+        // Mantém o feedback de exclusão mesmo se a atualização do sino falhar.
+      }
+    } catch (deleteAvisoError) {
+      setError(deleteAvisoError instanceof Error ? deleteAvisoError.message : "Falha ao excluir aviso.");
+    } finally {
+      setDeletingNoticeBroadcastKey(null);
+    }
+  }
+
+  async function submitBroadcastAviso(event: FormEvent) {
     event.preventDefault();
     setBroadcastAvisoSubmitting(true);
     setError("");
@@ -14483,16 +14975,23 @@ function App() {
       const payload = {
         title: broadcastAvisoTitle,
         message: broadcastAvisoMessage,
+        iconKey: broadcastAvisoIconKey,
       };
-      const result = await api.postJson<{ created: number }>("/avisos/broadcast", payload);
-      setBroadcastAvisoTitle("");
-      setBroadcastAvisoMessage("");
-      setNoticeAdminInfo(
-        result.created > 0
-          ? "Aviso enviado com sucesso."
-          : "Nenhum usuário encontrado para receber o aviso.",
-      );
-      await loadAll();
+      if (editingNoticeBroadcastKey) {
+        await api.putJson<{ updated: number }>(`/avisos/broadcasts/${editingNoticeBroadcastKey}`, payload);
+        setNoticeAdminInfo("Aviso atualizado com sucesso.");
+        resetBroadcastAvisoForm();
+        setNoticeAdminTab("edit");
+      } else {
+        const result = await api.postJson<{ created: number }>("/avisos/broadcast", payload);
+        setNoticeAdminInfo(
+          result.created > 0
+            ? "Aviso enviado com sucesso."
+            : "Nenhum usuário encontrado para receber o aviso.",
+        );
+        resetBroadcastAvisoForm();
+      }
+      await loadNoticeAdminBroadcasts({ withLoading: false });
       if (activeView === "notices") {
         await loadAvisosPage(avisosPage, { withSkeleton: false });
       }
@@ -14502,7 +15001,7 @@ function App() {
         // Mantém o feedback de sucesso mesmo se a atualização do sino falhar.
       }
     } catch (createAvisoError) {
-      setError(createAvisoError instanceof Error ? createAvisoError.message : "Falha ao enviar aviso.");
+      setError(createAvisoError instanceof Error ? createAvisoError.message : "Falha ao salvar aviso.");
     } finally {
       setBroadcastAvisoSubmitting(false);
     }
@@ -14580,22 +15079,29 @@ function App() {
     setPlanCodeInput("");
     setPlanNameInput("");
     setPlanDescriptionInput("");
+    setPlanSubtitleInput("");
+    setPlanHighlightsInput([""]);
     setPlanIsTrialInput(false);
     setPlanIsActiveInput(true);
     setPlanIsPublicInput(true);
-    setPlanWorkspaceLimitInput("1");
+    setPlanWorkspaceLimitInput("2");
     setPlanAgencyBonusWorkspaceLimitInput("0");
     setPlanMaxConnectionsInput("2");
     setPlanMaxMonthlyPublicationsInput("60");
+    setPlanSupportsWorkspaceInvitesInput(false);
+    setPlanSupportsClientApprovalInput(false);
     setPlanDisplayOrderInput("1");
     setPlanStripeProductIdInput("");
   }
 
   function startBillingPlanEdit(plan: BillingPlan) {
+    setRootConfigTab("createPlan");
     setEditingPlanId(plan.id);
     setPlanCodeInput(plan.code);
     setPlanNameInput(plan.name);
     setPlanDescriptionInput(plan.description ?? "");
+    setPlanSubtitleInput(plan.subtitle ?? plan.description ?? "");
+    setPlanHighlightsInput(plan.highlights.length > 0 ? [...plan.highlights] : resolvePlanFeatureBullets(plan));
     setPlanIsTrialInput(plan.isTrial);
     setPlanIsActiveInput(plan.isActive);
     setPlanIsPublicInput(plan.isPublic);
@@ -14603,6 +15109,8 @@ function App() {
     setPlanAgencyBonusWorkspaceLimitInput(String(plan.agencyBonusWorkspaceLimit));
     setPlanMaxConnectionsInput(String(plan.maxConnections));
     setPlanMaxMonthlyPublicationsInput(String(plan.maxMonthlyPublications));
+    setPlanSupportsWorkspaceInvitesInput(plan.supportsWorkspaceInvites);
+    setPlanSupportsClientApprovalInput(plan.supportsClientApproval);
     setPlanDisplayOrderInput(String(plan.displayOrder));
     setPlanStripeProductIdInput(plan.stripeProductId ?? "");
     window.requestAnimationFrame(() => {
@@ -14612,6 +15120,21 @@ function App() {
       }
       const targetTop = section.getBoundingClientRect().top + window.scrollY - 110;
       window.scrollTo({ top: Math.max(0, targetTop), behavior: "smooth" });
+    });
+  }
+
+  function updatePlanHighlightInput(index: number, value: string) {
+    setPlanHighlightsInput((current) => current.map((item, itemIndex) => (itemIndex === index ? value : item)));
+  }
+
+  function addPlanHighlightInput() {
+    setPlanHighlightsInput((current) => (current.length >= 8 ? current : [...current, ""]));
+  }
+
+  function removePlanHighlightInput(index: number) {
+    setPlanHighlightsInput((current) => {
+      const next = current.filter((_, itemIndex) => itemIndex !== index);
+      return next.length > 0 ? next : [""];
     });
   }
 
@@ -14680,6 +15203,8 @@ function App() {
         code: planCodeInput.trim().toUpperCase(),
         name: planNameInput.trim(),
         description: planDescriptionInput.trim(),
+        subtitle: planSubtitleInput.trim(),
+        highlights: planHighlightsInput.map((item) => item.trim()).filter(Boolean).slice(0, 8),
         isActive: planIsActiveInput,
         isPublic: planIsPublicInput,
         isTrial: planIsTrialInput,
@@ -14688,6 +15213,8 @@ function App() {
         agencyBonusWorkspaceLimit,
         maxConnections,
         maxMonthlyPublications,
+        supportsWorkspaceInvites: planSupportsWorkspaceInvitesInput,
+        supportsClientApproval: planSupportsClientApprovalInput,
         displayOrder,
         stripeProductId: planStripeProductIdInput.trim() || null,
       };
@@ -15431,7 +15958,7 @@ function App() {
 
   function renderNoticesBell(shellRef: { current: HTMLDivElement | null }, extraClassName = "") {
     const hasUnreadNotices =
-      unreadAvisosCount > 0 || hasUnreadMockSocialUpNotices;
+      unreadAvisosCount > 0;
     const canMarkAllNoticesAsRead =
       hasUnreadNotices;
     const tabs: Array<{ key: NoticesPopoverTabKey; label: string; unreadCount: number; icon: IconType }> = [
@@ -15440,7 +15967,7 @@ function App() {
       {
         key: "socialup",
         label: "SocialUp",
-        unreadCount: recentAvisosUnreadCounts.socialup || unreadMockSocialUpCount,
+        unreadCount: recentAvisosUnreadCounts.socialup,
         icon: FiMessageSquare,
       },
     ];
@@ -15550,7 +16077,7 @@ function App() {
     }
 
     function renderSocialUpTab(): ReactNode {
-      if (recentSocialUpAvisos.length === 0 && visibleMockSocialUpNotices.length === 0) {
+      if (recentSocialUpAvisos.length === 0) {
         return (
           <div className="notices-popover-empty">
             <strong>Sem recados da SocialUp</strong>
@@ -15562,10 +16089,11 @@ function App() {
       if (recentSocialUpAvisos.length > 0) {
         return recentSocialUpAvisos.map((notice) => {
           const unread = !notice.readAt;
+          const Icon = resolveAvisoPopoverIcon(notice);
           return (
             <article key={notice.id} className="notices-entry-card">
-              <span className="notices-entry-thumb notices-entry-thumb-success" aria-hidden="true">
-                <FiMessageSquare />
+              <span className={`notices-entry-thumb ${resolveAvisoPopoverThumbClass(notice)}`} aria-hidden="true">
+                <Icon />
               </span>
               <div className="notices-entry-copy">
                 <div className="notices-entry-heading">
@@ -15598,43 +16126,6 @@ function App() {
           );
         });
       }
-
-      return visibleMockSocialUpNotices.map((notice) => {
-        const unread = notice.unread && !locallyReadPopoverNoticeIds.includes(notice.id);
-        const Icon = notice.icon;
-        return (
-          <article key={notice.id} className="notices-entry-card">
-            <span className="notices-entry-thumb notices-entry-thumb-neutral" aria-hidden="true">
-              <Icon />
-            </span>
-            <div className="notices-entry-copy">
-              <div className="notices-entry-heading">
-                <strong>{notice.title}</strong>
-                <span className="notices-entry-time">{notice.createdAtLabel}</span>
-              </div>
-              <span className="notices-entry-kicker">Equipe SocialUp</span>
-              <p>{notice.message}</p>
-            </div>
-            <div className="notices-entry-side">
-              {renderNoticeReadState({
-                unread,
-                onMarkRead: () => markMockPopoverNoticeAsRead(notice.id),
-                unreadLabel: "Marcar aviso como lido",
-                readLabel: "Aviso lido",
-              })}
-              <button
-                type="button"
-                className="notices-entry-delete"
-                aria-label="Excluir aviso"
-                title="Excluir aviso"
-                onClick={() => dismissMockPopoverNotice(notice.id)}
-              >
-                <FiTrash2 aria-hidden="true" />
-              </button>
-            </div>
-          </article>
-        );
-      });
     }
 
     return (
@@ -15814,18 +16305,19 @@ function App() {
             </section>
           </>
         ) : (
-          <section className="auth-panel-clean">
-            {authError ? <div className="error-banner">{authError}</div> : null}
-            {authInfo ? <div className={`info-banner${isPositiveAuthInfo ? " info-banner-success" : ""}`}>{authInfo}</div> : null}
-            {showWorkspaceInvite && workspaceInvitePreview ? (
-              <div className="field-hint" style={{ marginBottom: 16 }}>
-                {`Convite para ${workspaceInvitePreview.workspace.name} como ${
-                  workspaceInvitePreview.role === "CLIENT" ? "cliente" : "equipe da agência"
-                }.`}
-              </div>
-            ) : null}
+          <>
+            <section className="auth-panel-clean">
+              {authError ? <div className="error-banner">{authError}</div> : null}
+              {authInfo ? <div className={`info-banner${isPositiveAuthInfo ? " info-banner-success" : ""}`}>{authInfo}</div> : null}
+              {showWorkspaceInvite && workspaceInvitePreview ? (
+                <div className="field-hint" style={{ marginBottom: 16 }}>
+                  {`Convite para ${workspaceInvitePreview.workspace.name} como ${
+                    workspaceInvitePreview.role === "CLIENT" ? "cliente" : "equipe da agência"
+                  }.`}
+                </div>
+              ) : null}
 
-            <form onSubmit={login} className="form-stack">
+              <form onSubmit={login} className="form-stack">
                 <input
                   value={loginIdentifier}
                   onChange={(event) => setLoginIdentifier(event.target.value)}
@@ -15836,47 +16328,60 @@ function App() {
                   maxLength={160}
                   title="Informe seu email ou usuário."
                 />
-              <div className="password-field">
-                <input
-                  type={showLoginPassword ? "text" : "password"}
-                  value={loginPassword}
-                  onChange={(event) => setLoginPassword(event.target.value)}
-                  placeholder="Senha"
-                  disabled={authLoginBusy}
-                  required
-                  minLength={8}
-                  maxLength={128}
-                  title="Informe sua senha."
-                />
-                <button
-                  type="button"
-                  className="password-toggle"
-                  onClick={() => setShowLoginPassword((current) => !current)}
-                  disabled={authLoginBusy}
-                  aria-label={showLoginPassword ? "Ocultar senha" : "Mostrar senha"}
-                >
-                  {showLoginPassword ? <FiEyeOff /> : <FiEye />}
+                <div className="password-field">
+                  <input
+                    type={showLoginPassword ? "text" : "password"}
+                    value={loginPassword}
+                    onChange={(event) => setLoginPassword(event.target.value)}
+                    placeholder="Senha"
+                    disabled={authLoginBusy}
+                    required
+                    minLength={8}
+                    maxLength={128}
+                    title="Informe sua senha."
+                  />
+                  <button
+                    type="button"
+                    className="password-toggle"
+                    onClick={() => setShowLoginPassword((current) => !current)}
+                    disabled={authLoginBusy}
+                    aria-label={showLoginPassword ? "Ocultar senha" : "Mostrar senha"}
+                  >
+                    {showLoginPassword ? <FiEyeOff /> : <FiEye />}
+                  </button>
+                </div>
+                <label className="auth-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={rememberMe}
+                    onChange={(event) => setRememberMe(event.target.checked)}
+                    disabled={authLoginBusy}
+                  />
+                  <span>Manter conectado</span>
+                </label>
+                <button type="submit" disabled={authLoginBusy}>
+                  {authSubmitting ? (
+                    <>
+                      <span className="button-spinner" />
+                      Entrando...
+                    </>
+                  ) : (
+                    "Entrar"
+                  )}
                 </button>
-              </div>
-              <label className="auth-checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={rememberMe}
-                  onChange={(event) => setRememberMe(event.target.checked)}
-                  disabled={authLoginBusy}
-                />
-                <span>Manter conectado</span>
-              </label>
-              <button type="submit" disabled={authLoginBusy}>
-                {authSubmitting ? (
-                  <>
-                    <span className="button-spinner" />
-                    Entrando...
-                  </>
-                ) : (
-                  "Entrar"
-                )}
-              </button>
+                {showWorkspaceInvite ? (
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={() => setWorkspaceInviteMode("create")}
+                    disabled={authLoginBusy}
+                  >
+                    Primeiro acesso? Criar conta
+                  </button>
+                ) : null}
+              </form>
+            </section>
+            <div className="auth-social-access">
               <div className="auth-provider-divider">
                 <span>ou continue com</span>
               </div>
@@ -15898,18 +16403,8 @@ function App() {
                   </>
                 )}
               </button>
-              {showWorkspaceInvite ? (
-                <button
-                  type="button"
-                  className="ghost-button"
-                  onClick={() => setWorkspaceInviteMode("create")}
-                  disabled={authLoginBusy}
-                >
-                  Primeiro acesso? Criar conta
-                </button>
-              ) : null}
-            </form>
-          </section>
+            </div>
+          </>
         )}
       </div>
     );
@@ -15917,6 +16412,7 @@ function App() {
 
   function renderInitialPlanSelection() {
     const selectablePlans = initialTrialSelectablePlans;
+    const trialPlanNetworks = ["instagram", "facebook", "threads", "x", "tiktok", "whatsapp"] as const;
 
     return (
       <div className="trial-onboarding-page">
@@ -15964,7 +16460,7 @@ function App() {
               {selectablePlans.map((plan) => {
                 const normalizedCode = (plan.code || "").trim().toUpperCase();
                 const isAgencyPlan = normalizedCode === "AGENCY";
-                const featureBullets = resolvePlanFeatureBullets(plan);
+                const featureBullets = plan.highlights.length > 0 ? plan.highlights : resolvePlanFeatureBullets(plan);
                 const isStartingThisPlan = startingInitialTrialPlanId === plan.id;
 
                 return (
@@ -15975,7 +16471,22 @@ function App() {
                     <div className="trial-onboarding-plan-head">
                       <div className="trial-onboarding-plan-title">
                         <strong>{plan.name}</strong>
-                        <p>{plan.description || "Plano inicial do seu workspace."}</p>
+                        <p>{plan.subtitle || plan.description || "Plano inicial do seu workspace."}</p>
+                        <div className="trial-onboarding-plan-platforms" aria-label="Redes disponíveis no sistema">
+                          {trialPlanNetworks.map((network) => {
+                            const Icon = socialPlatformIcon(network);
+                            return (
+                              <span
+                                key={`${plan.id}-${network}`}
+                                className={`trial-onboarding-plan-platform-icon trial-onboarding-plan-platform-icon-${network}`}
+                                title={socialPlatformLabel(network)}
+                                aria-label={socialPlatformLabel(network)}
+                              >
+                                <Icon aria-hidden="true" />
+                              </span>
+                            );
+                          })}
+                        </div>
                       </div>
                     </div>
 
@@ -16000,7 +16511,10 @@ function App() {
                           Continuando...
                         </>
                       ) : (
-                        "Continuar com este plano"
+                        <>
+                          Continuar com este plano
+                          <FiChevronRight aria-hidden="true" />
+                        </>
                       )}
                     </button>
                   </article>
@@ -16094,6 +16608,8 @@ function App() {
       selectedDashboardPopoverLatestJobs,
       isPastScheduledAtForUser,
     );
+    const selectedDashboardPopoverCanDuplicate =
+      selectedDashboardPopoverCanManage && selectedDashboardPopoverFailedJobs.length === 0;
 
     return (
       <div className="view-stack">
@@ -16111,8 +16627,8 @@ function App() {
               className="primary-button publications-primary-action"
               onClick={() => navigateToView("scheduler")}
             >
-              <FiPlus aria-hidden="true" />
-              Novo agendamento
+              <FiFileText aria-hidden="true" />
+              Nova publicação
             </button>
           ) : null}
         </section>
@@ -16381,37 +16897,27 @@ function App() {
                   ))}
                 </div>
                 <div className="home-calendar-popover-actions">
-                  {selectedDashboardPopoverCanEditTime ? (
-                    <button
-                      type="button"
-                      className="publications-board-action-button publications-board-action-button-schedule"
-                      title="Editar agendamento"
-                      aria-label="Editar agendamento"
-                      onClick={() => startDashboardCalendarTimeEdit(selectedDashboardPopoverJob)}
-                      disabled={selectedDashboardPopoverSavingTime}
-                    >
-                      <FiCalendar aria-hidden="true" />
-                    </button>
-                  ) : null}
                   {selectedDashboardPopoverCanManage ? (
                     <>
+                      {selectedDashboardPopoverCanDuplicate ? (
+                        <button
+                          type="button"
+                          className="publications-board-action-button publications-board-action-button-duplicate"
+                          title="Duplicar publicação"
+                          aria-label="Duplicar publicação"
+                          onClick={() => openPublicationDuplicateModal(selectedDashboardPopoverJob, { sourceJobs: selectedDashboardPopoverLatestJobs })}
+                        >
+                          <FiCopy aria-hidden="true" />
+                        </button>
+                      ) : null}
                       <button
                         type="button"
-                        className="publications-board-action-button publications-board-action-button-duplicate"
-                        title="Duplicar publicação"
-                        aria-label="Duplicar publicação"
-                        onClick={() => openPublicationDuplicateModal(selectedDashboardPopoverJob)}
+                        className="publications-board-action-button publications-board-action-button-delete"
+                        title="Excluir publicação"
+                        aria-label="Excluir publicação"
+                        onClick={() => void deleteGroupedHistoryJobs(selectedDashboardPopoverLatestJobs)}
                       >
-                        <FiCopy aria-hidden="true" />
-                      </button>
-                      <button
-                        type="button"
-                        className="publications-board-action-button publications-board-action-button-template"
-                        title="Criar template"
-                        aria-label="Criar template"
-                        onClick={() => savePublicationAsTemplate(selectedDashboardPopoverJob)}
-                      >
-                        <FiFileText aria-hidden="true" />
+                        <FiTrash2 aria-hidden="true" />
                       </button>
                     </>
                   ) : null}
@@ -16881,7 +17387,7 @@ function App() {
         ? "Seu período de teste expirou. Escolha um plano para continuar usando o painel."
         : billingMe?.blockMessage;
     if (billingLoading) {
-      return renderPlanSkeleton();
+      return renderPlanConfigSkeleton();
     }
 
     return (
@@ -17212,7 +17718,7 @@ function App() {
     }
 
     if (billingLoading) {
-      return renderPlanSkeleton();
+      return renderPlanConfigSkeleton();
     }
 
     const normalizedPostForMeWebhookUrl = (postForMeWebhookSettings?.webhookUrl || "").trim();
@@ -17222,299 +17728,208 @@ function App() {
       (normalizedPostForMeWebhookUrl.includes("localhost") ||
         (normalizedPostForMeWebhookEndpoint.length > 0 &&
           normalizedPostForMeWebhookUrl !== normalizedPostForMeWebhookEndpoint));
+    const postForMeWebhookStatusLabel = postForMeWebhookNeedsFix
+      ? "Corrigir"
+      : postForMeWebhookSettings?.configured
+        ? "Ativo"
+        : "Pendente";
+    const postForMeWebhookStatusTone = postForMeWebhookNeedsFix
+      ? "warning"
+      : postForMeWebhookSettings?.configured
+        ? "success"
+        : "pending";
+    const rootConfigTabs: Array<{ key: RootConfigTab; label: string; icon: IconType }> = [
+      { key: "settings", label: "Configurações básicas", icon: FiSliders },
+      { key: "webhook", label: "Webhook", icon: FiLink2 },
+      { key: "createPlan", label: "Cadastrar plano", icon: FiEdit3 },
+      { key: "plans", label: "Editar Planos", icon: FiGrid },
+    ];
 
     return (
       <div className="view-stack">
         {planInfo ? <div className={`info-banner${isPositivePlanInfo ? " info-banner-success" : ""}`}>{planInfo}</div> : null}
 
-        <section className="panel-card view-stack" aria-label="Configurações básicas">
-          <div className="section-head">
-            {renderSectionTitleWithIcon("planConfig", "Configurações básicas", "root")}
-            <div className="inline-actions">
+        <div className="history-anchor-tabs account-page-tabs" role="tablist" aria-label="Abas das configurações">
+          {rootConfigTabs.map((tab) => {
+            const isActive = rootConfigTab === tab.key;
+            return (
+              <button
+                key={tab.key}
+                type="button"
+                className={`history-anchor-tab account-page-tab${isActive ? " account-page-tab-active" : ""}`}
+                role="tab"
+                aria-selected={isActive}
+                onClick={() => setRootConfigTab(tab.key)}
+              >
+                <tab.icon aria-hidden="true" />
+                <span>{tab.label}</span>
+              </button>
+            );
+          })}
+        </div>
+
+        {rootConfigTab === "settings" ? (
+          <section className="panel-card view-stack" aria-label="Configurações básicas">
+            <div className="inline-actions" style={{ justifyContent: "flex-end" }}>
               <button type="button" className="ghost-button" onClick={openBillingDiscountModal}>
                 Desconto por usuário
               </button>
             </div>
-          </div>
-          <form onSubmit={saveBillingSettings} className="form-stack">
-            <label className="field-label">
-              <span>Trial automático para novas contas</span>
-              <select
-                value={billingSettings.autoTrialEnabled ? "enabled" : "disabled"}
-                onChange={(event) =>
-                  setBillingSettings((current) => ({
-                    ...current,
-                    autoTrialEnabled: event.target.value === "enabled",
-                  }))
-                }
-              >
-                <option value="enabled">Ativado</option>
-                <option value="disabled">Desativado</option>
-              </select>
-            </label>
-            <label className="field-label">
-              <span>Dias de trial automático</span>
-              <input
-                type="number"
-                min={0}
-                max={60}
-                value={billingSettings.autoTrialDays}
-                onChange={(event) =>
-                  setBillingSettings((current) => ({
-                    ...current,
-                    autoTrialDays: Math.max(0, Math.min(60, Number.parseInt(event.target.value || "0", 10) || 0)),
-                  }))
-                }
-              />
-            </label>
-            <small className="field-hint">
-              Limites do trial são recalculados automaticamente a partir da configuração global de dias.
-            </small>
-            <label className="field-label">
-              <span>Plano padrão do root</span>
-              <select
-                value={billingSettings.rootDisplayPlanId ?? ""}
-                onChange={(event) =>
-                  setBillingSettings((current) => ({
-                    ...current,
-                    rootDisplayPlanId: event.target.value || null,
-                  }))
-                }
-              >
-                <option value="">Automático (maior plano ativo)</option>
-                {billingPlans.map((plan) => (
-                  <option key={plan.id} value={plan.id}>
-                    {`${plan.name} (${plan.code})`}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button type="submit" disabled={savingBillingSettings}>
-              {savingBillingSettings ? "Salvando..." : "Salvar configuração"}
-            </button>
-          </form>
-          <div className="row-card billing-row-card">
-            <div className="form-stack">
-              <strong>Webhook Post for Me</strong>
-              <small className="field-hint">
-                Atualiza automaticamente avisos de conta expirada, desconectada ou renovada no SocialUp.
-              </small>
-              <small className="field-hint">
-                {postForMeWebhookNeedsFix
-                  ? `Webhook salvo com URL incorreta (${normalizedPostForMeWebhookUrl}). Corrija para ${normalizedPostForMeWebhookEndpoint || "a URL pública do backend"}.`
-                  : postForMeWebhookSettings?.configured
-                  ? `Webhook ativo em ${postForMeWebhookSettings.webhookUrl ?? "URL não informada"}.`
-                  : postForMeWebhookSettings?.secretConfigured
-                    ? "Secret já configurado, mas o webhook ainda não foi registrado por esta tela."
-                    : "Ainda não configurado no SocialUp."}
-              </small>
-              {postForMeWebhookSettings?.publicEndpointUrl ? (
-                <small className="field-hint">{`Endpoint: ${postForMeWebhookSettings.publicEndpointUrl}`}</small>
-              ) : null}
-              <div className="inline-actions">
-                <span className="unit-pill unit-pill-plan">
-                  {postForMeWebhookNeedsFix ? "Corrigir" : postForMeWebhookSettings?.configured ? "Ativo" : "Pendente"}
-                </span>
-                {!postForMeWebhookSettings?.configured || postForMeWebhookNeedsFix ? (
+            <form onSubmit={saveBillingSettings} className="root-config-form-shell">
+              <section className="root-config-form-card">
+                <div className="root-config-form-card-head">
+                  <span className="section-kicker root-config-form-kicker">Trial</span>
+                  <strong>Entrada inicial de novas contas</strong>
+                  <p>Defina se o acesso inicial entra com trial automático e por quantos dias esse período ficará ativo.</p>
+                </div>
+                <div className="root-config-form-grid">
+                  <label className="field-label">
+                    <span>Trial automático para novas contas</span>
+                    <select
+                      value={billingSettings.autoTrialEnabled ? "enabled" : "disabled"}
+                      onChange={(event) =>
+                        setBillingSettings((current) => ({
+                          ...current,
+                          autoTrialEnabled: event.target.value === "enabled",
+                        }))
+                      }
+                    >
+                      <option value="enabled">Ativado</option>
+                      <option value="disabled">Desativado</option>
+                    </select>
+                  </label>
+                  <label className="field-label">
+                    <span>Dias de trial automático</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={60}
+                      value={billingSettings.autoTrialDays}
+                      onChange={(event) =>
+                        setBillingSettings((current) => ({
+                          ...current,
+                          autoTrialDays: Math.max(0, Math.min(60, Number.parseInt(event.target.value || "0", 10) || 0)),
+                        }))
+                      }
+                    />
+                  </label>
+                </div>
+                <small className="field-hint root-config-form-helper">
+                  Limites do trial são recalculados automaticamente a partir da configuração global de dias.
+                </small>
+              </section>
+
+              <section className="root-config-form-card">
+                <div className="root-config-form-card-head">
+                  <span className="section-kicker root-config-form-kicker">Root</span>
+                  <strong>Plano padrão do ambiente</strong>
+                  <p>Escolha qual plano o root deve enxergar como referência principal dentro do painel.</p>
+                </div>
+                <div className="root-config-form-grid root-config-form-grid-single">
+                  <label className="field-label">
+                    <span>Plano padrão do root</span>
+                    <select
+                      value={billingSettings.rootDisplayPlanId ?? ""}
+                      onChange={(event) =>
+                        setBillingSettings((current) => ({
+                          ...current,
+                          rootDisplayPlanId: event.target.value || null,
+                        }))
+                      }
+                    >
+                      <option value="">Automático (maior plano ativo)</option>
+                      {billingPlans.map((plan) => (
+                        <option key={plan.id} value={plan.id}>
+                          {`${plan.name} (${plan.code})`}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+              </section>
+
+              <div className="root-config-form-footer">
+                <button type="submit" disabled={savingBillingSettings}>
+                  {savingBillingSettings ? "Salvando..." : "Salvar configuração"}
+                </button>
+              </div>
+            </form>
+          </section>
+        ) : null}
+
+        {rootConfigTab === "webhook" ? (
+          <section className="panel-card view-stack" aria-label="Webhook">
+            <div className="webhook-config-shell">
+              <div className="row-card billing-row-card webhook-config-summary">
+                <div className="webhook-config-copy">
+                  <div className="webhook-config-headline">
+                    <span className={`status-pill webhook-config-status-pill webhook-config-status-pill-${postForMeWebhookStatusTone}`}>
+                      {postForMeWebhookStatusLabel}
+                    </span>
+                    <strong>Post for Me</strong>
+                  </div>
+                  <p className="webhook-config-description">
+                    Atualiza automaticamente avisos de conta expirada, desconectada ou renovada no SocialUp.
+                  </p>
+                  <small className="field-hint webhook-config-note">
+                    {postForMeWebhookNeedsFix
+                      ? `Webhook salvo com URL incorreta (${normalizedPostForMeWebhookUrl}). Corrija para ${normalizedPostForMeWebhookEndpoint || "a URL pública do backend"}.`
+                      : postForMeWebhookSettings?.configured
+                      ? `Webhook ativo em ${postForMeWebhookSettings.webhookUrl ?? "URL não informada"}.`
+                      : postForMeWebhookSettings?.secretConfigured
+                        ? "Secret já configurado, mas o webhook ainda não foi registrado por esta tela."
+                        : "Ainda não configurado no SocialUp."}
+                  </small>
+                </div>
+                <div className="webhook-config-actions">
+                  {!postForMeWebhookSettings?.configured || postForMeWebhookNeedsFix ? (
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      onClick={() => void registerPostForMeWebhook(postForMeWebhookNeedsFix)}
+                      disabled={registeringPostForMeWebhook}
+                    >
+                      {registeringPostForMeWebhook
+                        ? "Registrando..."
+                        : postForMeWebhookNeedsFix
+                          ? "Corrigir webhook"
+                          : "Registrar webhook"}
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     className="ghost-button"
-                    onClick={() => void registerPostForMeWebhook(postForMeWebhookNeedsFix)}
-                    disabled={registeringPostForMeWebhook}
+                    onClick={() => void backfillPostForMeWebhookAvisos()}
+                    disabled={backfillingPostForMeWebhookAvisos}
                   >
-                    {registeringPostForMeWebhook
-                      ? "Registrando..."
-                      : postForMeWebhookNeedsFix
-                        ? "Corrigir webhook"
-                      : "Registrar webhook"}
+                    {backfillingPostForMeWebhookAvisos ? "Gerando avisos..." : "Gerar avisos pendentes"}
                   </button>
-                ) : null}
-                <button
-                  type="button"
-                  className="ghost-button"
-                  onClick={() => void backfillPostForMeWebhookAvisos()}
-                  disabled={backfillingPostForMeWebhookAvisos}
-                >
-                  {backfillingPostForMeWebhookAvisos ? "Gerando avisos..." : "Gerar avisos pendentes"}
-                </button>
+                </div>
               </div>
-            </div>
-          </div>
-        </section>
 
-        <section ref={planEditorSectionRef} className="panel-card view-stack" aria-label="Cadastrar plano">
-          <div className="section-head">
-            {renderSectionTitleWithIcon("planConfig", editingPlanId ? "Editar plano" : "Cadastrar plano", "root")}
-          </div>
-          <form onSubmit={createBillingPlan} className="form-stack">
-            <label className="field-label">
-              <span>Código</span>
-              <input
-                value={planCodeInput}
-                onChange={(event) => setPlanCodeInput(event.target.value.toUpperCase())}
-                placeholder="START"
-                required
-              />
-            </label>
-            <label className="field-label">
-              <span>Nome</span>
-              <input
-                value={planNameInput}
-                onChange={(event) => setPlanNameInput(event.target.value)}
-                placeholder="Plano Start"
-                required
-              />
-            </label>
-            <label className="field-label">
-              <span>Descrição</span>
-              <input
-                value={planDescriptionInput}
-                onChange={(event) => setPlanDescriptionInput(event.target.value)}
-                placeholder="Descrição opcional"
-              />
-            </label>
-            <label className="field-label">
-              <span>Tipo</span>
-              <select
-                value={planIsTrialInput ? "trial" : "paid"}
-                onChange={(event) => setPlanIsTrialInput(event.target.value === "trial")}
-              >
-                <option value="paid">Pago</option>
-                <option value="trial">Trial</option>
-              </select>
-            </label>
-            <label className="field-label">
-              <span>Status do plano</span>
-              <select
-                value={planIsActiveInput ? "active" : "inactive"}
-                onChange={(event) => setPlanIsActiveInput(event.target.value === "active")}
-              >
-                <option value="active">Ativo</option>
-                <option value="inactive">Inativo</option>
-              </select>
-            </label>
-            <label className="field-label">
-              <span>Visibilidade</span>
-              <select
-                value={planIsPublicInput ? "public" : "private"}
-                onChange={(event) => setPlanIsPublicInput(event.target.value === "public")}
-              >
-                <option value="public">Público</option>
-                <option value="private">Privado</option>
-              </select>
-            </label>
-            <label className="field-label">
-              <span>Workspaces de cliente</span>
-              <input
-                type="number"
-                min={1}
-                value={planWorkspaceLimitInput}
-                onChange={(event) => setPlanWorkspaceLimitInput(event.target.value)}
-                required
-              />
-            </label>
-            <label className="field-label">
-              <span>Workspaces bônus da agência</span>
-              <input
-                type="number"
-                min={0}
-                value={planAgencyBonusWorkspaceLimitInput}
-                onChange={(event) => setPlanAgencyBonusWorkspaceLimitInput(event.target.value)}
-                required
-              />
-            </label>
-            <label className="field-label">
-              <span>Total de contas</span>
-              <input
-                type="number"
-                min={1}
-                value={planMaxConnectionsInput}
-                onChange={(event) => setPlanMaxConnectionsInput(event.target.value)}
-                required
-              />
-            </label>
-            <label className="field-label">
-              <span>Publicações por mês</span>
-              <input
-                type="number"
-                min={1}
-                value={planMaxMonthlyPublicationsInput}
-                onChange={(event) => setPlanMaxMonthlyPublicationsInput(event.target.value)}
-                required
-              />
-            </label>
-            <label className="field-label">
-              <span>Ordem na landing page</span>
-              <input
-                type="number"
-                min={0}
-                value={planDisplayOrderInput}
-                onChange={(event) => setPlanDisplayOrderInput(event.target.value)}
-                required
-              />
-            </label>
-            {!planIsTrialInput ? (
-              <>
-                <label className="field-label">
-                  <span>Produto Stripe (obrigatório em plano pago)</span>
-                  <select
-                    value={planStripeProductIdInput}
-                    onChange={(event) => setPlanStripeProductIdInput(event.target.value)}
-                  >
-                    <option value="">Sem vínculo de produto</option>
-                    {stripeCatalogProducts.map((product) => (
-                      <option key={product.id} value={product.id}>
-                        {`${product.name} (${product.id})`}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="field-label">
-                  <span>Preço mensal (auto)</span>
-                  <input
-                    value={formatPriceFromCents(resolvedStripePriceIdsForSelectedProduct?.stripeMonthlyPriceCents ?? null)}
-                    placeholder="Definido automaticamente pelo produto"
-                    disabled
-                    readOnly
-                  />
-                </label>
-                <label className="field-label">
-                  <span>Preço anual (auto)</span>
-                  <input
-                    value={formatPriceFromCents(resolvedStripePriceIdsForSelectedProduct?.stripeYearlyPriceCents ?? null)}
-                    placeholder="Definido automaticamente pelo produto"
-                    disabled
-                    readOnly
-                  />
-                </label>
-                <label className="field-label">
-                  <span>Price assinatura mensal (auto)</span>
-                  <input
-                    value={resolvedStripePriceIdsForSelectedProduct?.stripeMonthlyPriceId ?? ""}
-                    placeholder="Definido automaticamente pelo produto"
-                    disabled
-                    readOnly
-                  />
-                </label>
-                <label className="field-label">
-                  <span>Price assinatura anual (auto)</span>
-                  <input
-                    value={resolvedStripePriceIdsForSelectedProduct?.stripeYearlyPriceId ?? ""}
-                    placeholder="Definido automaticamente pelo produto"
-                    disabled
-                    readOnly
-                  />
-                </label>
-                <small className="field-hint">
-                  Ao selecionar o produto Stripe, os preços recorrentes mensal e anual são vinculados automaticamente e não podem ser editados.
-                </small>
-              </>
-            ) : null}
-            {stripeCatalogError ? <small className="field-hint">{stripeCatalogError}</small> : null}
-            <div className="inline-actions">
-              <button type="submit" disabled={creatingPlan}>
-                {creatingPlan ? "Salvando..." : editingPlanId ? "Salvar alterações" : "Cadastrar plano"}
-              </button>
+              {postForMeWebhookSettings?.publicEndpointUrl ? (
+                <div className="row-card billing-row-card webhook-config-endpoint">
+                  <div className="webhook-config-endpoint-copy">
+                    <span className="section-kicker webhook-config-kicker">Endpoint público</span>
+                    <code>{postForMeWebhookSettings.publicEndpointUrl}</code>
+                  </div>
+                </div>
+              ) : null}
+              {normalizedPostForMeWebhookUrl ? (
+                <div className="row-card billing-row-card webhook-config-endpoint webhook-config-endpoint-muted">
+                  <div className="webhook-config-endpoint-copy">
+                    <span className="section-kicker webhook-config-kicker">Webhook salvo</span>
+                    <code>{normalizedPostForMeWebhookUrl}</code>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          </section>
+        ) : null}
+
+        {rootConfigTab === "createPlan" ? (
+          <section ref={planEditorSectionRef} className="panel-card view-stack" aria-label="Cadastrar plano">
+            <div className="inline-actions" style={{ justifyContent: "flex-end" }}>
               {editingPlanId ? (
                 <button
                   type="button"
@@ -17526,57 +17941,395 @@ function App() {
                 </button>
               ) : null}
             </div>
-          </form>
-        </section>
-
-        <section className="panel-card view-stack" aria-label="Planos cadastrados">
-          <div className="section-head">
-            {renderSectionTitleWithIcon("planConfig", "Planos", "root")}
-          </div>
-          <div className="table-list">
-            {billingPlans.map((plan) => (
-              <div key={plan.id} className="row-card billing-row-card billing-plan-catalog-row">
-                <div className="billing-plan-row-inline">
-                  <strong>{`${plan.name} (${plan.code})`}</strong>
-                  <span className={`status-pill ${plan.isActive ? "status-billing-active" : "status-billing-paused"}`}>
-                    {plan.isActive ? "Ativo" : "Pausado"}
-                  </span>
-                  <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{plan.isTrial ? "Trial" : "Pago"}</span>
-                  <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{plan.isPublic ? "Público" : "Privado"}</span>
-                  <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{`Clientes: ${plan.workspaceLimit}`}</span>
-                  <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{`Bônus agência: ${plan.agencyBonusWorkspaceLimit}`}</span>
-                  <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{`Contas: ${plan.maxConnections}`}</span>
-                  <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{`Posts/mês: ${plan.maxMonthlyPublications}`}</span>
-                  <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{`Ordem: ${plan.displayOrder}`}</span>
-                  {plan.isTrial ? (
-                    <span className="billing-plan-note">Plano de trial sem cobrança.</span>
-                  ) : null}
-                  {!plan.isTrial ? (
-                    <span className="billing-plan-note">
-                      {`Assinatura: ${formatCompactPriceFromCents(plan.monthlyPriceCents)}/${formatCompactPriceFromCents(plan.yearlyPriceCents)}`}
-                    </span>
-                  ) : null}
-                  {!plan.isTrial ? (
-                    <span className="billing-plan-note">
-                      {`PIX: ${formatCompactPriceFromCents(plan.monthlyPriceCents)}/${formatCompactPriceFromCents(plan.yearlyPriceCents)}`}
-                    </span>
-                  ) : null}
-                  <button type="button" className="ghost-button" onClick={() => startBillingPlanEdit(plan)}>
-                    Editar
-                  </button>
-                  <button
-                    type="button"
-                    className="danger-button"
-                    onClick={() => void deleteBillingPlan(plan)}
-                  >
-                    Excluir
-                  </button>
+            <form onSubmit={createBillingPlan} className="plan-builder-shell">
+              <section className="plan-builder-section">
+                <div className="plan-builder-section-head">
+                  <span className="section-kicker plan-builder-kicker">Identidade</span>
+                  <strong>{editingPlanId ? "Ajuste a apresentação do plano" : "Defina a base do novo plano"}</strong>
+                  <p>Nome, código e descrição que serão usados para identificar o plano dentro do produto.</p>
                 </div>
+                <div className="account-profile-form-grid">
+                  <label className="field-label">
+                    <span>Código</span>
+                    <input
+                      value={planCodeInput}
+                      onChange={(event) => setPlanCodeInput(event.target.value.toUpperCase())}
+                      placeholder="START"
+                      required
+                    />
+                  </label>
+                  <label className="field-label">
+                    <span>Nome</span>
+                    <input
+                      value={planNameInput}
+                      onChange={(event) => setPlanNameInput(event.target.value)}
+                      placeholder="Plano Start"
+                      required
+                    />
+                  </label>
+                  <label className="field-label">
+                    <span>Descrição</span>
+                    <input
+                      value={planDescriptionInput}
+                      onChange={(event) => setPlanDescriptionInput(event.target.value)}
+                      placeholder="Descrição opcional"
+                    />
+                  </label>
+                </div>
+                <div className="plan-builder-subsection">
+                  <div className="plan-builder-subsection-head">
+                    <strong>Apresentação do card</strong>
+                    <p>Edite o subtítulo e os highlights com check que aparecem na seleção de plano.</p>
+                  </div>
+                  <div className="plan-builder-grid plan-builder-grid-presentation">
+                    <label className="field-label plan-builder-grid-full">
+                      <span>Subtítulo</span>
+                      <input
+                        value={planSubtitleInput}
+                        onChange={(event) => setPlanSubtitleInput(event.target.value)}
+                        placeholder="Texto curto para o card de seleção do plano"
+                        maxLength={240}
+                      />
+                    </label>
+                  </div>
+                  <div className="plan-builder-repeater">
+                    <div className="plan-builder-repeater-head">
+                      <span>Highlights</span>
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        onClick={addPlanHighlightInput}
+                        disabled={planHighlightsInput.length >= 8}
+                      >
+                        <FiPlus aria-hidden="true" />
+                        <span>Adicionar highlight</span>
+                      </button>
+                    </div>
+                    <div className="plan-builder-repeater-list">
+                      {planHighlightsInput.map((highlight, index) => (
+                        <div key={`plan-highlight-${index}`} className="plan-builder-repeater-row">
+                          <span className="plan-builder-repeater-icon" aria-hidden="true">
+                            <FiCheck />
+                          </span>
+                          <input
+                            value={highlight}
+                            onChange={(event) => updatePlanHighlightInput(index, event.target.value)}
+                            placeholder={`Highlight ${index + 1}`}
+                            maxLength={120}
+                          />
+                          <button
+                            type="button"
+                            className="ghost-icon-button"
+                            onClick={() => removePlanHighlightInput(index)}
+                            aria-label={`Remover highlight ${index + 1}`}
+                            title="Remover highlight"
+                          >
+                            <FiX />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <section className="plan-builder-section">
+                <div className="plan-builder-section-head">
+                  <span className="section-kicker plan-builder-kicker">Regras</span>
+                  <strong>Comportamento e limites do plano</strong>
+                  <p>Organize o que esse plano libera em workspaces, contas, publicações e ordem de exibição.</p>
+                </div>
+                <div className="plan-builder-block-grid">
+                  <div className="plan-builder-subsection">
+                    <div className="plan-builder-subsection-head">
+                      <strong>Comportamento</strong>
+                      <p>Defina se o plano aparece para escolha e quais recursos colaborativos ficam liberados.</p>
+                    </div>
+                    <div className="plan-builder-grid plan-builder-grid-compact">
+                      <label className="field-label">
+                        <span>Tipo</span>
+                        <select
+                          value={planIsTrialInput ? "trial" : "paid"}
+                          onChange={(event) => setPlanIsTrialInput(event.target.value === "trial")}
+                        >
+                          <option value="paid">Pago</option>
+                          <option value="trial">Trial</option>
+                        </select>
+                      </label>
+                  <label className="field-label">
+                    <span>Status</span>
+                    <select
+                      value={planIsActiveInput ? "active" : "inactive"}
+                      onChange={(event) => setPlanIsActiveInput(event.target.value === "active")}
+                        >
+                          <option value="active">Ativo</option>
+                          <option value="inactive">Inativo</option>
+                        </select>
+                      </label>
+                      <label className="field-label">
+                        <span>Visibilidade</span>
+                        <select
+                          value={planIsPublicInput ? "public" : "private"}
+                          onChange={(event) => setPlanIsPublicInput(event.target.value === "public")}
+                        >
+                          <option value="public">Público</option>
+                          <option value="private">Privado</option>
+                        </select>
+                      </label>
+                      <label className="field-label">
+                        <span>Convites</span>
+                        <select
+                          value={planSupportsWorkspaceInvitesInput ? "enabled" : "disabled"}
+                          onChange={(event) => setPlanSupportsWorkspaceInvitesInput(event.target.value === "enabled")}
+                        >
+                          <option value="disabled">Bloqueados</option>
+                          <option value="enabled">Liberados</option>
+                        </select>
+                      </label>
+                      <label className="field-label">
+                        <span>Aprovação cliente</span>
+                        <select
+                          value={planSupportsClientApprovalInput ? "enabled" : "disabled"}
+                          onChange={(event) => setPlanSupportsClientApprovalInput(event.target.value === "enabled")}
+                        >
+                          <option value="disabled">Bloqueada</option>
+                          <option value="enabled">Liberada</option>
+                        </select>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div className="plan-builder-subsection">
+                    <div className="plan-builder-subsection-head">
+                      <strong>Limites</strong>
+                      <p>Capacidades principais de workspaces, contas e volume mensal.</p>
+                    </div>
+                    <div className="plan-builder-grid plan-builder-grid-limits">
+                      <label className="field-label">
+                        <span>Workspaces</span>
+                        <input
+                          type="number"
+                          min={1}
+                          value={planWorkspaceLimitInput}
+                          onChange={(event) => setPlanWorkspaceLimitInput(event.target.value)}
+                          required
+                        />
+                      </label>
+                  <label className="field-label">
+                    <span>Workspaces bônus</span>
+                    <input
+                      type="number"
+                      min={0}
+                          value={planAgencyBonusWorkspaceLimitInput}
+                          onChange={(event) => setPlanAgencyBonusWorkspaceLimitInput(event.target.value)}
+                          required
+                        />
+                      </label>
+                      <label className="field-label">
+                        <span>Total de contas</span>
+                        <input
+                          type="number"
+                          min={1}
+                          value={planMaxConnectionsInput}
+                          onChange={(event) => setPlanMaxConnectionsInput(event.target.value)}
+                          required
+                        />
+                      </label>
+                      <label className="field-label">
+                        <span>Publicações por mês</span>
+                        <input
+                          type="number"
+                          min={1}
+                          value={planMaxMonthlyPublicationsInput}
+                          onChange={(event) => setPlanMaxMonthlyPublicationsInput(event.target.value)}
+                          required
+                        />
+                      </label>
+                  <label className="field-label">
+                    <span>Ordem landing page</span>
+                    <input
+                      type="number"
+                      min={0}
+                          value={planDisplayOrderInput}
+                          onChange={(event) => setPlanDisplayOrderInput(event.target.value)}
+                          required
+                        />
+                      </label>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              {!planIsTrialInput ? (
+                <section className="plan-builder-section">
+                  <div className="plan-builder-section-head">
+                    <span className="section-kicker plan-builder-kicker">Cobrança</span>
+                    <strong>Vinculação com o produto Stripe</strong>
+                    <p>Os preços mensal e anual são puxados automaticamente do produto selecionado.</p>
+                  </div>
+                  <div className="plan-builder-block-grid">
+                    <div className="plan-builder-subsection">
+                      <div className="plan-builder-subsection-head">
+                        <strong>Produto</strong>
+                        <p>Selecione o produto principal que controla essa assinatura no Stripe.</p>
+                      </div>
+                      <div className="plan-builder-pricing-grid">
+                        <label className="field-label plan-builder-pricing-grid-full">
+                          <span>Produto Stripe</span>
+                          <select
+                            value={planStripeProductIdInput}
+                            onChange={(event) => setPlanStripeProductIdInput(event.target.value)}
+                          >
+                            <option value="">Sem vínculo de produto</option>
+                            {stripeCatalogProducts.map((product) => (
+                              <option key={product.id} value={product.id}>
+                                {`${product.name} (${product.id})`}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
+                    </div>
+
+                    <div className="plan-builder-subsection">
+                      <div className="plan-builder-subsection-head">
+                        <strong>Valores sincronizados</strong>
+                        <p>Esses campos são preenchidos automaticamente a partir do produto escolhido.</p>
+                      </div>
+                      <div className="plan-builder-pricing-grid">
+                        <label className="field-label">
+                          <span>Preço mensal</span>
+                          <input
+                            value={formatPriceFromCents(resolvedStripePriceIdsForSelectedProduct?.stripeMonthlyPriceCents ?? null)}
+                            placeholder="Definido automaticamente pelo produto"
+                            disabled
+                            readOnly
+                          />
+                        </label>
+                        <label className="field-label">
+                          <span>Preço anual</span>
+                          <input
+                            value={formatPriceFromCents(resolvedStripePriceIdsForSelectedProduct?.stripeYearlyPriceCents ?? null)}
+                            placeholder="Definido automaticamente pelo produto"
+                            disabled
+                            readOnly
+                          />
+                        </label>
+                        <label className="field-label">
+                          <span>ID do preço mensal</span>
+                          <input
+                            value={resolvedStripePriceIdsForSelectedProduct?.stripeMonthlyPriceId ?? ""}
+                            placeholder="Definido automaticamente pelo produto"
+                            disabled
+                            readOnly
+                          />
+                        </label>
+                        <label className="field-label">
+                          <span>ID do preço anual</span>
+                          <input
+                            value={resolvedStripePriceIdsForSelectedProduct?.stripeYearlyPriceId ?? ""}
+                            placeholder="Definido automaticamente pelo produto"
+                            disabled
+                            readOnly
+                          />
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+              ) : null}
+              {stripeCatalogError ? <small className="field-hint plan-builder-helper">{stripeCatalogError}</small> : null}
+              <div className="plan-builder-footer">
+                <button type="submit" disabled={creatingPlan}>
+                  {creatingPlan ? "Salvando..." : editingPlanId ? "Salvar alterações" : "Cadastrar plano"}
+                </button>
               </div>
-            ))}
-            {billingPlans.length === 0 ? <div className="empty-state">Nenhum plano cadastrado.</div> : null}
-          </div>
-        </section>
+            </form>
+          </section>
+        ) : null}
+
+        {rootConfigTab === "plans" ? (
+          <section className="panel-card view-stack" aria-label="Editar Planos">
+            <div className="billing-plan-editor-grid">
+              {billingPlans.map((plan) => {
+                const monthlyPriceLabel = formatPriceFromCents(plan.monthlyPriceCents);
+                const yearlyPriceLabel = formatPriceFromCents(plan.yearlyPriceCents);
+
+                return (
+                  <article key={plan.id} className="panel-card billing-plan-editor-card">
+                    <div className="billing-plan-editor-head">
+                    <div className="billing-plan-editor-title">
+                      <strong>{plan.name}</strong>
+                    </div>
+                      <div className="billing-plan-editor-meta">
+                        <span className={`unit-pill billing-plan-editor-status-pill ${plan.isActive ? "billing-plan-editor-status-pill-active" : "billing-plan-editor-status-pill-paused"}`}>
+                          {plan.isActive ? "Ativo" : "Pausado"}
+                        </span>
+                        <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{plan.isTrial ? "Trial" : "Pago"}</span>
+                        <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{plan.isPublic ? "Público" : "Privado"}</span>
+                      </div>
+                    </div>
+
+                    <div className="billing-plan-editor-body">
+                      <div className={`billing-plan-editor-pricing${plan.isTrial ? " billing-plan-editor-pricing-trial" : ""}`}>
+                        {plan.isTrial ? (
+                          <div className="billing-plan-editor-price-card">
+                            <span className="section-kicker billing-plan-editor-price-kicker">Cobrança</span>
+                            <strong>Sem cobrança</strong>
+                            <small>Uso inicial sem pagamento recorrente.</small>
+                          </div>
+                        ) : (
+                          <>
+                            <div className="billing-plan-editor-price-card">
+                              <span className="section-kicker billing-plan-editor-price-kicker">Mensal</span>
+                              <strong>{monthlyPriceLabel}</strong>
+                            </div>
+                            <div className="billing-plan-editor-price-card billing-plan-editor-price-card-highlight">
+                              <span className="section-kicker billing-plan-editor-price-kicker">Anual</span>
+                              <strong>{yearlyPriceLabel}</strong>
+                            </div>
+                          </>
+                        )}
+                      </div>
+
+                      <div className="billing-plan-editor-stats">
+                        <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{`Workspaces: ${plan.workspaceLimit}`}</span>
+                        <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{`Bônus agência: ${plan.agencyBonusWorkspaceLimit}`}</span>
+                        <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{`Contas: ${plan.maxConnections}`}</span>
+                        <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{`Posts/mês: ${plan.maxMonthlyPublications}`}</span>
+                        <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>{`Ordem: ${plan.displayOrder}`}</span>
+                        <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>
+                          {plan.supportsWorkspaceInvites ? "Convites ativos" : "Sem convites"}
+                        </span>
+                        <span className={`unit-pill unit-pill-plan${plan.isTrial ? " unit-pill-plan-trial" : ""}`}>
+                          {plan.supportsClientApproval ? "Aprovação ativa" : "Sem aprovação"}
+                        </span>
+                      </div>
+
+                      <div className="billing-plan-editor-notes">
+                        {plan.isTrial ? (
+                          <span className="billing-plan-note">Ideal para ativação inicial e configuração da conta.</span>
+                        ) : (
+                          <span className="billing-plan-note">Cobrança recorrente sincronizada pelo produto Stripe.</span>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="billing-plan-editor-footer">
+                      <button type="button" className="ghost-button" onClick={() => startBillingPlanEdit(plan)}>
+                        Editar
+                      </button>
+                      <button type="button" className="danger-button" onClick={() => void deleteBillingPlan(plan)}>
+                        Excluir
+                      </button>
+                    </div>
+                  </article>
+                );
+              })}
+              {billingPlans.length === 0 ? <div className="empty-state">Nenhum plano cadastrado.</div> : null}
+            </div>
+          </section>
+        ) : null}
       </div>
     );
   }
@@ -17649,7 +18402,7 @@ function App() {
                 className="primary-button publications-primary-action"
                 onClick={() => openCreateWorkspaceModal()}
               >
-                <FiPlus aria-hidden="true" />
+                <FiGrid aria-hidden="true" />
                 <span>Novo workspace</span>
               </button>
             ) : null}
@@ -17962,18 +18715,21 @@ function App() {
       }
 
       if (workspace.canConnectAccounts && connection.platform === "whatsapp") {
+        const hasReusableQr = hasReusableWhatsappQr(connection);
         return (
           <button
             type="button"
             className="agents-platform-card-primary"
             disabled={qrRequestingConnectionId === connection.id || qrCancellingConnectionId === connection.id}
-            onClick={() => void regenerateConnectionQr(connection.id)}
+            onClick={() => void (hasReusableQr ? openConnectionVisualAuth(connection.id, connection) : regenerateConnectionQr(connection.id))}
           >
             {qrCancellingConnectionId === connection.id
               ? "Cancelando..."
               : qrRequestingConnectionId === connection.id
                 ? "Gerando..."
-                : "Gerar novo QR"}
+                : hasReusableQr
+                  ? "Abrir QR"
+                  : "Gerar novo QR"}
           </button>
         );
       }
@@ -19964,7 +20720,7 @@ function App() {
             </div>
           </>
         ) : null}
-        {historyInfo ? (
+        {historyInfo && !activePublicationDuplicateJob ? (
           <div
             className={`info-banner${isPositiveHistoryInfo ? " info-banner-success" : ""}${isTransientHistoryInfo ? " info-banner-transient" : ""}`}
           >
@@ -20596,7 +21352,7 @@ function App() {
           {renderSectionTitleWithIcon("history", "Publicações", "timeline")}
           {hasAnyPublicationManageWorkspace ? (
             <button type="button" className="primary-button publications-primary-action" onClick={() => navigateToView("scheduler")}>
-              <FiPlus aria-hidden="true" />
+              <FiFileText aria-hidden="true" />
               <span>Nova publicação</span>
             </button>
           ) : null}
@@ -20803,6 +21559,31 @@ function App() {
                     </select>
                   </label>
                 ) : null}
+
+                {historyBulkAction === "SET_DRAFT" || historyBulkAction === "SET_CANCEL" ? (
+                  <>
+                    <label className="field-label">
+                      <span>Nova data</span>
+                      <input
+                        type="text"
+                        value="Não se aplica"
+                        className="history-bulk-placeholder-input"
+                        disabled
+                        readOnly
+                      />
+                    </label>
+                    <label className="field-label">
+                      <span>Novo horário</span>
+                      <input
+                        type="text"
+                        value="Não se aplica"
+                        className="history-bulk-placeholder-input"
+                        disabled
+                        readOnly
+                      />
+                    </label>
+                  </>
+                ) : null}
               </div>
 
               <div className="publications-toolbar-expanded-actions">
@@ -20901,7 +21682,7 @@ function App() {
           </div>
         </div>
 
-        {historyInfo ? (
+        {historyInfo && !activePublicationDuplicateJob ? (
           <div
             className={`info-banner${isPositiveHistoryInfo ? " info-banner-success" : ""}${isTransientHistoryInfo ? " info-banner-transient" : ""}`}
           >
@@ -20964,9 +21745,9 @@ function App() {
                     <span>Publicação</span>
                     {shouldShowWorkspaceColumn ? <span>Workspace</span> : null}
                     <span>Agendada para</span>
-                    <span>Redes</span>
-                    <span>Status</span>
+                    <span>Tipo</span>
                     <span>Ações</span>
+                    <span>Status</span>
                   </div>
                   <div className="publications-direct-body">
                     {paginatedPublicationDirectItems.map((item) => {
@@ -21113,11 +21894,6 @@ function App() {
                               ? renderPublicationNetworkPillList(publicationParticipantNetworks)
                               : renderPublicationTypePill(item.publicationType)}
                           </span>
-                          <span className="publications-direct-status">
-                            <span className={`publications-job-status-chip publications-job-status-chip-${item.tone}`}>
-                              {item.statusLabel}
-                            </span>
-                          </span>
                           <div className="publications-direct-actions">
                             {item.job ? (
                               <button
@@ -21146,25 +21922,13 @@ function App() {
                                 <FiEdit3 aria-hidden="true" />
                               </button>
                             ) : null}
-                            {canEditSchedule && item.job ? (
-                              <button
-                                type="button"
-                                className="publications-board-action-button publications-board-action-button-schedule"
-                                title="Editar agendamento"
-                                aria-label="Editar agendamento"
-                                onClick={() => startHistoryInlineTimeEdit(item.job!)}
-                                disabled={isSavingRow}
-                              >
-                                <FiCalendar aria-hidden="true" />
-                              </button>
-                            ) : null}
-                            {item.job && canManageItemActions ? (
+                            {item.job && canManageItemActions && item.filterKey !== "failed" ? (
                               <button
                                 type="button"
                                 className="publications-board-action-button publications-board-action-button-duplicate"
                                 title="Duplicar publicação"
                                 aria-label="Duplicar publicação"
-                                onClick={() => openPublicationDuplicateModal(item.job!)}
+                                onClick={() => openPublicationDuplicateModal(item.job!, { sourceJobs: item.groupedJobs })}
                               >
                                 <FiCopy aria-hidden="true" />
                               </button>
@@ -21172,12 +21936,12 @@ function App() {
                             {item.job && canManageItemActions ? (
                               <button
                                 type="button"
-                                className="publications-board-action-button publications-board-action-button-template"
-                                title="Criar template"
-                                aria-label="Criar template"
-                                onClick={() => savePublicationAsTemplate(item.job!)}
+                                className="publications-board-action-button publications-board-action-button-delete"
+                                title="Excluir publicação"
+                                aria-label="Excluir publicação"
+                                onClick={() => void deleteGroupedHistoryJobs(item.groupedJobs)}
                               >
-                                <FiFileText aria-hidden="true" />
+                                <FiTrash2 aria-hidden="true" />
                               </button>
                             ) : null}
                             {canRetry && item.job ? (
@@ -21205,6 +21969,11 @@ function App() {
                               </button>
                             ) : null}
                           </div>
+                          <span className="publications-direct-status">
+                            <span className={`publications-job-status-chip publications-job-status-chip-${item.tone}`}>
+                              {item.statusLabel}
+                            </span>
+                          </span>
                         </div>
                       );
                     })}
@@ -21480,25 +22249,13 @@ function App() {
                                         <FiEdit3 aria-hidden="true" />
                                       </button>
                                     ) : null}
-                                    {canEditSchedule && item.job ? (
-                                      <button
-                                        type="button"
-                                        className="publications-board-action-button publications-board-action-button-schedule"
-                                        title="Editar agendamento"
-                                        aria-label="Editar agendamento"
-                                        onClick={() => startHistoryInlineTimeEdit(item.job!)}
-                                        disabled={isSavingRow}
-                                      >
-                                        <FiCalendar aria-hidden="true" />
-                                      </button>
-                                    ) : null}
-                                    {item.job && canManageItemActions ? (
+                                    {item.job && canManageItemActions && group.filterKey !== "failed" ? (
                                       <button
                                         type="button"
                                         className="publications-board-action-button publications-board-action-button-duplicate"
                                         title="Duplicar publicação"
                                         aria-label="Duplicar publicação"
-                                        onClick={() => openPublicationDuplicateModal(item.job!)}
+                                        onClick={() => openPublicationDuplicateModal(item.job!, { sourceJobs: item.groupedJobs })}
                                       >
                                         <FiCopy aria-hidden="true" />
                                       </button>
@@ -21506,12 +22263,12 @@ function App() {
                                     {item.job && canManageItemActions ? (
                                       <button
                                         type="button"
-                                        className="publications-board-action-button publications-board-action-button-template"
-                                        title="Criar template"
-                                        aria-label="Criar template"
-                                        onClick={() => savePublicationAsTemplate(item.job!)}
+                                        className="publications-board-action-button publications-board-action-button-delete"
+                                        title="Excluir publicação"
+                                        aria-label="Excluir publicação"
+                                        onClick={() => void deleteGroupedHistoryJobs(item.groupedJobs)}
                                       >
-                                        <FiFileText aria-hidden="true" />
+                                        <FiTrash2 aria-hidden="true" />
                                       </button>
                                     ) : null}
                                     {canRetry && item.job ? (
@@ -21824,17 +22581,16 @@ function App() {
       <div className="publication-preview-body publication-preview-body-skeleton" aria-hidden="true">
         <div className="publication-preview-main">
           <div className="publication-preview-stage-shell publication-preview-stage-shell-skeleton">
-            <div className="publication-preview-stage-head">
-              <div>
-                <span className="skeleton-line publication-preview-caption-skeleton" />
-              </div>
+            <div className="publication-preview-stage-head publication-preview-stage-head-nav-only publication-preview-stage-head-skeleton">
               <div className="publication-preview-stage-nav">
                 <span className="skeleton-line publication-preview-icon-button-skeleton" />
                 <span className="skeleton-line publication-preview-counter-skeleton" />
                 <span className="skeleton-line publication-preview-icon-button-skeleton" />
               </div>
             </div>
-            <span className="skeleton-line publication-preview-stage-skeleton" />
+            <div className="publication-preview-stage publication-preview-stage-skeleton-shell">
+              <span className="skeleton-line publication-preview-stage-skeleton publication-preview-stage-media-skeleton" />
+            </div>
           </div>
 
           <div className="publication-preview-comments-panel publication-preview-comments-panel-skeleton">
@@ -21879,40 +22635,64 @@ function App() {
         </div>
 
         <aside className="publication-preview-side">
-          {Array.from({ length: 2 }, (_, index) => (
-            <div key={`preview-side-skeleton-${index}`} className="publication-preview-side-card publication-preview-side-card-skeleton">
-              <div className="publication-preview-side-head">
-                <span className="skeleton-line publication-preview-heading-skeleton" />
-                <span className="skeleton-line publication-preview-meta-skeleton" />
-              </div>
-              {index === 0 ? (
-                <div className="publication-preview-side-grid">
-                  <div>
-                    <span className="skeleton-line publication-preview-line-skeleton" />
-                    <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
-                  </div>
-                  <div>
-                    <span className="skeleton-line publication-preview-line-skeleton" />
-                    <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
-                  </div>
-                  <div>
-                    <span className="skeleton-line publication-preview-line-skeleton" />
-                    <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
-                  </div>
-                  <div>
-                    <span className="skeleton-line publication-preview-line-skeleton" />
-                    <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
-                  </div>
-                </div>
-              ) : (
-                <>
-                  <span className="skeleton-line publication-preview-line-skeleton" />
-                  <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
-                  <span className="skeleton-line publication-preview-line-skeleton" />
-                </>
-              )}
+          <div className="publication-preview-side-card publication-preview-side-card-skeleton">
+            <div className="publication-preview-side-head">
+              <span className="skeleton-line publication-preview-heading-skeleton" />
+              <span className="skeleton-line publication-preview-meta-skeleton" />
             </div>
-          ))}
+            <div className="publication-preview-side-grid">
+              <div>
+                <span className="skeleton-line publication-preview-line-skeleton" />
+                <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
+              </div>
+              <div>
+                <span className="skeleton-line publication-preview-line-skeleton" />
+                <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
+              </div>
+              <div>
+                <span className="skeleton-line publication-preview-line-skeleton" />
+                <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
+              </div>
+              <div>
+                <span className="skeleton-line publication-preview-line-skeleton" />
+                <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
+              </div>
+            </div>
+            <div className="publication-preview-caption-skeleton-stack">
+              <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
+              <span className="skeleton-line publication-preview-line-skeleton publication-preview-line-skeleton-wide" />
+              <span className="skeleton-line publication-preview-line-skeleton" />
+            </div>
+          </div>
+
+          <div className="publication-preview-side-card publication-preview-side-card-skeleton">
+            <div className="publication-preview-side-head">
+              <span className="skeleton-line publication-preview-heading-skeleton" />
+              <span className="skeleton-line publication-preview-meta-skeleton" />
+            </div>
+            <div className="publication-preview-target-summary publication-preview-target-summary-skeleton">
+              <div className="publication-preview-target-summary-copy">
+                <span className="skeleton-line publication-preview-line-skeleton" />
+                <div className="publication-preview-target-summary-icons">
+                  <span className="skeleton-line publication-preview-network-pill-skeleton" />
+                  <span className="skeleton-line publication-preview-network-pill-skeleton" />
+                </div>
+              </div>
+            </div>
+            <div className="publication-preview-target-list">
+              {Array.from({ length: 3 }, (_, index) => (
+                <div key={`preview-target-skeleton-${index}`} className="publication-preview-target-item publication-preview-target-item-skeleton">
+                  <div className="publication-preview-target-main">
+                    <span className="skeleton-line publication-preview-target-icon-skeleton" />
+                    <div className="publication-preview-target-copy">
+                      <span className="skeleton-line publication-preview-line-skeleton" />
+                    </div>
+                  </div>
+                  <span className="skeleton-line publication-preview-status-pill-skeleton" />
+                </div>
+              ))}
+            </div>
+          </div>
         </aside>
       </div>
     );
@@ -21968,27 +22748,43 @@ function App() {
     const isRetryingPreviewFailures = previewRetryAnchorJobId !== null && retryingJobId === previewRetryAnchorJobId;
     const canRetryPreviewFailures =
       preview?.currentUserRole !== "CLIENT" && previewFailedJobs.length > 0 && !publicationPreviewSubmitting;
+    const shouldShowPublicationPreviewSkeleton =
+      publicationPreviewLoading || (!!activePublicationPreviewJobId && !publicationPreviewData && !error);
     return (
       <section ref={publicationPreviewSectionRef} className="panel-card view-stack publication-preview-page-shell">
         <div className="publication-preview-page-topbar">
           <div className="publication-preview-page-heading">
-            <span className="publication-preview-page-eyebrow">Visualização da publicação</span>
-            <strong>{preview?.title?.trim() || activePublicationPreviewJob?.title?.trim() || "Prévia da publicação"}</strong>
-            <small>
-              {preview?.company.name || companies.find((company) => company.id === activePublicationPreviewJob?.companyId)?.name || "Workspace"}
-              {previewScheduledTime ? ` · às ${previewScheduledTime}` : ""}
-            </small>
+            {shouldShowPublicationPreviewSkeleton ? (
+              <>
+                <span className="skeleton-line skeleton-line-kicker publication-preview-topbar-kicker-skeleton" />
+                <span className="skeleton-line skeleton-line-heading-wide publication-preview-topbar-title-skeleton" />
+                <span className="skeleton-line skeleton-line-text-short publication-preview-topbar-meta-skeleton" />
+              </>
+            ) : (
+              <>
+                <span className="publication-preview-page-eyebrow">Visualização da publicação</span>
+                <strong>{preview?.title?.trim() || activePublicationPreviewJob?.title?.trim() || "Prévia da publicação"}</strong>
+                <small>
+                  {preview?.company.name || companies.find((company) => company.id === activePublicationPreviewJob?.companyId)?.name || "Workspace"}
+                  {previewScheduledTime ? ` · às ${previewScheduledTime}` : ""}
+                </small>
+              </>
+            )}
           </div>
 
           <div className="publication-preview-page-head-actions">
-            <button
-              type="button"
-              className="ghost-button publication-preview-back-button"
-              onClick={closePublicationPreviewPage}
-            >
-              <FiChevronLeft aria-hidden="true" />
-              <span>Publicações</span>
-            </button>
+            {shouldShowPublicationPreviewSkeleton ? (
+              <span className="skeleton-line skeleton-line-button publication-preview-topbar-button-skeleton" />
+            ) : (
+              <button
+                type="button"
+                className="ghost-button publication-preview-back-button"
+                onClick={closePublicationPreviewPage}
+              >
+                <FiChevronLeft aria-hidden="true" />
+                <span>Publicações</span>
+              </button>
+            )}
           </div>
         </div>
 
@@ -21996,17 +22792,14 @@ function App() {
           <div className="info-banner info-banner-success">{publicationPreviewInfo}</div>
         ) : null}
 
-        {publicationPreviewLoading ? (
+        {shouldShowPublicationPreviewSkeleton ? (
           renderPublicationPreviewSkeleton()
         ) : preview ? (
           <div className="publication-preview-body publication-preview-page-layout">
             <div className="publication-preview-main">
               <div className="publication-preview-stage-shell">
-                <div className="publication-preview-stage-head">
-                  <div>
-                    <span>Clique na mídia para ampliar e navegar pelas peças.</span>
-                  </div>
-                  {preview.mediaPaths.length > 1 ? (
+                {preview.mediaPaths.length > 1 ? (
+                  <div className="publication-preview-stage-head publication-preview-stage-head-nav-only">
                     <div className="publication-preview-stage-nav">
                       <button type="button" className="ghost-button publication-media-modal-nav-button" onClick={showPreviousPublicationPreviewMedia}>
                         <FiChevronLeft aria-hidden="true" />
@@ -22016,8 +22809,8 @@ function App() {
                         <FiChevronRight aria-hidden="true" />
                       </button>
                     </div>
-                  ) : null}
-                </div>
+                  </div>
+                ) : null}
 
                 <div className="publication-preview-stage">
                   {publicationPreviewMediaPath ? (
@@ -22028,30 +22821,13 @@ function App() {
                         muted
                         playsInline
                         preload="metadata"
-                        onClick={() => {
-                          if (activePublicationPreviewJob) {
-                            openPublicationMediaModal(activePublicationPreviewJob, publicationPreviewMediaIndex, {
-                              overrideTitle:
-                                preview.title?.trim() || activePublicationPreviewJob.title?.trim() || "Mídias da publicação",
-                              overridePaths: preview.mediaPaths,
-                            });
-                          }
-                        }}
+                        controls
                       />
                     ) : (
                       <img
                         className="publication-preview-stage-media"
                         src={`${api.baseUrl}${publicationPreviewMediaPath}`}
                         alt={`Mídia ${publicationPreviewMediaIndex + 1} da publicação`}
-                        onClick={() => {
-                          if (activePublicationPreviewJob) {
-                            openPublicationMediaModal(activePublicationPreviewJob, publicationPreviewMediaIndex, {
-                              overrideTitle:
-                                preview.title?.trim() || activePublicationPreviewJob.title?.trim() || "Mídias da publicação",
-                              overridePaths: preview.mediaPaths,
-                            });
-                          }
-                        }}
                       />
                     )
                   ) : (
@@ -22424,51 +23200,210 @@ function App() {
       );
     }
 
-    return (
-      <section className="panel-card view-stack">
+    const noticeAdminTabs: Array<{ key: NoticeAdminTab; label: string; icon: IconType }> = [
+      { key: "create", label: "Cadastrar", icon: FiEdit3 },
+      { key: "edit", label: "Editar", icon: FiGrid },
+    ];
+
+    const renderNoticeIconSelector = () => (
+      <div className="notice-admin-icon-grid" role="list" aria-label="Ícones do aviso">
+        {NOTICE_ICON_OPTIONS.map((option) => {
+          const isActive = broadcastAvisoIconKey === option.key;
+          const Icon = option.icon;
+          return (
+            <button
+              key={option.key}
+              type="button"
+              role="listitem"
+              className={`notice-admin-icon-option${isActive ? " notice-admin-icon-option-active" : ""}`}
+              onClick={() => setBroadcastAvisoIconKey(option.key)}
+            >
+              <span className="notice-admin-icon-option-glyph" aria-hidden="true">
+                <Icon />
+              </span>
+              <span>{option.label}</span>
+            </button>
+          );
+        })}
+      </div>
+    );
+
+    const renderNoticeBroadcastForm = (mode: "create" | "edit") => (
+      <section className="panel-card view-stack notice-admin-shell">
         <div className="section-head">
-          {renderSectionTitleWithIcon("noticeAdmin", "Cadastrar avisos", "root")}
+          <div className="section-title-stack">
+            <span className="section-kicker">{mode === "edit" ? "edição" : "avisos"}</span>
+            <strong>{mode === "edit" ? "Editar aviso" : "Cadastrar aviso"}</strong>
+          </div>
+          {mode === "edit" ? (
+            <button type="button" className="ghost-button" onClick={cancelBroadcastAvisoEditing}>
+              Cancelar edição
+            </button>
+          ) : null}
         </div>
 
+        <form onSubmit={submitBroadcastAviso} className="notice-admin-form">
+          <div className="notice-admin-form-main">
+            <label className="field-label">
+              <span>Título</span>
+              <input
+                value={broadcastAvisoTitle}
+                onChange={(event) => setBroadcastAvisoTitle(event.target.value)}
+                placeholder="Título do aviso"
+                maxLength={120}
+                required
+              />
+            </label>
+            <div className="field-shell">
+              <div className="field-head-with-action">
+                <span>Mensagem do aviso</span>
+                {renderQuickEmojiPicker({
+                  pickerKey: "notice-admin-message",
+                  disabled: broadcastAvisoSubmitting,
+                  onPick: appendEmojiToBroadcastAvisoMessage,
+                  label: "Emojis da mensagem",
+                  className: "emoji-picker-shell-right",
+                })}
+              </div>
+              <textarea
+                value={broadcastAvisoMessage}
+                onChange={(event) => setBroadcastAvisoMessage(event.target.value)}
+                placeholder="Mensagem para todos os usuários"
+                rows={6}
+                maxLength={2000}
+                required
+              />
+            </div>
+          </div>
+
+          <aside className="notice-admin-form-side">
+            <div className="notice-admin-side-card">
+              <div className="notice-admin-side-card-head">
+                <span className="section-kicker">ícone</span>
+                <strong>Escolha o destaque visual</strong>
+                <p>Os ícones abaixo são os mesmos usados nos recados e avisos do sistema.</p>
+              </div>
+              {renderNoticeIconSelector()}
+            </div>
+          </aside>
+
+          <div className="notice-admin-form-actions">
+            <button type="submit" disabled={broadcastAvisoSubmitting}>
+              {broadcastAvisoSubmitting
+                ? mode === "edit"
+                  ? "Salvando..."
+                  : "Enviando..."
+                : mode === "edit"
+                  ? "Salvar alterações"
+                  : "Enviar aviso global"}
+            </button>
+          </div>
+        </form>
+      </section>
+    );
+
+    return (
+      <div className="view-stack">
+        <section className="panel-card view-stack notice-admin-hero">
+          <div className="section-head">
+            {renderSectionTitleWithIcon("noticeAdmin", "Avisos", "root")}
+          </div>
+          <div className="history-anchor-tabs account-page-tabs" role="tablist" aria-label="Abas de avisos globais">
+            {noticeAdminTabs.map((tab) => {
+              const isActive = noticeAdminTab === tab.key;
+              return (
+                <button
+                  key={tab.key}
+                  type="button"
+                  className={`history-anchor-tab account-page-tab${isActive ? " account-page-tab-active" : ""}`}
+                  role="tab"
+                  aria-selected={isActive}
+                  onClick={() => {
+                    setNoticeAdminTab(tab.key);
+                    if (tab.key === "create") {
+                      resetBroadcastAvisoForm();
+                    }
+                  }}
+                >
+                  <tab.icon aria-hidden="true" />
+                  <span>{tab.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        </section>
         {noticeAdminInfo ? (
           <div className={`info-banner${isPositiveNoticeAdminInfo ? " info-banner-success" : ""}`}>
             {noticeAdminInfo}
           </div>
         ) : null}
 
-        <form onSubmit={createBroadcastAviso} className="form-stack">
-          <input
-            value={broadcastAvisoTitle}
-            onChange={(event) => setBroadcastAvisoTitle(event.target.value)}
-            placeholder="Titulo do aviso"
-            maxLength={120}
-            required
-          />
-          <div className="field-shell">
-            <div className="field-head-with-action">
-              <span>Mensagem do aviso</span>
-              {renderQuickEmojiPicker({
-                pickerKey: "notice-admin-message",
-                disabled: broadcastAvisoSubmitting,
-                onPick: appendEmojiToBroadcastAvisoMessage,
-                label: "Emojis da mensagem",
-                className: "emoji-picker-shell-right",
-              })}
-            </div>
-            <textarea
-              value={broadcastAvisoMessage}
-              onChange={(event) => setBroadcastAvisoMessage(event.target.value)}
-              placeholder="Mensagem para todos os clientes"
-              rows={6}
-              maxLength={2000}
-              required
-            />
-          </div>
-          <button type="submit" disabled={broadcastAvisoSubmitting}>
-            {broadcastAvisoSubmitting ? "Enviando..." : "Enviar aviso global"}
-          </button>
-        </form>
-      </section>
+        {noticeAdminTab === "create" ? (
+          renderNoticeBroadcastForm("create")
+        ) : (
+          <>
+            {isEditingBroadcastAviso ? renderNoticeBroadcastForm("edit") : null}
+            <section className="panel-card view-stack notice-admin-shell">
+              {noticeAdminBroadcastsLoading ? (
+                renderSkeletonRows(4)
+              ) : noticeAdminBroadcasts.length === 0 ? (
+                <div className="empty-state">Nenhum aviso global cadastrado até agora.</div>
+              ) : (
+                <div className="notice-admin-broadcast-grid">
+                  {noticeAdminBroadcasts.map((item) => {
+                    const Icon = resolveNoticeIconByKey(item.iconKey) ?? FiBell;
+                    return (
+                      <article key={item.broadcastKey} className="notice-admin-broadcast-card">
+                        <div className="notice-admin-broadcast-card-head">
+                          <span className="notice-admin-broadcast-card-thumb" aria-hidden="true">
+                            <Icon />
+                          </span>
+                          <div className="notice-admin-broadcast-card-copy">
+                            <strong>{item.title}</strong>
+                            <span>{formatRelativeTime(item.updatedAt, effectiveUserTimeZone)}</span>
+                          </div>
+                        </div>
+                        <p>{item.message}</p>
+                        <div className="meta-pill-row notice-admin-broadcast-meta">
+                          <span className="unit-pill">{`${item.recipientsCount} destinatário(s)`}</span>
+                          <span className="unit-pill">{`${item.unreadCount} não lido(s)`}</span>
+                        </div>
+                        <div className="inline-actions" style={{ justifyContent: "space-between" }}>
+                          <small className="field-hint">
+                            Criado em {formatDate(item.createdAt, effectiveUserTimeZone)}
+                          </small>
+                          <div className="notice-admin-broadcast-actions" aria-label="Ações do aviso">
+                            <button
+                              type="button"
+                              className="publications-board-action-button publications-board-action-button-edit"
+                              title="Editar aviso"
+                              aria-label="Editar aviso"
+                              onClick={() => openBroadcastAvisoEditor(item)}
+                              disabled={deletingNoticeBroadcastKey === item.broadcastKey}
+                            >
+                              <FiEdit3 aria-hidden="true" />
+                            </button>
+                            <button
+                              type="button"
+                              className="publications-board-action-button publications-board-action-button-delete"
+                              title="Excluir aviso"
+                              aria-label="Excluir aviso"
+                              onClick={() => void deleteBroadcastAviso(item)}
+                              disabled={deletingNoticeBroadcastKey === item.broadcastKey}
+                            >
+                              <FiTrash2 aria-hidden="true" />
+                            </button>
+                          </div>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          </>
+        )}
+      </div>
     );
   }
 
@@ -22998,6 +23933,31 @@ function App() {
     return renderAccountPageSkeleton();
   }
 
+  function renderPlanConfigSkeleton() {
+    return (
+      <div className="view-stack skeleton-shell" aria-busy="true">
+        <div className="history-anchor-tabs account-page-tabs" aria-hidden="true">
+          <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
+          <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
+          <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
+          <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
+        </div>
+        <section className="panel-card view-stack" aria-hidden="true">
+          <div className="inline-actions" style={{ justifyContent: "flex-end" }}>
+            <span className="skeleton-line skeleton-line-pill skeleton-line-pill-wide" />
+          </div>
+          <div className="form-stack">
+            <span className="skeleton-line skeleton-line-input" />
+            <span className="skeleton-line skeleton-line-input" />
+            <span className="skeleton-line skeleton-line-text" />
+            <span className="skeleton-line skeleton-line-input" />
+            <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" />
+          </div>
+        </section>
+      </div>
+    );
+  }
+
   function renderContentSkeleton() {
     switch (activeView) {
       case "dashboard":
@@ -23024,7 +23984,9 @@ function App() {
         return renderProfileSkeleton();
       case "plan":
       case "planStart":
+        return renderPlanSkeleton();
       case "planConfig":
+        return renderPlanConfigSkeleton();
       case "beeUpAdmin":
         return renderPlanSkeleton();
       default:
@@ -23037,7 +23999,7 @@ function App() {
       return renderAgentsSkeleton();
     }
 
-    if (contentLoading && (activeView !== "history" || !historyHasLoadedOnce)) {
+    if (contentLoading && activeView !== "historyPreview" && (activeView !== "history" || !historyHasLoadedOnce)) {
       return renderContentSkeleton();
     }
 
@@ -23364,7 +24326,6 @@ function App() {
               <div className="connection-create-modal-header">
                 <div>
                   <strong>Duplicar publicação</strong>
-                  <small className="field-hint">{resolveHistoryCalendarTitle(activePublicationDuplicateJob)}</small>
                 </div>
                 <button
                   type="button"
@@ -23383,11 +24344,27 @@ function App() {
                   <span>Título da cópia</span>
                   <input
                     value={publicationDuplicateTitle}
-                    onChange={(event) => setPublicationDuplicateTitle(event.target.value)}
+                    onChange={(event) => {
+                      const nextValue = event.target.value;
+                      setPublicationDuplicateTitle(nextValue);
+                      if (activePublicationDuplicateJob) {
+                        setPublicationDuplicateTitleError(
+                          publicationDuplicateTitleError
+                            ? getPublicationDuplicateTitleValidationMessage(
+                                nextValue,
+                                resolveHistoryCalendarTitle(activePublicationDuplicateJob),
+                              )
+                            : "",
+                        );
+                      }
+                    }}
                     placeholder="Título da nova publicação"
                     maxLength={120}
                     required
+                    aria-invalid={publicationDuplicateTitleError ? "true" : "false"}
+                    className={publicationDuplicateTitleError ? "field-input-error" : ""}
                   />
+                  {publicationDuplicateTitleError ? <small className="field-hint field-hint-error">{publicationDuplicateTitleError}</small> : null}
                 </label>
                 <div className="form-grid form-grid-two">
                   <label className="field-label">
@@ -23420,8 +24397,15 @@ function App() {
                           type="button"
                           className={`publication-duplicate-company-chip${isSelected ? " publication-duplicate-company-chip-selected" : ""}`}
                           onClick={() => togglePublicationDuplicateCompany(company.id)}
+                          aria-pressed={isSelected}
                         >
-                          {company.name}
+                          <span className="publication-duplicate-company-chip-indicator" aria-hidden="true">
+                            {isSelected ? <FiCheck aria-hidden="true" /> : <FiGrid aria-hidden="true" />}
+                          </span>
+                          <span className="publication-duplicate-company-chip-copy">
+                            <strong>{company.name}</strong>
+                            <small>{company.slug}</small>
+                          </span>
                         </button>
                       );
                     })}
@@ -23432,7 +24416,8 @@ function App() {
                 </small>
                 <div className="connection-create-modal-actions">
                   <button type="submit" disabled={creatingPublicationDuplicate || publicationDuplicateCompanyIds.length === 0}>
-                    {creatingPublicationDuplicate ? "Criando..." : "Criar cópia"}
+                    {creatingPublicationDuplicate ? <span className="button-spinner" aria-hidden="true" /> : <FiCopy aria-hidden="true" />}
+                    {creatingPublicationDuplicate ? "Criando cópia..." : "Criar cópia"}
                   </button>
                 </div>
               </form>
