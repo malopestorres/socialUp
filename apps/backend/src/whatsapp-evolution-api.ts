@@ -1363,7 +1363,7 @@ export async function dismissWhatsappQr(connectionId: string): Promise<void> {
     qrStatus: "IDLE",
     qrImageDataUrl: null,
     qrGeneratedAt: null,
-    qrMessage: "Geracao de QR cancelada.",
+    qrMessage: null,
   });
 }
 
@@ -1373,7 +1373,7 @@ export async function markWhatsappConnected(connectionId: string): Promise<void>
     qrStatus: "CONNECTED",
     qrImageDataUrl: null,
     qrGeneratedAt: null,
-    qrMessage: "Conta WhatsApp conectada.",
+    qrMessage: null,
   });
 }
 
@@ -1406,7 +1406,7 @@ export async function disconnectWhatsappConnection(connectionId: string): Promis
     qrStatus: "IDLE",
     qrImageDataUrl: null,
     qrGeneratedAt: null,
-    qrMessage: "Conta desconectada.",
+    qrMessage: null,
   });
 }
 

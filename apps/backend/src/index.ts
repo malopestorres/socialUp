@@ -2,7 +2,7 @@ import cors from "cors";
 import express from "express";
 import type { NextFunction, Request, Response } from "express";
 import multer from "multer";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { appendFile, mkdir, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -77,6 +77,7 @@ import {
   executeWhatsappJobWithEvolutionApi,
   getWhatsappConnectionOverlay,
   isWhatsappEvolutionHardcodedEnabled,
+  markWhatsappConnected,
   resolveWhatsappConnectionRuntimeAuthStatus,
   resolveWhatsappConnectionRuntimeMetadata,
   requestWhatsappQr,
@@ -221,12 +222,17 @@ type DefaultPlanSeed = {
   code: string;
   name: string;
   description: string;
+  subtitle: string;
+  highlights: string[];
   isTrial: boolean;
   maxProfiles: number;
   workspaceLimit: number;
   agencyBonusWorkspaceLimit: number;
   maxConnections: number;
+  maxWhatsappConnections: number | null;
   maxMonthlyPublications: number;
+  supportsWorkspaceInvites: boolean;
+  supportsClientApproval: boolean;
   monthlyPriceCents: number | null;
   yearlyPriceCents: number | null;
   isPublic?: boolean;
@@ -237,12 +243,22 @@ const DEFAULT_BILLING_TRIAL_PLAN: DefaultPlanSeed = {
   code: BILLING_TRIAL_PLAN_CODE,
   name: "Trial",
   description: "Entrada inicial com limites reduzidos para conhecer o painel.",
+  subtitle: "Configuração inicial para conhecer o SocialUp com uma operação enxuta.",
+  highlights: [
+    "1 workspace próprio",
+    "2 contas sociais",
+    "30 publicações no mês",
+    "Sem convites e sem aprovação de cliente",
+  ],
   isTrial: true,
   maxProfiles: 1,
   workspaceLimit: 1,
   agencyBonusWorkspaceLimit: 0,
   maxConnections: 2,
+  maxWhatsappConnections: 2,
   maxMonthlyPublications: 30,
+  supportsWorkspaceInvites: false,
+  supportsClientApproval: false,
   monthlyPriceCents: null,
   yearlyPriceCents: null,
   isPublic: false,
@@ -252,13 +268,23 @@ const DEFAULT_BILLING_TRIAL_PLAN: DefaultPlanSeed = {
 const DEFAULT_BILLING_SINGLE_PLAN: DefaultPlanSeed = {
   code: BILLING_SINGLE_PLAN_CODE,
   name: "Single",
-  description: "Plano individual para operar 1 workspace próprio sem recursos colaborativos.",
+  description: "Plano individual para operar até 2 workspaces próprios sem recursos colaborativos.",
+  subtitle: "Operação solo com até 2 workspaces próprios e rotina sem colaboração externa.",
+  highlights: [
+    "2 workspaces próprios",
+    "12 contas sociais",
+    "300 publicações por mês",
+    "Sem convites e sem aprovação de cliente",
+  ],
   isTrial: false,
-  maxProfiles: 1,
-  workspaceLimit: 1,
+  maxProfiles: 2,
+  workspaceLimit: 2,
   agencyBonusWorkspaceLimit: 0,
   maxConnections: 12,
+  maxWhatsappConnections: 1,
   maxMonthlyPublications: 300,
+  supportsWorkspaceInvites: false,
+  supportsClientApproval: false,
   monthlyPriceCents: null,
   yearlyPriceCents: null,
   isPublic: true,
@@ -269,12 +295,22 @@ const DEFAULT_BILLING_AGENCY_PLAN: DefaultPlanSeed = {
   code: BILLING_AGENCY_PLAN_CODE,
   name: "Agency",
   description: "Plano com múltiplos workspaces e fluxo colaborativo com cliente.",
+  subtitle: "Estrutura para operação com múltiplos workspaces e colaboração com cliente.",
+  highlights: [
+    "5 workspaces de cliente",
+    "5 workspaces bônus",
+    "60 contas sociais",
+    "Convites e aprovação com cliente",
+  ],
   isTrial: false,
   maxProfiles: 5,
   workspaceLimit: 5,
   agencyBonusWorkspaceLimit: 5,
   maxConnections: 60,
+  maxWhatsappConnections: null,
   maxMonthlyPublications: 3000,
+  supportsWorkspaceInvites: true,
+  supportsClientApproval: true,
   monthlyPriceCents: null,
   yearlyPriceCents: null,
   isPublic: true,
@@ -328,6 +364,17 @@ function parseUnknownString(value: unknown): string | null {
   }
 
   return null;
+}
+
+function normalizePlanHighlights(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter((item) => item.length > 0)
+    .slice(0, 8);
 }
 
 function isValidIanaTimeZone(value: string): boolean {
@@ -1337,6 +1384,10 @@ const openVisualAuthSchema = z.object({
   returnToUrl: z.string().trim().url().max(2000).optional().nullable(),
 });
 
+const dismissQrSchema = z.object({
+  requestSeenAt: z.string().trim().max(80).optional().nullable(),
+});
+
 const authEmailSchema = z.string().trim().email().max(160);
 
 const loginSchema = z.object({
@@ -1481,7 +1532,25 @@ const avisoRecentQuerySchema = z.object({
 const createBroadcastAvisoSchema = z.object({
   title: z.string().trim().min(2).max(120),
   message: z.string().trim().min(2).max(2000),
+  iconKey: z.string().trim().min(1).max(40).optional().nullable(),
 });
+
+const updateBroadcastAvisoSchema = z.object({
+  title: z.string().trim().min(2).max(120),
+  message: z.string().trim().min(2).max(2000),
+  iconKey: z.string().trim().min(1).max(40).optional().nullable(),
+});
+
+const NOTICE_ICON_KEYS = new Set([
+  "message-square",
+  "calendar",
+  "alert-circle",
+  "trending-up",
+  "check-circle",
+  "wifi",
+  "credit-card",
+  "bell",
+]);
 
 const publicationPreviewCommentSchema = z.object({
   message: z.string().trim().min(1, "Escreva uma mensagem.").max(2000),
@@ -1501,6 +1570,8 @@ const createPlanSchema = z.object({
   code: z.string().trim().min(2).max(40).regex(/^[A-Z0-9_]+$/),
   name: z.string().trim().min(2).max(80),
   description: z.string().trim().max(240).optional().nullable(),
+  subtitle: z.string().trim().max(240).optional().nullable(),
+  highlights: z.array(z.string().trim().min(1).max(120)).max(8).optional().default([]),
   isActive: z.boolean().optional().default(true),
   isPublic: z.boolean().optional().default(true),
   isTrial: z.boolean().optional().default(false),
@@ -1508,7 +1579,10 @@ const createPlanSchema = z.object({
   workspaceLimit: z.coerce.number().int().min(1).max(5000),
   agencyBonusWorkspaceLimit: z.coerce.number().int().min(0).max(5000).default(0),
   maxConnections: z.coerce.number().int().min(1).max(20000),
+  maxWhatsappConnections: z.coerce.number().int().min(0).max(1000).nullable().optional(),
   maxMonthlyPublications: z.coerce.number().int().min(1).max(2000000),
+  supportsWorkspaceInvites: z.boolean().optional().default(false),
+  supportsClientApproval: z.boolean().optional().default(false),
   displayOrder: z.coerce.number().int().min(0).max(5000).default(0),
   stripeProductId: z.string().trim().max(120).optional().nullable(),
 });
@@ -2793,7 +2867,7 @@ async function resolveWorkspaceOwnerPlanCapabilities(
         supportsClientApproval: true,
         maxWhatsappConnections: null,
       }
-    : resolveBillingPlanCapabilities((await resolveUserBillingAccess(ownerUserId)).plan?.code);
+    : resolveBillingPlanCapabilities((await resolveUserBillingAccess(ownerUserId)).plan);
 
   cache?.set(ownerUserId, capabilities);
   return capabilities;
@@ -3824,7 +3898,10 @@ type BillingAccessSnapshot = {
     workspaceLimit: number;
     agencyBonusWorkspaceLimit: number;
     maxConnections: number;
+    maxWhatsappConnections: number | null;
     maxMonthlyPublications: number;
+    supportsWorkspaceInvites: boolean;
+    supportsClientApproval: boolean;
   } | null;
   usage: {
     profilesUsed: number;
@@ -3850,21 +3927,38 @@ function normalizeResolvedPlanCode(value: string | null | undefined): string {
   return (value || "").trim().toUpperCase();
 }
 
-function resolveBillingPlanCapabilities(planCode: string | null | undefined): BillingPlanCapabilities {
-  const normalizedPlanCode = normalizeResolvedPlanCode(planCode);
+function resolveBillingPlanCapabilities(
+  planLike:
+    | {
+        code?: string | null;
+        supportsWorkspaceInvites?: boolean | null;
+        supportsClientApproval?: boolean | null;
+        maxWhatsappConnections?: number | null;
+      }
+    | string
+    | null
+    | undefined,
+): BillingPlanCapabilities {
+  const plan =
+    typeof planLike === "string"
+      ? {
+          code: planLike,
+          supportsWorkspaceInvites: null,
+          supportsClientApproval: null,
+          maxWhatsappConnections: null,
+        }
+      : planLike;
+  const normalizedPlanCode = normalizeResolvedPlanCode(plan?.code);
 
-  if (normalizedPlanCode === BILLING_AGENCY_PLAN_CODE) {
-    return {
-      supportsWorkspaceInvites: true,
-      supportsClientApproval: true,
-      maxWhatsappConnections: null,
-    };
-  }
+  const defaultSupportsWorkspaceInvites = normalizedPlanCode === BILLING_AGENCY_PLAN_CODE;
+  const defaultSupportsClientApproval = normalizedPlanCode === BILLING_AGENCY_PLAN_CODE;
+  const defaultMaxWhatsappConnections = normalizedPlanCode === BILLING_AGENCY_PLAN_CODE ? null : 2;
 
   return {
-    supportsWorkspaceInvites: false,
-    supportsClientApproval: false,
-    maxWhatsappConnections: 2,
+    supportsWorkspaceInvites: plan?.supportsWorkspaceInvites ?? defaultSupportsWorkspaceInvites,
+    supportsClientApproval: plan?.supportsClientApproval ?? defaultSupportsClientApproval,
+    maxWhatsappConnections:
+      plan?.maxWhatsappConnections === undefined ? defaultMaxWhatsappConnections : plan.maxWhatsappConnections,
   };
 }
 
@@ -4121,6 +4215,8 @@ async function ensureCanonicalBillingPlans(): Promise<void> {
         code: BILLING_TRIAL_PLAN_CODE,
         name: DEFAULT_BILLING_TRIAL_PLAN.name,
         description: DEFAULT_BILLING_TRIAL_PLAN.description,
+        subtitle: DEFAULT_BILLING_TRIAL_PLAN.subtitle,
+        highlights: DEFAULT_BILLING_TRIAL_PLAN.highlights,
         isActive: true,
         isPublic: DEFAULT_BILLING_TRIAL_PLAN.isPublic ?? false,
         isTrial: true,
@@ -4128,7 +4224,10 @@ async function ensureCanonicalBillingPlans(): Promise<void> {
         workspaceLimit: DEFAULT_BILLING_TRIAL_PLAN.workspaceLimit,
         agencyBonusWorkspaceLimit: DEFAULT_BILLING_TRIAL_PLAN.agencyBonusWorkspaceLimit,
         maxConnections: DEFAULT_BILLING_TRIAL_PLAN.maxConnections,
+        maxWhatsappConnections: DEFAULT_BILLING_TRIAL_PLAN.maxWhatsappConnections,
         maxMonthlyPublications: DEFAULT_BILLING_TRIAL_PLAN.maxMonthlyPublications,
+        supportsWorkspaceInvites: DEFAULT_BILLING_TRIAL_PLAN.supportsWorkspaceInvites,
+        supportsClientApproval: DEFAULT_BILLING_TRIAL_PLAN.supportsClientApproval,
         displayOrder: DEFAULT_BILLING_TRIAL_PLAN.displayOrder ?? 0,
       },
     });
@@ -4140,6 +4239,8 @@ async function ensureCanonicalBillingPlans(): Promise<void> {
       update: {
         name: planSeed.name,
         description: planSeed.description,
+        subtitle: planSeed.subtitle,
+        highlights: planSeed.highlights,
         isActive: true,
         isPublic: planSeed.isPublic ?? false,
         isTrial: planSeed.isTrial,
@@ -4147,13 +4248,18 @@ async function ensureCanonicalBillingPlans(): Promise<void> {
         workspaceLimit: planSeed.workspaceLimit,
         agencyBonusWorkspaceLimit: planSeed.agencyBonusWorkspaceLimit,
         maxConnections: planSeed.maxConnections,
+        maxWhatsappConnections: planSeed.maxWhatsappConnections,
         maxMonthlyPublications: planSeed.maxMonthlyPublications,
+        supportsWorkspaceInvites: planSeed.supportsWorkspaceInvites,
+        supportsClientApproval: planSeed.supportsClientApproval,
         displayOrder: planSeed.displayOrder ?? 0,
       },
       create: {
         code: planSeed.code,
         name: planSeed.name,
         description: planSeed.description,
+        subtitle: planSeed.subtitle,
+        highlights: planSeed.highlights,
         isActive: true,
         isPublic: planSeed.isPublic ?? false,
         isTrial: planSeed.isTrial,
@@ -4161,7 +4267,10 @@ async function ensureCanonicalBillingPlans(): Promise<void> {
         workspaceLimit: planSeed.workspaceLimit,
         agencyBonusWorkspaceLimit: planSeed.agencyBonusWorkspaceLimit,
         maxConnections: planSeed.maxConnections,
+        maxWhatsappConnections: planSeed.maxWhatsappConnections,
         maxMonthlyPublications: planSeed.maxMonthlyPublications,
+        supportsWorkspaceInvites: planSeed.supportsWorkspaceInvites,
+        supportsClientApproval: planSeed.supportsClientApproval,
         displayOrder: planSeed.displayOrder ?? 0,
         monthlyPriceCents: planSeed.monthlyPriceCents,
         yearlyPriceCents: planSeed.yearlyPriceCents,
@@ -4374,7 +4483,10 @@ async function resolveUserBillingAccessOnce(userId: string): Promise<BillingAcce
             workspaceLimit: true,
             agencyBonusWorkspaceLimit: true,
             maxConnections: true,
+            maxWhatsappConnections: true,
             maxMonthlyPublications: true,
+            supportsWorkspaceInvites: true,
+            supportsClientApproval: true,
             isActive: true,
           },
         },
@@ -4491,7 +4603,10 @@ async function resolveUserBillingAccessOnce(userId: string): Promise<BillingAcce
         workspaceLimit: true,
         agencyBonusWorkspaceLimit: true,
         maxConnections: true,
+        maxWhatsappConnections: true,
         maxMonthlyPublications: true,
+        supportsWorkspaceInvites: true,
+        supportsClientApproval: true,
         isActive: true,
       },
     });
@@ -4548,7 +4663,10 @@ async function resolveUserBillingAccessOnce(userId: string): Promise<BillingAcce
           workspaceLimit: exposedPlan.workspaceLimit,
           agencyBonusWorkspaceLimit: exposedPlan.agencyBonusWorkspaceLimit,
           maxConnections: exposedPlan.maxConnections,
+          maxWhatsappConnections: exposedPlan.maxWhatsappConnections,
           maxMonthlyPublications: exposedPlan.maxMonthlyPublications,
+          supportsWorkspaceInvites: exposedPlan.supportsWorkspaceInvites,
+          supportsClientApproval: exposedPlan.supportsClientApproval,
         }
       : null,
     usage: {
@@ -6324,11 +6442,14 @@ async function waitForWhatsappRuntimeConnected(input: {
 
 function mapAviso(aviso: {
   id: string;
+  broadcastKey: string | null;
   kind: string;
+  iconKey: string | null;
   title: string;
   message: string;
   readAt: Date | null;
   createdAt: Date;
+  updatedAt: Date;
   createdBy?: {
     id: string;
     name: string;
@@ -6337,11 +6458,14 @@ function mapAviso(aviso: {
 }): Record<string, unknown> {
   return {
     id: aviso.id,
+    broadcastKey: aviso.broadcastKey,
     kind: aviso.kind,
+    iconKey: aviso.iconKey,
     title: aviso.title,
     message: aviso.message,
     readAt: aviso.readAt,
     createdAt: aviso.createdAt,
+    updatedAt: aviso.updatedAt,
     createdBy: aviso.createdBy
       ? {
           id: aviso.createdBy.id,
@@ -6350,6 +6474,65 @@ function mapAviso(aviso: {
         }
       : null,
   };
+}
+
+function normalizeNoticeIconKey(iconKey: string | null | undefined): string | null {
+  const normalized = typeof iconKey === "string" ? iconKey.trim() : "";
+  if (!normalized) {
+    return null;
+  }
+  return NOTICE_ICON_KEYS.has(normalized) ? normalized : null;
+}
+
+async function ensureLegacyBroadcastKeys(): Promise<void> {
+  const legacyItems = await prisma.aviso.findMany({
+    where: {
+      kind: "SYSTEM_BROADCAST",
+      broadcastKey: null,
+    },
+    select: {
+      id: true,
+      createdByUserId: true,
+      title: true,
+      message: true,
+      iconKey: true,
+      createdAt: true,
+    },
+  });
+
+  if (legacyItems.length === 0) {
+    return;
+  }
+
+  const groups = new Map<string, string[]>();
+  for (const item of legacyItems) {
+    const groupKey = [
+      item.createdByUserId ?? "",
+      item.createdAt.toISOString(),
+      item.title,
+      item.message,
+      item.iconKey ?? "",
+    ].join("::");
+    const current = groups.get(groupKey);
+    if (current) {
+      current.push(item.id);
+    } else {
+      groups.set(groupKey, [item.id]);
+    }
+  }
+
+  for (const ids of groups.values()) {
+    await prisma.aviso.updateMany({
+      where: {
+        id: {
+          in: ids,
+        },
+      },
+      data: {
+        broadcastKey: randomUUID(),
+      },
+    });
+  }
 }
 
 type LiveUpdateScope = "jobs" | "dashboard" | "avisos" | "connections" | "companies" | "logs";
@@ -12825,28 +13008,6 @@ app.post("/connections", async (request, response) => {
     return;
   }
 
-  const maxWhatsappConnections = resolveBillingPlanCapabilities(billingAccess?.plan?.code).maxWhatsappConnections;
-  if (payload.platform === "whatsapp" && maxWhatsappConnections !== null) {
-    const ownerUserId = company.createdByUserId?.trim() || "";
-    const existingWhatsappConnections = ownerUserId
-      ? await prisma.socialConnection.count({
-          where: {
-            platform: "whatsapp",
-            company: {
-              createdByUserId: ownerUserId,
-            },
-          },
-        })
-      : 0;
-
-    if (existingWhatsappConnections >= maxWhatsappConnections) {
-      response.status(409).json({
-        error: `Seu plano permite até ${maxWhatsappConnections} conta(s) de WhatsApp conectada(s).`,
-      });
-      return;
-    }
-  }
-
   const existingConnectionForPlatform = await prisma.socialConnection.findFirst({
     where: {
       companyId: payload.companyId,
@@ -13064,7 +13225,7 @@ app.post("/connections/:id/open-visual-auth", async (request, response) => {
     });
 
     try {
-      await requestWhatsappQr(updatedConnection.id, false);
+      await requestWhatsappQr(updatedConnection.id, true);
     } catch (error) {
       const message = humanizeWhatsappQrErrorMessage(
         error instanceof Error && error.message ? error.message : "Falha ao iniciar a geracao do QR do WhatsApp.",
@@ -13274,6 +13435,7 @@ app.post("/connections/:id/regenerate-qr", async (request, response) => {
 });
 
 app.post("/connections/:id/dismiss-qr", async (request, response) => {
+  const payload = dismissQrSchema.parse(request.body ?? {});
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
   const connection = await findConnectionWithWorkspaceContext(request.params.id);
 
@@ -13295,6 +13457,17 @@ app.post("/connections/:id/dismiss-qr", async (request, response) => {
 
   if (connection.platform !== "whatsapp") {
     response.status(400).json({ error: "Fechamento de QR disponivel apenas para contas de WhatsApp." });
+    return;
+  }
+
+  const expectedSeenAt = parseOptionalDateFromUnknown(payload.requestSeenAt);
+  if (
+    expectedSeenAt &&
+    connection.lastSeenAt instanceof Date &&
+    connection.authStatus === "AUTH_IN_PROGRESS" &&
+    connection.lastSeenAt.getTime() !== expectedSeenAt.getTime()
+  ) {
+    response.json(mapConnection(connection));
     return;
   }
 
@@ -13325,7 +13498,7 @@ app.post("/connections/:id/dismiss-qr", async (request, response) => {
       },
     });
 
-    await dismissWhatsappQr(updatedConnection.id);
+    await markWhatsappConnected(updatedConnection.id);
 
     await appendLog({
       companyId: updatedConnection.companyId,
@@ -15456,14 +15629,24 @@ app.get("/billing/me", async (request, response) => {
         workspaceLimit: bestPlan?.workspaceLimit ?? 999999,
         agencyBonusWorkspaceLimit: bestPlan?.agencyBonusWorkspaceLimit ?? 999999,
         maxConnections: bestPlan?.maxConnections ?? 999999,
+        maxWhatsappConnections: bestPlan?.maxWhatsappConnections ?? null,
         maxMonthlyPublications: bestPlan?.maxMonthlyPublications ?? 999999999,
+        supportsWorkspaceInvites: bestPlan?.supportsWorkspaceInvites ?? true,
+        supportsClientApproval: bestPlan?.supportsClientApproval ?? true,
       },
       usage: rootUsage,
       canCancelStripeSubscription: false,
       stripeCancelAtPeriodEnd: false,
       stripePixAvailable,
       requiresInitialPlanSelection: false,
-      planCapabilities: resolveBillingPlanCapabilities(bestPlan?.code ?? "ROOT"),
+      planCapabilities: resolveBillingPlanCapabilities(
+        bestPlan ?? {
+          code: "ROOT",
+          supportsWorkspaceInvites: true,
+          supportsClientApproval: true,
+          maxWhatsappConnections: null,
+        },
+      ),
     });
     return;
   }
@@ -15489,7 +15672,7 @@ app.get("/billing/me", async (request, response) => {
     stripeCancelAtPeriodEnd: billing.stripeCancelAtPeriodEnd,
     stripePixAvailable,
     requiresInitialPlanSelection: Boolean(authUser?.needsPlanSelection && canStartInitialPlanTrial(billing)),
-    planCapabilities: resolveBillingPlanCapabilities(billing.plan?.code),
+    planCapabilities: resolveBillingPlanCapabilities(billing.plan),
   });
 });
 
@@ -15604,7 +15787,7 @@ app.post("/billing/start-trial", adminAuthMiddleware, async (request, response) 
       stripeCancelAtPeriodEnd: billing.stripeCancelAtPeriodEnd,
       stripePixAvailable: await resolveStripePixAvailability().catch(() => false),
       requiresInitialPlanSelection: false,
-      planCapabilities: resolveBillingPlanCapabilities(billing.plan?.code),
+      planCapabilities: resolveBillingPlanCapabilities(billing.plan),
     },
   });
 });
@@ -15661,6 +15844,8 @@ app.get("/billing/plans", async (request, response) => {
       code: plan.code,
       name: plan.name,
       description: plan.description,
+      subtitle: trimNullable(plan.subtitle) ?? trimNullable(plan.description),
+      highlights: normalizePlanHighlights(plan.highlights),
       isActive: plan.isActive,
       isPublic: plan.isPublic,
       isTrial: plan.isTrial,
@@ -15668,7 +15853,10 @@ app.get("/billing/plans", async (request, response) => {
       workspaceLimit: plan.workspaceLimit,
       agencyBonusWorkspaceLimit: plan.agencyBonusWorkspaceLimit,
       maxConnections: plan.maxConnections,
+      maxWhatsappConnections: plan.maxWhatsappConnections,
       maxMonthlyPublications: plan.maxMonthlyPublications,
+      supportsWorkspaceInvites: plan.supportsWorkspaceInvites,
+      supportsClientApproval: plan.supportsClientApproval,
       displayOrder: plan.displayOrder,
       monthlyPriceCents: plan.monthlyPriceCents,
       yearlyPriceCents: plan.yearlyPriceCents,
@@ -16100,6 +16288,8 @@ app.post("/billing/plans", async (request, response) => {
   const payload = createPlanSchema.parse(request.body);
   const normalizedCode = normalizePlanCode(payload.code);
   const normalizedDescription = trimNullable(payload.description);
+  const normalizedSubtitle = trimNullable(payload.subtitle);
+  const normalizedHighlights = normalizePlanHighlights(payload.highlights);
   const normalizedStripeProductId = trimNullable(payload.stripeProductId);
 
   if (payload.isTrial) {
@@ -16157,6 +16347,8 @@ app.post("/billing/plans", async (request, response) => {
       code: normalizedCode,
       name: payload.name.trim(),
       description: normalizedDescription,
+      subtitle: normalizedSubtitle,
+      highlights: normalizedHighlights,
       isActive: payload.isActive,
       isPublic: payload.isPublic,
       isTrial: payload.isTrial,
@@ -16164,7 +16356,10 @@ app.post("/billing/plans", async (request, response) => {
       workspaceLimit: payload.workspaceLimit,
       agencyBonusWorkspaceLimit: payload.agencyBonusWorkspaceLimit,
       maxConnections: payload.maxConnections,
+      maxWhatsappConnections: payload.maxWhatsappConnections ?? 2,
       maxMonthlyPublications: payload.maxMonthlyPublications,
+      supportsWorkspaceInvites: payload.supportsWorkspaceInvites,
+      supportsClientApproval: payload.supportsClientApproval,
       displayOrder: payload.displayOrder,
       monthlyPriceCents: payload.isTrial ? null : resolvedStripePriceIds.stripeMonthlyPriceCents,
       yearlyPriceCents: payload.isTrial ? null : resolvedStripePriceIds.stripeYearlyPriceCents,
@@ -16274,6 +16469,8 @@ app.put("/billing/plans/:id", async (request, response) => {
       code: payload.code ? normalizePlanCode(payload.code) : undefined,
       name: payload.name?.trim(),
       description: payload.description !== undefined ? trimNullable(payload.description) : undefined,
+      subtitle: payload.subtitle !== undefined ? trimNullable(payload.subtitle) : undefined,
+      highlights: payload.highlights !== undefined ? normalizePlanHighlights(payload.highlights) : undefined,
       isActive: payload.isActive,
       isPublic: payload.isPublic,
       isTrial: payload.isTrial,
@@ -16281,7 +16478,10 @@ app.put("/billing/plans/:id", async (request, response) => {
       workspaceLimit: payload.workspaceLimit,
       agencyBonusWorkspaceLimit: payload.agencyBonusWorkspaceLimit,
       maxConnections: payload.maxConnections,
+      maxWhatsappConnections: payload.maxWhatsappConnections,
       maxMonthlyPublications: payload.maxMonthlyPublications,
+      supportsWorkspaceInvites: payload.supportsWorkspaceInvites,
+      supportsClientApproval: payload.supportsClientApproval,
       displayOrder: payload.displayOrder,
       monthlyPriceCents: isTrial ? null : nextStripePriceIds.stripeMonthlyPriceCents,
       yearlyPriceCents: isTrial ? null : nextStripePriceIds.stripeYearlyPriceCents,
@@ -16970,6 +17170,92 @@ app.get("/avisos", async (request, response) => {
   });
 });
 
+app.get("/avisos/broadcasts", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+
+  if (!isRootUser(authRequest)) {
+    response.status(403).json({ error: "Apenas o usuario root pode gerenciar avisos globais." });
+    return;
+  }
+
+  await ensureLegacyBroadcastKeys();
+
+  const items = await prisma.aviso.findMany({
+    where: {
+      kind: "SYSTEM_BROADCAST",
+      broadcastKey: {
+        not: null,
+      },
+    },
+    select: {
+      broadcastKey: true,
+      title: true,
+      message: true,
+      iconKey: true,
+      createdAt: true,
+      updatedAt: true,
+      readAt: true,
+      userId: true,
+    },
+    orderBy: {
+      createdAt: "desc",
+    },
+  });
+
+  const grouped = new Map<
+    string,
+    {
+      broadcastKey: string;
+      title: string;
+      message: string;
+      iconKey: string | null;
+      createdAt: Date;
+      updatedAt: Date;
+      recipientsCount: number;
+      unreadCount: number;
+    }
+  >();
+
+  for (const item of items) {
+    const broadcastKey = item.broadcastKey;
+    if (!broadcastKey) {
+      continue;
+    }
+
+    const current = grouped.get(broadcastKey);
+    if (!current) {
+      grouped.set(broadcastKey, {
+        broadcastKey,
+        title: item.title,
+        message: item.message,
+        iconKey: item.iconKey,
+        createdAt: item.createdAt,
+        updatedAt: item.updatedAt,
+        recipientsCount: 1,
+        unreadCount: item.readAt ? 0 : 1,
+      });
+      continue;
+    }
+
+    current.recipientsCount += 1;
+    if (!item.readAt) {
+      current.unreadCount += 1;
+    }
+    if (item.updatedAt.getTime() > current.updatedAt.getTime()) {
+      current.updatedAt = item.updatedAt;
+    }
+    if (item.createdAt.getTime() > current.createdAt.getTime()) {
+      current.createdAt = item.createdAt;
+    }
+  }
+
+  response.json({
+    items: Array.from(grouped.values()).sort(
+      (left, right) => right.updatedAt.getTime() - left.updatedAt.getTime(),
+    ),
+  });
+});
+
 app.post("/avisos/broadcast", async (request, response) => {
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
 
@@ -16979,6 +17265,8 @@ app.post("/avisos/broadcast", async (request, response) => {
   }
 
   const payload = createBroadcastAvisoSchema.parse(request.body);
+  const broadcastKey = randomUUID();
+  const iconKey = normalizeNoticeIconKey(payload.iconKey);
 
   const recipients = await prisma.user.findMany({
     select: {
@@ -16995,7 +17283,9 @@ app.post("/avisos/broadcast", async (request, response) => {
     data: recipients.map((recipient) => ({
       userId: recipient.id,
       createdByUserId: authRequest.adminUser!.id,
+      broadcastKey,
       kind: "SYSTEM_BROADCAST",
+      iconKey,
       title: payload.title,
       message: payload.message,
     })),
@@ -17006,6 +17296,102 @@ app.post("/avisos/broadcast", async (request, response) => {
   );
 
   response.status(201).json({ created: recipients.length });
+});
+
+app.put("/avisos/broadcasts/:broadcastKey", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+
+  if (!isRootUser(authRequest)) {
+    response.status(403).json({ error: "Apenas o usuario root pode editar avisos globais." });
+    return;
+  }
+
+  const broadcastKey = request.params.broadcastKey?.trim();
+  if (!broadcastKey) {
+    response.status(400).json({ error: "Broadcast invalido." });
+    return;
+  }
+
+  const payload = updateBroadcastAvisoSchema.parse(request.body);
+  const iconKey = normalizeNoticeIconKey(payload.iconKey);
+
+  const matching = await prisma.aviso.findMany({
+    where: {
+      kind: "SYSTEM_BROADCAST",
+      broadcastKey,
+    },
+    select: {
+      userId: true,
+    },
+  });
+
+  if (matching.length === 0) {
+    response.status(404).json({ error: "Aviso global não encontrado." });
+    return;
+  }
+
+  await prisma.aviso.updateMany({
+    where: {
+      kind: "SYSTEM_BROADCAST",
+      broadcastKey,
+    },
+    data: {
+      title: payload.title,
+      message: payload.message,
+      iconKey,
+    },
+  });
+
+  notifyLiveUpdateForUsers(
+    matching.map((item) => item.userId),
+    ["avisos"],
+  );
+
+  response.json({ updated: matching.length });
+});
+
+app.delete("/avisos/broadcasts/:broadcastKey", async (request, response) => {
+  const authRequest = request as Request & { adminUser?: AdminUserAuth };
+
+  if (!isRootUser(authRequest)) {
+    response.status(403).json({ error: "Apenas o usuario root pode excluir avisos globais." });
+    return;
+  }
+
+  const broadcastKey = request.params.broadcastKey?.trim();
+  if (!broadcastKey) {
+    response.status(400).json({ error: "Broadcast invalido." });
+    return;
+  }
+
+  const matching = await prisma.aviso.findMany({
+    where: {
+      kind: "SYSTEM_BROADCAST",
+      broadcastKey,
+    },
+    select: {
+      userId: true,
+    },
+  });
+
+  if (matching.length === 0) {
+    response.status(404).json({ error: "Aviso global não encontrado." });
+    return;
+  }
+
+  await prisma.aviso.deleteMany({
+    where: {
+      kind: "SYSTEM_BROADCAST",
+      broadcastKey,
+    },
+  });
+
+  notifyLiveUpdateForUsers(
+    matching.map((item) => item.userId),
+    ["avisos"],
+  );
+
+  response.json({ deleted: matching.length });
 });
 
 app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
