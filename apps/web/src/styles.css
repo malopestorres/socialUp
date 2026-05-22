@@ -4415,6 +4415,7 @@ code,
   justify-content: center;
   padding: 32px 20px;
   gap: 16px;
+  position: relative;
 }
 
 .auth-boot-loading {
@@ -4808,6 +4809,30 @@ code,
   color: #16a34a;
 }
 
+.billing-checkout-plan-grid .trial-onboarding-plan-platform-icon-instagram,
+.billing-checkout-plan-grid .trial-onboarding-plan-platform-icon-instagram svg {
+  color: #ec4899;
+}
+
+.billing-checkout-plan-grid .trial-onboarding-plan-platform-icon-facebook,
+.billing-checkout-plan-grid .trial-onboarding-plan-platform-icon-facebook svg {
+  color: #2563eb;
+}
+
+.billing-checkout-plan-grid .trial-onboarding-plan-platform-icon-threads,
+.billing-checkout-plan-grid .trial-onboarding-plan-platform-icon-threads svg,
+.billing-checkout-plan-grid .trial-onboarding-plan-platform-icon-x,
+.billing-checkout-plan-grid .trial-onboarding-plan-platform-icon-x svg,
+.billing-checkout-plan-grid .trial-onboarding-plan-platform-icon-tiktok,
+.billing-checkout-plan-grid .trial-onboarding-plan-platform-icon-tiktok svg {
+  color: #111827;
+}
+
+.billing-checkout-plan-grid .trial-onboarding-plan-platform-icon-whatsapp,
+.billing-checkout-plan-grid .trial-onboarding-plan-platform-icon-whatsapp svg {
+  color: #16a34a;
+}
+
 .trial-onboarding-plan-features {
   display: grid;
   gap: 10px;
@@ -4828,6 +4853,63 @@ code,
   flex: 0 0 16px;
   color: #db2777;
   margin-top: 2px;
+}
+
+.trial-onboarding-plan-price {
+  display: grid;
+  gap: 10px;
+  margin-top: 4px;
+  padding: 14px 16px;
+  border: 1px solid rgba(219, 39, 119, 0.2);
+  border-radius: 16px;
+  background: rgba(253, 242, 248, 0.72);
+  text-align: center;
+}
+
+.trial-onboarding-plan-cycle-toggle {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  padding: 4px;
+  border-radius: 999px;
+  background: #ffffff;
+  border: 1px solid rgba(219, 39, 119, 0.16);
+}
+
+.trial-onboarding-plan-cycle-toggle button {
+  min-height: 34px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: #64748b;
+  font-size: 0.9rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.trial-onboarding-plan-cycle-toggle button:not(:disabled):hover,
+.trial-onboarding-plan-cycle-toggle button:not(:disabled):focus-visible,
+.trial-onboarding-plan-cycle-toggle-active {
+  background: #db2777 !important;
+  color: #ffffff !important;
+}
+
+.trial-onboarding-plan-cycle-toggle button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.trial-onboarding-plan-price strong {
+  color: #db2777;
+  font-size: 1.35rem;
+  line-height: 1.15;
+}
+
+.trial-onboarding-plan-price span {
+  color: #64748b;
+  font-size: 0.92rem;
+  line-height: 1.35;
 }
 
 .trial-onboarding-plan-button {
@@ -5483,7 +5565,8 @@ code,
 }
 
 @media (max-width: 980px) {
-  .trial-onboarding-plan-grid {
+  .trial-onboarding-plan-grid,
+  .billing-checkout-plan-grid {
     grid-template-columns: 1fr;
   }
 
@@ -5526,6 +5609,11 @@ code,
 
   .trial-onboarding-plan-card {
     padding: 20px;
+  }
+
+  .billing-checkout-plan-actions,
+  .billing-checkout-price-row {
+    grid-template-columns: 1fr;
   }
 
   .billing-plan-editor-head,
@@ -7315,18 +7403,21 @@ button {
   display: flex;
   width: 100%;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   flex-wrap: wrap;
 }
 
 .billing-summary-inline > strong {
   line-height: 1;
+  font-size: 1rem;
+  color: #111827;
+  margin-right: 2px;
 }
 
 .billing-summary-inline .status-pill,
 .billing-summary-inline .unit-pill,
 .billing-summary-inline .billing-cancel-button {
-  min-height: 34px;
+  min-height: 44px;
   display: inline-flex;
   align-items: center;
 }
@@ -7340,12 +7431,38 @@ button {
 .billing-summary-inline .unit-pill {
   padding-top: 0;
   padding-bottom: 0;
+  padding-left: 18px;
+  padding-right: 18px;
+  border-radius: 999px;
+  font-size: 1rem;
+  font-weight: 400;
+  letter-spacing: 0;
 }
 
 .billing-model-pill {
-  background: #dbeafe;
-  color: #1e3a8a;
-  border-color: #bfdbfe;
+  background: rgba(241, 245, 249, 0.95);
+  color: #64748b;
+  border-color: rgba(203, 213, 225, 0.95);
+}
+
+.billing-summary-inline .status-billing-active {
+  background: #ffffff;
+  color: #db2777;
+  border-color: rgba(219, 39, 119, 0.22);
+  box-shadow: inset 0 0 0 1px rgba(219, 39, 119, 0.12);
+}
+
+.billing-validity-inline {
+  color: #db2777 !important;
+  font-size: 0.98rem;
+  font-weight: 400;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.row-card .billing-validity-inline,
+.billing-summary-inline .billing-validity-inline {
+  color: #db2777 !important;
 }
 
 .billing-plan-catalog-row > .billing-plan-row-inline {
@@ -7362,6 +7479,95 @@ button {
 .billing-plan-action-row {
   width: 100%;
   justify-content: flex-end;
+}
+
+.billing-checkout-card-shell {
+  width: 100%;
+  display: grid;
+  gap: 16px;
+}
+
+.billing-checkout-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.billing-checkout-card-head > div {
+  display: grid;
+  gap: 4px;
+}
+
+.billing-checkout-card-head strong {
+  color: #1f2a44;
+  font-size: 1.05rem;
+}
+
+.billing-checkout-card-head span {
+  color: var(--text-soft);
+  line-height: 1.5;
+}
+
+.billing-checkout-plan-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  align-items: stretch;
+}
+
+.billing-checkout-plan-card {
+  border-radius: 20px;
+  box-shadow: none;
+}
+
+.billing-checkout-plan-card-selected {
+  border-color: rgba(219, 39, 119, 0.3);
+  box-shadow: 0 14px 34px rgba(219, 39, 119, 0.08);
+}
+
+.billing-checkout-plan-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.billing-checkout-price-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.billing-checkout-price-row > span {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border-radius: 14px;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+}
+
+.billing-checkout-price-row small {
+  color: var(--text-soft);
+  font-size: 0.78rem;
+}
+
+.billing-checkout-price-row strong {
+  color: #1f2a44;
+  font-size: 1.02rem;
+}
+
+.billing-checkout-plan-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+}
+
+.billing-checkout-secondary-button {
+  width: 100%;
+  justify-content: center;
+  margin-top: 4px;
 }
 
 .billing-plan-note {
@@ -11525,15 +11731,21 @@ code {
 }
 
 .unit-pill-plan {
-  background: #f0fdf4;
-  color: #14532d;
-  border-color: #bbf7d0;
+  background: rgba(241, 245, 249, 0.95);
+  color: #64748b;
+  border-color: rgba(203, 213, 225, 0.95);
 }
 
 .row-card .unit-pill-plan {
-  color: #14532d;
-  border-color: #bbf7d0;
-  background: #f0fdf4;
+  min-height: 44px;
+  padding: 0 18px;
+  border-radius: 999px;
+  color: #64748b;
+  border-color: rgba(203, 213, 225, 0.95);
+  background: rgba(241, 245, 249, 0.95);
+  font-size: 1rem;
+  font-weight: 400;
+  letter-spacing: 0;
 }
 
 .row-card .unit-pill-plan.unit-pill-plan-trial {

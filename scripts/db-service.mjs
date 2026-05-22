@@ -159,8 +159,8 @@ async function startPostgres(host, port) {
     return 1;
   }
 
-  console.log("PostgreSQL indisponível. Tentando iniciar via `brew services start postgresql@16`...");
-  const startCode = runCommand("brew", ["services", "start", "postgresql@16"]);
+  console.log("PostgreSQL indisponível. Tentando iniciar via `brew services start postgresql@17`...");
+  const startCode = runCommand("brew", ["services", "start", "postgresql@17"]);
   if (startCode !== 0) {
     return startCode;
   }
@@ -177,7 +177,7 @@ async function startPostgres(host, port) {
 }
 
 function stopPostgres() {
-  return runCommand("brew", ["services", "stop", "postgresql@16"]);
+  return runCommand("brew", ["services", "stop", "postgresql@17"]);
 }
 
 async function showStatus(host, port, databaseName) {

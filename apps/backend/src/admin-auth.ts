@@ -1,5 +1,5 @@
 import type { Request, Response, NextFunction } from "express";
-import { prisma } from "./prisma.js";
+import { prisma, withPrismaConnectionRetry } from "./prisma.js";
 
 export type AdminUserAuth = {
   id: string;
@@ -28,16 +28,35 @@ export async function adminAuthMiddleware(
     return;
   }
 
-  const user = await prisma.user.findFirst({
-    where: { sessionToken },
-    select: {
-      id: true,
-      username: true,
-      name: true,
-      timeZone: true,
-      role: true,
-    },
-  });
+  let user:
+    | {
+        id: string;
+        username: string;
+        name: string;
+        timeZone: string;
+        role: string;
+      }
+    | null = null;
+
+  try {
+    user = await withPrismaConnectionRetry(
+      () =>
+        prisma.user.findFirst({
+          where: { sessionToken },
+          select: {
+            id: true,
+            username: true,
+            name: true,
+            timeZone: true,
+            role: true,
+          },
+        }),
+      { maxAttempts: 3, retryDelayMs: 350 },
+    );
+  } catch {
+    response.status(503).json({ error: "Banco temporariamente indisponível. Tente novamente." });
+    return;
+  }
 
   if (!user) {
     response.status(401).json({ error: "Sessao invalida ou expirada." });

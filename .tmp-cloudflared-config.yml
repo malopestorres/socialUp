@@ -4,4 +4,8 @@ credentials-file: /Users/marcustorres/.cloudflared/8ebb40a5-eb9a-414c-b52a-ddf9f
 ingress:
   - hostname: oauth.socialup.space
     service: http://localhost:4000
+  - hostname: api.socialup.space
+    service: http://localhost:4000
+  - hostname: dev.socialup.space
+    service: http://localhost:5173
   - service: http_status:404

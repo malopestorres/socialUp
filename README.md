@@ -33,6 +33,11 @@ Terminal 2:
 npm run dev:web
 ```
 
+Se voce abrir o painel por um dominio/tunnel (nao localhost), configure a API do frontend:
+
+1) Copie `apps/web/.env.example` para `apps/web/.env.local`
+2) Preencha `VITE_API_URL` com a URL do backend (ex: seu tunnel do backend)
+
 Atalho para stack WhatsApp local (Evolution API + Postgres local):
 
 ```bash

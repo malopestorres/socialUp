@@ -4,11 +4,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EVOLUTION_DIR="$ROOT_DIR/services/evolution-api"
-PG_BIN="/Applications/Postgres.app/Contents/Versions/17/bin"
+PG_BIN="${EVOLUTION_PG_BIN:-/opt/homebrew/opt/postgresql@17/bin}"
 PG_DATA_DIR="${EVOLUTION_PG_DATA_DIR:-$HOME/.evolution-postgres/data}"
 PG_LOG_DIR="${EVOLUTION_PG_LOG_DIR:-$HOME/.evolution-postgres/logs}"
 PG_LOG_FILE="$PG_LOG_DIR/postgres.log"
 PG_PORT="${EVOLUTION_PG_PORT:-5433}"
+PG_DATABASE="${EVOLUTION_PG_DATABASE:-evolution_db}"
 
 if [ ! -d "$EVOLUTION_DIR" ]; then
   echo "services/evolution-api nao encontrado. Clone/configure a Evolution API primeiro."
@@ -16,8 +17,9 @@ if [ ! -d "$EVOLUTION_DIR" ]; then
 fi
 
 if [ ! -x "$PG_BIN/pg_ctl" ]; then
-  echo "Postgres.app nao encontrado em /Applications/Postgres.app."
-  echo "Instale o Postgres.app ou ajuste PG_BIN no script scripts/dev-whatsapp.sh."
+  echo "PostgreSQL 17 nao encontrado em $PG_BIN."
+  echo "Instale com: brew install postgresql@17"
+  echo "Ou ajuste EVOLUTION_PG_BIN apontando para a pasta bin do PostgreSQL."
   exit 1
 fi
 
@@ -43,6 +45,11 @@ if ! "$PG_BIN/pg_ctl" -D "$PG_DATA_DIR" status >/dev/null 2>&1; then
   "$PG_BIN/pg_ctl" -D "$PG_DATA_DIR" -l "$PG_LOG_FILE" -o "-p $PG_PORT" start
 fi
 
+if ! "$PG_BIN/psql" -p "$PG_PORT" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '$PG_DATABASE'" | grep -q 1; then
+  echo "Criando banco PostgreSQL local da Evolution ($PG_DATABASE)..."
+  "$PG_BIN/createdb" -p "$PG_PORT" "$PG_DATABASE"
+fi
+
 cd "$EVOLUTION_DIR"
 
 if [ ! -d node_modules ]; then
@@ -55,6 +62,10 @@ if [ ! -f .env ]; then
   echo "Crie esse arquivo antes de rodar (ou copie de .env.example)."
   exit 1
 fi
+
+echo "Preparando schema Prisma da Evolution API..."
+npm run db:generate
+npm run db:deploy
 
 echo "Subindo Evolution API em modo dev na porta 8080..."
 npm run dev:server

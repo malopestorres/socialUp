@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-PG_BIN="/Applications/Postgres.app/Contents/Versions/17/bin"
+PG_BIN="${EVOLUTION_PG_BIN:-/opt/homebrew/opt/postgresql@17/bin}"
 PG_DATA_DIR="${EVOLUTION_PG_DATA_DIR:-$HOME/.evolution-postgres/data}"
 
 echo "Parando Evolution API (se estiver rodando)..."

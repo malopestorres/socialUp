@@ -35,10 +35,10 @@ const DEFAULT_BILLING_PLANS = [
   {
     code: "SINGLE",
     name: "Single",
-    description: "Plano para uma única operação.",
+    description: "Plano individual para operar até 2 workspaces próprios.",
     isTrial: false,
-    maxProfiles: 1,
-    workspaceLimit: 1,
+    maxProfiles: 2,
+    workspaceLimit: 2,
     agencyBonusWorkspaceLimit: 0,
     isPublic: true,
     displayOrder: 1,
