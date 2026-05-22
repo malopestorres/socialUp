@@ -118,6 +118,7 @@ const EVOLUTION_API_BASE_URL = normalizeBaseUrl(process.env.EVOLUTION_API_BASE_U
 const EVOLUTION_API_KEY = (process.env.EVOLUTION_API_KEY || "").trim();
 const EVOLUTION_API_TIMEOUT_MS = parsePositiveInt(process.env.EVOLUTION_API_TIMEOUT_MS, 45_000);
 const EVOLUTION_QR_POLL_INTERVAL_MS = parsePositiveInt(process.env.EVOLUTION_QR_POLL_INTERVAL_MS, 800);
+const EVOLUTION_QR_REUSE_WINDOW_MS = parsePositiveInt(process.env.EVOLUTION_QR_REUSE_WINDOW_MS, 45_000);
 const EVOLUTION_INSTANCE_INTEGRATION = (process.env.EVOLUTION_INSTANCE_INTEGRATION || "WHATSAPP-BAILEYS").trim();
 const EVOLUTION_STATUS_TEXT_BACKGROUND = process.env.EVOLUTION_STATUS_TEXT_BACKGROUND?.trim() || "#202C33";
 const EVOLUTION_STATUS_TEXT_FONT = parseStatusTextFont(process.env.EVOLUTION_STATUS_TEXT_FONT, 1);
@@ -136,6 +137,49 @@ const JOB_MEDIA_BUNDLE_STORAGE_PREFIX = "__JOB_MEDIA_BUNDLE__";
 
 const qrOverlayByConnectionId = new Map<string, QrOverlayState>();
 const qrPollersByConnectionId = new Map<string, NodeJS.Timeout>();
+
+function preserveQrGeneratedAtForSameCode(connectionId: string, nextImageDataUrl: string | null): Date {
+  const previous = qrOverlayByConnectionId.get(connectionId);
+  if (
+    previous?.qrImageDataUrl &&
+    nextImageDataUrl &&
+    previous.qrImageDataUrl === nextImageDataUrl &&
+    previous.qrGeneratedAt instanceof Date
+  ) {
+    return previous.qrGeneratedAt;
+  }
+
+  return new Date();
+}
+
+function isSameQrCodeExpired(connectionId: string, nextImageDataUrl: string | null, nowMs = Date.now()): boolean {
+  const previous = qrOverlayByConnectionId.get(connectionId);
+  if (!previous?.qrImageDataUrl || !nextImageDataUrl || previous.qrImageDataUrl !== nextImageDataUrl) {
+    return false;
+  }
+
+  const generatedAtMs = previous.qrGeneratedAt instanceof Date ? previous.qrGeneratedAt.getTime() : 0;
+  return generatedAtMs > 0 && nowMs - generatedAtMs > EVOLUTION_QR_REUSE_WINDOW_MS;
+}
+
+function isReusableQrOverlay(state: QrOverlayState | null | undefined, nowMs = Date.now()): boolean {
+  if (!state) {
+    return false;
+  }
+
+  if (state.qrStatus !== "WAITING_QR_SCAN" && state.qrStatus !== "PREPARING") {
+    return false;
+  }
+
+  const generatedAtMs = state.qrGeneratedAt instanceof Date ? state.qrGeneratedAt.getTime() : Number.NaN;
+  if (!Number.isFinite(generatedAtMs)) {
+    // PREPARING pode não ter data ainda, mas só consideramos reutilizável se viu atividade recente.
+    const lastSeenMs = state.workerLastSeenAt instanceof Date ? state.workerLastSeenAt.getTime() : 0;
+    return lastSeenMs > 0 && nowMs - lastSeenMs <= EVOLUTION_QR_REUSE_WINDOW_MS;
+  }
+
+  return nowMs - generatedAtMs <= EVOLUTION_QR_REUSE_WINDOW_MS;
+}
 
 function buildAutoWhatsappInstanceName(connectionId: string): string {
   const normalized = connectionId.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
@@ -462,6 +506,32 @@ async function markConnectionConnected(connectionId: string): Promise<void> {
       authStatus: "CONNECTED",
       lastAuthAt: new Date(),
       lastSeenAt: new Date(),
+    },
+  });
+}
+
+async function markConnectionAuthRequired(connectionId: string): Promise<void> {
+  if (isWhatsappEvolutionHardcodedEnabled()) {
+    await prisma.socialConnection.updateMany({
+      where: { id: connectionId, platform: "whatsapp" },
+      data: {
+        authStatus: "AUTH_REQUIRED",
+        authLaunchUrl: null,
+        lastAuthAt: null,
+        lastSeenAt: null,
+      },
+    });
+    return;
+  }
+
+  await prisma.socialConnection.updateMany({
+    where: { id: connectionId, platform: "whatsapp" },
+    data: {
+      authStatus: "AUTH_REQUIRED",
+      loginIdentifier: buildFreshWhatsappInstanceName(connectionId),
+      authLaunchUrl: null,
+      lastAuthAt: null,
+      lastSeenAt: null,
     },
   });
 }
@@ -902,22 +972,45 @@ async function syncQrState(
   const pairingCode = connect.pairingCode?.trim() || "";
 
   if (qrBase64) {
+    const qrImageDataUrl = toQrImageDataUrl(qrBase64);
+    if (isSameQrCodeExpired(connectionId, qrImageDataUrl)) {
+      await markConnectionAuthRequired(connectionId);
+      setQrOverlay(connectionId, {
+        qrStatus: "QR_EXPIRED",
+        qrImageDataUrl: null,
+        qrGeneratedAt: null,
+        qrMessage: "QR expirado. Gere um novo QR Code do WhatsApp.",
+      });
+      return "STOP";
+    }
+
     setQrOverlay(connectionId, {
       qrStatus: "WAITING_QR_SCAN",
-      qrImageDataUrl: toQrImageDataUrl(qrBase64),
+      qrImageDataUrl,
       qrMessage: "Escaneie o QR Code no WhatsApp do celular.",
-      qrGeneratedAt: new Date(),
+      qrGeneratedAt: preserveQrGeneratedAtForSameCode(connectionId, qrImageDataUrl),
     });
     return "CONTINUE";
   }
 
   if (qrCodeContent) {
     const qrDataUrl = await qrCodeToDataUrl(qrCodeContent);
+    if (isSameQrCodeExpired(connectionId, qrDataUrl)) {
+      await markConnectionAuthRequired(connectionId);
+      setQrOverlay(connectionId, {
+        qrStatus: "QR_EXPIRED",
+        qrImageDataUrl: null,
+        qrGeneratedAt: null,
+        qrMessage: "QR expirado. Gere um novo QR Code do WhatsApp.",
+      });
+      return "STOP";
+    }
+
     setQrOverlay(connectionId, {
       qrStatus: "WAITING_QR_SCAN",
       qrImageDataUrl: qrDataUrl,
       qrMessage: "Escaneie o QR Code no WhatsApp do celular.",
-      qrGeneratedAt: new Date(),
+      qrGeneratedAt: preserveQrGeneratedAtForSameCode(connectionId, qrDataUrl),
     });
     return "CONTINUE";
   }
@@ -938,6 +1031,22 @@ async function syncQrState(
     qrMessage: formatStateMessage(state),
     qrGeneratedAt: null,
   });
+
+  if (normalizedState === "close" || normalizedState === "closed") {
+    // QR expirou / sessão fechada sem autenticar: "esquece" a tentativa para não prender em AUTH_IN_PROGRESS.
+    await markConnectionAuthRequired(connectionId);
+    clearQrPoller(connectionId);
+    setQrOverlay(connectionId, {
+      qrStatus: "IDLE",
+      qrImageDataUrl: null,
+      qrGeneratedAt: null,
+      qrMessage: null,
+      whatsappOwnerJid: null,
+      whatsappProfileName: null,
+    });
+    return "STOP";
+  }
+
   return "CONTINUE";
 }
 
@@ -1289,6 +1398,34 @@ export async function requestWhatsappQr(connectionId: string, forceRegenerate: b
     throw error;
   }
 
+  const existingOverlay = qrOverlayByConnectionId.get(connectionId);
+  if (!forceRegenerate && isReusableQrOverlay(existingOverlay)) {
+    // Reaproveita o QR recente, mas só se a Evolution ainda não marcou a sessão como fechada/expirada.
+    try {
+      const state = normalizeState(await getEffectiveConnectionState(credentials));
+      if (state === "close" || state === "closed") {
+        // QR expirou de fato no provedor; segue fluxo normal para gerar outro.
+      } else {
+        setQrOverlay(connectionId, {
+          qrStatus: existingOverlay?.qrStatus ?? "WAITING_QR_SCAN",
+          qrImageDataUrl: existingOverlay?.qrImageDataUrl ?? null,
+          qrGeneratedAt: existingOverlay?.qrGeneratedAt ?? null,
+          qrMessage: existingOverlay?.qrMessage ?? "Escaneie o QR Code no WhatsApp do celular.",
+        });
+        return;
+      }
+    } catch {
+      // Se não conseguir validar com a Evolution, reaproveita para evitar spam de geração.
+      setQrOverlay(connectionId, {
+        qrStatus: existingOverlay?.qrStatus ?? "WAITING_QR_SCAN",
+        qrImageDataUrl: existingOverlay?.qrImageDataUrl ?? null,
+        qrGeneratedAt: existingOverlay?.qrGeneratedAt ?? null,
+        qrMessage: existingOverlay?.qrMessage ?? "Escaneie o QR Code no WhatsApp do celular.",
+      });
+      return;
+    }
+  }
+
   setQrOverlay(connectionId, {
     qrStatus: "PREPARING",
     qrImageDataUrl: null,
@@ -1369,11 +1506,32 @@ export async function dismissWhatsappQr(connectionId: string): Promise<void> {
 
 export async function markWhatsappConnected(connectionId: string): Promise<void> {
   clearQrPoller(connectionId);
+  const connection = await getConnectionIdentity(connectionId);
+  let ownerJid: string | null = null;
+  let profileName: string | null = null;
+
+  if (connection) {
+    try {
+      const credentials = getConnectionCredentials(connection);
+      const instance = await fetchInstanceRecord(credentials);
+      ownerJid = typeof instance?.ownerJid === "string" && instance.ownerJid.trim().length > 0
+        ? instance.ownerJid.trim()
+        : null;
+      profileName = typeof instance?.profileName === "string" && instance.profileName.trim().length > 0
+        ? instance.profileName.trim()
+        : null;
+    } catch {
+      // Mantem o conectado mesmo se a Evolution demorar para devolver metadados.
+    }
+  }
+
   setQrOverlay(connectionId, {
     qrStatus: "CONNECTED",
     qrImageDataUrl: null,
     qrGeneratedAt: null,
     qrMessage: null,
+    whatsappOwnerJid: ownerJid,
+    whatsappProfileName: profileName,
   });
 }
 

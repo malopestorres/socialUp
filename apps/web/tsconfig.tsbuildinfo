@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/api.ts","./src/bee-up.tsx","./src/main.tsx","./src/meta-location-catalog.ts"],"errors":true,"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/api.ts","./src/bee-up.tsx","./src/firebase-auth.ts","./src/main.tsx","./src/meta-location-catalog.ts"],"errors":true,"version":"5.9.3"}

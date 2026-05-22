@@ -3,6 +3,14 @@ import { loadBackendEnv } from "./env-loader.js";
 
 loadBackendEnv();
 
+try {
+  const bootstrapUrl = import.meta.url || "";
+  const mode = bootstrapUrl.includes("/dist/") ? "dist" : bootstrapUrl.includes("/src/") ? "src" : "unknown";
+  console.log(`[bootstrap] mode=${mode}`);
+} catch {
+  // ignore
+}
+
 const DATABASE_BOOT_ATTEMPTS = parsePositiveInt(process.env.BACKEND_DB_BOOT_ATTEMPTS, 20);
 const DATABASE_BOOT_DELAY_MS = parsePositiveInt(process.env.BACKEND_DB_BOOT_DELAY_MS, 1_500);
 

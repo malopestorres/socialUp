@@ -1,4 +1,14 @@
 function resolveApiUrl(): string {
+  const envApiUrl =
+    typeof import.meta !== "undefined" &&
+    typeof import.meta.env !== "undefined" &&
+    typeof import.meta.env.VITE_API_URL === "string"
+      ? import.meta.env.VITE_API_URL.trim()
+      : "";
+  if (envApiUrl) {
+    return envApiUrl.replace(/\/+$/, "");
+  }
+
   if (typeof window === "undefined") {
     return "http://localhost:4000";
   }

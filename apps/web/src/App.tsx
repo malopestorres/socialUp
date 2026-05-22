@@ -329,7 +329,16 @@ type SchedulerProfileTarget = {
 };
 
 const DEFAULT_WHATSAPP_BACKGROUND_COLOR = "#202C33";
-const WHATSAPP_QR_REUSE_WINDOW_MS = 45_000;
+const WHATSAPP_QR_REUSE_WINDOW_MS = (() => {
+  const raw =
+    typeof import.meta !== "undefined" &&
+    typeof import.meta.env !== "undefined" &&
+    typeof import.meta.env.VITE_WHATSAPP_QR_REUSE_WINDOW_MS === "string"
+      ? import.meta.env.VITE_WHATSAPP_QR_REUSE_WINDOW_MS.trim()
+      : "";
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 45_000;
+})();
 
 const schedulerPublicationTypeChoices: Array<{
   value: SchedulerSelectablePublicationType;
@@ -946,10 +955,10 @@ const HISTORY_MONTH_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "12", label: "Dezembro" },
 ];
 const DEFAULT_USER_TIME_ZONE = "America/Sao_Paulo";
-const DEFAULT_WORKSPACE_COLOR = "#1F2A44";
+const DEFAULT_WORKSPACE_COLOR = "#1D4ED8";
 const WORKSPACE_PRESET_COLORS = [
   DEFAULT_WORKSPACE_COLOR,
-  "#1D4ED8",
+  "#1F2A44",
   "#BE185D",
   "#A16207",
   "#166534",
@@ -4093,7 +4102,7 @@ function resolveSchedulerTargetAccountLabel(connection: SocialConnection): strin
     return connection.loginIdentifier?.trim() || connection.displayName;
   }
 
-  return resolveWhatsappOwnerNumber(connection.whatsappOwnerJid) || connection.whatsappProfileName || connection.displayName;
+  return connection.whatsappProfileName?.trim() || resolveWhatsappOwnerNumber(connection.whatsappOwnerJid) || connection.displayName;
 }
 
 function resolveSchedulerTargetAccountMeta(connection: SocialConnection): string | null {
@@ -4117,6 +4126,10 @@ function resolveSchedulerTargetAccountMeta(connection: SocialConnection): string
   const profileName = connection.whatsappProfileName?.trim() || null;
   const displayName = connection.displayName?.trim() || null;
   const accountLabel = resolveSchedulerTargetAccountLabel(connection).trim();
+
+  if (ownerNumber && ownerNumber !== accountLabel) {
+    return `Número: ${ownerNumber.replace(/^@/, "")}`;
+  }
 
   if (ownerNumber && profileName && profileName !== ownerNumber && profileName !== accountLabel) {
     return profileName;
@@ -4687,6 +4700,8 @@ function App() {
   const [agentStatusFilter, setAgentStatusFilter] = useState<AgentConnectionStatusFilter>("all");
   const [activeAgentFilterMenu, setActiveAgentFilterMenu] = useState<"workspace" | "platform" | "status" | null>(null);
   const [googleAuthSubmitting, setGoogleAuthSubmitting] = useState(false);
+  const [googleAuthHandoffPending, setGoogleAuthHandoffPending] = useState(false);
+  const [googleAuthScreenLocked, setGoogleAuthScreenLocked] = useState(false);
   const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [profileName, setProfileName] = useState("");
   const [profileEmail, setProfileEmail] = useState("");
@@ -4875,6 +4890,7 @@ function App() {
     StripeCatalogResponse["resolvedByProduct"]
   >({});
   const [stripeCatalogError, setStripeCatalogError] = useState("");
+  const [planCardBillingCycles, setPlanCardBillingCycles] = useState<Record<string, "MONTHLY" | "YEARLY">>({});
   const [checkoutPlanId, setCheckoutPlanId] = useState("");
   const [checkoutCycle, setCheckoutCycle] = useState<"" | "MONTHLY" | "YEARLY">("");
   const [startingCheckout, setStartingCheckout] = useState(false);
@@ -5145,7 +5161,8 @@ function App() {
     const canReusePaidPlanReference =
       billingMe?.billingModel === "STRIPE_SUBSCRIPTION" ||
       billingMe?.billingModel === "PIX_MANUAL" ||
-      billingMe?.billingModel === "MANUAL";
+      billingMe?.billingModel === "MANUAL" ||
+      billingMe?.billingModel === "TRIAL";
 
     if (!canReusePaidPlanReference) {
       return null;
@@ -5275,11 +5292,25 @@ function App() {
     (Boolean(authUser?.billingIsBlocked) &&
       (authUser?.billingStatus === "EXPIRED" || authUser?.billingStatus === "PAYMENT_REQUIRED") &&
       !authUser?.billingPlanCode);
+  const trialEndsAtMs = authUser?.billingTrialEndsAt ? new Date(authUser.billingTrialEndsAt).getTime() : Number.NaN;
+  const trialDaysRemaining =
+    Number.isFinite(trialEndsAtMs)
+      ? Math.max(0, Math.ceil((trialEndsAtMs - Date.now()) / (24 * 60 * 60 * 1000)))
+      : null;
+  const hasActiveTrialWarning =
+    !authUser?.billingIsBlocked &&
+    authUser?.billingStatus === "TRIALING" &&
+    authUser?.billingPlanCode !== "ROOT" &&
+    trialDaysRemaining !== null;
   const billingWarningMessage = authUser?.billingIsBlocked
     ? hasExpiredTrialContext
       ? "Seu período de teste expirou. Ative um plano para continuar usando o painel."
       : (authUser.billingBlockMessage || "Conta bloqueada por pagamento pendente. Renove para continuar.")
-    : "";
+    : hasActiveTrialWarning
+      ? trialDaysRemaining === 0
+        ? "Seu período de testes termina hoje. Escolha um plano para manter o painel ativo."
+        : `Seu período de testes termina em ${trialDaysRemaining} dia${trialDaysRemaining === 1 ? "" : "s"}.`
+      : "";
   const schedulerSelectedPublicationSet = useMemo(
     () => normalizeSchedulerSelectedPublicationTypes(publicationType, selectedPublicationTypes),
     [publicationType, selectedPublicationTypes],
@@ -5594,6 +5625,7 @@ function App() {
 
     return companies.some((company) => company.canManageWorkspace);
   }, [billingMe?.plan?.workspaceLimit, companies, isBlockedBilling, isRootUser, shouldRenderInitialPlanSelection]);
+  const canCreateAgencyBonusWorkspace = isRootUser || (billingMe?.plan?.agencyBonusWorkspaceLimit ?? 0) > 0;
   const hasAnyWorkspaceInviteSupport = useMemo(
     () => isRootUser || companies.some((company) => company.supportsWorkspaceInvites),
     [companies, isRootUser],
@@ -5653,6 +5685,8 @@ function App() {
   );
 
   const activeQrState = activeQrConnection?.qrStatus ?? (activeQrConnectionId ? "PREPARING" : "IDLE");
+  const activeQrIsConnected =
+    activeQrConnection?.authStatus === "CONNECTED" || activeQrConnection?.qrStatus === "CONNECTED";
   const hasQrModalError = qrModalInfoTone === "error" && qrModalInfo.trim().length > 0;
 
   function hasReusableWhatsappQr(connection: SocialConnection | null | undefined): boolean {
@@ -6209,14 +6243,18 @@ function App() {
       clearManagedPopupWatch(googleAuthPopupWatchIntervalRef);
       closeManagedPopupWindow(googleAuthPopupRef.current);
       googleAuthPopupRef.current = null;
-      setGoogleAuthSubmitting(false);
 
       if (!payload.success || !payload.sessionToken || !payload.user) {
+        setGoogleAuthSubmitting(false);
+        setGoogleAuthHandoffPending(false);
+        setGoogleAuthScreenLocked(false);
         setAuthInfo("");
         setAuthError(payload.message || "Falha ao entrar com Google.");
         return;
       }
 
+      setGoogleAuthScreenLocked(true);
+      setGoogleAuthHandoffPending(true);
       api.setSessionToken(payload.sessionToken, rememberMe);
       if (rememberMe) {
         const rememberedIdentifier = payload.user.email?.trim() || payload.user.username;
@@ -6680,6 +6718,10 @@ function App() {
       (connection.qrStatus === "PREPARING" || connection.qrStatus === "WAITING_QR_SCAN" || connection.qrStatus === "QR_EXPIRED")
     ) {
       return "AUTH_IN_PROGRESS";
+    }
+
+    if (connection.platform === "whatsapp" && connection.authStatus === "AUTH_IN_PROGRESS") {
+      return "AUTH_REQUIRED";
     }
 
     return connection.authStatus;
@@ -8346,6 +8388,55 @@ function App() {
     return formatted.replace(/^R\$\s?/, "");
   }
 
+  function hasPlanCyclePrice(plan: BillingPlan, cycle: "MONTHLY" | "YEARLY"): boolean {
+    return typeof (cycle === "YEARLY" ? plan.yearlyPriceCents : plan.monthlyPriceCents) === "number";
+  }
+
+  function resolvePlanDisplayCycle(plan: BillingPlan, preferredCycle: "MONTHLY" | "YEARLY"): "MONTHLY" | "YEARLY" {
+    if (hasPlanCyclePrice(plan, preferredCycle)) {
+      return preferredCycle;
+    }
+    return hasPlanCyclePrice(plan, "MONTHLY") ? "MONTHLY" : "YEARLY";
+  }
+
+  function resolvePlanCardBillingCycle(plan: BillingPlan): "MONTHLY" | "YEARLY" {
+    return resolvePlanDisplayCycle(plan, planCardBillingCycles[plan.id] ?? "MONTHLY");
+  }
+
+  function resolvePlanCyclePriceLabel(plan: BillingPlan, cycle: "MONTHLY" | "YEARLY"): string {
+    const price = cycle === "YEARLY" ? plan.yearlyPriceCents : plan.monthlyPriceCents;
+    if (typeof price !== "number") {
+      return "Preço indisponível";
+    }
+    return `${formatPriceFromCents(price)}/${cycle === "YEARLY" ? "ano" : "mês"}`;
+  }
+
+  function renderPlanBillingCycleToggle(plan: BillingPlan, selectedCycle: "MONTHLY" | "YEARLY") {
+    return (
+      <div className="trial-onboarding-plan-cycle-toggle" role="group" aria-label="Selecionar ciclo de cobrança">
+        {(["MONTHLY", "YEARLY"] as const).map((cycle) => {
+          const enabled = hasPlanCyclePrice(plan, cycle);
+          return (
+            <button
+              key={`${plan.id}-${cycle}`}
+              type="button"
+              className={selectedCycle === cycle ? "trial-onboarding-plan-cycle-toggle-active" : ""}
+              disabled={!enabled}
+              onClick={() =>
+                setPlanCardBillingCycles((current) => ({
+                  ...current,
+                  [plan.id]: cycle,
+                }))
+              }
+            >
+              {cycle === "YEARLY" ? "Anual" : "Mensal"}
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
+
   function formatPlanLimitDisplay(limit: number | null | undefined, planCode?: string | null): string {
     if (planCode === "ROOT") {
       return "Ilimitado";
@@ -8623,8 +8714,21 @@ function App() {
       try {
         const response = await api.get<{ user: AuthUser }>("/auth/me");
         setAuthUser(response.user);
-      } catch {
-        api.setSessionToken("");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "";
+        const normalized = message.trim().toLowerCase();
+        const isInvalidSession =
+          normalized.includes("sessao invalida") ||
+          normalized.includes("sessão inválida") ||
+          normalized.includes("expirada") ||
+          normalized === "http 401";
+
+        if (isInvalidSession) {
+          api.setSessionToken("");
+        } else {
+          // Evita "deslogar do nada" em instabilidades de rede/back-end.
+          setAuthError(message || "Falha ao validar sessão.");
+        }
       } finally {
         setAuthChecked(true);
       }
@@ -9482,52 +9586,6 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!googleAuthSubmitting || typeof window === "undefined") {
-      return;
-    }
-
-    let settleTimer: number | null = null;
-
-    const settleQuicklyIfStillPending = () => {
-      if (googleAuthResultReceivedRef.current) {
-        return;
-      }
-
-      if (settleTimer !== null) {
-        window.clearTimeout(settleTimer);
-      }
-
-      settleTimer = window.setTimeout(() => {
-        if (!googleAuthResultReceivedRef.current) {
-          setGoogleAuthSubmitting(false);
-          setAuthInfo("");
-        }
-      }, 180);
-    };
-
-    const handleFocus = () => {
-      settleQuicklyIfStillPending();
-    };
-
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === "visible") {
-        settleQuicklyIfStillPending();
-      }
-    };
-
-    window.addEventListener("focus", handleFocus);
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-
-    return () => {
-      window.removeEventListener("focus", handleFocus);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-      if (settleTimer !== null) {
-        window.clearTimeout(settleTimer);
-      }
-    };
-  }, [googleAuthSubmitting]);
-
-  useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
@@ -10088,7 +10146,9 @@ function App() {
     setCompanyColorInput(DEFAULT_WORKSPACE_COLOR);
     setWorkspaceModalInfo("");
     setWorkspaceModalInfoTone("success");
-    if (defaultKind) {
+    if (defaultKind === "AGENCY_BONUS" && !canCreateAgencyBonusWorkspace) {
+      setCompanyKindInput("CLIENT");
+    } else if (defaultKind) {
       setCompanyKindInput(defaultKind);
     } else {
       setCompanyKindInput("CLIENT");
@@ -11220,7 +11280,7 @@ function App() {
     setAuthInfo("");
     primeWhatsappQrGeneration(connectionId);
     try {
-      await api.postJson(`/connections/${connectionId}/regenerate-qr`, {});
+      await api.postJson(`/connections/${connectionId}/regenerate-qr?force=1`, {});
       setError("");
       setAuthInfo("Novo QR solicitado com sucesso.");
     } catch (error) {
@@ -11265,11 +11325,23 @@ function App() {
     }
 
     if (shouldKeepReusableQr) {
-      setDismissedAgentAuthConnectionIds((current) => (current.includes(connectionId) ? current : [...current, connectionId]));
+      setQrCancellingConnectionId(connectionId);
       setAuthInfo("");
-      window.setTimeout(() => {
-        void refreshAgentsConnectionsSnapshot();
-      }, 1800);
+      try {
+        await api.postJson<SocialConnection>(`/connections/${connectionId}/dismiss-qr?keepReusable=1`, {
+          requestSeenAt: connectionSnapshot?.lastSeenAt ?? null,
+        });
+      } catch {
+        // Se falhar, pelo menos não derruba a UI; mantém o estado local.
+      } finally {
+        setDismissedAgentAuthConnectionIds((current) =>
+          current.includes(connectionId) ? current : [...current, connectionId],
+        );
+        setQrCancellingConnectionId((current) => (current === connectionId ? null : current));
+        window.setTimeout(() => {
+          void refreshAgentsConnectionsSnapshot();
+        }, 500);
+      }
       return;
     }
 
@@ -11286,7 +11358,23 @@ function App() {
         return;
       }
       if (result.authStatus === "CONNECTED") {
-        markWhatsappQrConnectionConnected(connectionId);
+        setDismissedAgentAuthConnectionIds((current) => current.filter((id) => id !== connectionId));
+        setConnections((current) =>
+          current.map((connection) =>
+            connection.id === connectionId
+              ? {
+                  ...connection,
+                  ...result,
+                  authStatus: "CONNECTED",
+                  qrStatus: "CONNECTED",
+                  qrImageDataUrl: null,
+                  qrGeneratedAt: null,
+                  workerLastSeenAt: null,
+                  qrMessage: null,
+                }
+              : connection,
+          ),
+        );
         setAuthInfo("Conta WhatsApp conectada com sucesso.");
       } else {
         resetWhatsappQrConnectionState(connectionId);
@@ -15378,6 +15466,16 @@ function App() {
     });
   }
 
+  async function startStripeCheckoutForPlan(plan: BillingPlan, cycle: "MONTHLY" | "YEARLY") {
+    setCheckoutPlanId(plan.id);
+    setCheckoutCycle(cycle);
+    await startStripeCheckoutRequest({
+      planId: plan.id,
+      billingModel: "STRIPE_SUBSCRIPTION",
+      cycle,
+    });
+  }
+
   async function cancelStripeSubscription() {
     if (!window.confirm("Deseja cancelar a assinatura recorrente no fim do ciclo atual?")) {
       return;
@@ -15553,11 +15651,14 @@ function App() {
   async function startGoogleLogin() {
     setAuthError("");
     setAuthInfo("");
+    setGoogleAuthScreenLocked(true);
+    setGoogleAuthHandoffPending(false);
     googleAuthResultReceivedRef.current = false;
     setGoogleAuthSubmitting(true);
 
     try {
       const { idToken } = await signInWithGoogleViaFirebase();
+      setGoogleAuthHandoffPending(true);
       const result = await api.postJson<{ sessionToken: string; user: AuthUser }>("/auth/firebase/google", {
         idToken,
       });
@@ -15595,6 +15696,8 @@ function App() {
         navigateToView("dashboard");
       }
     } catch (googleError) {
+      setGoogleAuthScreenLocked(false);
+      setGoogleAuthHandoffPending(false);
       if (isFirebaseGoogleLoginCancelledError(googleError)) {
         setAuthError("");
       } else {
@@ -15617,6 +15720,8 @@ function App() {
       googleAuthPopupRef.current = null;
       googleAuthResultReceivedRef.current = false;
       setGoogleAuthSubmitting(false);
+      setGoogleAuthHandoffPending(false);
+      setGoogleAuthScreenLocked(false);
       api.setSessionToken("");
       setAuthUser(null);
       setAuthChecked(true);
@@ -16156,7 +16261,6 @@ function App() {
             <div className="notices-popover-header">
               <div className="notices-popover-title-block">
                 <strong>Notificações</strong>
-                <span>Painel, feedbacks de clientes e recados da SocialUp em um só lugar.</span>
               </div>
               <div className="notices-popover-meta">
                 <button
@@ -16462,6 +16566,7 @@ function App() {
                 const isAgencyPlan = normalizedCode === "AGENCY";
                 const featureBullets = plan.highlights.length > 0 ? plan.highlights : resolvePlanFeatureBullets(plan);
                 const isStartingThisPlan = startingInitialTrialPlanId === plan.id;
+                const selectedPriceCycle = resolvePlanCardBillingCycle(plan);
 
                 return (
                   <article
@@ -16497,6 +16602,11 @@ function App() {
                           <span>{feature}</span>
                         </span>
                       ))}
+                    </div>
+
+                    <div className="trial-onboarding-plan-price">
+                      {renderPlanBillingCycleToggle(plan, selectedPriceCycle)}
+                      <strong>{resolvePlanCyclePriceLabel(plan, selectedPriceCycle)}</strong>
                     </div>
 
                     <button
@@ -17386,6 +17496,90 @@ function App() {
       billingMeHasExpiredTrialContext
         ? "Seu período de teste expirou. Escolha um plano para continuar usando o painel."
         : billingMe?.blockMessage;
+    const billingValidityLabel = billingMe?.trialEndsAt
+      ? `Período de testes expira em: ${formatDate(billingMe.trialEndsAt, effectiveUserTimeZone)}`
+      : billingMe?.endsAt
+        ? `Vigência até ${formatDate(billingMe.endsAt, effectiveUserTimeZone)}`
+        : "";
+    const shouldShowBillingTypePill = billingMe?.billingModel !== "TRIAL";
+    const workspaceUsageLabel =
+      (billingMe?.plan?.agencyBonusWorkspaceLimit ?? 0) > 0 ? "Workspaces cliente" : "Workspaces";
+    const shouldShowAgencyBonusUsage = (billingMe?.plan?.agencyBonusWorkspaceLimit ?? 0) > 0;
+    const checkoutPlanCards = [
+      ...(activeCheckoutPlan ? [activeCheckoutPlan] : []),
+      ...availablePaidPlans.filter((plan) => plan.id !== activeCheckoutPlan?.id),
+    ];
+    const checkoutPlanNetworks = ["instagram", "facebook", "threads", "x", "tiktok", "whatsapp"] as const;
+    const renderCheckoutPlanCard = (plan: BillingPlan, options?: { selected?: boolean }) => {
+      const selected = Boolean(options?.selected);
+      const featureBullets = plan.highlights.length > 0 ? plan.highlights : resolvePlanFeatureBullets(plan);
+      const startingThisPlan = startingCheckout && checkoutPlanId === plan.id;
+      const checkoutCycleForPlan = resolvePlanCardBillingCycle(plan);
+
+      return (
+        <article
+          key={plan.id}
+          className={`panel-card trial-onboarding-plan-card${
+            selected ? " billing-checkout-plan-card-selected" : ""
+          }`}
+        >
+          <div className="trial-onboarding-plan-head">
+            <div className="trial-onboarding-plan-title">
+              <strong>{plan.name}</strong>
+              <p>{plan.subtitle || plan.description || "Plano para continuar usando o SocialUp."}</p>
+              <div className="trial-onboarding-plan-platforms" aria-label="Redes disponíveis no sistema">
+                {checkoutPlanNetworks.map((network) => {
+                  const Icon = socialPlatformIcon(network);
+                  return (
+                    <span
+                      key={`${plan.id}-${network}`}
+                      className={`trial-onboarding-plan-platform-icon trial-onboarding-plan-platform-icon-${network}`}
+                      title={socialPlatformLabel(network)}
+                      aria-label={socialPlatformLabel(network)}
+                    >
+                      <Icon aria-hidden="true" />
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          <div className="trial-onboarding-plan-features">
+            {featureBullets.map((feature) => (
+              <span key={`${plan.id}-${feature}`} className="trial-onboarding-plan-feature-item">
+                <FiCheck aria-hidden="true" />
+                <span>{feature}</span>
+              </span>
+            ))}
+          </div>
+
+          <div className="trial-onboarding-plan-price">
+            {renderPlanBillingCycleToggle(plan, checkoutCycleForPlan)}
+            <strong>{resolvePlanCyclePriceLabel(plan, checkoutCycleForPlan)}</strong>
+          </div>
+
+          <button
+            type="button"
+            className="primary-button trial-onboarding-plan-button"
+            disabled={startingCheckout}
+            onClick={() => void startStripeCheckoutForPlan(plan, checkoutCycleForPlan)}
+          >
+            {startingThisPlan ? (
+              <>
+                <span className="button-spinner" aria-hidden="true" />
+                Abrindo checkout...
+              </>
+            ) : (
+              <>
+                {selected ? "Pagar este plano" : "Trocar para este plano"}
+                <FiChevronRight aria-hidden="true" />
+              </>
+            )}
+          </button>
+        </article>
+      );
+    };
     if (billingLoading) {
       return renderPlanConfigSkeleton();
     }
@@ -17407,7 +17601,10 @@ function App() {
                   <span className={`status-pill status-${billingStatusTone(billingMe.status)}`}>{`Status: ${billingStatusDisplayLabel(billingMe.status)}`}</span>
                   <span className="status-pill status-billing-active">{`Valor: ${activeBillingAmountLabel}`}</span>
                   <span className="unit-pill billing-model-pill">{`Cobrança: ${billingModelDisplayLabel(billingMe.billingModel)}`}</span>
-                  <span className="unit-pill billing-model-pill">{`Tipo: ${billingSubscriptionTypeDisplayLabel(billingMe.billingModel, billingMe.cycle)}`}</span>
+                  {shouldShowBillingTypePill ? (
+                    <span className="unit-pill billing-model-pill">{`Tipo: ${billingSubscriptionTypeDisplayLabel(billingMe.billingModel, billingMe.cycle)}`}</span>
+                  ) : null}
+                  {billingValidityLabel ? <span className="billing-validity-inline">{billingValidityLabel}</span> : null}
                   {billingMe.canCancelStripeSubscription ? (
                     <button
                       type="button"
@@ -17420,12 +17617,6 @@ function App() {
                   ) : null}
                 </div>
                 {billingSummaryMessage ? <span>{billingSummaryMessage}</span> : null}
-                {billingMe.trialEndsAt ? (
-                  <span>{`Trial até ${formatDate(billingMe.trialEndsAt, effectiveUserTimeZone)}`}</span>
-                ) : null}
-                {billingMe.endsAt ? (
-                  <span>{`Vigência até ${formatDate(billingMe.endsAt, effectiveUserTimeZone)}`}</span>
-                ) : null}
                 {billingMe.stripeCancelAtPeriodEnd ? (
                   <span className="billing-plan-note">Assinatura já marcada para cancelamento no fim do ciclo.</span>
                 ) : null}
@@ -17435,8 +17626,10 @@ function App() {
               <div className="billing-usage-inline">
                 <strong>Uso do ciclo atual</strong>
                 <div className="meta-pill-row">
-                  <span className="unit-pill unit-pill-plan">{`Workspaces cliente: ${billingMe.usage.workspaceClientUsed}/${formatPlanLimitDisplay(billingMe.plan?.workspaceLimit, billingMe.plan?.code)}`}</span>
-                  <span className="unit-pill unit-pill-plan">{`Bônus agência: ${billingMe.usage.workspaceAgencyBonusUsed}/${formatPlanLimitDisplay(billingMe.plan?.agencyBonusWorkspaceLimit, billingMe.plan?.code)}`}</span>
+                  <span className="unit-pill unit-pill-plan">{`${workspaceUsageLabel}: ${billingMe.usage.workspaceClientUsed}/${formatPlanLimitDisplay(billingMe.plan?.workspaceLimit, billingMe.plan?.code)}`}</span>
+                  {shouldShowAgencyBonusUsage ? (
+                    <span className="unit-pill unit-pill-plan">{`Bônus agência: ${billingMe.usage.workspaceAgencyBonusUsed}/${formatPlanLimitDisplay(billingMe.plan?.agencyBonusWorkspaceLimit, billingMe.plan?.code)}`}</span>
+                  ) : null}
                   <span className="unit-pill unit-pill-plan">{`Contas: ${billingMe.usage.connectionsUsed}/${formatPlanLimitDisplay(billingMe.plan?.maxConnections, billingMe.plan?.code)}`}</span>
                   <span className="unit-pill unit-pill-plan">{`Publicações/mês: ${billingMe.usage.postsUsedThisMonth}/${formatPlanLimitDisplay(
                     billingMe.plan?.maxMonthlyPublications,
@@ -17519,71 +17712,25 @@ function App() {
               </div>
             ) : (
               <div id={BILLING_PLAN_CHECKOUT_ANCHOR_ID} className="row-card billing-row-card">
-                <form onSubmit={startStripeCheckout} className="form-stack">
-                  <strong>Pagamento Stripe (teste)</strong>
-                  <label className="field-label">
-                    <span>Plano</span>
-                    <select
-                      value={checkoutPlanId}
-                      onChange={(event) => setCheckoutPlanId(event.target.value)}
-                      required
-                      disabled={availablePaidPlans.length === 0 || checkoutTargetPlans.length === 0}
-                    >
-                      <option value="">
-                        {checkoutTargetPlans.length === 0 ? "Nenhum upgrade disponível" : "Selecione um plano"}
-                      </option>
-                      {availablePaidPlans.map((plan) => (
-                        <option key={plan.id} value={plan.id} disabled={plan.id === activeCheckoutPlanId}>
-                          {`${plan.name} (${plan.code})${plan.id === activeCheckoutPlanId ? " - plano atual" : ""}`}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <small className="field-hint">
-                    {billingMe.plan?.name
-                      ? `Plano atual: ${billingMe.plan.name}${billingMe.plan.code ? ` (${billingMe.plan.code})` : ""}.`
-                      : "Sua conta ainda não tem um plano ativo."}
-                  </small>
-                  <small className="field-hint">Cobrança via Stripe: assinatura recorrente.</small>
-                  <label className="field-label">
-                    <span>Ciclo</span>
-                    <select
-                      value={checkoutCycle}
-                      onChange={(event) =>
-                        setCheckoutCycle(event.target.value === "YEARLY" ? "YEARLY" : event.target.value === "MONTHLY" ? "MONTHLY" : "")
-                      }
-                      required
-                    >
-                      <option value="">Selecione um ciclo</option>
-                      <option value="MONTHLY">Mensal</option>
-                      <option value="YEARLY">Anual</option>
-                    </select>
-                  </label>
-                  <strong className="checkout-price-preview">
-                    {isCheckoutSelectionReady
-                      ? `Valor: ${checkoutSelectedPriceLabel}`
-                      : checkoutTargetPlans.length === 0
-                        ? "Nenhum plano diferente disponível para troca no momento."
-                        : "Selecione plano, cobrança e ciclo para continuar."}
-                  </strong>
-                  <button
-                    type="submit"
-                    className="stripe-pay-button"
-                    disabled={
-                      startingCheckout ||
-                      availablePaidPlans.length === 0 ||
-                      checkoutTargetPlans.length === 0 ||
-                      !isCheckoutSelectionReady
-                    }
-                  >
-                    {startingCheckout ? "Abrindo checkout..." : "Pagar com Stripe"}
-                  </button>
-                  <small className="field-hint">
-                    {isBlockedBilling
-                      ? "Sua conta está sem um plano pago ativo. Escolha um plano para reativar o acesso."
-                      : "O link abre no Checkout oficial do Stripe e volta automaticamente para esta tela."}
-                  </small>
-                </form>
+                <div className="billing-checkout-card-shell">
+                  <div className="billing-checkout-card-head">
+                    <div>
+                      <strong>Ativar assinatura</strong>
+                      <span>
+                        {activeCheckoutPlan
+                          ? `Você escolheu ${activeCheckoutPlan.name}. Pode pagar esse plano ou trocar antes de ir ao Stripe.`
+                          : "Escolha um plano para continuar usando o painel."}
+                      </span>
+                    </div>
+                  </div>
+                  {checkoutPlanCards.length > 0 ? (
+                    <div className="billing-checkout-plan-grid">
+                      {checkoutPlanCards.map((plan) => renderCheckoutPlanCard(plan, { selected: plan.id === activeCheckoutPlan?.id }))}
+                    </div>
+                  ) : (
+                    <div className="empty-state">Nenhum plano pago disponível para checkout.</div>
+                  )}
+                </div>
               </div>
             )}
           </div>
@@ -18358,6 +18505,9 @@ function App() {
       0,
     );
     const totalMembersCount = companies.reduce((total, company) => total + company.members.length, 0);
+    const shouldShowAgencyBonusOverview = (billingMe?.plan?.agencyBonusWorkspaceLimit ?? 0) > 0;
+    const clientWorkspaceOverviewLabel = shouldShowAgencyBonusOverview ? "Clientes" : "Workspaces";
+    const shouldShowWorkspaceStructureToolbar = shouldShowAgencyBonusOverview || hasAnyWorkspaceInviteSupport;
     const workspaceOverviewCards = [
       {
         key: "active",
@@ -18368,7 +18518,7 @@ function App() {
       },
       {
         key: "client",
-        label: "Clientes",
+        label: clientWorkspaceOverviewLabel,
         value: clientWorkspacesCount,
         tone: "client",
         icon: FiHome,
@@ -18387,7 +18537,12 @@ function App() {
         tone: "invite",
         icon: FiLink2,
       },
-    ].filter((card) => card.key !== "invites" || hasAnyWorkspaceInviteSupport);
+    ].filter((card) => {
+      if (card.key === "agency") {
+        return shouldShowAgencyBonusOverview;
+      }
+      return card.key !== "invites" || hasAnyWorkspaceInviteSupport;
+    });
 
     return (
       <div className="view-stack workspace-shell">
@@ -18425,19 +18580,21 @@ function App() {
             })}
           </div>
 
-          <div className="workspace-toolbar-shell">
-            <div className="workspace-toolbar-copy">
-              <strong>Estrutura dos seus workspaces</strong>
-              <small>
-                Workspaces de cliente contam na cota principal do plano. O bônus da agência depende da configuração do seu
-                plano.
-              </small>
+          {shouldShowWorkspaceStructureToolbar ? (
+            <div className="workspace-toolbar-shell">
+              <div className="workspace-toolbar-copy">
+                <strong>Estrutura dos seus workspaces</strong>
+                <small>
+                  Workspaces de cliente contam na cota principal do plano. O bônus da agência depende da configuração do seu
+                  plano.
+                </small>
+              </div>
+              <div className="workspace-toolbar-meta">
+                <span className="text-chip">{`${companies.length} workspace${companies.length === 1 ? "" : "s"}`}</span>
+                <span className="text-chip">{`${totalMembersCount} membro${totalMembersCount === 1 ? "" : "s"}`}</span>
+              </div>
             </div>
-            <div className="workspace-toolbar-meta">
-              <span className="text-chip">{`${companies.length} workspace${companies.length === 1 ? "" : "s"}`}</span>
-              <span className="text-chip">{`${totalMembersCount} membro${totalMembersCount === 1 ? "" : "s"}`}</span>
-            </div>
-          </div>
+          ) : null}
 
           <div className="table-list workspace-board-grid">
             {companies.length === 0 ? (
@@ -18714,7 +18871,7 @@ function App() {
         );
       }
 
-      if (workspace.canConnectAccounts && connection.platform === "whatsapp") {
+      if (workspace.canConnectAccounts && connection.platform === "whatsapp" && effectiveAuthStatus !== "CONNECTED") {
         const hasReusableQr = hasReusableWhatsappQr(connection);
         return (
           <button
@@ -18771,146 +18928,148 @@ function App() {
         <div className="section-head">{renderSectionTitleWithIcon("agents", "Conectar contas", "operação")}</div>
 
         <div className="agents-platform-shell">
-          <div className="agents-platform-toolbar" ref={agentFiltersRef}>
-            <div className="agents-platform-toolbar-left">
-              <span className="agents-platform-toolbar-kicker">Workspaces</span>
-              <div className="agents-platform-select-shell">
-                <button
-                  type="button"
-                  className={`agents-platform-select-trigger${activeAgentFilterMenu === "workspace" ? " agents-platform-select-trigger-open" : ""}`}
-                  onClick={() => setActiveAgentFilterMenu((current) => (current === "workspace" ? null : "workspace"))}
-                >
-                  <span className="agents-platform-workspace-avatar" aria-hidden="true">
-                    {selectedWorkspaceOption?.company ? workspaceInitials(selectedWorkspaceOption.company.name) : "WS"}
-                  </span>
-                  <span className="agents-platform-select-copy">
-                    <strong>{selectedWorkspaceOption?.label ?? "Selecione o workspace"}</strong>
-                    <small>{selectedWorkspaceOption?.subtitle ?? "Nenhum workspace disponível"}</small>
-                  </span>
-                  <FiChevronDown aria-hidden="true" />
-                </button>
-                {activeAgentFilterMenu === "workspace" ? (
-                  <div className="agents-platform-select-menu">
-                    {workspaceFilterOptions.map((option) => (
-                      <button
-                        key={option.value}
-                        type="button"
-                        className={`agents-platform-select-option${
-                          workspaceFilterValue === option.value ? " agents-platform-select-option-active" : ""
-                        }`}
-                        onClick={() => {
-                          setAgentWorkspaceFilter(option.value);
-                          setActiveAgentFilterMenu(null);
-                        }}
-                      >
-                        <span className="agents-platform-workspace-avatar" aria-hidden="true">
-                          {option.company ? workspaceInitials(option.company.name) : "WS"}
-                        </span>
-                        <span className="agents-platform-select-copy">
-                          <strong>{option.label}</strong>
-                          <small>{option.subtitle}</small>
-                        </span>
-                        {workspaceFilterValue === option.value ? <FiCheck aria-hidden="true" /> : null}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
-              </div>
-            </div>
-
-            <div className="agents-platform-toolbar-right">
-              <div className="agents-platform-mini-select-shell">
-                <button
-                  type="button"
-                  className={`agents-platform-mini-select${activeAgentFilterMenu === "platform" ? " agents-platform-mini-select-open" : ""}`}
-                  onClick={() => setActiveAgentFilterMenu((current) => (current === "platform" ? null : "platform"))}
-                >
-                  <span
-                    className={`agents-platform-mini-select-leading${
-                      agentPlatformFilter !== "all" ? ` agents-platform-mini-select-leading-${agentPlatformFilter}` : ""
-                    }`}
-                  >
-                    {SelectedPlatformFilterIcon ? (
-                      <SelectedPlatformFilterIcon aria-hidden="true" />
-                    ) : (
-                      <FiLink2 aria-hidden="true" />
-                    )}
-                  </span>
-                  <span>{selectedPlatformOption.label}</span>
-                  <FiChevronDown aria-hidden="true" />
-                </button>
-                {activeAgentFilterMenu === "platform" ? (
-                  <div className="agents-platform-select-menu agents-platform-select-menu-compact">
-                    {platformFilterOptions.map((option) => {
-                      const OptionIcon = option.icon;
-                      return (
-                        <button
-                          key={option.value}
-                          type="button"
-                          className={`agents-platform-select-option${
-                            agentPlatformFilter === option.value ? " agents-platform-select-option-active" : ""
-                          }`}
-                          onClick={() => {
-                            setAgentPlatformFilter(option.value);
-                            setActiveAgentFilterMenu(null);
-                          }}
-                        >
-                          <span
-                            className={`agents-platform-option-icon${
-                              option.value !== "all" ? ` agents-platform-option-icon-${option.value}` : ""
-                            }`}
-                            aria-hidden="true"
-                          >
-                            {OptionIcon ? <OptionIcon /> : <FiLink2 />}
-                          </span>
-                          <span className="agents-platform-select-copy agents-platform-select-copy-single">
-                            <strong>{option.label}</strong>
-                          </span>
-                          {agentPlatformFilter === option.value ? <FiCheck aria-hidden="true" /> : null}
-                        </button>
-                      );
-                    })}
-                  </div>
-                ) : null}
-              </div>
-
-              {!isAllWorkspacesView ? (
-                <div className="agents-platform-mini-select-shell">
+          {companies.length > 0 ? (
+            <div className="agents-platform-toolbar" ref={agentFiltersRef}>
+              <div className="agents-platform-toolbar-left">
+                <span className="agents-platform-toolbar-kicker">Workspaces</span>
+                <div className="agents-platform-select-shell">
                   <button
                     type="button"
-                    className={`agents-platform-mini-select${activeAgentFilterMenu === "status" ? " agents-platform-mini-select-open" : ""}`}
-                    onClick={() => setActiveAgentFilterMenu((current) => (current === "status" ? null : "status"))}
+                    className={`agents-platform-select-trigger${activeAgentFilterMenu === "workspace" ? " agents-platform-select-trigger-open" : ""}`}
+                    onClick={() => setActiveAgentFilterMenu((current) => (current === "workspace" ? null : "workspace"))}
                   >
-                    <span>{selectedStatusOption.label}</span>
+                    <span className="agents-platform-workspace-avatar" aria-hidden="true">
+                      {selectedWorkspaceOption?.company ? workspaceInitials(selectedWorkspaceOption.company.name) : "WS"}
+                    </span>
+                    <span className="agents-platform-select-copy">
+                      <strong>{selectedWorkspaceOption?.label ?? "Selecione o workspace"}</strong>
+                      <small>{selectedWorkspaceOption?.subtitle ?? "Nenhum workspace disponível"}</small>
+                    </span>
                     <FiChevronDown aria-hidden="true" />
                   </button>
-                  {activeAgentFilterMenu === "status" ? (
-                    <div className="agents-platform-select-menu agents-platform-select-menu-compact">
-                      {statusFilterOptions.map((option) => (
+                  {activeAgentFilterMenu === "workspace" ? (
+                    <div className="agents-platform-select-menu">
+                      {workspaceFilterOptions.map((option) => (
                         <button
                           key={option.value}
                           type="button"
                           className={`agents-platform-select-option${
-                            agentStatusFilter === option.value ? " agents-platform-select-option-active" : ""
+                            workspaceFilterValue === option.value ? " agents-platform-select-option-active" : ""
                           }`}
                           onClick={() => {
-                            setAgentStatusFilter(option.value);
+                            setAgentWorkspaceFilter(option.value);
                             setActiveAgentFilterMenu(null);
                           }}
                         >
+                          <span className="agents-platform-workspace-avatar" aria-hidden="true">
+                            {option.company ? workspaceInitials(option.company.name) : "WS"}
+                          </span>
                           <span className="agents-platform-select-copy">
                             <strong>{option.label}</strong>
-                            <small>{option.description}</small>
+                            <small>{option.subtitle}</small>
                           </span>
-                          {agentStatusFilter === option.value ? <FiCheck aria-hidden="true" /> : null}
+                          {workspaceFilterValue === option.value ? <FiCheck aria-hidden="true" /> : null}
                         </button>
                       ))}
                     </div>
                   ) : null}
                 </div>
-              ) : null}
+              </div>
+
+              <div className="agents-platform-toolbar-right">
+                <div className="agents-platform-mini-select-shell">
+                  <button
+                    type="button"
+                    className={`agents-platform-mini-select${activeAgentFilterMenu === "platform" ? " agents-platform-mini-select-open" : ""}`}
+                    onClick={() => setActiveAgentFilterMenu((current) => (current === "platform" ? null : "platform"))}
+                  >
+                    <span
+                      className={`agents-platform-mini-select-leading${
+                        agentPlatformFilter !== "all" ? ` agents-platform-mini-select-leading-${agentPlatformFilter}` : ""
+                      }`}
+                    >
+                      {SelectedPlatformFilterIcon ? (
+                        <SelectedPlatformFilterIcon aria-hidden="true" />
+                      ) : (
+                        <FiLink2 aria-hidden="true" />
+                      )}
+                    </span>
+                    <span>{selectedPlatformOption.label}</span>
+                    <FiChevronDown aria-hidden="true" />
+                  </button>
+                  {activeAgentFilterMenu === "platform" ? (
+                    <div className="agents-platform-select-menu agents-platform-select-menu-compact">
+                      {platformFilterOptions.map((option) => {
+                        const OptionIcon = option.icon;
+                        return (
+                          <button
+                            key={option.value}
+                            type="button"
+                            className={`agents-platform-select-option${
+                              agentPlatformFilter === option.value ? " agents-platform-select-option-active" : ""
+                            }`}
+                            onClick={() => {
+                              setAgentPlatformFilter(option.value);
+                              setActiveAgentFilterMenu(null);
+                            }}
+                          >
+                            <span
+                              className={`agents-platform-option-icon${
+                                option.value !== "all" ? ` agents-platform-option-icon-${option.value}` : ""
+                              }`}
+                              aria-hidden="true"
+                            >
+                              {OptionIcon ? <OptionIcon /> : <FiLink2 />}
+                            </span>
+                            <span className="agents-platform-select-copy agents-platform-select-copy-single">
+                              <strong>{option.label}</strong>
+                            </span>
+                            {agentPlatformFilter === option.value ? <FiCheck aria-hidden="true" /> : null}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+                </div>
+
+                {!isAllWorkspacesView ? (
+                  <div className="agents-platform-mini-select-shell">
+                    <button
+                      type="button"
+                      className={`agents-platform-mini-select${activeAgentFilterMenu === "status" ? " agents-platform-mini-select-open" : ""}`}
+                      onClick={() => setActiveAgentFilterMenu((current) => (current === "status" ? null : "status"))}
+                    >
+                      <span>{selectedStatusOption.label}</span>
+                      <FiChevronDown aria-hidden="true" />
+                    </button>
+                    {activeAgentFilterMenu === "status" ? (
+                      <div className="agents-platform-select-menu agents-platform-select-menu-compact">
+                        {statusFilterOptions.map((option) => (
+                          <button
+                            key={option.value}
+                            type="button"
+                            className={`agents-platform-select-option${
+                              agentStatusFilter === option.value ? " agents-platform-select-option-active" : ""
+                            }`}
+                            onClick={() => {
+                              setAgentStatusFilter(option.value);
+                              setActiveAgentFilterMenu(null);
+                            }}
+                          >
+                            <span className="agents-platform-select-copy">
+                              <strong>{option.label}</strong>
+                              <small>{option.description}</small>
+                            </span>
+                            {agentStatusFilter === option.value ? <FiCheck aria-hidden="true" /> : null}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
             </div>
-          </div>
+          ) : null}
 
           {companies.length === 0 ? (
             <div className="empty-state">Crie um workspace antes de conectar contas.</div>
@@ -18938,7 +19097,7 @@ function App() {
                   ? isConnectionManualRenewalExpired(connection)
                   : false;
                 const expiryLabel =
-                  showConnectionAccount
+                  showConnectionAccount && connection
                     ? connectionIsExpired
                       ? resolveConnectionExpiredInstructionCopy(connection, effectiveUserTimeZone)
                       : resolveConnectionExpiryMetaLabel(connection, effectiveUserTimeZone)
@@ -18965,14 +19124,15 @@ function App() {
                       ? "connected"
                       : "pending";
                 const isWhatsappCard = platform === "whatsapp";
-                const whatsappNumber = connection
-                  ? resolveWhatsappOwnerNumber(connection.whatsappOwnerJid) ||
-                    connection.loginIdentifier?.trim() ||
-                    accountLabel?.trim() ||
-                    ""
-                  : "";
+                const whatsappNumber = connection ? resolveWhatsappOwnerNumber(connection.whatsappOwnerJid) || "" : "";
                 const whatsappNumberLabel = whatsappNumber ? `Número: ${whatsappNumber.replace(/^@/, "")}` : "";
-                const accountMetaLine = connection ? expiryLabel : null;
+                const whatsappPrimaryLabel = accountLabel?.trim() || whatsappNumberLabel;
+                const accountMetaLine =
+                  connection && isWhatsappCard
+                    ? (whatsappNumberLabel && whatsappNumberLabel !== whatsappPrimaryLabel ? whatsappNumberLabel : expiryLabel)
+                    : connection
+                      ? expiryLabel
+                      : null;
                 const accountInitial =
                   connection?.displayName?.trim().charAt(0).toUpperCase() || option.label.charAt(0).toUpperCase();
                 const primaryAction = renderAgentsPrimaryAction(workspace, platform, connection);
@@ -19024,12 +19184,12 @@ function App() {
                               <div className="agents-platform-board-account-copy">
                                 <span
                                   className={`agents-platform-board-account-handle${
-                                    (isWhatsappCard ? Boolean(whatsappNumberLabel) : showAccountLabel)
+                                    (isWhatsappCard ? Boolean(whatsappPrimaryLabel) : showAccountLabel)
                                       ? ""
                                       : " agents-platform-board-account-handle-empty"
                                   }`}
                                 >
-                                  {isWhatsappCard ? whatsappNumberLabel || "\u00A0" : showAccountLabel ? accountLabel : "\u00A0"}
+                                  {isWhatsappCard ? whatsappPrimaryLabel || "\u00A0" : showAccountLabel ? accountLabel : "\u00A0"}
                                 </span>
                                 {accountMetaLine ? (
                                   <small
@@ -24091,6 +24251,19 @@ function App() {
       );
     }
 
+    if (googleAuthScreenLocked) {
+      return (
+        <div
+          className="auth-boot-loading"
+          role="status"
+          aria-live="polite"
+          aria-label={googleAuthHandoffPending ? "Finalizando login com Google" : "Aguardando login com Google"}
+        >
+          <span className="auth-boot-spinner" aria-hidden="true" />
+        </div>
+      );
+    }
+
     return renderAuthScreen();
   }
 
@@ -24193,7 +24366,7 @@ function App() {
                 className="billing-warning-link"
                 onClick={navigateToPlanCheckout}
               >
-                Ir para pagamento
+                {hasActiveTrialWarning ? "Ver planos" : "Ir para pagamento"}
               </a>
             ) : null}
           </div>
@@ -24215,7 +24388,6 @@ function App() {
               <div className="connection-create-modal-header">
                 <div>
                   <strong>{editingWorkspaceId ? "Editar workspace" : "Criar workspace"}</strong>
-                  <small className="field-hint">Organize clientes, marcas e a operação da sua agência.</small>
                 </div>
                 <button
                   type="button"
@@ -24254,18 +24426,20 @@ function App() {
                     title="Informe o nome do workspace com 2 a 80 caracteres."
                   />
                 </label>
-                <button
-                  type="button"
-                  className={`workspace-kind-toggle${companyKindInput === "AGENCY_BONUS" ? " workspace-kind-toggle-active" : ""}`}
-                  onClick={() => setCompanyKindInput((current) => (current === "AGENCY_BONUS" ? "CLIENT" : "AGENCY_BONUS"))}
-                  aria-pressed={companyKindInput === "AGENCY_BONUS"}
-                  disabled={Boolean(editingWorkspaceId)}
-                >
-                  <span className="workspace-kind-toggle-box" aria-hidden="true">
-                    {companyKindInput === "AGENCY_BONUS" ? <FiCheck /> : null}
-                  </span>
-                  <span className="workspace-kind-toggle-label">My workspace</span>
-                </button>
+                {canCreateAgencyBonusWorkspace ? (
+                  <button
+                    type="button"
+                    className={`workspace-kind-toggle${companyKindInput === "AGENCY_BONUS" ? " workspace-kind-toggle-active" : ""}`}
+                    onClick={() => setCompanyKindInput((current) => (current === "AGENCY_BONUS" ? "CLIENT" : "AGENCY_BONUS"))}
+                    aria-pressed={companyKindInput === "AGENCY_BONUS"}
+                    disabled={Boolean(editingWorkspaceId)}
+                  >
+                    <span className="workspace-kind-toggle-box" aria-hidden="true">
+                      {companyKindInput === "AGENCY_BONUS" ? <FiCheck /> : null}
+                    </span>
+                    <span className="workspace-kind-toggle-label">My workspace</span>
+                  </button>
+                ) : null}
                 <label className="field-label">
                   <span>Cor de identidade (opcional)</span>
                   <div className="workspace-color-picker-row">
@@ -25093,7 +25267,7 @@ function App() {
                     <span>Quando o dispositivo conectar no celular, você pode fechar esta janela.</span>
                   </div>
                 ) : null}
-                {activeQrState !== "CONNECTED" && (hasQrModalError || activeQrState === "QR_EXPIRED") ? (
+                {!activeQrIsConnected && (hasQrModalError || activeQrState === "QR_EXPIRED") ? (
                   <div className="qr-modal-actions">
                     <button
                       type="button"

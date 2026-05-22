@@ -217,6 +217,10 @@ const DEFAULT_AUTO_TRIAL_ENABLED = true;
 const DEFAULT_AUTO_TRIAL_DAYS = 10;
 const POST_FOR_ME_ACCOUNT_WEBHOOK_EVENT_TYPES = ["social.account.created", "social.account.updated"] as const;
 const POST_FOR_ME_RENEWAL_AVISO_DEDUPE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const WHATSAPP_CONNECTION_MONITOR_INTERVAL_MS = Math.max(
+  3_000,
+  Number.parseInt(process.env.WHATSAPP_CONNECTION_MONITOR_INTERVAL_MS || "5000", 10) || 5_000,
+);
 
 type DefaultPlanSeed = {
   code: string;
@@ -281,7 +285,7 @@ const DEFAULT_BILLING_SINGLE_PLAN: DefaultPlanSeed = {
   workspaceLimit: 2,
   agencyBonusWorkspaceLimit: 0,
   maxConnections: 12,
-  maxWhatsappConnections: 1,
+  maxWhatsappConnections: 2,
   maxMonthlyPublications: 300,
   supportsWorkspaceInvites: false,
   supportsClientApproval: false,
@@ -4091,33 +4095,36 @@ async function backfillLegacyPlanWorkspaceConfig(): Promise<void> {
     },
   });
 
-  await Promise.all(
-    plans.map(async (plan, index) => {
-      const nextData: Prisma.PlanUpdateInput = {};
+  // Evita rajadas de queries em bootstrap (DB remota pode encerrar conexão).
+  for (const [index, plan] of plans.entries()) {
+    const nextData: Prisma.PlanUpdateInput = {};
 
-      const looksLegacyWorkspaceLimit = plan.workspaceLimit <= 1 && plan.maxProfiles > 1;
-      if (looksLegacyWorkspaceLimit) {
-        nextData.workspaceLimit = plan.maxProfiles;
-      }
+    const looksLegacyWorkspaceLimit = plan.workspaceLimit <= 1 && plan.maxProfiles > 1;
+    if (looksLegacyWorkspaceLimit) {
+      nextData.workspaceLimit = plan.maxProfiles;
+    }
 
-      if (plan.code === BILLING_TRIAL_PLAN_CODE && plan.isPublic) {
-        nextData.isPublic = false;
-      }
+    if (plan.code === BILLING_TRIAL_PLAN_CODE && plan.isPublic) {
+      nextData.isPublic = false;
+    }
 
-      if (plan.displayOrder === 0) {
-        nextData.displayOrder = index + 1;
-      }
+    if (plan.displayOrder === 0) {
+      nextData.displayOrder = index + 1;
+    }
 
-      if (Object.keys(nextData).length === 0) {
-        return;
-      }
+    if (Object.keys(nextData).length === 0) {
+      continue;
+    }
 
-      await prisma.plan.update({
-        where: { id: plan.id },
-        data: nextData,
-      });
-    }),
-  );
+    await withPrismaConnectionRetry(
+      () =>
+        prisma.plan.update({
+          where: { id: plan.id },
+          data: nextData,
+        }),
+      { maxAttempts: 3, retryDelayMs: 350 },
+    );
+  }
 }
 
 async function backfillLegacyWorkspaceMembers(): Promise<void> {
@@ -4803,29 +4810,36 @@ async function buildAuthUserPayload(user: {
   billingEndsAt: Date | null;
   billingTrialEndsAt: Date | null;
 }> {
-  const [billing, authProviders, passwordOwner] = await Promise.all([
-    user.username === "root"
-      ? Promise.resolve(null)
-      : resolveUserBillingAccess(user.id),
-    prisma.userAuthProvider.findMany({
-      where: { userId: user.id },
-      orderBy: [{ createdAt: "asc" }],
-      select: {
-        provider: true,
-        email: true,
-        avatarUrl: true,
-      },
-    }),
-    prisma.user.findUnique({
-      where: { id: user.id },
-      select: {
-        id: true,
-        passwordHash: true,
-        email: true,
-        needsPlanSelection: true,
-      },
-    }),
-  ]);
+  // Evita rajadas paralelas durante auth (DB externa pode encerrar conexão).
+  const billing = user.username === "root" ? null : await resolveUserBillingAccess(user.id);
+
+  const authProviders = await withPrismaConnectionRetry(
+    () =>
+      prisma.userAuthProvider.findMany({
+        where: { userId: user.id },
+        orderBy: [{ createdAt: "asc" }],
+        select: {
+          provider: true,
+          email: true,
+          avatarUrl: true,
+        },
+      }),
+    { maxAttempts: 3, retryDelayMs: 350 },
+  );
+
+  const passwordOwner = await withPrismaConnectionRetry(
+    () =>
+      prisma.user.findUnique({
+        where: { id: user.id },
+        select: {
+          id: true,
+          passwordHash: true,
+          email: true,
+          needsPlanSelection: true,
+        },
+      }),
+    { maxAttempts: 3, retryDelayMs: 350 },
+  );
 
   if (user.username === "root") {
     const bestPlan = await getRootDisplayPlanForDisplay();
@@ -6108,10 +6122,6 @@ async function syncConnectionRuntimeState(connection: {
     now.getTime() - overlayWorkerLastSeenAt.getTime() < 2 * 60 * 1000;
   const hasRecentLastAuthAt =
     connection.lastAuthAt instanceof Date && now.getTime() - connection.lastAuthAt.getTime() < 2 * 60 * 1000;
-  const hasRecentAuthInProgressSeenAt =
-    connection.authStatus === "AUTH_IN_PROGRESS" &&
-    connection.lastSeenAt instanceof Date &&
-    now.getTime() - connection.lastSeenAt.getTime() < 2 * 60 * 1000;
 
   let runtimeAuthStatus: "CONNECTED" | "AUTH_IN_PROGRESS" | "AUTH_REQUIRED" | null = null;
   try {
@@ -6128,6 +6138,70 @@ async function syncConnectionRuntimeState(connection: {
       "WHATSAPP_CONNECTION_STATUS_TIMEOUT",
     );
   } catch {
+    // Se a Evolution estiver indisponível, evitamos ficar presos em AUTH_IN_PROGRESS pra sempre.
+    if (connection.authStatus !== "AUTH_IN_PROGRESS") {
+      return connection;
+    }
+
+    const lastSeenAtMs = connection.lastSeenAt instanceof Date ? connection.lastSeenAt.getTime() : 0;
+    const authStartedAtMs = connection.lastAuthAt instanceof Date ? connection.lastAuthAt.getTime() : lastSeenAtMs;
+    const ageMs = authStartedAtMs > 0 ? now.getTime() - authStartedAtMs : Number.POSITIVE_INFINITY;
+    const staleAuthInProgress = ageMs > 3 * 60 * 1000;
+
+    if (!hasRecentQrOverlayActivity && staleAuthInProgress) {
+      try {
+        const updatedConnection = await withPrismaConnectionRetry(
+          () =>
+            prisma.socialConnection.update({
+              where: { id: connection.id },
+              data: {
+                authStatus: "AUTH_REQUIRED",
+                lastSeenAt: null,
+              },
+            }),
+          { maxAttempts: 3, retryDelayMs: 350 },
+        );
+        return updatedConnection;
+      } catch {
+        return connection;
+      }
+    }
+
+    return connection;
+  }
+
+  // Se a Evolution não respondeu com um estado claro, não deixa AUTH_IN_PROGRESS ficar preso.
+  if (!runtimeAuthStatus) {
+    if (connection.authStatus !== "AUTH_IN_PROGRESS") {
+      return connection;
+    }
+
+    const lastSeenAtMs = connection.lastSeenAt instanceof Date ? connection.lastSeenAt.getTime() : 0;
+    const authStartedAtMs = connection.lastAuthAt instanceof Date ? connection.lastAuthAt.getTime() : lastSeenAtMs;
+    const ageMs = authStartedAtMs > 0 ? now.getTime() - authStartedAtMs : Number.POSITIVE_INFINITY;
+    const staleAuthInProgress = ageMs > 3 * 60 * 1000;
+
+    if (!hasRecentQrOverlayActivity && staleAuthInProgress) {
+      try {
+        const updatedConnection = await withPrismaConnectionRetry(
+          () =>
+            prisma.socialConnection.update({
+              where: { id: connection.id },
+              data: {
+                authStatus: "AUTH_REQUIRED",
+                authLaunchUrl: null,
+                lastSeenAt: null,
+                lastAuthAt: null,
+              },
+            }),
+          { maxAttempts: 3, retryDelayMs: 350 },
+        );
+        return updatedConnection;
+      } catch {
+        return connection;
+      }
+    }
+
     return connection;
   }
 
@@ -6135,7 +6209,7 @@ async function syncConnectionRuntimeState(connection: {
     return connection;
   }
 
-  if (connection.authStatus === "AUTH_REQUIRED") {
+  if (connection.authStatus === "AUTH_REQUIRED" && runtimeAuthStatus !== "CONNECTED") {
     return connection;
   }
 
@@ -6150,20 +6224,24 @@ async function syncConnectionRuntimeState(connection: {
   if (
     connection.authStatus === "AUTH_IN_PROGRESS" &&
     runtimeAuthStatus === "AUTH_REQUIRED" &&
-    (hasRecentQrOverlayActivity || hasRecentAuthInProgressSeenAt)
+    hasRecentQrOverlayActivity
   ) {
     return connection;
   }
 
-  const updatedConnection = await prisma.socialConnection.update({
-    where: { id: connection.id },
-    data: {
-      authStatus: runtimeAuthStatus,
-      authLaunchUrl: runtimeAuthStatus === "CONNECTED" ? null : connection.authLaunchUrl,
-      lastAuthAt: runtimeAuthStatus === "CONNECTED" ? connection.lastAuthAt ?? now : connection.lastAuthAt,
-      lastSeenAt: runtimeAuthStatus === "AUTH_REQUIRED" ? null : now,
-    },
-  });
+  const updatedConnection = await withPrismaConnectionRetry(
+    () =>
+      prisma.socialConnection.update({
+        where: { id: connection.id },
+        data: {
+          authStatus: runtimeAuthStatus,
+          authLaunchUrl: runtimeAuthStatus === "CONNECTED" ? null : connection.authLaunchUrl,
+          lastAuthAt: runtimeAuthStatus === "CONNECTED" ? connection.lastAuthAt ?? now : connection.lastAuthAt,
+          lastSeenAt: runtimeAuthStatus === "AUTH_REQUIRED" ? null : now,
+        },
+      }),
+    { maxAttempts: 3, retryDelayMs: 350 },
+  );
 
   await appendLog({
     companyId: updatedConnection.companyId,
@@ -6176,6 +6254,93 @@ async function syncConnectionRuntimeState(connection: {
   notifyLiveUpdateForWorkspace(updatedConnection.companyId, ["connections", "dashboard"]);
 
   return updatedConnection;
+}
+
+function startWhatsappConnectionStateMonitor(): void {
+  const tick = async () => {
+    try {
+      const connections = await withPrismaConnectionRetry(
+        () =>
+          prisma.socialConnection.findMany({
+            where: {
+              platform: "whatsapp",
+              authStatus: {
+                in: ["CONNECTED", "AUTH_IN_PROGRESS", "AUTH_REQUIRED"],
+              },
+            },
+            select: {
+              id: true,
+              companyId: true,
+              displayName: true,
+              platform: true,
+              loginIdentifier: true,
+              secretCipher: true,
+              authStatus: true,
+              authLaunchUrl: true,
+              lastAuthAt: true,
+              lastSeenAt: true,
+            },
+          }),
+        { maxAttempts: 3, retryDelayMs: 500 },
+      );
+
+      for (const connection of connections) {
+        const runtimeAuthStatus = await resolveWhatsappConnectionRuntimeAuthStatus({
+          id: connection.id,
+          companyId: connection.companyId,
+          displayName: connection.displayName,
+          platform: connection.platform,
+          loginIdentifier: connection.loginIdentifier,
+          secretCipher: connection.secretCipher ?? null,
+        }).catch(() => null);
+
+        if (!runtimeAuthStatus || runtimeAuthStatus === connection.authStatus) {
+          continue;
+        }
+
+        if (connection.authStatus === "CONNECTED" && runtimeAuthStatus === "AUTH_IN_PROGRESS") {
+          continue;
+        }
+
+        const updatedConnection = await withPrismaConnectionRetry(
+          () =>
+            prisma.socialConnection.update({
+              where: { id: connection.id },
+              data: {
+                authStatus: runtimeAuthStatus,
+                authLaunchUrl: runtimeAuthStatus === "CONNECTED" ? null : connection.authLaunchUrl,
+                lastAuthAt:
+                  runtimeAuthStatus === "CONNECTED"
+                    ? connection.lastAuthAt ?? new Date()
+                    : connection.lastAuthAt,
+                lastSeenAt: runtimeAuthStatus === "AUTH_REQUIRED" ? null : new Date(),
+              },
+            }),
+          { maxAttempts: 3, retryDelayMs: 500 },
+        );
+
+        await appendLog({
+          companyId: updatedConnection.companyId,
+          level: runtimeAuthStatus === "AUTH_REQUIRED" ? "WARN" : "INFO",
+          errorCode: "WHATSAPP_CONNECTION_STATE_MONITOR",
+          message:
+            `Estado da conta ${updatedConnection.displayName} sincronizado pelo monitor WhatsApp: ` +
+            `${connection.authStatus} -> ${runtimeAuthStatus}.`,
+        }).catch((error) => {
+          console.error("Failed to append WhatsApp monitor log", error);
+        });
+
+        notifyLiveUpdateForWorkspace(updatedConnection.companyId, ["connections", "dashboard"]);
+      }
+    } catch (error) {
+      console.error("WhatsApp connection state monitor error", error);
+    }
+  };
+
+  void tick();
+  setInterval(() => {
+    void tick();
+  }, WHATSAPP_CONNECTION_MONITOR_INTERVAL_MS);
 }
 
 async function handlePostForMeAccountWebhook(payload: unknown): Promise<{
@@ -6573,6 +6738,21 @@ function unregisterLiveEventClient(userId: string, clientId: string): void {
   if (userClients.size === 0) {
     liveEventClientsByUserId.delete(userId);
   }
+}
+
+function closeAllLiveEventClients(): void {
+  for (const [, userClients] of liveEventClientsByUserId) {
+    for (const [, client] of userClients) {
+      clearInterval(client.heartbeatIntervalId);
+      try {
+        client.response.end();
+      } catch {
+        // Ignora conexões SSE já encerradas pelo navegador.
+      }
+    }
+  }
+
+  liveEventClientsByUserId.clear();
 }
 
 function emitLiveUpdateToUser(userId: string, scopes: LiveUpdateScope[], companyId?: string | null): void {
@@ -10443,30 +10623,34 @@ async function executeInstagramRunningJob(job: {
 function startServerInstagramJobWorker(): void {
   const tick = async () => {
     try {
-      const candidateJobs = await prisma.job.findMany({
-        where: {
-          publicationType: {
-            in: [
-              "instagram_post",
-              "instagram_reel",
-              "instagram_story",
-              "facebook_post",
-              "threads_post",
-              "tiktok_post",
-              "x_post",
-            ],
-          },
-          publicationState: "PUBLISHED",
-          status: {
-            in: ["PENDING", "WAITING_LOGIN"],
-          },
-          dataPostagem: {
-            lte: new Date(),
-          },
-        },
-        orderBy: [{ dataPostagem: "asc" }, { criadoEm: "asc" }],
-        take: JOB_DISPATCH_BATCH_SIZE,
-      });
+      const candidateJobs = await withPrismaConnectionRetry(
+        () =>
+          prisma.job.findMany({
+            where: {
+              publicationType: {
+                in: [
+                  "instagram_post",
+                  "instagram_reel",
+                  "instagram_story",
+                  "facebook_post",
+                  "threads_post",
+                  "tiktok_post",
+                  "x_post",
+                ],
+              },
+              publicationState: "PUBLISHED",
+              status: {
+                in: ["PENDING", "WAITING_LOGIN"],
+              },
+              dataPostagem: {
+                lte: new Date(),
+              },
+            },
+            orderBy: [{ dataPostagem: "asc" }, { criadoEm: "asc" }],
+            take: JOB_DISPATCH_BATCH_SIZE,
+          }),
+        { maxAttempts: 3, retryDelayMs: 500 },
+      );
 
       for (const job of candidateJobs) {
         const expectedPlatform = platformForPublication(normalizePublicationType(job));
@@ -10494,21 +10678,26 @@ function startServerInstagramJobWorker(): void {
           continue;
         }
 
-        const connection = await prisma.socialConnection.findFirst({
-          where: {
-            id: job.socialConnectionId,
-            companyId: job.companyId,
-            platform: expectedPlatform,
-          },
-          select: {
-            id: true,
-            platform: true,
-            authStatus: true,
-            provider: true,
-            providerAccountId: true,
-            secretCipher: true,
-          },
-        });
+        const socialConnectionId = job.socialConnectionId;
+        const connection = await withPrismaConnectionRetry(
+          () =>
+            prisma.socialConnection.findFirst({
+              where: {
+                id: socialConnectionId,
+                companyId: job.companyId,
+                platform: expectedPlatform,
+              },
+              select: {
+                id: true,
+                platform: true,
+                authStatus: true,
+                provider: true,
+                providerAccountId: true,
+                secretCipher: true,
+              },
+            }),
+          { maxAttempts: 3, retryDelayMs: 500 },
+        );
 
         if (!connection) {
           if (
@@ -10727,45 +10916,49 @@ function startInstagramTokenKeepAliveWorker(): void {
 function startPostForMeMetaPostSyncWorker(): void {
   const tick = async () => {
     try {
-      const candidateJobs = await prisma.job.findMany({
-        where: {
-          publicationState: "PUBLISHED",
-          status: {
-            in: ["RUNNING", "COMPLETED", "SENT_UNCONFIRMED"],
-          },
-          OR: [
-            {
+      const candidateJobs = await withPrismaConnectionRetry(
+        () =>
+          prisma.job.findMany({
+            where: {
+              publicationState: "PUBLISHED",
               status: {
-                in: ["RUNNING", "SENT_UNCONFIRMED"],
+                in: ["RUNNING", "COMPLETED", "SENT_UNCONFIRMED"],
+              },
+              OR: [
+                {
+                  status: {
+                    in: ["RUNNING", "SENT_UNCONFIRMED"],
+                  },
+                },
+                {
+                  publicationType: {
+                    in: ["instagram_post", "instagram_reel", "instagram_story", "threads_post", "tiktok_post", "x_post"],
+                  },
+                  whatsappRelinkEnabled: true,
+                  whatsappRelinkDispatchedAt: null,
+                },
+              ],
+              socialConnection: {
+                is: {
+                  provider: "POST_FOR_ME",
+                  platform: {
+                    in: ["instagram", "facebook", "threads", "tiktok", "x"],
+                  },
+                },
               },
             },
-            {
-              publicationType: {
-                in: ["instagram_post", "instagram_reel", "instagram_story", "threads_post", "tiktok_post", "x_post"],
-              },
-              whatsappRelinkEnabled: true,
-              whatsappRelinkDispatchedAt: null,
-            },
-          ],
-          socialConnection: {
-            is: {
-              provider: "POST_FOR_ME",
-              platform: {
-                in: ["instagram", "facebook", "threads", "tiktok", "x"],
+            orderBy: [{ completedAt: "asc" }, { criadoEm: "asc" }],
+            take: POST_FOR_ME_WHATSAPP_RELINK_BATCH_SIZE,
+            include: {
+              socialConnection: {
+                select: {
+                  platform: true,
+                },
               },
             },
-          },
-        },
-        orderBy: [{ completedAt: "asc" }, { criadoEm: "asc" }],
-        take: POST_FOR_ME_WHATSAPP_RELINK_BATCH_SIZE,
-        include: {
-          socialConnection: {
-            select: {
-              platform: true,
-            },
-          },
-        },
-      });
+          }),
+        { maxAttempts: 3, retryDelayMs: 500 },
+      );
 
       for (const job of candidateJobs) {
         const providerPlatform = job.socialConnection?.platform ?? "";
@@ -11502,22 +11695,26 @@ async function startRabbitJobExecutionConsumer(): Promise<void> {
 function startServerWhatsappJobWorker(): void {
   const tick = async () => {
     try {
-      const candidateJobs = await prisma.job.findMany({
-        where: {
-          publicationType: {
-            in: ["whatsapp_status_midia"],
-          },
-          publicationState: "PUBLISHED",
-          status: {
-            in: ["PENDING", "WAITING_LOGIN"],
-          },
-          dataPostagem: {
-            lte: new Date(),
-          },
-        },
-        orderBy: [{ dataPostagem: "asc" }, { criadoEm: "asc" }],
-        take: JOB_DISPATCH_BATCH_SIZE,
-      });
+      const candidateJobs = await withPrismaConnectionRetry(
+        () =>
+          prisma.job.findMany({
+            where: {
+              publicationType: {
+                in: ["whatsapp_status_midia"],
+              },
+              publicationState: "PUBLISHED",
+              status: {
+                in: ["PENDING", "WAITING_LOGIN"],
+              },
+              dataPostagem: {
+                lte: new Date(),
+              },
+            },
+            orderBy: [{ dataPostagem: "asc" }, { criadoEm: "asc" }],
+            take: JOB_DISPATCH_BATCH_SIZE,
+          }),
+        { maxAttempts: 3, retryDelayMs: 500 },
+      );
 
       for (const job of candidateJobs) {
         const billingBlockedMessage = await resolveJobBillingBlockMessage(job);
@@ -11534,17 +11731,22 @@ function startServerWhatsappJobWorker(): void {
           continue;
         }
 
-        const connection = await prisma.socialConnection.findFirst({
-          where: {
-            id: job.socialConnectionId,
-            companyId: job.companyId,
-            platform: "whatsapp",
-          },
-          select: {
-            id: true,
-            authStatus: true,
-          },
-        });
+        const socialConnectionId = job.socialConnectionId;
+        const connection = await withPrismaConnectionRetry(
+          () =>
+            prisma.socialConnection.findFirst({
+              where: {
+                id: socialConnectionId,
+                companyId: job.companyId,
+                platform: "whatsapp",
+              },
+              select: {
+                id: true,
+                authStatus: true,
+              },
+            }),
+          { maxAttempts: 3, retryDelayMs: 500 },
+        );
 
         if (!connection) {
           await failJobDueToConnectionUnavailable(job, {
@@ -11675,6 +11877,8 @@ app.get("/events", async (request, response) => {
     .update(`${user.id}:${Date.now()}:${Math.random()}:${user.username}`)
     .digest("hex");
 
+  console.log("[events] connect", { userId: user.id, username: user.username, clientId });
+
   const heartbeatIntervalId = setInterval(() => {
     try {
       writeLiveEvent(response, {
@@ -11698,6 +11902,7 @@ app.get("/events", async (request, response) => {
   });
 
   request.on("close", () => {
+    console.log("[events] close", { userId: user.id, username: user.username, clientId });
     unregisterLiveEventClient(user.id, clientId);
     response.end();
   });
@@ -12877,13 +13082,18 @@ registerBeeUpRoutes(app, {
 app.get("/connections", async (request, response) => {
   const companyId = typeof request.query.companyId === "string" ? request.query.companyId : undefined;
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
-  const connections = await prisma.socialConnection.findMany({
-    where: connectionVisibilityWhere(authRequest, companyId),
-    orderBy: [{ companyId: "asc" }, { createdAt: "desc" }],
-  });
+  try {
+    const connections = await withPrismaConnectionRetry(
+      () =>
+        prisma.socialConnection.findMany({
+          where: connectionVisibilityWhere(authRequest, companyId),
+          orderBy: [{ companyId: "asc" }, { createdAt: "desc" }],
+        }),
+      { maxAttempts: 3, retryDelayMs: 350 },
+    );
 
-  const mappedConnections = await Promise.all(
-    connections.map(async (connection) => {
+    const mappedConnections: Array<Record<string, unknown>> = [];
+    for (const connection of connections) {
       const syncedConnection = await syncConnectionRuntimeState(connection);
       const runtimeMetadata = await resolveConnectionRuntimeMetadata(syncedConnection);
       let effectiveConnection = syncedConnection;
@@ -12898,25 +13108,32 @@ app.get("/connections", async (request, response) => {
             runtimeMetadata.threadsUsername !== syncedConnection.loginIdentifier)
         )
       ) {
-        effectiveConnection = await prisma.socialConnection.update({
-          where: { id: syncedConnection.id },
-          data: {
-            loginIdentifier:
-              syncedConnection.platform === "instagram"
-                ? runtimeMetadata.instagramUsername
-                : runtimeMetadata.threadsUsername,
-          },
-        });
+        effectiveConnection = await withPrismaConnectionRetry(
+          () =>
+            prisma.socialConnection.update({
+              where: { id: syncedConnection.id },
+              data: {
+                loginIdentifier:
+                  syncedConnection.platform === "instagram"
+                    ? runtimeMetadata.instagramUsername
+                    : runtimeMetadata.threadsUsername,
+              },
+            }),
+          { maxAttempts: 3, retryDelayMs: 350 },
+        );
       }
 
-      return {
+      mappedConnections.push({
         ...mapConnection(effectiveConnection),
         ...runtimeMetadata,
-      };
-    }),
-  );
+      });
+    }
 
-  response.json(mappedConnections);
+    response.json(mappedConnections);
+  } catch (error) {
+    console.error("Connections query failed", error);
+    response.status(503).json({ error: "Banco temporariamente indisponível. Tente novamente." });
+  }
 });
 
 app.get("/connections/:id/instagram-location-candidates", async (request, response) => {
@@ -13225,7 +13442,8 @@ app.post("/connections/:id/open-visual-auth", async (request, response) => {
     });
 
     try {
-      await requestWhatsappQr(updatedConnection.id, true);
+      // Reaproveita QR recente se houver; só força regeneração quando estiver expirado.
+      await requestWhatsappQr(updatedConnection.id, false);
     } catch (error) {
       const message = humanizeWhatsappQrErrorMessage(
         error instanceof Error && error.message ? error.message : "Falha ao iniciar a geracao do QR do WhatsApp.",
@@ -13397,8 +13615,9 @@ app.post("/connections/:id/regenerate-qr", async (request, response) => {
     },
   });
 
+  const shouldForce = (typeof request.query.force === "string" ? request.query.force : "").trim() === "1";
   try {
-    await requestWhatsappQr(updatedConnection.id, true);
+    await requestWhatsappQr(updatedConnection.id, shouldForce);
   } catch (error) {
     const message = humanizeWhatsappQrErrorMessage(
       error instanceof Error && error.message ? error.message : "Falha ao gerar um novo QR do WhatsApp.",
@@ -13437,6 +13656,7 @@ app.post("/connections/:id/regenerate-qr", async (request, response) => {
 app.post("/connections/:id/dismiss-qr", async (request, response) => {
   const payload = dismissQrSchema.parse(request.body ?? {});
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
+  const keepReusableQr = (typeof request.query.keepReusable === "string" ? request.query.keepReusable : "").trim() === "1";
   const connection = await findConnectionWithWorkspaceContext(request.params.id);
 
   if (!connection) {
@@ -13481,7 +13701,7 @@ app.post("/connections/:id/dismiss-qr", async (request, response) => {
   }).catch(() => null);
 
   if (runtimeAuthStatus !== "CONNECTED") {
-    const becameConnected = await waitForWhatsappRuntimeConnected(connection, 5_000, 500);
+    const becameConnected = await waitForWhatsappRuntimeConnected(connection, 20_000, 1_000);
     if (becameConnected) {
       runtimeAuthStatus = "CONNECTED";
     }
@@ -13518,7 +13738,9 @@ app.post("/connections/:id/dismiss-qr", async (request, response) => {
     },
   });
 
-  await dismissWhatsappQr(updatedConnection.id);
+  if (!keepReusableQr) {
+    await dismissWhatsappQr(updatedConnection.id);
+  }
 
   await appendLog({
     companyId: updatedConnection.companyId,
@@ -15538,17 +15760,33 @@ app.get("/dashboard", async (request, response) => {
   const authRequest = request as Request & { adminUser?: AdminUserAuth };
   const where = jobVisibilityWhere(authRequest, companyId);
 
-  const [jobs, connectedAccounts] = await Promise.all([
-    prisma.job.findMany({ where, select: { status: true, publicationState: true } }),
-    prisma.socialConnection.count({
-      where: {
-        ...connectionVisibilityWhere(authRequest, companyId),
-        authStatus: {
-          in: ["CONNECTED", "AUTH_IN_PROGRESS"],
-        },
-      },
-    }),
-  ]);
+  let jobs: Array<{ status: string; publicationState: string }> = [];
+  let connectedAccounts = 0;
+
+  try {
+    jobs = await withPrismaConnectionRetry(
+      () => prisma.job.findMany({ where, select: { status: true, publicationState: true } }),
+      { maxAttempts: 3, retryDelayMs: 350 },
+    );
+
+    connectedAccounts = await withPrismaConnectionRetry(
+      () =>
+        prisma.socialConnection.count({
+          where: {
+            ...connectionVisibilityWhere(authRequest, companyId),
+            authStatus: {
+              in: ["CONNECTED", "AUTH_IN_PROGRESS"],
+            },
+          },
+        }),
+      { maxAttempts: 3, retryDelayMs: 350 },
+    );
+  } catch (error) {
+    // Evita derrubar o processo em falhas transitórias de conexão com o Postgres externo.
+    console.error("Dashboard query failed", error);
+    response.status(503).json({ error: "Banco temporariamente indisponível. Tente novamente." });
+    return;
+  }
 
   const totals = {
     PENDING: 0,
@@ -17409,12 +17647,26 @@ const port = Number(process.env.PORT ?? 4000);
 let server: ReturnType<typeof app.listen> | null = null;
 
 async function bootBackend(): Promise<void> {
-  await ensureBillingBootstrap();
+  try {
+    await withPrismaConnectionRetry(() => ensureBillingBootstrap(), {
+      maxAttempts: 5,
+      retryDelayMs: 750,
+    });
+  } catch (error) {
+    const strict =
+      (process.env.BILLING_BOOTSTRAP_STRICT || "").trim().toLowerCase() === "true" || process.env.NODE_ENV === "production";
+    console.error("Billing bootstrap failed", error);
+    if (strict) {
+      throw error;
+    }
+    console.warn("Continuando boot sem billing bootstrap (dev mode).");
+  }
 
   startServerInstagramJobWorker();
   startInstagramTokenKeepAliveWorker();
   startPostForMeMetaPostSyncWorker();
   startServerWhatsappJobWorker();
+  startWhatsappConnectionStateMonitor();
   void startRabbitJobExecutionConsumer().catch((error) => {
     console.error("Failed to start RabbitMQ job consumer", error);
   });
@@ -17436,6 +17688,7 @@ async function shutdownGracefully(signal: string): Promise<void> {
   }
   shuttingDown = true;
   console.log(`Received ${signal}. Shutting down backend...`);
+  closeAllLiveEventClients();
 
   if (server) {
     await new Promise<void>((resolve) => {

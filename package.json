@@ -9,9 +9,11 @@
   "scripts": {
     "dev:web": "npm run dev -w apps/web",
     "dev:backend": "npm run dev -w apps/backend",
+    "dev:backend:log": "bash ./scripts/dev-backend-logged.sh",
     "dev:all": "bash ./scripts/dev-all.sh core",
     "dev:all:full": "bash ./scripts/dev-all.sh full",
     "dev:tunnel": "cloudflared tunnel run socialup-backend",
+    "dev:tunnel:token": "node ./scripts/run-with-root-env.mjs bash ./scripts/dev-tunnel-token.sh",
     "dev:whatsapp": "bash ./scripts/dev-whatsapp.sh",
     "stop:whatsapp": "bash ./scripts/stop-whatsapp.sh",
     "db:start": "node ./scripts/db-service.mjs start",

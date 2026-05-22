@@ -34,7 +34,8 @@ export function isRetryablePrismaConnectionError(error: unknown): boolean {
       message.includes("server has closed the connection") ||
       message.includes("connection terminated unexpectedly") ||
       message.includes("can't reach database server") ||
-      message.includes("connection closed")
+      message.includes("connection closed") ||
+      message.includes("response from the engine was empty")
     );
   }
 
@@ -43,7 +44,8 @@ export function isRetryablePrismaConnectionError(error: unknown): boolean {
     message.includes("server has closed the connection") ||
     message.includes("connection terminated unexpectedly") ||
     message.includes("can't reach database server") ||
-    message.includes("connection closed")
+    message.includes("connection closed") ||
+    message.includes("response from the engine was empty")
   );
 }
 
