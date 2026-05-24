@@ -5,7 +5,6 @@ import {
   FiChevronUp,
   FiMessageSquare,
   FiPlus,
-  FiRefreshCw,
   FiSend,
   FiX,
   FiZap,
@@ -38,6 +37,8 @@ type BeeUpToolIntent = "get_plan_limits" | "get_recent_failures" | "get_connecti
 type BeeUpToolParams = {
   workspaceId?: string;
 };
+
+type BeeUpWorkspaceChoice = { id: string; name: string };
 
 type BeeUpSource = {
   title: string;
@@ -405,7 +406,7 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
   const [summary, setSummary] = useState<BeeUpSummaryResponse>({ alerts: [], quickPrompts: beeUpQuickPromptFallbacks });
   const [threads, setThreads] = useState<BeeUpThreadSummary[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
-  const [openPanel, setOpenPanel] = useState<"threads" | "alerts" | "prompts" | null>(null);
+  const [openPanel, setOpenPanel] = useState<"threads" | "prompts" | null>(null);
   const [messages, setMessages] = useState<BeeUpMessage[]>([]);
   const [input, setInput] = useState("");
   const [loadingSummary, setLoadingSummary] = useState(false);
@@ -415,6 +416,11 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
   const [animatedMessageId, setAnimatedMessageId] = useState<string | null>(null);
   const messagesViewportRef = useRef<HTMLDivElement | null>(null);
   const animationTimeoutRef = useRef<number | null>(null);
+  const [workspacePicker, setWorkspacePicker] = useState<{
+    sourceMessageId: string;
+    choices: BeeUpWorkspaceChoice[];
+  } | null>(null);
+  const [workspacePickerQuery, setWorkspacePickerQuery] = useState("");
 
   const scrollMessagesToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
     const element = messagesViewportRef.current;
@@ -427,6 +433,35 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
   const handleAnimatedProgress = useCallback(() => {
     scrollMessagesToBottom("auto");
   }, [scrollMessagesToBottom]);
+
+  const closeWorkspacePicker = useCallback(
+    (options?: { cancel?: boolean }) => {
+      setWorkspacePicker(null);
+      setWorkspacePickerQuery("");
+      if (options?.cancel) {
+        const nowIso = new Date().toISOString();
+        setMessages((current) => [
+          ...current,
+          {
+            id: `bee-up-local-cancel-${Date.now()}`,
+            role: "assistant",
+            content: "Processo cancelado pelo usuário.",
+            toolName: null,
+            toolPayload: null,
+            createdAt: nowIso,
+            actions: [],
+            sources: [],
+            mode: null,
+            payload: null,
+          } satisfies BeeUpMessage,
+        ]);
+        window.requestAnimationFrame(() => {
+          scrollMessagesToBottom("smooth");
+        });
+      }
+    },
+    [scrollMessagesToBottom],
+  );
 
   async function loadSummary() {
     setLoadingSummary(true);
@@ -447,7 +482,8 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
     try {
       const response = await api.get<BeeUpThreadsResponse>("/bee-up/threads");
       setThreads(response.items ?? []);
-      setActiveThreadId((current) => current ?? response.items?.[0]?.id ?? null);
+      // Do not auto-open an existing thread when opening the drawer.
+      // Bee Up should always open in "new conversation" mode (like ChatGPT).
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Falha ao carregar conversas do Bee Up.");
     }
@@ -500,6 +536,7 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
   useEffect(() => {
     if (!isOpen) {
       setOpenPanel(null);
+      closeWorkspacePicker();
       return;
     }
 
@@ -518,7 +555,7 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [isOpen, onClose, openPanel]);
+  }, [isOpen, onClose, openPanel, closeWorkspacePicker]);
 
   useEffect(() => {
     return () => {
@@ -726,9 +763,10 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
     setInput("");
     setError(null);
     setOpenPanel(null);
+    closeWorkspacePicker();
   }
 
-  function togglePanel(panel: "threads" | "alerts" | "prompts") {
+  function togglePanel(panel: "threads" | "prompts") {
     setOpenPanel((current) => (current === panel ? null : panel));
   }
 
@@ -768,13 +806,13 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
 
   return (
     <>
-      <button
-        type="button"
-        className={`bee-up-launcher ${isOpen ? "bee-up-launcher-open" : ""}`}
-        onClick={isOpen ? onClose : onOpen}
-        aria-label={isOpen ? "Fechar Assistente Bee Up" : "Abrir Assistente Bee Up"}
-        title={isOpen ? "Fechar assistente de IA Bee Up" : "Abrir assistente de IA Bee Up"}
-      >
+	      <button
+	        type="button"
+	        className={`bee-up-launcher ${isOpen ? "bee-up-launcher-open" : ""}`}
+	        onClick={isOpen ? onClose : onOpen}
+	        aria-label={isOpen ? "Fechar Assistente Bee Up" : "Abrir Assistente Bee Up"}
+	        title={isOpen ? "Fechar Bee Up" : "Abrir Bee Up"}
+	      >
         <span className="bee-up-launcher-logo-wrap" aria-hidden="true">
           <img className="bee-up-launcher-logo" src={beeUpLogo} alt="" />
         </span>
@@ -804,64 +842,49 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
             </span>
           </div>
 
-          <div className="bee-up-drawer-toolbar">
-            <div className="bee-up-drawer-toolbar-actions">
-              <button
-                type="button"
-                className={`bee-up-icon-button bee-up-icon-button-action ${openPanel === "prompts" ? "bee-up-icon-button-active" : ""}`}
-                onClick={() => togglePanel("prompts")}
-                aria-label="Abrir atalhos do Bee Up"
-                aria-expanded={openPanel === "prompts"}
-              >
-                <FiZap />
-              </button>
-              <button
-                type="button"
-                className={`bee-up-icon-button bee-up-icon-button-action ${openPanel === "threads" ? "bee-up-icon-button-active" : ""}`}
-                onClick={() => togglePanel("threads")}
-                aria-label="Abrir conversas do Bee Up"
-                aria-expanded={openPanel === "threads"}
-              >
-                <FiMessageSquare />
-              </button>
-              <button
-                type="button"
-                className={`bee-up-icon-button bee-up-icon-button-action ${openPanel === "alerts" ? "bee-up-icon-button-active" : ""}`}
-                onClick={() => togglePanel("alerts")}
-                aria-label="Abrir avisos do Bee Up"
-                aria-expanded={openPanel === "alerts"}
-              >
-                <FiAlertCircle />
-              </button>
-              <button
-                type="button"
-                className="bee-up-icon-button bee-up-icon-button-action"
-                onClick={resetConversation}
-                aria-label="Iniciar nova conversa"
-              >
-                <FiPlus />
-              </button>
-              <button
-                type="button"
-                className="bee-up-icon-button bee-up-icon-button-action"
-                onClick={() =>
-                  void (async () => {
-                    await Promise.all([loadSummary(), loadThreads()]);
-                    if (activeThreadId) {
-                      await loadMessages(activeThreadId);
-                    }
-                  })()
-                }
-                aria-label="Atualizar Bee Up"
-              >
-                <FiRefreshCw />
-              </button>
-            </div>
-            <button type="button" className="bee-up-icon-button bee-up-icon-button-close" onClick={onClose} aria-label="Fechar Bee Up">
-              <FiX />
-            </button>
-          </div>
-        </div>
+	          <div className="bee-up-drawer-toolbar">
+	            <div className="bee-up-drawer-toolbar-actions">
+	              <button
+	                type="button"
+	                className={`bee-up-icon-button bee-up-icon-button-action ${openPanel === "prompts" ? "bee-up-icon-button-active" : ""}`}
+	                onClick={() => togglePanel("prompts")}
+	                aria-label="Abrir atalhos do Bee Up"
+	                title="Atalhos"
+	                aria-expanded={openPanel === "prompts"}
+	              >
+	                <FiZap />
+	              </button>
+	              <button
+	                type="button"
+	                className={`bee-up-icon-button bee-up-icon-button-action ${openPanel === "threads" ? "bee-up-icon-button-active" : ""}`}
+	                onClick={() => togglePanel("threads")}
+	                aria-label="Abrir conversas do Bee Up"
+	                title="Conversas"
+	                aria-expanded={openPanel === "threads"}
+	              >
+	                <FiMessageSquare />
+	              </button>
+	              <button
+	                type="button"
+	                className="bee-up-icon-button bee-up-icon-button-action"
+	                onClick={resetConversation}
+	                aria-label="Iniciar nova conversa"
+	                title="Nova conversa"
+		              >
+		                <FiPlus />
+		              </button>
+		            </div>
+		            <button
+		              type="button"
+		              className="bee-up-icon-button bee-up-icon-button-close"
+	              onClick={onClose}
+	              aria-label="Fechar Bee Up"
+	              title="Fechar"
+	            >
+	              <FiX />
+	            </button>
+	          </div>
+	        </div>
 
         {openPanel === "prompts" ? (
           <div className="bee-up-dropdown-panel">
@@ -896,15 +919,16 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
                 <div className="bee-up-empty-subtle">A primeira conversa do Bee Up será criada quando você enviar uma mensagem.</div>
               ) : (
                 threads.map((thread) => (
-                  <button
-                    key={thread.id}
-                    type="button"
-                    className={`bee-up-thread-button ${activeThreadId === thread.id ? "bee-up-thread-button-active" : ""}`}
-                    onClick={() => {
-                      setActiveThreadId(thread.id);
-                      setOpenPanel(null);
-                    }}
-                  >
+	                  <button
+	                    key={thread.id}
+	                    type="button"
+	                    className={`bee-up-thread-button ${activeThreadId === thread.id ? "bee-up-thread-button-active" : ""}`}
+	                    title="Abrir conversa"
+	                    onClick={() => {
+	                      setActiveThreadId(thread.id);
+	                      setOpenPanel(null);
+	                    }}
+	                  >
                     <strong>{thread.title}</strong>
                     <span>{thread.preview || "Sem prévia ainda."}</span>
                     <small>{formatBeeUpDate(thread.lastMessageAt)}</small>
@@ -915,45 +939,7 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
           </div>
         ) : null}
 
-        {openPanel === "alerts" ? (
-          <div className="bee-up-dropdown-panel">
-            <div className="bee-up-dropdown-panel-head">
-              <strong>Avisos do Bee Up</strong>
-              {loadingSummary ? <small>Atualizando…</small> : null}
-            </div>
-            <div className="bee-up-alert-list bee-up-alert-list-compact">
-              {summary.alerts.length === 0 ? (
-                <div className="bee-up-empty-subtle">Nenhum aviso do Bee Up por enquanto.</div>
-              ) : (
-                summary.alerts.map((alert) => (
-                  <article key={alert.id} className={`bee-up-alert bee-up-alert-${alert.kind}`}>
-                    <strong>{alert.title}</strong>
-                    <span>{alert.message}</span>
-                    {alert.actions?.length ? (
-                      <div className="bee-up-inline-actions">
-                        {alert.actions.map((action) => (
-                          <button
-                            key={`${alert.id}-${action.label}`}
-                            type="button"
-                            className="bee-up-inline-button"
-                            onClick={() => {
-                              setOpenPanel(null);
-                              void handleAction(action);
-                            }}
-                          >
-                            {action.label}
-                          </button>
-                        ))}
-                      </div>
-                    ) : null}
-                  </article>
-                ))
-              )}
-            </div>
-          </div>
-        ) : null}
-
-        <div className="bee-up-chat-panel">
+	        <div className="bee-up-chat-panel">
           <div className="bee-up-chat-meta">
             <div className="bee-up-chat-meta-copy">
               <span className="bee-up-context-pill">
@@ -965,7 +951,17 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
 
           <div ref={messagesViewportRef} className="bee-up-messages">
             {loadingMessages ? (
-              <div className="bee-up-empty-state">Carregando conversa do Bee Up…</div>
+              <div className="bee-up-messages-skeleton" aria-label="Carregando conversa">
+                {Array.from({ length: 5 }).map((_, index) => (
+                  <div
+                    key={`bee-up-skeleton-${index}`}
+                    className={`bee-up-message-skeleton ${index % 2 === 0 ? "bee-up-message-skeleton-user" : "bee-up-message-skeleton-assistant"}`}
+                  >
+                    <span className="skeleton-line skeleton-line-text-wide" />
+                    <span className="skeleton-line skeleton-line-text-medium" />
+                  </div>
+                ))}
+              </div>
             ) : emptyThreadState ? (
               <div className="bee-up-empty-state">
                 <strong>Bee Up pronto para ajudar</strong>
@@ -1012,23 +1008,20 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
                     ) : null}
                     {workspaceChoices.length > 0 ? (
                       <div className="bee-up-workspace-choice-list">
-                        {workspaceChoices.map((workspace) => (
-                          <button
-                            key={workspace.id}
-                            type="button"
-                            className="bee-up-workspace-choice-button"
-                            onClick={() =>
-                              void sendMessage(
-                                `Gerar QR do WhatsApp no workspace ${workspace.name}`,
-                                "generate_whatsapp_qr",
-                                { workspaceId: workspace.id },
-                              )
-                            }
-                            disabled={sending}
-                          >
-                            {workspace.name}
-                          </button>
-                        ))}
+                        <button
+                          type="button"
+                          className="bee-up-workspace-choice-button"
+                          onClick={() => {
+                            setWorkspacePicker({
+                              sourceMessageId: message.id,
+                              choices: workspaceChoices,
+                            });
+                            setWorkspacePickerQuery("");
+                          }}
+                          disabled={sending}
+                        >
+                          Selecionar workspace
+                        </button>
                       </div>
                     ) : null}
                     {message.actions.length > 0 ? (
@@ -1051,6 +1044,75 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
             )}
           </div>
 
+          {workspacePicker ? (
+            <div
+              className="bee-up-inline-popover-backdrop"
+              role="presentation"
+              onClick={() => closeWorkspacePicker({ cancel: true })}
+            >
+              <section
+                className="bee-up-inline-popover"
+                role="dialog"
+                aria-label="Selecionar workspace"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="bee-up-inline-popover-head">
+                  <strong>Selecionar workspace</strong>
+                  <button
+                    type="button"
+                    className="bee-up-inline-popover-close"
+                    aria-label="Fechar"
+                    title="Fechar"
+                    onClick={() => closeWorkspacePicker({ cancel: true })}
+                  >
+                    <FiX aria-hidden="true" />
+                  </button>
+                </div>
+
+                <form className="bee-up-inline-popover-search" onSubmit={(event) => event.preventDefault()}>
+                  <input
+                    value={workspacePickerQuery}
+                    onChange={(event) => setWorkspacePickerQuery(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        // Don't let enter leak into the main chat composer.
+                        event.preventDefault();
+                        event.stopPropagation();
+                      }
+                    }}
+                    placeholder="Pesquisar workspace..."
+                    autoFocus
+                  />
+                </form>
+
+                <div className="bee-up-inline-popover-list" role="list">
+                  {workspacePicker.choices
+                    .filter((choice) =>
+                      choice.name.toLowerCase().includes(workspacePickerQuery.trim().toLowerCase()),
+                    )
+                    .map((choice) => (
+                      <button
+                        key={choice.id}
+                        type="button"
+                        className="bee-up-inline-popover-item"
+                        onClick={() => {
+                          closeWorkspacePicker();
+                          void sendMessage(
+                            `Gerar QR do WhatsApp no workspace ${choice.name}`,
+                            "generate_whatsapp_qr",
+                            { workspaceId: choice.id },
+                          );
+                        }}
+                        disabled={sending}
+                      >
+                        {choice.name}
+                      </button>
+                    ))}
+                </div>
+              </section>
+            </div>
+          ) : null}
+
           {error ? (
             <div className="info-banner info-banner-error bee-up-info-banner">
               <FiAlertCircle aria-hidden="true" />
@@ -1071,13 +1133,13 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
               placeholder="Pergunte algo ao Bee Up…"
               rows={2}
             />
-            <div className="bee-up-compose-actions">
-              <span className="bee-up-compose-hint">Use os ícones do topo para atalhos, conversas e avisos.</span>
-              <button type="submit" className="bee-up-send-button" disabled={sending || !input.trim()}>
-                <FiSend aria-hidden="true" />
-                <span>{sending ? "Enviando…" : "Enviar"}</span>
-              </button>
-            </div>
+	            <div className="bee-up-compose-actions">
+	              <span className="bee-up-compose-hint">Use os ícones do topo para atalhos e conversas.</span>
+	              <button type="submit" className="bee-up-send-button" disabled={sending || !input.trim()}>
+	                <FiSend aria-hidden="true" />
+	                <span>{sending ? "Enviando…" : "Enviar"}</span>
+	              </button>
+	            </div>
           </form>
         </div>
       </aside>

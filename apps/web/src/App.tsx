@@ -595,7 +595,9 @@ type AuthUser = {
   billingIsBlocked?: boolean;
   billingBlockMessage?: string | null;
   billingEndsAt?: string | null;
+  billingTrialStartsAt?: string | null;
   billingTrialEndsAt?: string | null;
+  serverNow?: string;
 };
 
 type BillingPlan = {
@@ -4650,6 +4652,9 @@ function HistoryCalendarDraggableCard({
 function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [serverTimeOffsetMs, setServerTimeOffsetMs] = useState(0);
+  // Used to keep time-sensitive banners (trial countdown) fresh even when the app is idle.
+  const [trialClockTick, setTrialClockTick] = useState(0);
   const [loginIdentifier, setLoginIdentifier] = useState(() => {
     if (typeof window === "undefined") {
       return "";
@@ -4683,6 +4688,21 @@ function App() {
   const [creatingWorkspaceInviteUser, setCreatingWorkspaceInviteUser] = useState(false);
   const [creatingSignupUser, setCreatingSignupUser] = useState(false);
   const [requestingPasswordReset, setRequestingPasswordReset] = useState(false);
+
+  useEffect(() => {
+    const trialEndsAt = authUser?.billingTrialEndsAt ? new Date(authUser.billingTrialEndsAt).getTime() : Number.NaN;
+    if (!authUser || authUser.billingStatus !== "TRIALING" || !Number.isFinite(trialEndsAt)) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      setTrialClockTick((value) => (value + 1) % 1_000_000);
+    }, 60_000);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [authUser?.billingStatus, authUser?.billingTrialEndsAt]);
   const [confirmingPasswordReset, setConfirmingPasswordReset] = useState(false);
   const [passwordResetEmail, setPasswordResetEmail] = useState("");
   const [passwordResetKey, setPasswordResetKey] = useState(() => {
@@ -4723,6 +4743,7 @@ function App() {
   const [googleAuthHandoffPending, setGoogleAuthHandoffPending] = useState(false);
   const [googleAuthScreenLocked, setGoogleAuthScreenLocked] = useState(false);
   const [showLoginPassword, setShowLoginPassword] = useState(false);
+  const [showSignupPassword, setShowSignupPassword] = useState(false);
   const [profileName, setProfileName] = useState("");
   const [profileEmail, setProfileEmail] = useState("");
   const [profileUsername, setProfileUsername] = useState("");
@@ -5319,11 +5340,14 @@ function App() {
     (Boolean(authUser?.billingIsBlocked) &&
       (authUser?.billingStatus === "EXPIRED" || authUser?.billingStatus === "PAYMENT_REQUIRED") &&
       !authUser?.billingPlanCode);
+  const nowServerAlignedMs = Date.now() + serverTimeOffsetMs;
   const trialEndsAtMs = authUser?.billingTrialEndsAt ? new Date(authUser.billingTrialEndsAt).getTime() : Number.NaN;
+  const trialMsRemaining = Number.isFinite(trialEndsAtMs) ? trialEndsAtMs - nowServerAlignedMs : Number.NaN;
   const trialDaysRemaining =
-    Number.isFinite(trialEndsAtMs)
-      ? Math.max(0, Math.ceil((trialEndsAtMs - Date.now()) / (24 * 60 * 60 * 1000)))
+    Number.isFinite(trialMsRemaining)
+      ? Math.max(0, Math.floor(trialMsRemaining / (24 * 60 * 60 * 1000)))
       : null;
+  void trialClockTick;
   const hasActiveTrialWarning =
     !authUser?.billingIsBlocked &&
     authUser?.billingStatus === "TRIALING" &&
@@ -5619,6 +5643,11 @@ function App() {
   async function refreshAuthUserSnapshot(): Promise<void> {
     try {
       const response = await api.get<{ user: AuthUser }>("/auth/me");
+      const serverNowIso = response.user?.serverNow ? String(response.user.serverNow) : "";
+      const serverNowMs = serverNowIso ? new Date(serverNowIso).getTime() : Number.NaN;
+      if (Number.isFinite(serverNowMs)) {
+        setServerTimeOffsetMs(serverNowMs - Date.now());
+      }
       setAuthUser(response.user);
     } catch {
       // Mantém o estado atual quando o refresh falha por rede.
@@ -6661,8 +6690,8 @@ function App() {
     }
 
     setAgentWorkspaceFilter((current) => {
-      const hasAnyConnectedConnection = connections.some((connection) => connection.authStatus === "CONNECTED");
-      if (!hasAnyConnectedConnection) {
+      const hasAnyConnection = connections.length > 0;
+      if (!hasAnyConnection) {
         return companies[0]?.id ?? "all";
       }
 
@@ -6671,7 +6700,7 @@ function App() {
       }
 
       if (previousCount <= 1) {
-        return companies[0]?.id ?? "all";
+        return "all";
       }
 
       if (current === "all") {
@@ -6755,6 +6784,7 @@ function App() {
     () => connections.filter((connection) => connection.authStatus === "CONNECTED").length,
     [connections],
   );
+  const totalConnections = connections.length;
   const dismissedAgentAuthConnectionIdSet = useMemo(
     () => new Set(dismissedAgentAuthConnectionIds),
     [dismissedAgentAuthConnectionIds],
@@ -6857,7 +6887,7 @@ function App() {
       return companyOptions;
     }
 
-    if (totalConnectedConnections === 0) {
+    if (totalConnections === 0) {
       return companyOptions;
     }
 
@@ -6866,13 +6896,13 @@ function App() {
         value: "all" as const,
         label: "Todos os workspaces",
         subtitle:
-          totalConnectedConnections > 0
-            ? `${totalConnectedConnections} conta(s) conectada(s) no total`
+          totalConnections > 0
+            ? `${totalConnections} conta(s) adicionada(s) no total`
             : `${companies.length} workspaces disponíveis`,
       },
       ...companyOptions,
     ];
-  }, [companies, connectedConnectionCountByCompanyId, totalConnectedConnections]);
+  }, [companies, connectedConnectionCountByCompanyId, totalConnections]);
 
   const agentVisibleWorkspaces = useMemo(() => {
     if (companies.length <= 1) {
@@ -8813,6 +8843,11 @@ function App() {
 
       try {
         const response = await api.get<{ user: AuthUser }>("/auth/me");
+        const serverNowIso = response.user?.serverNow ? String(response.user.serverNow) : "";
+        const serverNowMs = serverNowIso ? new Date(serverNowIso).getTime() : Number.NaN;
+        if (Number.isFinite(serverNowMs)) {
+          setServerTimeOffsetMs(serverNowMs - Date.now());
+        }
         setAuthUser(response.user);
       } catch (error) {
         const message = error instanceof Error ? error.message : "";
@@ -16789,33 +16824,44 @@ function App() {
                     maxLength={60}
                     title="Informe seu sobrenome."
                   />
-                  <input
-                    type="email"
-                    value={setupEmail}
-                    onChange={(event) => setSetupEmail(event.target.value)}
-                    placeholder="Email"
-                    autoComplete="off"
-                    disabled={authLoginBusy}
-                    required
-                    maxLength={160}
-                    title="Informe seu email principal."
-                  />
-                  <input
-                    type="password"
-                    value={setupPassword}
-                    onChange={(event) => setSetupPassword(event.target.value)}
-                    placeholder="Senha"
-                    autoComplete="new-password"
-                    disabled={authLoginBusy}
-                    required
-                    minLength={8}
-                    maxLength={128}
-                    title="Defina uma senha com pelo menos 8 caracteres."
-                  />
-                  <button type="submit" disabled={authLoginBusy}>
-                    {creatingSignupUser ? (
-                      <>
-                        <span className="button-spinner" aria-hidden="true" />
+	                  <input
+	                    type="email"
+	                    value={setupEmail}
+	                    onChange={(event) => setSetupEmail(event.target.value)}
+	                    placeholder="Email"
+	                    autoComplete="off"
+	                    disabled={authLoginBusy}
+	                    required
+	                    maxLength={160}
+	                    title="Informe seu email principal."
+	                  />
+	                  <div className="password-field">
+	                    <input
+	                      type={showSignupPassword ? "text" : "password"}
+	                      value={setupPassword}
+	                      onChange={(event) => setSetupPassword(event.target.value)}
+	                      placeholder="Senha"
+	                      autoComplete="new-password"
+	                      disabled={authLoginBusy}
+	                      required
+	                      minLength={8}
+	                      maxLength={128}
+	                      title="Defina uma senha com pelo menos 8 caracteres."
+	                    />
+	                    <button
+	                      type="button"
+	                      className="password-toggle"
+	                      onClick={() => setShowSignupPassword((current) => !current)}
+	                      disabled={authLoginBusy}
+	                      aria-label={showSignupPassword ? "Ocultar senha" : "Mostrar senha"}
+	                    >
+	                      {showSignupPassword ? <FiEyeOff /> : <FiEye />}
+	                    </button>
+	                  </div>
+	                  <button type="submit" disabled={authLoginBusy}>
+	                    {creatingSignupUser ? (
+	                      <>
+	                        <span className="button-spinner" aria-hidden="true" />
                         Cadastrando...
                       </>
                     ) : (
@@ -18210,9 +18256,9 @@ function App() {
 
   function renderAccountPage(targetTab: ProfilePageTab) {
     const currentTab = targetTab;
-    const tabItems: Array<{ key: ProfilePageTab; label: string; icon: IconType }> = [
+    const tabItems: Array<{ key: ProfilePageTab; label: string; subtitle?: string; icon: IconType }> = [
       { key: "profile", label: "Informações", icon: FiUser },
-      { key: "plan", label: "Planos", icon: FiCreditCard },
+      { key: "plan", label: "Planos", subtitle: "Assinatura", icon: FiCreditCard },
       { key: "danger", label: "Zona de perigo", icon: FiSlash },
     ];
 
@@ -18253,13 +18299,16 @@ function App() {
                 onClick={() =>
                   navigateToView(tab.key === "plan" ? "plan" : "profile", { profileTab: tab.key })
                 }
-              >
-                <tab.icon aria-hidden="true" />
-                <span>{tab.label}</span>
-              </button>
-            );
-          })}
-        </div>
+	              >
+	                <tab.icon aria-hidden="true" />
+	                <span className="account-page-tab-copy">
+	                  <strong>{tab.label}</strong>
+	                  {tab.subtitle ? <small>{tab.subtitle}</small> : null}
+	                </span>
+	              </button>
+	            );
+	          })}
+	        </div>
 
         {currentTab === "plan"
           ? renderProfilePlanTabContent()
@@ -24075,15 +24124,15 @@ function App() {
           <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" />
         </section>
 
-        <section className="panel-card home-calendar-shell" aria-hidden="true">
-          <div className="home-calendar-toolbar">
-            <div className="home-calendar-toolbar-copy home-calendar-toolbar-copy-skeleton">
-              <FiCalendar aria-hidden="true" />
-              <div className="home-calendar-toolbar-copy-skeleton-lines">
-                <span className="skeleton-line home-calendar-title-skeleton" />
-                <span className="skeleton-line home-calendar-subtitle-skeleton" />
-              </div>
-            </div>
+	        <section className="panel-card home-calendar-shell" aria-hidden="true">
+	          <div className="home-calendar-toolbar">
+	            <div className="home-calendar-toolbar-copy home-calendar-toolbar-copy-skeleton">
+	              <span className="skeleton-line home-calendar-icon-skeleton" aria-hidden="true" />
+	              <div className="home-calendar-toolbar-copy-skeleton-lines">
+	                <span className="skeleton-line home-calendar-title-skeleton" />
+	                <span className="skeleton-line home-calendar-subtitle-skeleton" />
+	              </div>
+	            </div>
             <div className="home-calendar-toolbar-actions">
               <span className="skeleton-line home-calendar-period-skeleton" />
               <span className="skeleton-line home-calendar-nav-button-skeleton" />
@@ -24129,80 +24178,120 @@ function App() {
     );
   }
 
-  function renderCompaniesSkeleton() {
-    return (
-      <div className="view-stack workspace-shell skeleton-shell" aria-busy="true">
-        <section className="panel-card view-stack workspace-panel">
-          <div className="section-head publications-section-head skeleton-section-head-inline">
-            <div className="skeleton-title-stack">
-              <span className="skeleton-line skeleton-line-kicker" />
-              <span className="skeleton-line skeleton-line-heading" />
-            </div>
-            <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" />
-          </div>
+	  function renderCompaniesSkeleton() {
+	    const shouldShowAgencyBonusOverview = (billingMe?.plan?.agencyBonusWorkspaceLimit ?? 0) > 0;
+	    const shouldShowWorkspaceStructureToolbar = shouldShowAgencyBonusOverview || hasAnyWorkspaceInviteSupport;
+	    const overviewCardCount = 2 + (shouldShowAgencyBonusOverview ? 1 : 0) + (hasAnyWorkspaceInviteSupport ? 1 : 0);
+	    const skeletonCompanies =
+	      companies.length > 0
+	        ? companies
+	        : [
+	            { id: "skeleton-0", supportsWorkspaceInvites: hasAnyWorkspaceInviteSupport, canManageWorkspace: false, canManageMembers: false, status: "ACTIVE" as const },
+	            { id: "skeleton-1", supportsWorkspaceInvites: hasAnyWorkspaceInviteSupport, canManageWorkspace: false, canManageMembers: false, status: "ACTIVE" as const },
+	          ];
+	    return (
+	      <div className="view-stack workspace-shell skeleton-shell" aria-busy="true">
+	        <section className="panel-card view-stack workspace-panel">
+	          <div className="section-head publications-section-head skeleton-section-head-inline">
+	            <div className="skeleton-title-stack">
+	              <span className="skeleton-line skeleton-line-kicker" />
+	              <span className="skeleton-line skeleton-line-heading" />
+	            </div>
+	            {canCreateOwnedWorkspace ? <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" /> : null}
+	          </div>
 
-          <div className="workspace-overview-grid" aria-hidden="true">
-            {Array.from({ length: 4 }, (_, index) => (
-              <article key={`workspace-overview-skeleton-${index}`} className="workspace-overview-card workspace-overview-card-skeleton">
-                <span className="skeleton-line skeleton-line-icon-badge" />
-                <span className="workspace-overview-card-copy">
-                  <span className="skeleton-line skeleton-line-chip" />
-                  <span className="skeleton-line skeleton-line-metric-value" />
-                </span>
-              </article>
-            ))}
-          </div>
+	          <div className="workspace-overview-grid" aria-hidden="true">
+	            {Array.from({ length: overviewCardCount }, (_, index) => (
+	              <article key={`workspace-overview-skeleton-${index}`} className="workspace-overview-card workspace-overview-card-skeleton">
+	                <span className="skeleton-line skeleton-line-icon-badge" />
+	                <span className="workspace-overview-card-copy">
+	                  <span className="skeleton-line skeleton-line-chip" />
+	                  <span className="skeleton-line skeleton-line-metric-value" />
+	                </span>
+	              </article>
+	            ))}
+	          </div>
 
-          <div className="workspace-toolbar-shell workspace-toolbar-shell-skeleton" aria-hidden="true">
-            <div className="workspace-toolbar-copy">
-              <span className="skeleton-line skeleton-line-title" />
-              <span className="skeleton-line skeleton-line-text-medium" />
-            </div>
-            <div className="workspace-toolbar-meta">
-              <span className="skeleton-line skeleton-line-chip" />
-              <span className="skeleton-line skeleton-line-chip" />
-            </div>
-          </div>
+	          {shouldShowWorkspaceStructureToolbar ? (
+	            <div className="workspace-toolbar-shell workspace-toolbar-shell-skeleton" aria-hidden="true">
+	              <div className="workspace-toolbar-copy">
+	                <span className="skeleton-line skeleton-line-title" />
+	                <span className="skeleton-line skeleton-line-text-medium" />
+	              </div>
+	              <div className="workspace-toolbar-meta">
+	                <span className="skeleton-line skeleton-line-chip" />
+	                <span className="skeleton-line skeleton-line-chip" />
+	              </div>
+	            </div>
+	          ) : null}
 
-          <div className="table-list workspace-board-grid" aria-hidden="true">
-            {Array.from({ length: 3 }, (_, index) => (
-              <article key={`workspace-card-skeleton-${index}`} className="workspace-board-card workspace-board-card-skeleton">
-                <div className="workspace-board-card-head workspace-board-card-head-skeleton">
-                  <div className="workspace-board-card-identity">
-                    <span className="workspace-board-avatar workspace-board-avatar-skeleton" />
-                    <div className="workspace-board-card-copy workspace-board-card-copy-skeleton">
-                      <span className="skeleton-line skeleton-line-title" />
-                      <span className="skeleton-line skeleton-line-text" />
-                    </div>
-                  </div>
-                  <div className="workspace-board-card-aside workspace-board-card-aside-skeleton">
-                    <div className="workspace-card-actions workspace-card-actions-top workspace-card-actions-skeleton">
-                      <span className="skeleton-line skeleton-line-icon-button" />
-                      <span className="skeleton-line skeleton-line-icon-button" />
-                      <span className="skeleton-line skeleton-line-icon-button" />
-                    </div>
-                    <span className="skeleton-line skeleton-line-chip" />
-                  </div>
-                </div>
-                <div className="workspace-board-card-footer workspace-board-card-footer-skeleton">
-                  <div className="workspace-inline-summary-item workspace-inline-summary-item-card workspace-inline-summary-item-skeleton">
-                    <span className="skeleton-line skeleton-line-icon-button" />
-                    <span className="skeleton-line skeleton-line-text-short" />
-                    <span className="skeleton-line skeleton-line-icon-button" />
-                  </div>
-                  <div className="workspace-inline-summary-item workspace-inline-summary-item-card workspace-inline-summary-item-skeleton">
-                    <span className="skeleton-line skeleton-line-icon-button" />
-                    <span className="skeleton-line skeleton-line-text-short" />
-                    <span className="skeleton-line skeleton-line-icon-button" />
-                  </div>
-                </div>
-              </article>
-            ))}
-          </div>
-        </section>
-      </div>
-    );
-  }
+	          <div className="table-list workspace-board-grid" aria-hidden="true">
+	            {skeletonCompanies.map((company, index) => {
+	              const supportsWorkspaceInvites = Boolean((company as any).supportsWorkspaceInvites);
+	              const status = (company as any).status === "INACTIVE" ? "INACTIVE" : "ACTIVE";
+	              // Keep the skeleton stable while permissions/company data are still loading.
+	              // Otherwise the number of action placeholders "pops" from 2 -> 3/4.
+	              const actionPlaceholderCount = supportsWorkspaceInvites ? 4 : 3;
+
+	              return (
+	              <article key={`workspace-card-skeleton-${(company as any).id ?? index}`} className="workspace-board-card workspace-board-card-skeleton">
+	                <div className="workspace-board-card-head workspace-board-card-head-skeleton">
+	                  <div className="workspace-board-card-main">
+	                    <div className="workspace-board-card-identity">
+	                      <span className="workspace-board-avatar workspace-board-avatar-skeleton" />
+	                      <div className="workspace-board-card-copy workspace-board-card-copy-skeleton">
+	                        <strong>
+	                          <span className="skeleton-line workspace-board-title-skeleton" />
+	                        </strong>
+	                        <small className="workspace-card-created-at">
+	                          <span className="skeleton-line workspace-board-created-skeleton" />
+	                        </small>
+	                      </div>
+	                    </div>
+	                  </div>
+	                  <div className="workspace-board-card-aside workspace-board-card-aside-skeleton">
+	                    <div className="workspace-card-actions workspace-card-actions-top workspace-card-actions-skeleton">
+	                      {Array.from({ length: actionPlaceholderCount }, (_, actionIndex) => (
+	                        <span key={`workspace-skeleton-action-${index}-${actionIndex}`} className="skeleton-line skeleton-line-icon-button" />
+	                      ))}
+	                    </div>
+	                    <span className="workspace-status-badge skeleton-line workspace-status-badge-skeleton" />
+	                  </div>
+	                </div>
+	                <div className="workspace-board-card-footer workspace-board-card-footer-skeleton">
+	                  <div className="workspace-inline-summary-item workspace-inline-summary-item-card workspace-inline-summary-item-skeleton">
+	                    <span className="workspace-inline-summary-meta">
+	                      <span className="workspace-inline-summary-icon" aria-hidden="true">
+	                        <span className="skeleton-line skeleton-line-icon-button" />
+	                      </span>
+	                      <strong className="workspace-inline-summary-value">
+	                        <span className="skeleton-line workspace-inline-summary-value-skeleton" />
+	                      </strong>
+	                    </span>
+	                    <span className="skeleton-line skeleton-line-icon-button" />
+	                  </div>
+	                  {supportsWorkspaceInvites ? (
+	                    <div className="workspace-inline-summary-item workspace-inline-summary-item-card workspace-inline-summary-item-skeleton">
+	                      <span className="workspace-inline-summary-meta">
+	                        <span className="workspace-inline-summary-icon" aria-hidden="true">
+	                          <span className="skeleton-line skeleton-line-icon-button" />
+	                        </span>
+	                        <strong className="workspace-inline-summary-value">
+	                          <span className="skeleton-line workspace-inline-summary-value-skeleton" />
+	                        </strong>
+	                      </span>
+	                      <span className="skeleton-line skeleton-line-icon-button" />
+	                    </div>
+	                  ) : null}
+	                </div>
+	              </article>
+	              );
+	            })}
+	          </div>
+	        </section>
+	      </div>
+	    );
+	  }
 
   function renderAgentsSkeleton() {
     return (
@@ -24265,69 +24354,79 @@ function App() {
     );
   }
 
-  function renderSchedulerSkeleton() {
-    return (
-      <section className="panel-card view-stack skeleton-shell" aria-busy="true">
-        <div className="section-head skeleton-section-head-inline">
-          <div className="skeleton-title-stack">
-            <span className="skeleton-line skeleton-line-kicker" />
-            <span className="skeleton-line skeleton-line-heading" />
-          </div>
-          <span className="skeleton-line skeleton-line-button" />
-        </div>
-        <div className="form-stack" aria-hidden="true">
-          <div className="form-grid form-grid-two scheduler-choice-grid">
-            <div className="field-shell scheduler-choice-shell scheduler-choice-shell-types scheduler-skeleton-shell">
-              <span className="skeleton-line skeleton-line-kicker" />
-              <div className="scheduler-choice-row scheduler-skeleton-choice-row">
-                <span className="skeleton-line scheduler-skeleton-choice-button" />
-                <span className="skeleton-line scheduler-skeleton-choice-button" />
-                <span className="skeleton-line scheduler-skeleton-choice-button" />
-              </div>
-            </div>
-            <div className="field-shell scheduler-choice-shell scheduler-choice-shell-status scheduler-skeleton-shell">
-              <span className="skeleton-line skeleton-line-kicker" />
-              <div className="scheduler-choice-row scheduler-skeleton-choice-row">
-                <span className="skeleton-line scheduler-skeleton-choice-button" />
-                <span className="skeleton-line scheduler-skeleton-choice-button" />
-              </div>
-            </div>
-          </div>
+	  function renderSchedulerSkeleton() {
+	    return (
+	      <section className="panel-card view-stack skeleton-shell" aria-busy="true">
+	        <div className="section-head skeleton-section-head-inline">
+	          <div className="skeleton-title-stack">
+	            <span className="skeleton-line skeleton-line-kicker" />
+	            <span className="skeleton-line skeleton-line-heading" />
+	          </div>
+	          <span className="skeleton-line skeleton-line-button" />
+	        </div>
+	        <div className="form-stack" aria-hidden="true">
+	          <div className="form-grid form-grid-two scheduler-choice-grid">
+	            <div className="field-shell scheduler-choice-shell scheduler-choice-shell-types scheduler-skeleton-shell">
+	              <span className="skeleton-line skeleton-line-kicker" />
+	              <div className="scheduler-choice-carousel">
+	                <span className="skeleton-line scheduler-skeleton-carousel-arrow" />
+	                <div className="scheduler-choice-row scheduler-choice-row-carousel scheduler-skeleton-choice-row-carousel" aria-hidden="true">
+	                  <span className="skeleton-line scheduler-skeleton-choice-button" />
+	                  <span className="skeleton-line scheduler-skeleton-choice-button" />
+	                  <span className="skeleton-line scheduler-skeleton-choice-button" />
+	                </div>
+	                <span className="skeleton-line scheduler-skeleton-carousel-arrow" />
+	              </div>
+	            </div>
+	            <div className="field-shell scheduler-choice-shell scheduler-choice-shell-status scheduler-skeleton-shell">
+	              <span className="skeleton-line skeleton-line-kicker" />
+	              <div className="scheduler-choice-row scheduler-skeleton-status-row">
+	                <span className="skeleton-line scheduler-skeleton-choice-button scheduler-skeleton-choice-button-compact" />
+	                <span className="skeleton-line scheduler-skeleton-choice-button scheduler-skeleton-choice-button-compact" />
+	              </div>
+	            </div>
+	          </div>
 
-          <div className="field-shell scheduler-profile-selector-shell scheduler-skeleton-shell">
-            <span className="skeleton-line skeleton-line-kicker" />
-            <div className="scheduler-selected-target-grid scheduler-skeleton-target-grid">
-              <span className="skeleton-line scheduler-skeleton-target-card" />
-              <span className="skeleton-line scheduler-skeleton-target-card" />
-            </div>
-          </div>
+	          <div className="field-shell scheduler-profile-selector-shell scheduler-skeleton-shell">
+	            <span className="skeleton-line skeleton-line-kicker" />
+	            <div className="scheduler-selected-target-grid scheduler-skeleton-target-grid">
+	              <span className="skeleton-line scheduler-skeleton-target-card" />
+	              <span className="skeleton-line scheduler-skeleton-target-card" />
+	            </div>
+	          </div>
 
-          <span className="skeleton-line skeleton-line-input" />
+	          <label className="field-shell">
+	            <span className="skeleton-line skeleton-line-kicker" />
+	            <span className="skeleton-line skeleton-line-input" />
+	          </label>
 
-          <div className="form-grid form-grid-two scheduler-top-grid">
-            <span className="skeleton-line skeleton-line-input" />
-            <span className="skeleton-line skeleton-line-input" />
-          </div>
+	          <div className="form-grid form-grid-two scheduler-top-grid">
+	            <span className="skeleton-line skeleton-line-input" />
+	            <span className="skeleton-line skeleton-line-input" />
+	          </div>
 
-          <span className="skeleton-line skeleton-line-text-medium" />
+	          <div className="text-chip scheduler-inline-helper scheduler-skeleton-helper-chip" aria-hidden="true">
+	            <span className="skeleton-line scheduler-skeleton-helper-text" />
+	          </div>
 
-          <div className="upload-shell scheduler-skeleton-upload-shell">
-            <span className="skeleton-line skeleton-line-kicker" />
-            <span className="skeleton-line scheduler-skeleton-upload-dropzone" />
-            <div className="scheduler-skeleton-upload-preview-row">
-              <span className="skeleton-line scheduler-skeleton-upload-thumb" />
-              <span className="skeleton-line scheduler-skeleton-upload-thumb" />
-              <span className="skeleton-line scheduler-skeleton-upload-thumb" />
-            </div>
-          </div>
+	          <div className="upload-shell scheduler-skeleton-upload-shell">
+	            <span className="skeleton-line skeleton-line-kicker" />
+	            <div className="upload-dropzone scheduler-skeleton-upload-dropzone" aria-hidden="true">
+	              <span className="skeleton-line scheduler-skeleton-dropzone-icon" />
+	              <div className="scheduler-skeleton-dropzone-copy">
+	                <span className="skeleton-line scheduler-skeleton-dropzone-title" />
+	                <span className="skeleton-line scheduler-skeleton-dropzone-subtitle" />
+	              </div>
+	            </div>
+	          </div>
 
-          <span className="skeleton-line skeleton-line-textarea" />
-          <span className="skeleton-line skeleton-line-input" />
-          <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" />
-        </div>
-      </section>
-    );
-  }
+	          <span className="skeleton-line skeleton-line-textarea" />
+	          <span className="skeleton-line skeleton-line-input" />
+	          <span className="skeleton-line skeleton-line-button skeleton-line-button-wide" />
+	        </div>
+	      </section>
+	    );
+	  }
 
   function renderMediaSkeleton() {
     return (
