@@ -197,6 +197,10 @@ const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
 const STRIPE_WEBHOOK_PATH = "/billing/stripe/webhook";
 const POST_FOR_ME_WEBHOOK_SECRET = (process.env.POST_FOR_ME_WEBHOOK_SECRET || "").trim();
 const POST_FOR_ME_WEBHOOK_PATH = "/integrations/post-for-me/webhook";
+const RESEND_API_KEY = (process.env.RESEND_API_KEY || "").trim();
+const PASSWORD_RESET_FROM_EMAIL = (process.env.PASSWORD_RESET_FROM_EMAIL || "SocialUp <no-reply@socialup.space>").trim();
+const PASSWORD_RESET_EXPIRES_MINUTES = parseEnvPositiveInt(process.env.PASSWORD_RESET_EXPIRES_MINUTES, 30);
+const PASSWORD_RESET_PATH = (process.env.PASSWORD_RESET_PATH || "/reset-password").trim() || "/reset-password";
 const POST_FOR_ME_WEBHOOK_PUBLIC_BASE_URL = (process.env.POST_FOR_ME_WEBHOOK_PUBLIC_BASE_URL || "")
   .trim()
   .replace(/\/+$/, "");
@@ -221,6 +225,33 @@ const WHATSAPP_CONNECTION_MONITOR_INTERVAL_MS = Math.max(
   3_000,
   Number.parseInt(process.env.WHATSAPP_CONNECTION_MONITOR_INTERVAL_MS || "5000", 10) || 5_000,
 );
+const WHATSAPP_CONNECTED_DOWNGRADE_GRACE_MS = Math.max(
+  60_000,
+  Number.parseInt(process.env.WHATSAPP_CONNECTED_DOWNGRADE_GRACE_MS || "600000", 10) || 600_000,
+);
+const WHATSAPP_AUTH_IN_PROGRESS_STALE_MS = Math.max(
+  60_000,
+  Number.parseInt(process.env.WHATSAPP_AUTH_IN_PROGRESS_STALE_MS || "180000", 10) || 180_000,
+);
+const WHATSAPP_QR_WARMUP_THROTTLE_MS = Math.max(
+  2_000,
+  Number.parseInt(process.env.WHATSAPP_QR_WARMUP_THROTTLE_MS || "4000", 10) || 4_000,
+);
+
+const whatsappQrWarmupLastAttemptAtByConnectionId = new Map<string, number>();
+
+function maybeWarmupWhatsappQr(connectionId: string): void {
+  const nowMs = Date.now();
+  const lastAttemptMs = whatsappQrWarmupLastAttemptAtByConnectionId.get(connectionId) ?? 0;
+  if (nowMs - lastAttemptMs < WHATSAPP_QR_WARMUP_THROTTLE_MS) {
+    return;
+  }
+
+  whatsappQrWarmupLastAttemptAtByConnectionId.set(connectionId, nowMs);
+  void requestWhatsappQr(connectionId, false).catch(() => {
+    // O erro ja e registrado/propagado pelo fluxo de QR em outros pontos.
+  });
+}
 
 type DefaultPlanSeed = {
   code: string;
@@ -402,6 +433,85 @@ function normalizeUserTimeZone(value: string | null | undefined): string {
 function normalizeEmail(value: string | null | undefined): string | null {
   const normalized = (value || "").trim().toLowerCase();
   return normalized.length > 0 ? normalized : null;
+}
+
+function hashPasswordResetToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function resolvePasswordResetBaseUrl(request: Request): string {
+  const configured = (process.env.APP_PUBLIC_URL || "").trim().replace(/\/+$/, "");
+  if (configured) {
+    return configured;
+  }
+
+  const origin = request.get("origin")?.trim().replace(/\/+$/, "");
+  if (origin) {
+    return origin;
+  }
+
+  return "http://localhost:5173";
+}
+
+function buildPasswordResetUrl(request: Request, token: string): string {
+  const baseUrl = resolvePasswordResetBaseUrl(request);
+  const normalizedPath = PASSWORD_RESET_PATH.startsWith("/") ? PASSWORD_RESET_PATH : `/${PASSWORD_RESET_PATH}`;
+  const url = new URL(normalizedPath, baseUrl);
+  url.searchParams.set("key", token);
+  return url.toString();
+}
+
+async function sendPasswordResetEmail(input: {
+  to: string;
+  name: string;
+  resetUrl: string;
+  expiresMinutes: number;
+}): Promise<void> {
+  if (!RESEND_API_KEY) {
+    throw new Error("RESEND_API_KEY_MISSING");
+  }
+
+  const subject = "Redefinição de senha da SocialUp";
+  const text =
+    `Olá, ${input.name}.\n\n` +
+    "Você solicitou a redefinição da sua senha na SocialUp.\n\n" +
+    `Use este link para criar uma nova senha nos próximos ${input.expiresMinutes} minutos:\n${input.resetUrl}\n\n` +
+    "Se você não solicitou isso, ignore este email.";
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;color:#111827;line-height:1.55">
+      <h2 style="margin:0 0 12px;color:#db2777">Redefinição de senha</h2>
+      <p>Olá, ${escapeHtml(input.name)}.</p>
+      <p>Você solicitou a redefinição da sua senha na SocialUp.</p>
+      <p>
+        <a href="${escapeHtml(input.resetUrl)}" style="display:inline-block;background:#111827;color:#ffffff;text-decoration:none;border-radius:12px;padding:12px 18px;font-weight:700">
+          Criar nova senha
+        </a>
+      </p>
+      <p>Este link expira em ${input.expiresMinutes} minutos.</p>
+      <p style="color:#64748b;font-size:13px">Se você não solicitou isso, ignore este email.</p>
+    </div>
+  `;
+
+  const resendResponse = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: PASSWORD_RESET_FROM_EMAIL,
+      to: [input.to],
+      subject,
+      text,
+      html,
+    }),
+  });
+
+  if (!resendResponse.ok) {
+    const body = await resendResponse.text().catch(() => "");
+    throw new Error(`RESEND_SEND_FAILED:${resendResponse.status}:${body}`);
+  }
 }
 
 async function findUserByLoginIdentifier(identifier: string): Promise<{
@@ -1291,12 +1401,25 @@ function applyConnectionWorkerOverlay(connection: {
   id: string;
   companyId: string;
   platform?: string;
+  providerMetadata?: Prisma.JsonValue | null;
 }): Partial<Record<string, unknown>> {
   if (connection.platform !== "whatsapp") {
     return {};
   }
 
-  return getWhatsappConnectionOverlay(connection.id);
+  const metadata =
+    connection.providerMetadata && typeof connection.providerMetadata === "object" && !Array.isArray(connection.providerMetadata)
+      ? connection.providerMetadata as Record<string, unknown>
+      : {};
+  const overlay = getWhatsappConnectionOverlay(connection.id);
+
+  return {
+    whatsappOwnerJid:
+      typeof metadata.whatsappOwnerJid === "string" ? metadata.whatsappOwnerJid : null,
+    whatsappProfileName:
+      typeof metadata.whatsappProfileName === "string" ? metadata.whatsappProfileName : null,
+    ...overlay,
+  };
 }
 
 const app = express();
@@ -1403,15 +1526,19 @@ const firebaseGoogleLoginSchema = z.object({
   idToken: z.string().trim().min(1),
 });
 
-const setupInviteQuerySchema = z.object({
-  key: z.string().min(1),
+const passwordResetRequestSchema = z.object({
+  email: authEmailSchema,
 });
 
-const createUserFromInviteSchema = z.object({
-  key: z.string().min(1),
+const passwordResetConfirmSchema = z.object({
+  key: z.string().trim().min(32).max(256),
+  password: z.string().min(8).max(128),
+});
+
+const createPublicUserSchema = z.object({
   name: z.string().min(2).max(80),
   email: authEmailSchema,
-  username: z.string().min(3).max(32).regex(/^[a-z0-9._-]+$/i),
+  username: z.string().min(3).max(32).regex(/^[a-z0-9._-]+$/i).optional(),
   password: z.string().min(8).max(128),
 });
 
@@ -5804,6 +5931,7 @@ async function resolveConnectionRuntimeMetadata(connection: {
   loginIdentifier: string | null;
   secretCipher?: string | null;
   authStatus: string;
+  providerMetadata?: Prisma.JsonValue | null;
 }): Promise<ConnectionRuntimeMetadata> {
   if (connection.authStatus !== "CONNECTED") {
     return {};
@@ -5854,6 +5982,19 @@ async function resolveConnectionRuntimeMetadata(connection: {
   }
 
   if (connection.platform === "whatsapp") {
+    const storedMetadata =
+      connection.providerMetadata && typeof connection.providerMetadata === "object" && !Array.isArray(connection.providerMetadata)
+        ? connection.providerMetadata as Record<string, unknown>
+        : {};
+    const storedProfileName = typeof storedMetadata.whatsappProfileName === "string" ? storedMetadata.whatsappProfileName : null;
+    const storedOwnerJid = typeof storedMetadata.whatsappOwnerJid === "string" ? storedMetadata.whatsappOwnerJid : null;
+    if (storedProfileName || storedOwnerJid) {
+      return {
+        whatsappProfileName: storedProfileName,
+        whatsappOwnerJid: storedOwnerJid,
+      };
+    }
+
     try {
       const metadata = await withTimeout(
         resolveWhatsappConnectionRuntimeMetadata({
@@ -5867,6 +6008,18 @@ async function resolveConnectionRuntimeMetadata(connection: {
         3_000,
         "WHATSAPP_CONNECTION_METADATA_TIMEOUT",
       );
+
+      if (metadata.profileName || metadata.ownerJid) {
+        await prisma.socialConnection.update({
+          where: { id: connection.id },
+          data: {
+            providerMetadata: {
+              whatsappProfileName: metadata.profileName,
+              whatsappOwnerJid: metadata.ownerJid,
+            },
+          },
+        });
+      }
 
       return {
         whatsappProfileName: metadata.profileName,
@@ -6104,6 +6257,36 @@ async function syncConnectionRuntimeState(connection: {
     return connection;
   }
 
+  if (connection.authStatus === "CONNECTED") {
+    return connection;
+  }
+
+  if (connection.authStatus === "AUTH_IN_PROGRESS") {
+    const now = new Date();
+    const lastSeenAtMs = connection.lastSeenAt instanceof Date ? connection.lastSeenAt.getTime() : 0;
+    const ageMs = lastSeenAtMs > 0 ? now.getTime() - lastSeenAtMs : Number.POSITIVE_INFINITY;
+    if (ageMs > WHATSAPP_AUTH_IN_PROGRESS_STALE_MS) {
+      try {
+        const updatedConnection = await withPrismaConnectionRetry(
+          () =>
+            prisma.socialConnection.update({
+              where: { id: connection.id },
+              data: {
+                authStatus: "AUTH_REQUIRED",
+                authLaunchUrl: null,
+                lastSeenAt: null,
+                lastAuthAt: null,
+              },
+            }),
+          { maxAttempts: 3, retryDelayMs: 350 },
+        );
+        return updatedConnection;
+      } catch {
+        // Se falhar, segue com o estado atual; outros fluxos podem corrigir depois.
+      }
+    }
+  }
+
   const now = new Date();
   const overlay = getWhatsappConnectionOverlay(connection.id) as {
     qrStatus?: unknown;
@@ -6121,7 +6304,8 @@ async function syncConnectionRuntimeState(connection: {
     overlayWorkerLastSeenAt !== null &&
     now.getTime() - overlayWorkerLastSeenAt.getTime() < 2 * 60 * 1000;
   const hasRecentLastAuthAt =
-    connection.lastAuthAt instanceof Date && now.getTime() - connection.lastAuthAt.getTime() < 2 * 60 * 1000;
+    connection.lastAuthAt instanceof Date &&
+    now.getTime() - connection.lastAuthAt.getTime() < WHATSAPP_CONNECTED_DOWNGRADE_GRACE_MS;
 
   let runtimeAuthStatus: "CONNECTED" | "AUTH_IN_PROGRESS" | "AUTH_REQUIRED" | null = null;
   try {
@@ -6205,6 +6389,17 @@ async function syncConnectionRuntimeState(connection: {
     return connection;
   }
 
+  if (
+    connection.authStatus === "AUTH_IN_PROGRESS" &&
+    runtimeAuthStatus === "AUTH_IN_PROGRESS" &&
+    !hasRecentQrOverlayActivity &&
+    (overlayQrStatus === null || overlayQrStatus === "IDLE")
+  ) {
+    // Se o backend reiniciar durante a geracao, o overlay some e a UI fica presa em "Gerando...".
+    // Re-aquece o fluxo do QR de forma throttled, sem forcar regeneracao.
+    maybeWarmupWhatsappQr(connection.id);
+  }
+
   if (!runtimeAuthStatus || runtimeAuthStatus === connection.authStatus) {
     return connection;
   }
@@ -6236,7 +6431,7 @@ async function syncConnectionRuntimeState(connection: {
         data: {
           authStatus: runtimeAuthStatus,
           authLaunchUrl: runtimeAuthStatus === "CONNECTED" ? null : connection.authLaunchUrl,
-          lastAuthAt: runtimeAuthStatus === "CONNECTED" ? connection.lastAuthAt ?? now : connection.lastAuthAt,
+          lastAuthAt: runtimeAuthStatus === "CONNECTED" ? now : connection.lastAuthAt,
           lastSeenAt: runtimeAuthStatus === "AUTH_REQUIRED" ? null : now,
         },
       }),
@@ -6302,6 +6497,27 @@ function startWhatsappConnectionStateMonitor(): void {
           continue;
         }
 
+        if (connection.authStatus === "CONNECTED" && runtimeAuthStatus !== "CONNECTED") {
+          const now = new Date();
+          const overlay = getWhatsappConnectionOverlay(connection.id) as {
+            qrStatus?: unknown;
+            workerLastSeenAt?: unknown;
+          };
+          const overlayQrStatus = typeof overlay.qrStatus === "string" ? overlay.qrStatus : null;
+          const overlayWorkerLastSeenAt = overlay.workerLastSeenAt instanceof Date ? overlay.workerLastSeenAt : null;
+          const hasRecentConnectedOverlay =
+            overlayQrStatus === "CONNECTED" &&
+            overlayWorkerLastSeenAt !== null &&
+            now.getTime() - overlayWorkerLastSeenAt.getTime() < WHATSAPP_CONNECTED_DOWNGRADE_GRACE_MS;
+          const hasRecentLastAuthAt =
+            connection.lastAuthAt instanceof Date &&
+            now.getTime() - connection.lastAuthAt.getTime() < WHATSAPP_CONNECTED_DOWNGRADE_GRACE_MS;
+
+          if (hasRecentConnectedOverlay || hasRecentLastAuthAt) {
+            continue;
+          }
+        }
+
         const updatedConnection = await withPrismaConnectionRetry(
           () =>
             prisma.socialConnection.update({
@@ -6309,10 +6525,7 @@ function startWhatsappConnectionStateMonitor(): void {
               data: {
                 authStatus: runtimeAuthStatus,
                 authLaunchUrl: runtimeAuthStatus === "CONNECTED" ? null : connection.authLaunchUrl,
-                lastAuthAt:
-                  runtimeAuthStatus === "CONNECTED"
-                    ? connection.lastAuthAt ?? new Date()
-                    : connection.lastAuthAt,
+                lastAuthAt: runtimeAuthStatus === "CONNECTED" ? new Date() : connection.lastAuthAt,
                 lastSeenAt: runtimeAuthStatus === "AUTH_REQUIRED" ? null : new Date(),
               },
             }),
@@ -11908,51 +12121,19 @@ app.get("/events", async (request, response) => {
   });
 });
 
-app.get("/auth/setup-access", async (request, response) => {
-  const query = setupInviteQuerySchema.parse(request.query);
-  const invite = await prisma.setupInvite.findFirst({
-    where: {
-      inviteKey: query.key,
-      usedAt: null,
-    },
-    select: {
-      inviteKey: true,
-      createdAt: true,
-    },
-  });
-
-  if (!invite) {
-    response.status(404).json({ error: "Chave de cadastro invalida ou ja utilizada." });
-    return;
-  }
-
-  response.json({
-    valid: true,
-    inviteKey: invite.inviteKey,
-    createdAt: invite.createdAt,
-  });
-});
-
-app.post("/auth/setup-access", async (request, response) => {
-  const payload = createUserFromInviteSchema.parse(request.body);
+app.post("/auth/register", async (request, response) => {
+  const payload = createPublicUserSchema.parse(request.body);
   const billingSettings = await getBillingSettingsSnapshot();
   const normalizedEmail = normalizeEmail(payload.email);
+  const username = payload.username
+    ? normalizeUsernameCandidate(payload.username)
+    : await resolveAvailableUsername(prisma, normalizedEmail?.split("@")[0] || payload.name || "usuario");
 
-  const invite = await prisma.setupInvite.findFirst({
-    where: {
-      inviteKey: payload.key,
-      usedAt: null,
-    },
-  });
-
-  if (!invite) {
-    response.status(404).json({ error: "Chave de cadastro invalida ou ja utilizada." });
-    return;
-  }
-
-  const existingUser = await prisma.user.findUnique({
-    where: { username: payload.username },
-  });
+  const existingUser = payload.username
+    ? await prisma.user.findUnique({
+        where: { username },
+      })
+    : null;
 
   if (existingUser) {
     response.status(409).json({ error: "Ja existe um usuario com esse username." });
@@ -11970,12 +12151,12 @@ app.post("/auth/setup-access", async (request, response) => {
     return;
   }
 
-  const user = await prisma.$transaction(async (transaction) => {
-    const createdUser = await transaction.user.create({
-      data: {
-        name: payload.name,
-        email: normalizedEmail,
-        username: payload.username,
+  const createdUser = await prisma.$transaction(async (transaction) => {
+    const user = await transaction.user.create({
+        data: {
+          name: payload.name,
+          email: normalizedEmail,
+          username,
         passwordHash: hashPassword(payload.password),
         needsPlanSelection: true,
         role: "ADMIN",
@@ -11985,24 +12166,37 @@ app.post("/auth/setup-access", async (request, response) => {
         name: true,
         username: true,
         email: true,
-        role: true,
         timeZone: true,
-        createdAt: true,
+        role: true,
       },
     });
 
-    await createInitialBillingSubscriptionForUser(transaction, createdUser.id, billingSettings);
-
-    await transaction.setupInvite.update({
-      where: { id: invite.id },
-      data: { usedAt: new Date() },
-    });
-
-    return createdUser;
+    await createInitialBillingSubscriptionForUser(transaction, user.id, billingSettings);
+    return user;
   });
 
-  const authUserPayload = await buildAuthUserPayload(user);
-  response.status(201).json(authUserPayload);
+  const sessionToken = createRandomToken();
+  const authenticatedUser = await prisma.user.update({
+    where: { id: createdUser.id },
+    data: {
+      sessionToken,
+      sessionIssuedAt: new Date(),
+    },
+    select: {
+      id: true,
+      name: true,
+      username: true,
+      email: true,
+      timeZone: true,
+      role: true,
+    },
+  });
+
+  const authUserPayload = await buildAuthUserPayload(authenticatedUser);
+  response.status(201).json({
+    sessionToken,
+    user: authUserPayload,
+  });
 });
 
 app.get("/auth/workspace-access", async (request, response) => {
@@ -12159,9 +12353,200 @@ app.post("/auth/workspace-access/setup", async (request, response) => {
   }
 });
 
+app.post("/auth/password-reset/request", async (request, response) => {
+  const payload = passwordResetRequestSchema.parse(request.body);
+  const normalizedEmail = normalizeEmail(payload.email);
+
+  if (!normalizedEmail) {
+    response.json({ ok: true });
+    return;
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { email: normalizedEmail },
+    select: {
+      id: true,
+      name: true,
+      email: true,
+      passwordHash: true,
+      authProviders: {
+        where: {
+          provider: "GOOGLE",
+        },
+        select: {
+          id: true,
+        },
+        take: 1,
+      },
+    },
+  });
+
+  if (!user?.email) {
+    response.json({ ok: true });
+    return;
+  }
+
+  if (!user.passwordHash && user.authProviders.length > 0) {
+    response.status(400).json({
+      error: "Essa conta foi criada pelo Google. Entre usando o botão Entrar/Cadastrar com Google.",
+    });
+    return;
+  }
+
+  const token = createRandomToken(32);
+  const expiresAt = new Date(Date.now() + PASSWORD_RESET_EXPIRES_MINUTES * 60 * 1000);
+
+  await prisma.$transaction([
+    prisma.passwordResetToken.updateMany({
+      where: {
+        userId: user.id,
+        consumedAt: null,
+      },
+      data: {
+        consumedAt: new Date(),
+      },
+    }),
+    prisma.passwordResetToken.deleteMany({
+      where: {
+        expiresAt: {
+          lt: new Date(Date.now() - 24 * 60 * 60 * 1000),
+        },
+      },
+    }),
+    prisma.passwordResetToken.create({
+      data: {
+        userId: user.id,
+        tokenHash: hashPasswordResetToken(token),
+        expiresAt,
+      },
+    }),
+  ]);
+
+  try {
+    await sendPasswordResetEmail({
+      to: user.email,
+      name: user.name,
+      resetUrl: buildPasswordResetUrl(request, token),
+      expiresMinutes: PASSWORD_RESET_EXPIRES_MINUTES,
+    });
+  } catch (error) {
+    console.error("Password reset email error", error);
+    response.status(503).json({ error: "Não foi possível enviar o email agora. Tente novamente em instantes." });
+    return;
+  }
+
+  response.json({ ok: true });
+});
+
+app.post("/auth/password-reset/confirm", async (request, response) => {
+  const payload = passwordResetConfirmSchema.parse(request.body);
+  const tokenHash = hashPasswordResetToken(payload.key);
+  const now = new Date();
+
+  const resetToken = await prisma.passwordResetToken.findFirst({
+    where: {
+      tokenHash,
+      consumedAt: null,
+      expiresAt: {
+        gt: now,
+      },
+    },
+    select: {
+      id: true,
+      userId: true,
+      user: {
+        select: {
+          id: true,
+          name: true,
+          username: true,
+          email: true,
+          timeZone: true,
+          role: true,
+        },
+      },
+    },
+  });
+
+  if (!resetToken) {
+    response.status(400).json({ error: "Link de recuperação inválido ou expirado." });
+    return;
+  }
+
+  const sessionToken = createRandomToken();
+  const authenticatedUser = await prisma.$transaction(async (transaction) => {
+    const consumed = await transaction.passwordResetToken.updateMany({
+      where: {
+        id: resetToken.id,
+        consumedAt: null,
+      },
+      data: {
+        consumedAt: now,
+      },
+    });
+
+    if (consumed.count !== 1) {
+      throw new Error("PASSWORD_RESET_TOKEN_CONSUMED");
+    }
+
+    await transaction.passwordResetToken.updateMany({
+      where: {
+        userId: resetToken.userId,
+        consumedAt: null,
+      },
+      data: {
+        consumedAt: now,
+      },
+    });
+
+    return transaction.user.update({
+      where: { id: resetToken.userId },
+      data: {
+        passwordHash: hashPassword(payload.password),
+        sessionToken,
+        sessionIssuedAt: now,
+      },
+      select: {
+        id: true,
+        name: true,
+        username: true,
+        email: true,
+        timeZone: true,
+        role: true,
+      },
+    });
+  });
+
+  const authUserPayload = await buildAuthUserPayload(authenticatedUser);
+  response.json({
+    sessionToken,
+    user: authUserPayload,
+  });
+});
+
 app.post("/auth/login", async (request, response) => {
   const payload = loginSchema.parse(request.body);
   const user = await findUserByLoginIdentifier(payload.identifier);
+
+  if (user && !user.passwordHash) {
+    const googleProvider = await prisma.userAuthProvider.findUnique({
+      where: {
+        userId_provider: {
+          userId: user.id,
+          provider: "GOOGLE",
+        },
+      },
+      select: {
+        id: true,
+      },
+    });
+
+    if (googleProvider) {
+      response.status(401).json({
+        error: "Essa conta foi criada pelo Google. Entre usando o botão Entrar/Cadastrar com Google.",
+      });
+      return;
+    }
+  }
 
   if (!user || !verifyPassword(payload.password, user.passwordHash)) {
     response.status(401).json({ error: "Email, usuario ou senha invalidos." });
@@ -12309,6 +12694,27 @@ app.post("/auth/logout", adminAuthMiddleware, async (request, response) => {
       sessionIssuedAt: null,
     },
   });
+  response.status(204).send();
+});
+
+app.delete("/auth/account", adminAuthMiddleware, async (request, response) => {
+  const user = (request as Request & { adminUser?: { id: string; username: string } }).adminUser!;
+
+  if (user.username === "root") {
+    response.status(403).json({ error: "A conta root não pode ser excluída." });
+    return;
+  }
+
+  await prisma.$transaction(async (transaction) => {
+    await transaction.company.deleteMany({
+      where: { createdByUserId: user.id },
+    });
+
+    await transaction.user.delete({
+      where: { id: user.id },
+    });
+  });
+
   response.status(204).send();
 });
 
@@ -13076,7 +13482,9 @@ registerBeeUpRoutes(app, {
   isRootUser,
   resolveUserBillingAccess,
   requestWhatsappQr,
+  getWhatsappConnectionOverlay,
   appendLog,
+  appendAviso,
 });
 
 app.get("/connections", async (request, response) => {
@@ -13713,7 +14121,7 @@ app.post("/connections/:id/dismiss-qr", async (request, response) => {
       data: {
         authStatus: "CONNECTED",
         authLaunchUrl: null,
-        lastAuthAt: connection.lastAuthAt ?? new Date(),
+        lastAuthAt: new Date(),
         lastSeenAt: new Date(),
       },
     });

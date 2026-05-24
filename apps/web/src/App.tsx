@@ -4128,7 +4128,7 @@ function resolveSchedulerTargetAccountMeta(connection: SocialConnection): string
   const accountLabel = resolveSchedulerTargetAccountLabel(connection).trim();
 
   if (ownerNumber && ownerNumber !== accountLabel) {
-    return `Número: ${ownerNumber.replace(/^@/, "")}`;
+    return ownerNumber.replace(/^@/, "");
   }
 
   if (ownerNumber && profileName && profileName !== ownerNumber && profileName !== accountLabel) {
@@ -4667,16 +4667,35 @@ function App() {
     const stored = window.localStorage.getItem(REMEMBER_ME_STORAGE_KEY);
     return stored === null ? true : stored === "true";
   });
-  const [setupKey, setSetupKey] = useState(() => new URLSearchParams(window.location.search).get("setupKey") ?? "");
   const [workspaceInviteKey, setWorkspaceInviteKey] = useState(
     () => new URLSearchParams(window.location.search).get("workspaceInviteKey") ?? "",
   );
-  const [setupInviteValid, setSetupInviteValid] = useState(false);
   const [workspaceInvitePreview, setWorkspaceInvitePreview] = useState<WorkspaceInvitePreview | null>(null);
+  const [authMode, setAuthMode] = useState<"login" | "signup" | "forgot" | "reset">(() => {
+    if (typeof window === "undefined") {
+      return "login";
+    }
+
+    return new URLSearchParams(window.location.search).get("key") ? "reset" : "login";
+  });
   const [workspaceInviteMode, setWorkspaceInviteMode] = useState<"login" | "create">("login");
   const [acceptingWorkspaceInvite, setAcceptingWorkspaceInvite] = useState(false);
   const [creatingWorkspaceInviteUser, setCreatingWorkspaceInviteUser] = useState(false);
+  const [creatingSignupUser, setCreatingSignupUser] = useState(false);
+  const [requestingPasswordReset, setRequestingPasswordReset] = useState(false);
+  const [confirmingPasswordReset, setConfirmingPasswordReset] = useState(false);
+  const [passwordResetEmail, setPasswordResetEmail] = useState("");
+  const [passwordResetKey, setPasswordResetKey] = useState(() => {
+    if (typeof window === "undefined") {
+      return "";
+    }
+
+    return new URLSearchParams(window.location.search).get("key") ?? "";
+  });
+  const [passwordResetPassword, setPasswordResetPassword] = useState("");
+  const [passwordResetConfirmPassword, setPasswordResetConfirmPassword] = useState("");
   const [setupName, setSetupName] = useState("");
+  const [setupLastName, setSetupLastName] = useState("");
   const [setupEmail, setSetupEmail] = useState("");
   const [setupUsername, setSetupUsername] = useState("");
   const [setupPassword, setSetupPassword] = useState("");
@@ -4685,6 +4704,7 @@ function App() {
   const googleAuthPopupRef = useRef<Window | null>(null);
   const googleAuthPopupWatchIntervalRef = useRef<number | null>(null);
   const googleAuthResultReceivedRef = useRef(false);
+  const suppressLoginSubmitUntilRef = useRef(0);
   const activePostForMeSyncConnectionIdRef = useRef<string | null>(null);
   const postForMeAuthPopupRef = useRef<Window | null>(null);
   const postForMeAuthPopupConnectionIdRef = useRef<string | null>(null);
@@ -4898,6 +4918,7 @@ function App() {
   const [rootAssignPlanId, setRootAssignPlanId] = useState("");
   const [assigningRootPlan, setAssigningRootPlan] = useState(false);
   const [cancelingStripeSubscription, setCancelingStripeSubscription] = useState(false);
+  const [deletingAccount, setDeletingAccount] = useState(false);
   const [isBillingDiscountModalOpen, setIsBillingDiscountModalOpen] = useState(false);
   const [billingDiscountUsers, setBillingDiscountUsers] = useState<BillingUserDiscountItem[]>([]);
   const [billingDiscountUsersLoading, setBillingDiscountUsersLoading] = useState(false);
@@ -5101,6 +5122,12 @@ function App() {
   );
   const isEditingBroadcastAviso = Boolean(editingNoticeBroadcastKey);
   const isRootUser = authUser?.username === "root";
+  const isTwoWorkspaceAccountPlan =
+    !isRootUser &&
+    (billingMe?.plan
+      ? billingMe.plan.workspaceLimit <= 2 && billingMe.plan.agencyBonusWorkspaceLimit <= 0
+      : (authUser?.billingPlanCode || "").trim().toUpperCase() === "SINGLE");
+  const shouldShowFeedbackNotifications = !isTwoWorkspaceAccountPlan;
   const normalizedAuthUsername = normalizeProfileRouteUsername(authUser?.username);
   const resolvedProfileRouteUsername = profileRouteUsername || normalizedAuthUsername || null;
   const resolvedProfilePageTab: ProfilePageTab = activeView === "plan" ? "plan" : profilePageTab;
@@ -5619,12 +5646,23 @@ function App() {
       return false;
     }
 
-    if ((billingMe?.plan?.workspaceLimit ?? 0) > 0) {
+    const authPlanCode = (authUser?.billingPlanCode || "").trim().toUpperCase();
+    const workspaceLimit =
+      billingMe?.plan?.workspaceLimit ?? (authPlanCode === "SINGLE" ? 2 : authPlanCode === "AGENCY" ? 5 : 0);
+
+    if (workspaceLimit > 0) {
       return true;
     }
 
     return companies.some((company) => company.canManageWorkspace);
-  }, [billingMe?.plan?.workspaceLimit, companies, isBlockedBilling, isRootUser, shouldRenderInitialPlanSelection]);
+  }, [
+    authUser?.billingPlanCode,
+    billingMe?.plan?.workspaceLimit,
+    companies,
+    isBlockedBilling,
+    isRootUser,
+    shouldRenderInitialPlanSelection,
+  ]);
   const canCreateAgencyBonusWorkspace = isRootUser || (billingMe?.plan?.agencyBonusWorkspaceLimit ?? 0) > 0;
   const hasAnyWorkspaceInviteSupport = useMemo(
     () => isRootUser || companies.some((company) => company.supportsWorkspaceInvites),
@@ -5703,7 +5741,9 @@ function App() {
       return Boolean(connection.qrImageDataUrl || connection.qrMessage?.trim());
     }
 
-    return connection.qrStatus === "PREPARING";
+    // "PREPARING" sem QR visivel nao deve ser tratado como reaproveitavel.
+    // Isso evita ficar mostrando "Abrir QR" quando o backend perdeu o overlay ou a geracao falhou.
+    return false;
   }
 
   const activeQrHeading =
@@ -6540,6 +6580,29 @@ function App() {
   }, [activeQrConnection, qrRequestingConnectionId]);
 
   useEffect(() => {
+    if (!activeQrConnectionId) {
+      return;
+    }
+
+    const connection = connections.find((entry) => entry.id === activeQrConnectionId) ?? null;
+    if (!connection || connection.platform !== "whatsapp") {
+      setActiveQrConnectionId(null);
+      setQrRequestingConnectionId(null);
+      return;
+    }
+
+    const qrStatus = connection.qrStatus ?? "IDLE";
+    const hasActiveQrFlow =
+      qrStatus === "PREPARING" || qrStatus === "WAITING_QR_SCAN" || qrStatus === "QR_EXPIRED";
+
+    // Se nao existe QR ativo/visivel, nao deixa o "activeQrConnectionId" forcar o card como "Autenticando".
+    if (!hasActiveQrFlow && !connection.qrImageDataUrl) {
+      setActiveQrConnectionId(null);
+      setQrRequestingConnectionId((current) => (current === connection.id ? null : current));
+    }
+  }, [activeQrConnectionId, connections]);
+
+  useEffect(() => {
     if (!authUser || activeView !== "agents" || !activeQrConnectionId) {
       return;
     }
@@ -6598,12 +6661,17 @@ function App() {
     }
 
     setAgentWorkspaceFilter((current) => {
+      const hasAnyConnectedConnection = connections.some((connection) => connection.authStatus === "CONNECTED");
+      if (!hasAnyConnectedConnection) {
+        return companies[0]?.id ?? "all";
+      }
+
       if (companies.length === 1) {
         return companies[0]?.id ?? "all";
       }
 
       if (previousCount <= 1) {
-        return "all";
+        return companies[0]?.id ?? "all";
       }
 
       if (current === "all") {
@@ -6614,9 +6682,9 @@ function App() {
         return current;
       }
 
-      return "all";
+      return companies[0]?.id ?? "all";
     });
-  }, [companies]);
+  }, [companies, connections]);
 
   useEffect(() => {
     setSelectedCompanyId((current) => {
@@ -6712,16 +6780,59 @@ function App() {
       return "AUTH_REQUIRED";
     }
 
+    if (connection.platform === "whatsapp") {
+      const qrStatus = connection.qrStatus ?? "IDLE";
+      const rawQrMessage = (connection.qrMessage || "").trim();
+      const isPlaceholderQrMessage =
+        rawQrMessage === "" ||
+        rawQrMessage === "Gerando QR do WhatsApp..." ||
+        rawQrMessage === "Preparando QR Code do WhatsApp..." ||
+        rawQrMessage === "Conectando o WhatsApp. Aguarde alguns segundos...";
+      const hasUsefulQrMessage = Boolean(rawQrMessage) && !isPlaceholderQrMessage;
+      const hasQrImage = Boolean(connection.qrImageDataUrl);
+      const hasQrActiveStatus = qrStatus === "WAITING_QR_SCAN" || qrStatus === "QR_EXPIRED";
+      const hasAnyQrEvidence = hasQrImage || hasUsefulQrMessage || hasQrActiveStatus;
+
+      // Se o backend devolveu AUTH_IN_PROGRESS mas nao existe QR "de verdade", nao fica preso em Autenticando.
+      if (connection.authStatus === "AUTH_IN_PROGRESS" && !hasAnyQrEvidence) {
+        const lastSeenAtMs = connection.lastSeenAt ? new Date(connection.lastSeenAt).getTime() : 0;
+        const workerSeenAtMs = connection.workerLastSeenAt ? new Date(connection.workerLastSeenAt).getTime() : 0;
+        const referenceMs = Math.max(lastSeenAtMs, workerSeenAtMs);
+        const ageMs = referenceMs > 0 ? Date.now() - referenceMs : Number.POSITIVE_INFINITY;
+
+        // Damos uma janela curtissima pro "PREPARING" aparecer sem QR, pra evitar flicker.
+        if (qrStatus === "PREPARING" && ageMs < 8_000) {
+          return "AUTH_IN_PROGRESS";
+        }
+
+        return "AUTH_REQUIRED";
+      }
+    }
+
     if (
       connection.platform === "whatsapp" &&
       activeQrConnectionId === connection.id &&
       (connection.qrStatus === "PREPARING" || connection.qrStatus === "WAITING_QR_SCAN" || connection.qrStatus === "QR_EXPIRED")
     ) {
-      return "AUTH_IN_PROGRESS";
+      // Só considera "em progresso" se existe algo de QR para o usuario acompanhar.
+      const rawQrMessage = (connection.qrMessage || "").trim();
+      const isPlaceholderQrMessage =
+        rawQrMessage === "" ||
+        rawQrMessage === "Gerando QR do WhatsApp..." ||
+        rawQrMessage === "Preparando QR Code do WhatsApp..." ||
+        rawQrMessage === "Conectando o WhatsApp. Aguarde alguns segundos...";
+      if (connection.qrImageDataUrl || (rawQrMessage && !isPlaceholderQrMessage)) {
+        return "AUTH_IN_PROGRESS";
+      }
     }
 
     if (connection.platform === "whatsapp" && connection.authStatus === "AUTH_IN_PROGRESS") {
-      return "AUTH_REQUIRED";
+      const lastSeenAtMs = connection.lastSeenAt ? new Date(connection.lastSeenAt).getTime() : 0;
+      const ageMs = lastSeenAtMs > 0 ? Date.now() - lastSeenAtMs : Number.POSITIVE_INFINITY;
+      // Se ficar muito tempo sem evoluir (sem QR ativo), consideramos expirado.
+      if (ageMs > 2 * 60 * 1000 && !connection.qrImageDataUrl) {
+        return "AUTH_REQUIRED";
+      }
     }
 
     return connection.authStatus;
@@ -6743,6 +6854,10 @@ function App() {
     }));
 
     if (companies.length <= 1) {
+      return companyOptions;
+    }
+
+    if (totalConnectedConnections === 0) {
       return companyOptions;
     }
 
@@ -6770,6 +6885,10 @@ function App() {
 
     return companies.filter((company) => company.id === agentWorkspaceFilter);
   }, [agentWorkspaceFilter, companies]);
+
+  // Nota: nao auto-altera o workspace selecionado no filtro.
+  // Mesmo que o workspace nao tenha contas conectadas, o usuario deve conseguir
+  // inspecionar as caixas "Nao conectada" e iniciar a conexao ali mesmo.
 
   const agentConnectionBoardCards = useMemo(() => {
     return agentVisibleWorkspaces
@@ -6814,18 +6933,6 @@ function App() {
       .sort((left, right) => {
         if (!left || !right) {
           return 0;
-        }
-
-        if (left.isConnected !== right.isConnected) {
-          return left.isConnected ? -1 : 1;
-        }
-
-        if (left.isConnected && right.isConnected) {
-          const leftTimestamp = left.connection?.lastAuthAt ?? left.connection?.updatedAt ?? left.connection?.createdAt ?? "";
-          const rightTimestamp = right.connection?.lastAuthAt ?? right.connection?.updatedAt ?? right.connection?.createdAt ?? "";
-          if (leftTimestamp !== rightTimestamp) {
-            return leftTimestamp.localeCompare(rightTimestamp);
-          }
         }
 
         const workspaceCompare = left.workspace.name.localeCompare(right.workspace.name, "pt-BR");
@@ -8668,18 +8775,6 @@ function App() {
   useEffect(() => {
     const bootstrapAuth = async () => {
       try {
-        if (setupKey) {
-          await api.get<{ valid: true }>(`/auth/setup-access?key=${encodeURIComponent(setupKey)}`);
-          setSetupInviteValid(true);
-        }
-      } catch {
-        setSetupInviteValid(false);
-        if (setupKey) {
-          setAuthError("A chave de cadastro informada ja foi usada ou nao e valida.");
-        }
-      }
-
-      try {
         if (workspaceInviteKey) {
           const preview = await api.get<{
             valid: true;
@@ -8702,6 +8797,11 @@ function App() {
         if (workspaceInviteKey) {
           setAuthError("O convite de workspace informado já foi usado, revogado ou não é válido.");
         }
+      }
+
+      if (passwordResetKey) {
+        setAuthChecked(true);
+        return;
       }
 
       const sessionToken = api.getSessionToken();
@@ -8735,7 +8835,7 @@ function App() {
     };
 
     void bootstrapAuth();
-  }, [setupKey, workspaceInviteKey]);
+  }, [passwordResetKey, workspaceInviteKey]);
 
   useEffect(() => {
     if (!authChecked || !authUser || isPopupWindowContext()) {
@@ -15588,6 +15688,9 @@ function App() {
 
   async function login(event: FormEvent) {
     event.preventDefault();
+    if (Date.now() < suppressLoginSubmitUntilRef.current) {
+      return;
+    }
     setAuthError("");
     setAuthSubmitting(true);
 
@@ -15621,6 +15724,79 @@ function App() {
       setAuthError(loginError instanceof Error ? loginError.message : "Falha ao fazer login.");
     } finally {
       setAuthSubmitting(false);
+    }
+  }
+
+  function returnToLoginFromPasswordReset() {
+    suppressLoginSubmitUntilRef.current = Date.now() + 1200;
+    setAuthMode("login");
+    setAuthError("");
+    setAuthInfo("");
+  }
+
+  async function requestPasswordReset(event: FormEvent) {
+    event.preventDefault();
+    setAuthError("");
+    setAuthInfo("");
+    setRequestingPasswordReset(true);
+
+    try {
+      await api.postJson<{ ok: true }>("/auth/password-reset/request", {
+        email: passwordResetEmail,
+      });
+      setAuthInfo("Se esse email estiver cadastrado, enviamos um link para redefinir a senha.");
+    } catch (resetError) {
+      setAuthError(resetError instanceof Error ? resetError.message : "Falha ao solicitar recuperação de senha.");
+    } finally {
+      setRequestingPasswordReset(false);
+    }
+  }
+
+  async function confirmPasswordReset(event: FormEvent) {
+    event.preventDefault();
+    setAuthError("");
+    setAuthInfo("");
+
+    if (passwordResetPassword !== passwordResetConfirmPassword) {
+      setAuthError("As senhas não conferem.");
+      return;
+    }
+
+    setConfirmingPasswordReset(true);
+
+    try {
+      const result = await api.postJson<{ sessionToken: string; user: AuthUser }>("/auth/password-reset/confirm", {
+        key: passwordResetKey,
+        password: passwordResetPassword,
+      });
+
+      api.setSessionToken(result.sessionToken, true);
+      window.localStorage.setItem(REMEMBERED_USERNAME_STORAGE_KEY, result.user.email || result.user.username);
+      setPasswordResetKey("");
+      setPasswordResetPassword("");
+      setPasswordResetConfirmPassword("");
+      setLoginIdentifier(result.user.email || result.user.username);
+      setLoginPassword("");
+      setAuthChecked(true);
+      setAuthUser(result.user);
+      setAuthMode("login");
+      setAuthError("");
+      setAuthInfo("");
+
+      if (typeof window !== "undefined") {
+        window.history.replaceState({}, "", VIEW_ROUTE_MAP.dashboard);
+      }
+
+      if (result.user.needsPlanSelection) {
+        enterInitialPlanSelectionFlow(result.user);
+        return;
+      }
+
+      navigateToView("dashboard");
+    } catch (resetError) {
+      setAuthError(resetError instanceof Error ? resetError.message : "Falha ao redefinir senha.");
+    } finally {
+      setConfirmingPasswordReset(false);
     }
   }
 
@@ -15743,33 +15919,92 @@ function App() {
     }
   }
 
-  async function createUserFromSetup(event: FormEvent) {
-    event.preventDefault();
+  async function deleteAccount() {
+    if (isRootUser) {
+      setAuthError("A conta root não pode ser excluída.");
+      return;
+    }
+
+    const challengeWords = ["socialup", "excluir", "confirmar", "workspace", "seguranca"];
+    const challenge = challengeWords[Math.floor(Math.random() * challengeWords.length)] ?? "excluir";
+    const typed = window.prompt(
+      `Para excluir sua conta definitivamente, digite exatamente: ${challenge}`,
+    );
+
+    if (typed === null) {
+      return;
+    }
+
+    if (typed.trim() !== challenge) {
+      window.alert("Confirmação incorreta. A conta não foi excluída.");
+      return;
+    }
+
+    setDeletingAccount(true);
+    setError("");
     setAuthError("");
 
     try {
-      await api.postJson("/auth/setup-access", {
-        key: setupKey,
-        name: setupName,
+      await api.delete("/auth/account");
+      api.setSessionToken("");
+      setAuthUser(null);
+      setAuthChecked(true);
+      setNoticesPopoverOpen(false);
+      setProfileMenuOpen(false);
+      setSelectedCompanyId("");
+      setActiveView("dashboard");
+      contentLoadingCounterRef.current = 0;
+      setContentLoading(false);
+      window.history.replaceState({}, "", "/");
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : "Falha ao excluir conta.");
+    } finally {
+      setDeletingAccount(false);
+    }
+  }
+
+  async function createPublicUser(event: FormEvent) {
+    event.preventDefault();
+    setCreatingSignupUser(true);
+    setAuthError("");
+    setAuthInfo("");
+
+    try {
+      const fullName = [setupName.trim(), setupLastName.trim()].filter(Boolean).join(" ");
+      const result = await api.postJson<{ sessionToken: string; user: AuthUser }>("/auth/register", {
+        name: fullName,
         email: setupEmail,
-        username: setupUsername,
         password: setupPassword,
       });
 
-      setSetupInviteValid(false);
-      setSetupKey("");
-      setSetupName("");
-      setSetupEmail("");
-      setSetupPassword("");
-      setAuthInfo("Novo usuario criado com sucesso.");
-      setLoginIdentifier(setupEmail);
-      setSetupUsername("");
+      api.setSessionToken(result.sessionToken, rememberMe);
+      if (rememberMe) {
+        window.localStorage.setItem(REMEMBERED_USERNAME_STORAGE_KEY, result.user.email || result.user.username);
+      } else {
+        window.localStorage.removeItem(REMEMBERED_USERNAME_STORAGE_KEY);
+      }
 
-      const url = new URL(window.location.href);
-      url.searchParams.delete("setupKey");
-      window.history.replaceState({}, "", url.toString());
-    } catch (setupError) {
-      setAuthError(setupError instanceof Error ? setupError.message : "Falha ao criar usuario.");
+      setSetupName("");
+      setSetupLastName("");
+      setSetupPassword("");
+      setSetupUsername("");
+      setLoginIdentifier(result.user.email || result.user.username);
+      setLoginPassword("");
+      setAuthError("");
+      setAuthInfo("");
+
+      if (result.user.needsPlanSelection) {
+        enterInitialPlanSelectionFlow(result.user);
+        return;
+      }
+
+      setAuthChecked(true);
+      setAuthUser(result.user);
+      navigateToView("dashboard");
+    } catch (signupError) {
+      setAuthError(signupError instanceof Error ? signupError.message : "Falha ao cadastrar usuario.");
+    } finally {
+      setCreatingSignupUser(false);
     }
   }
 
@@ -16062,13 +16297,20 @@ function App() {
   }
 
   function renderNoticesBell(shellRef: { current: HTMLDivElement | null }, extraClassName = "") {
-    const hasUnreadNotices =
-      unreadAvisosCount > 0;
+    const visibleUnreadNoticesCount =
+      recentAvisosUnreadCounts.panel +
+      recentAvisosUnreadCounts.socialup +
+      (shouldShowFeedbackNotifications ? recentAvisosUnreadCounts.feedbacks : 0);
+    const hasUnreadNotices = visibleUnreadNoticesCount > 0;
     const canMarkAllNoticesAsRead =
       hasUnreadNotices;
+    const effectiveNoticesPopoverTab =
+      noticesPopoverTab === "feedbacks" && !shouldShowFeedbackNotifications ? "panel" : noticesPopoverTab;
     const tabs: Array<{ key: NoticesPopoverTabKey; label: string; unreadCount: number; icon: IconType }> = [
       { key: "panel", label: "Painel", unreadCount: recentAvisosUnreadCounts.panel, icon: FiHome },
-      { key: "feedbacks", label: "Feedbacks", unreadCount: recentAvisosUnreadCounts.feedbacks, icon: FiMessageCircle },
+      ...(shouldShowFeedbackNotifications
+        ? [{ key: "feedbacks" as const, label: "Feedbacks", unreadCount: recentAvisosUnreadCounts.feedbacks, icon: FiMessageCircle }]
+        : []),
       {
         key: "socialup",
         label: "SocialUp",
@@ -16298,8 +16540,8 @@ function App() {
                   key={tab.key}
                   type="button"
                   role="tab"
-                  aria-selected={noticesPopoverTab === tab.key}
-                  className={`notices-panel-tab${noticesPopoverTab === tab.key ? " notices-panel-tab-active" : ""}`}
+                  aria-selected={effectiveNoticesPopoverTab === tab.key}
+                  className={`notices-panel-tab${effectiveNoticesPopoverTab === tab.key ? " notices-panel-tab-active" : ""}`}
                   onClick={() => setNoticesPopoverTab(tab.key)}
                 >
                   <tab.icon aria-hidden="true" />
@@ -16312,9 +16554,9 @@ function App() {
             </div>
 
             <div className="notices-popover-list">
-              {noticesPopoverTab === "panel"
+              {effectiveNoticesPopoverTab === "panel"
                 ? renderUpdatesTab()
-                : noticesPopoverTab === "feedbacks"
+                : effectiveNoticesPopoverTab === "feedbacks"
                   ? renderFeedbackTab()
                   : renderSocialUpTab()}
             </div>
@@ -16325,10 +16567,11 @@ function App() {
   }
 
   function renderAuthScreen() {
-    const showSetup = Boolean(setupKey) && setupInviteValid;
     const showWorkspaceInvite = Boolean(workspaceInviteKey) && Boolean(workspaceInvitePreview);
     const showWorkspaceInviteCreate = showWorkspaceInvite && workspaceInviteMode === "create";
-    const authLoginBusy = authSubmitting || googleAuthSubmitting;
+    const authLoginBusy = authSubmitting || googleAuthSubmitting || creatingSignupUser || requestingPasswordReset || confirmingPasswordReset;
+    const showAuthModeTabs = !showWorkspaceInvite && (authMode === "login" || authMode === "signup");
+    const showAuthSocialAccess = !showWorkspaceInvite && (authMode === "login" || authMode === "signup");
 
     return (
       <div className="auth-shell">
@@ -16336,16 +16579,16 @@ function App() {
           <img src={activeAppLogo} alt="SocialUp" className="brand-logo auth-brand-logo" />
         </div>
 
-        {showSetup || showWorkspaceInviteCreate ? (
+        {showWorkspaceInviteCreate ? (
           <>
             <div className="auth-setup-copy">
-              <h1>{showWorkspaceInviteCreate ? "Entrar no workspace" : "Criar novo usuário"}</h1>
+              <h1>Entrar no workspace</h1>
               <p>
-                {showWorkspaceInviteCreate && workspaceInvitePreview
+                {workspaceInvitePreview
                   ? `Você foi convidado para o workspace ${workspaceInvitePreview.workspace.name} como ${
                       workspaceInvitePreview.role === "CLIENT" ? "cliente" : "equipe da agência"
                     }.`
-                  : "Esta chave de cadastro é de uso único. Depois que o usuário for criado, esse link não poderá ser reutilizado."}
+                  : "Crie sua conta para acessar o workspace compartilhado."}
               </p>
             </div>
 
@@ -16353,7 +16596,7 @@ function App() {
               {authError ? <div className="error-banner">{authError}</div> : null}
               {authInfo ? <div className={`info-banner${isPositiveAuthInfo ? " info-banner-success" : ""}`}>{authInfo}</div> : null}
 
-              <form onSubmit={showWorkspaceInviteCreate ? createUserFromWorkspaceInvite : createUserFromSetup} className="form-stack">
+              <form onSubmit={createUserFromWorkspaceInvite} className="form-stack">
                 <input
                   value={setupName}
                   onChange={(event) => setSetupName(event.target.value)}
@@ -16410,6 +16653,31 @@ function App() {
           </>
         ) : (
           <>
+            {showAuthModeTabs ? (
+              <div className="auth-mode-tabs" role="tablist" aria-label="Acesso">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={authMode === "login"}
+                  className={authMode === "login" ? "auth-mode-tab auth-mode-tab-active" : "auth-mode-tab"}
+                  onClick={() => setAuthMode("login")}
+                  disabled={authLoginBusy}
+                >
+                  Entrar
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={authMode === "signup"}
+                  className={authMode === "signup" ? "auth-mode-tab auth-mode-tab-active" : "auth-mode-tab"}
+                  onClick={() => setAuthMode("signup")}
+                  disabled={authLoginBusy}
+                >
+                  Cadastrar
+                </button>
+              </div>
+            ) : null}
+
             <section className="auth-panel-clean">
               {authError ? <div className="error-banner">{authError}</div> : null}
               {authInfo ? <div className={`info-banner${isPositiveAuthInfo ? " info-banner-success" : ""}`}>{authInfo}</div> : null}
@@ -16421,71 +16689,222 @@ function App() {
                 </div>
               ) : null}
 
-              <form onSubmit={login} className="form-stack">
-                <input
-                  value={loginIdentifier}
-                  onChange={(event) => setLoginIdentifier(event.target.value)}
-                  placeholder="Email ou usuário"
-                  disabled={authLoginBusy}
-                  required
-                  minLength={3}
-                  maxLength={160}
-                  title="Informe seu email ou usuário."
-                />
-                <div className="password-field">
+              {authMode === "forgot" && !showWorkspaceInvite ? (
+                <form onSubmit={requestPasswordReset} className="form-stack">
+                  <div className="auth-flow-copy">
+                    <strong>Recuperar senha</strong>
+                    <span>Informe seu email e enviaremos um link de recuperação.</span>
+                  </div>
                   <input
-                    type={showLoginPassword ? "text" : "password"}
-                    value={loginPassword}
-                    onChange={(event) => setLoginPassword(event.target.value)}
-                    placeholder="Senha"
+                    type="email"
+                    value={passwordResetEmail}
+                    onChange={(event) => setPasswordResetEmail(event.target.value)}
+                    placeholder="Email"
+                    disabled={authLoginBusy}
+                    required
+                    maxLength={160}
+                    title="Informe o email cadastrado."
+                  />
+                  <button type="submit" disabled={authLoginBusy}>
+                    {requestingPasswordReset ? (
+                      <>
+                        <span className="button-spinner" aria-hidden="true" />
+                        Enviando...
+                      </>
+                    ) : (
+                      "Enviar link"
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost-button auth-secondary-action"
+                    onClick={returnToLoginFromPasswordReset}
+                    disabled={authLoginBusy}
+                  >
+                    Voltar para entrar
+                  </button>
+                </form>
+              ) : authMode === "reset" && !showWorkspaceInvite ? (
+                <form onSubmit={confirmPasswordReset} className="form-stack">
+                  <div className="auth-flow-copy">
+                    <strong>Criar nova senha</strong>
+                    <span>Digite e confirme a nova senha para acessar o painel.</span>
+                  </div>
+                  <input
+                    type="password"
+                    value={passwordResetPassword}
+                    onChange={(event) => setPasswordResetPassword(event.target.value)}
+                    placeholder="Nova senha"
+                    autoComplete="new-password"
                     disabled={authLoginBusy}
                     required
                     minLength={8}
                     maxLength={128}
-                    title="Informe sua senha."
+                    title="Defina uma senha com pelo menos 8 caracteres."
                   />
-                  <button
-                    type="button"
-                    className="password-toggle"
-                    onClick={() => setShowLoginPassword((current) => !current)}
-                    disabled={authLoginBusy}
-                    aria-label={showLoginPassword ? "Ocultar senha" : "Mostrar senha"}
-                  >
-                    {showLoginPassword ? <FiEyeOff /> : <FiEye />}
-                  </button>
-                </div>
-                <label className="auth-checkbox-row">
                   <input
-                    type="checkbox"
-                    checked={rememberMe}
-                    onChange={(event) => setRememberMe(event.target.checked)}
+                    type="password"
+                    value={passwordResetConfirmPassword}
+                    onChange={(event) => setPasswordResetConfirmPassword(event.target.value)}
+                    placeholder="Confirmar senha"
+                    autoComplete="new-password"
                     disabled={authLoginBusy}
+                    required
+                    minLength={8}
+                    maxLength={128}
+                    title="Repita a nova senha."
                   />
-                  <span>Manter conectado</span>
-                </label>
-                <button type="submit" disabled={authLoginBusy}>
-                  {authSubmitting ? (
-                    <>
-                      <span className="button-spinner" />
-                      Entrando...
-                    </>
-                  ) : (
-                    "Entrar"
-                  )}
-                </button>
-                {showWorkspaceInvite ? (
-                  <button
-                    type="button"
-                    className="ghost-button"
-                    onClick={() => setWorkspaceInviteMode("create")}
-                    disabled={authLoginBusy}
-                  >
-                    Primeiro acesso? Criar conta
+                  <button type="submit" disabled={authLoginBusy}>
+                    {confirmingPasswordReset ? (
+                      <>
+                        <span className="button-spinner" aria-hidden="true" />
+                        Salvando...
+                      </>
+                    ) : (
+                      "Salvar nova senha"
+                    )}
                   </button>
-                ) : null}
-              </form>
+                </form>
+              ) : authMode === "signup" && !showWorkspaceInvite ? (
+                <form onSubmit={createPublicUser} className="form-stack" autoComplete="off">
+                  <input
+                    value={setupName}
+                    onChange={(event) => setSetupName(event.target.value)}
+                    placeholder="Nome"
+                    autoComplete="off"
+                    disabled={authLoginBusy}
+                    required
+                    minLength={2}
+                    maxLength={40}
+                    title="Informe seu nome."
+                  />
+                  <input
+                    value={setupLastName}
+                    onChange={(event) => setSetupLastName(event.target.value)}
+                    placeholder="Sobrenome"
+                    autoComplete="off"
+                    disabled={authLoginBusy}
+                    required
+                    minLength={2}
+                    maxLength={60}
+                    title="Informe seu sobrenome."
+                  />
+                  <input
+                    type="email"
+                    value={setupEmail}
+                    onChange={(event) => setSetupEmail(event.target.value)}
+                    placeholder="Email"
+                    autoComplete="off"
+                    disabled={authLoginBusy}
+                    required
+                    maxLength={160}
+                    title="Informe seu email principal."
+                  />
+                  <input
+                    type="password"
+                    value={setupPassword}
+                    onChange={(event) => setSetupPassword(event.target.value)}
+                    placeholder="Senha"
+                    autoComplete="new-password"
+                    disabled={authLoginBusy}
+                    required
+                    minLength={8}
+                    maxLength={128}
+                    title="Defina uma senha com pelo menos 8 caracteres."
+                  />
+                  <button type="submit" disabled={authLoginBusy}>
+                    {creatingSignupUser ? (
+                      <>
+                        <span className="button-spinner" aria-hidden="true" />
+                        Cadastrando...
+                      </>
+                    ) : (
+                      "Cadastrar"
+                    )}
+                  </button>
+                </form>
+              ) : (
+                <form onSubmit={login} className="form-stack">
+                  <input
+                    value={loginIdentifier}
+                    onChange={(event) => setLoginIdentifier(event.target.value)}
+                    placeholder="Email ou usuário"
+                    disabled={authLoginBusy}
+                    required
+                    minLength={3}
+                    maxLength={160}
+                    title="Informe seu email ou usuário."
+                  />
+                  <div className="password-field">
+                    <input
+                      type={showLoginPassword ? "text" : "password"}
+                      value={loginPassword}
+                      onChange={(event) => setLoginPassword(event.target.value)}
+                      placeholder="Senha"
+                      disabled={authLoginBusy}
+                      required
+                      minLength={8}
+                      maxLength={128}
+                      title="Informe sua senha."
+                    />
+                    <button
+                      type="button"
+                      className="password-toggle"
+                      onClick={() => setShowLoginPassword((current) => !current)}
+                      disabled={authLoginBusy}
+                      aria-label={showLoginPassword ? "Ocultar senha" : "Mostrar senha"}
+                    >
+                      {showLoginPassword ? <FiEyeOff /> : <FiEye />}
+                    </button>
+                  </div>
+                  <div className="auth-login-options-row">
+                    <label className="auth-checkbox-row">
+                      <input
+                        type="checkbox"
+                        checked={rememberMe}
+                        onChange={(event) => setRememberMe(event.target.checked)}
+                        disabled={authLoginBusy}
+                      />
+                      <span>Manter conectado</span>
+                    </label>
+                    <button
+                      type="button"
+                      className="auth-forgot-password-link"
+                      disabled={authLoginBusy}
+                      onClick={() => {
+                        setPasswordResetEmail(loginIdentifier.includes("@") ? loginIdentifier : "");
+                        setAuthMode("forgot");
+                        setAuthError("");
+                        setAuthInfo("");
+                      }}
+                    >
+                      Esqueceu a senha?
+                    </button>
+                  </div>
+                  <button type="submit" disabled={authLoginBusy}>
+                    {authSubmitting ? (
+                      <>
+                        <span className="button-spinner" />
+                        Entrando...
+                      </>
+                    ) : (
+                      "Entrar"
+                    )}
+                  </button>
+                  {showWorkspaceInvite ? (
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      onClick={() => setWorkspaceInviteMode("create")}
+                      disabled={authLoginBusy}
+                    >
+                      Primeiro acesso? Criar conta
+                    </button>
+                  ) : null}
+                </form>
+              )}
             </section>
-            <div className="auth-social-access">
+            {showAuthSocialAccess ? <div className="auth-social-access">
               <div className="auth-provider-divider">
                 <span>ou continue com</span>
               </div>
@@ -16503,11 +16922,11 @@ function App() {
                 ) : (
                   <>
                     <GoogleGlyph />
-                    Entrar com Google
+                    Entrar/Cadastrar com Google
                   </>
                 )}
               </button>
-            </div>
+            </div> : null}
           </>
         )}
       </div>
@@ -16638,7 +17057,8 @@ function App() {
   }
 
   function renderDashboard() {
-    const welcomeName = authUser?.name?.trim().split(/\s+/)[0] || "por aqui";
+    const welcomeNameParts = authUser?.name?.trim().split(/\s+/).filter(Boolean) ?? [];
+    const welcomeName = welcomeNameParts.slice(0, 2).join(" ") || "por aqui";
     const monthLabel = dashboardCalendarMonthLabel.charAt(0).toUpperCase() + dashboardCalendarMonthLabel.slice(1);
     const selectedDashboardPopoverJob = dashboardCalendarPopoverJobId
       ? dashboardCalendarJobs.find((job) => job.id === dashboardCalendarPopoverJobId) ?? null
@@ -16727,7 +17147,7 @@ function App() {
           <div className="home-welcome-copy">
             <small>Home</small>
             <h2>
-              <span>Bem-vindo, </span>
+              <span>Bem-vindo (a), </span>
               <span className="home-welcome-highlight">{welcomeName}</span>
             </h2>
           </div>
@@ -17594,15 +18014,16 @@ function App() {
 
         {billingMe ? (
           <div className="table-list">
+            <strong className="billing-section-title">Meu plano</strong>
             <div className="row-card billing-row-card">
               <div className="view-stack billing-summary-stack">
                 <div className="billing-summary-inline">
                   <strong>{billingMe.plan?.name || "Sem plano ativo"}</strong>
                   <span className={`status-pill status-${billingStatusTone(billingMe.status)}`}>{`Status: ${billingStatusDisplayLabel(billingMe.status)}`}</span>
-                  <span className="status-pill status-billing-active">{`Valor: ${activeBillingAmountLabel}`}</span>
-                  <span className="unit-pill billing-model-pill">{`Cobrança: ${billingModelDisplayLabel(billingMe.billingModel)}`}</span>
+                  <span className="billing-summary-label">{`Valor: ${activeBillingAmountLabel}`}</span>
+                  <span className="billing-summary-label">{`Cobrança: ${billingModelDisplayLabel(billingMe.billingModel)}`}</span>
                   {shouldShowBillingTypePill ? (
-                    <span className="unit-pill billing-model-pill">{`Tipo: ${billingSubscriptionTypeDisplayLabel(billingMe.billingModel, billingMe.cycle)}`}</span>
+                    <span className="billing-summary-label">{`Tipo: ${billingSubscriptionTypeDisplayLabel(billingMe.billingModel, billingMe.cycle)}`}</span>
                   ) : null}
                   {billingValidityLabel ? <span className="billing-validity-inline">{billingValidityLabel}</span> : null}
                   {billingMe.canCancelStripeSubscription ? (
@@ -17622,16 +18043,16 @@ function App() {
                 ) : null}
               </div>
             </div>
+            <strong className="billing-section-title">Uso do ciclo atual</strong>
             <div className="row-card billing-row-card">
               <div className="billing-usage-inline">
-                <strong>Uso do ciclo atual</strong>
                 <div className="meta-pill-row">
-                  <span className="unit-pill unit-pill-plan">{`${workspaceUsageLabel}: ${billingMe.usage.workspaceClientUsed}/${formatPlanLimitDisplay(billingMe.plan?.workspaceLimit, billingMe.plan?.code)}`}</span>
+                  <span className="billing-usage-label">{`${workspaceUsageLabel}: ${billingMe.usage.workspaceClientUsed}/${formatPlanLimitDisplay(billingMe.plan?.workspaceLimit, billingMe.plan?.code)}`}</span>
                   {shouldShowAgencyBonusUsage ? (
-                    <span className="unit-pill unit-pill-plan">{`Bônus agência: ${billingMe.usage.workspaceAgencyBonusUsed}/${formatPlanLimitDisplay(billingMe.plan?.agencyBonusWorkspaceLimit, billingMe.plan?.code)}`}</span>
+                    <span className="billing-usage-label">{`Bônus agência: ${billingMe.usage.workspaceAgencyBonusUsed}/${formatPlanLimitDisplay(billingMe.plan?.agencyBonusWorkspaceLimit, billingMe.plan?.code)}`}</span>
                   ) : null}
-                  <span className="unit-pill unit-pill-plan">{`Contas: ${billingMe.usage.connectionsUsed}/${formatPlanLimitDisplay(billingMe.plan?.maxConnections, billingMe.plan?.code)}`}</span>
-                  <span className="unit-pill unit-pill-plan">{`Publicações/mês: ${billingMe.usage.postsUsedThisMonth}/${formatPlanLimitDisplay(
+                  <span className="billing-usage-label">{`Contas: ${billingMe.usage.connectionsUsed}/${formatPlanLimitDisplay(billingMe.plan?.maxConnections, billingMe.plan?.code)}`}</span>
+                  <span className="billing-usage-label">{`Publicações/mês: ${billingMe.usage.postsUsedThisMonth}/${formatPlanLimitDisplay(
                     billingMe.plan?.maxMonthlyPublications,
                     billingMe.plan?.code,
                   )}`}</span>
@@ -17769,10 +18190,16 @@ function App() {
             <div className="account-danger-row account-danger-row-critical">
               <div className="account-danger-copy">
                 <strong>Excluir conta</strong>
-                <span>Essa ação ainda vai ganhar confirmação e fluxo próprio antes de ser liberada.</span>
+                <span>Remove sua conta e os workspaces criados por ela. Essa ação não pode ser desfeita.</span>
               </div>
-              <button type="button" className="danger-button" disabled title="Em breve">
-                Excluir conta
+              <button
+                type="button"
+                className="danger-button"
+                onClick={() => void deleteAccount()}
+                disabled={deletingAccount || isRootUser}
+                title={isRootUser ? "A conta root não pode ser excluída." : undefined}
+              >
+                {deletingAccount ? "Excluindo..." : "Excluir conta"}
               </button>
             </div>
           </div>
@@ -19072,7 +19499,20 @@ function App() {
           ) : null}
 
           {companies.length === 0 ? (
-            <div className="empty-state">Crie um workspace antes de conectar contas.</div>
+            <div className="empty-state">
+              Crie um{" "}
+              <a
+                href={VIEW_ROUTE_MAP.companies}
+                className="empty-state-inline-link"
+                onClick={(event) => {
+                  event.preventDefault();
+                  navigateToView("companies");
+                }}
+              >
+                workspace
+              </a>{" "}
+              antes de conectar contas.
+            </div>
           ) : isAllWorkspacesView && !hasAnyAddedConnections ? (
             <div className="empty-state">
               Nenhuma conta conectada aos seus workspaces. Selecione um workspace para começar a adicionar contas.
@@ -19124,15 +19564,18 @@ function App() {
                       ? "connected"
                       : "pending";
                 const isWhatsappCard = platform === "whatsapp";
-                const whatsappNumber = connection ? resolveWhatsappOwnerNumber(connection.whatsappOwnerJid) || "" : "";
-                const whatsappNumberLabel = whatsappNumber ? `Número: ${whatsappNumber.replace(/^@/, "")}` : "";
-                const whatsappPrimaryLabel = accountLabel?.trim() || whatsappNumberLabel;
-                const accountMetaLine =
-                  connection && isWhatsappCard
-                    ? (whatsappNumberLabel && whatsappNumberLabel !== whatsappPrimaryLabel ? whatsappNumberLabel : expiryLabel)
-                    : connection
-                      ? expiryLabel
-                      : null;
+                const whatsappOwnerNumberRaw = connection && isWhatsappCard ? resolveWhatsappOwnerNumber(connection.whatsappOwnerJid) : null;
+                const whatsappOwnerNumber = whatsappOwnerNumberRaw ? whatsappOwnerNumberRaw.replace(/^@/, "") : "";
+                const whatsappPrimaryLabel = isWhatsappCard
+                  ? (whatsappOwnerNumber || connection?.whatsappProfileName?.trim() || accountLabel?.trim() || connection?.displayName)
+                  : (accountLabel?.trim() || null);
+                const whatsappSecondaryLabel =
+                  isWhatsappCard && connection
+                    ? (connection.whatsappProfileName?.trim() && connection.whatsappProfileName.trim() !== whatsappPrimaryLabel
+                        ? connection.whatsappProfileName.trim()
+                        : expiryLabel)
+                    : null;
+                const accountMetaLine = connection && isWhatsappCard ? whatsappSecondaryLabel : connection ? expiryLabel : null;
                 const accountInitial =
                   connection?.displayName?.trim().charAt(0).toUpperCase() || option.label.charAt(0).toUpperCase();
                 const primaryAction = renderAgentsPrimaryAction(workspace, platform, connection);
@@ -19181,16 +19624,27 @@ function App() {
                                   <PlatformIcon />
                                 </span>
                               </span>
-                              <div className="agents-platform-board-account-copy">
-                                <span
-                                  className={`agents-platform-board-account-handle${
-                                    (isWhatsappCard ? Boolean(whatsappPrimaryLabel) : showAccountLabel)
-                                      ? ""
-                                      : " agents-platform-board-account-handle-empty"
-                                  }`}
-                                >
-                                  {isWhatsappCard ? whatsappPrimaryLabel || "\u00A0" : showAccountLabel ? accountLabel : "\u00A0"}
-                                </span>
+                              <div
+                                className={`agents-platform-board-account-copy${
+                                  isWhatsappCard && whatsappOwnerNumber ? " agents-platform-board-account-copy-singleline" : ""
+                                }`}
+                              >
+                                {isWhatsappCard && whatsappOwnerNumber ? (
+                                  <span className="agents-platform-board-account-handle agents-platform-board-account-handle-inline">
+                                    <strong className="agents-platform-board-account-inline-label">Número</strong>
+                                    <span className="agents-platform-board-account-inline-value">{whatsappOwnerNumber}</span>
+                                  </span>
+                                ) : (
+                                  <span
+                                    className={`agents-platform-board-account-handle${
+                                      (isWhatsappCard ? Boolean(whatsappPrimaryLabel) : showAccountLabel)
+                                        ? ""
+                                        : " agents-platform-board-account-handle-empty"
+                                    }`}
+                                  >
+                                    {isWhatsappCard ? whatsappPrimaryLabel || "\u00A0" : showAccountLabel ? accountLabel : "\u00A0"}
+                                  </span>
+                                )}
                                 {accountMetaLine ? (
                                   <small
                                     className={`agents-platform-board-account-meta${
@@ -20668,7 +21122,9 @@ function App() {
               </article>
             );
           })}
-          {mediaFilteredItems.length === 0 ? <div className="empty-state">Nenhuma mídia encontrada neste filtro.</div> : null}
+          {mediaFilteredItems.length === 0 ? (
+            <div className="empty-state media-empty-state">Nenhuma mídia encontrada neste filtro.</div>
+          ) : null}
         </div>
         {renderNumericPagination("media-bottom", mediaPage, mediaTotalPages, setMediaPage, mediaSectionRef)}
       </section>
