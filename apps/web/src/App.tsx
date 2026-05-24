@@ -18256,9 +18256,9 @@ function App() {
 
   function renderAccountPage(targetTab: ProfilePageTab) {
     const currentTab = targetTab;
-    const tabItems: Array<{ key: ProfilePageTab; label: string; subtitle?: string; icon: IconType }> = [
+    const tabItems: Array<{ key: ProfilePageTab; label: string; icon: IconType }> = [
       { key: "profile", label: "Informações", icon: FiUser },
-      { key: "plan", label: "Planos", subtitle: "Assinatura", icon: FiCreditCard },
+      { key: "plan", label: "Planos e assinatura", icon: FiCreditCard },
       { key: "danger", label: "Zona de perigo", icon: FiSlash },
     ];
 
@@ -18301,10 +18301,7 @@ function App() {
                 }
 	              >
 	                <tab.icon aria-hidden="true" />
-	                <span className="account-page-tab-copy">
-	                  <strong>{tab.label}</strong>
-	                  {tab.subtitle ? <small>{tab.subtitle}</small> : null}
-	                </span>
+	                <span>{tab.label}</span>
 	              </button>
 	            );
 	          })}
