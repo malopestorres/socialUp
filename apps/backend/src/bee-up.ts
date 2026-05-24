@@ -1278,6 +1278,41 @@ async function executePlanLimitsTool(
 
   const billing = await dependencies.resolveUserBillingAccess(userId);
   const planName = billing.plan?.name ?? "Sem plano ativo";
+  const billingStatusLabel = (() => {
+    switch ((billing.status || "").trim().toUpperCase()) {
+      case "ACTIVE":
+        return "Ativo";
+      case "TRIALING":
+        return "Período de Testes";
+      case "PAYMENT_REQUIRED":
+        return "Pagamento pendente";
+      case "BLOCKED":
+        return "Bloqueado";
+      case "EXPIRED":
+        return "Expirado";
+      case "NONE":
+        return "Sem plano";
+      default:
+        return "Indefinido";
+    }
+  })();
+
+  const subscriptionLabel = (() => {
+    switch ((billing.billingModel || "").trim().toUpperCase()) {
+      case "TRIAL":
+        return "Período de Testes";
+      case "STRIPE_SUBSCRIPTION":
+        return "Assinatura recorrente";
+      case "PIX_MANUAL":
+        return "Pagamento avulso (Pix)";
+      case "MANUAL":
+        return "Manual";
+      case "NONE":
+        return "Sem cobrança";
+      default:
+        return "Manual";
+    }
+  })();
 
   return {
     name: "get_plan_limits",
@@ -1289,7 +1324,7 @@ async function executePlanLimitsTool(
       `Perfis: ${billing.usage.profilesUsed}/${billing.plan?.maxProfiles ?? 0}`,
       `Contas: ${billing.usage.connectionsUsed}/${billing.plan?.maxConnections ?? 0}`,
       `Publicações no ciclo: ${billing.usage.postsUsedThisMonth}/${billing.plan?.maxMonthlyPublications ?? 0}`,
-      `Status do billing: ${billing.status}`,
+      `Status da Assinatura: ${subscriptionLabel}`,
     ],
     actions: [
       {

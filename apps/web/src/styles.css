@@ -16,6 +16,34 @@
   --shadow: 0 18px 42px rgba(157, 39, 95, 0.08);
 }
 
+/* ==========================================================
+   Bee Up: Thread Popover Must Not Look Like Buttons/Cards
+   (Overrides go at EOF to beat generic button styles.)
+   ========================================================== */
+
+.bee-up-dropdown-panel .bee-up-thread-button,
+.bee-up-dropdown-panel .bee-up-thread-button-active {
+  width: 100% !important;
+  padding: 8px 2px !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  background: transparent !important;
+  background-image: none !important;
+  filter: none !important;
+}
+
+.bee-up-dropdown-panel .bee-up-thread-button:hover,
+.bee-up-dropdown-panel .bee-up-thread-button:active,
+.bee-up-dropdown-panel .bee-up-thread-button:focus,
+.bee-up-dropdown-panel .bee-up-thread-button:focus-visible {
+  border: 0 !important;
+  border-radius: 12px !important;
+  box-shadow: none !important;
+  background: #f3f4f6 !important;
+  background-image: none !important;
+}
+
 body .bee-up-launcher {
   width: auto;
   min-width: 0;
@@ -360,7 +388,7 @@ body .bee-up-send-button {
   padding: 14px;
   border-radius: 22px;
   border: 1px solid rgba(226, 232, 240, 0.95);
-  background: rgba(255, 255, 255, 0.98);
+  background: #ffffff;
   box-shadow: 0 20px 48px rgba(15, 23, 42, 0.14);
 }
 
@@ -449,6 +477,7 @@ body .bee-up-send-button {
   max-height: 308px;
   overflow-y: auto;
   padding-right: 4px;
+  background: transparent;
 }
 
 .bee-up-alert {
@@ -489,10 +518,20 @@ body .bee-up-send-button {
   text-align: left;
   display: grid;
   gap: 6px;
-  padding: 8px 2px;
+  padding: 10px 10px;
   border-radius: 0;
   border: 0;
   background: transparent;
+}
+
+.bee-up-thread-button:hover,
+.bee-up-thread-button:active,
+.bee-up-thread-button:focus,
+.bee-up-thread-button:focus-visible {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
 }
 
 .bee-up-thread-button strong,
@@ -536,10 +575,118 @@ body .bee-up-send-button {
 
 .bee-up-chat-panel {
   min-height: 0;
+  position: relative;
   display: grid;
   grid-template-rows: auto 1fr auto auto;
   gap: 12px;
   padding: 16px;
+}
+
+.bee-up-inline-popover-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  background: rgba(15, 23, 42, 0.12);
+}
+
+.bee-up-inline-popover {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  top: 120px;
+  margin: 0 auto;
+  background: #ffffff;
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  border-radius: 18px;
+  box-shadow: 0 20px 48px rgba(15, 23, 42, 0.18);
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.bee-up-inline-popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.bee-up-inline-popover-head strong {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.bee-up-inline-popover-close {
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
+  border-radius: 999px;
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  background: #ffffff;
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.bee-up-inline-popover-search {
+  display: block;
+}
+
+.bee-up-inline-popover-search input {
+  width: 100%;
+  border-radius: 12px;
+  border: 1px solid rgba(226, 232, 240, 0.95);
+  padding: 10px 12px;
+  background: #ffffff;
+}
+
+/* search submit button removed */
+
+.bee-up-inline-popover-list {
+  max-height: 280px;
+  overflow: auto;
+  display: grid;
+  gap: 6px;
+}
+
+.bee-up-inline-popover-item {
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  padding: 10px 10px;
+  border-radius: 12px;
+  color: var(--text);
+}
+
+.bee-up-inline-popover-item:hover {
+  background: #f3f4f6;
+}
+
+.bee-up-messages-skeleton {
+  display: grid;
+  gap: 10px;
+  padding: 10px 2px;
+}
+
+.bee-up-message-skeleton {
+  width: min(92%, 360px);
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(241, 245, 249, 0.55);
+}
+
+.bee-up-message-skeleton-user {
+  justify-self: end;
+}
+
+.bee-up-message-skeleton-assistant {
+  justify-self: start;
 }
 
 .bee-up-chat-meta {
@@ -2621,6 +2768,8 @@ a {
 }
 
 .workspace-card-actions-top {
+  display: flex;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: flex-end;
   gap: 4px;
@@ -4310,6 +4459,36 @@ code,
   margin-top: auto;
 }
 
+.workspace-board-title-skeleton {
+  width: min(100%, 220px);
+  height: 18px;
+  border-radius: 999px;
+}
+
+.workspace-board-created-skeleton {
+  width: min(100%, 190px);
+  height: 12px;
+  border-radius: 999px;
+}
+
+.workspace-status-badge-skeleton {
+  width: 96px;
+  height: 34px;
+  border-radius: 999px;
+}
+
+.workspace-inline-summary-value-skeleton {
+  width: 22px;
+  height: 14px;
+  border-radius: 999px;
+}
+
+.workspace-board-card-copy-skeleton strong,
+.workspace-board-card-copy-skeleton small,
+.workspace-board-card-copy-skeleton span {
+  display: block;
+}
+
 .workspace-inline-summary-item-skeleton {
   align-items: center;
   justify-content: space-between;
@@ -4371,6 +4550,28 @@ code,
   gap: 14px;
 }
 
+.scheduler-skeleton-carousel-arrow {
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  border-radius: 999px;
+  flex: 0 0 auto;
+}
+
+.scheduler-skeleton-choice-row-carousel {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.scheduler-skeleton-status-row {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 10px;
+  align-items: center;
+}
+
 .scheduler-skeleton-choice-row {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -4382,8 +4583,14 @@ code,
 }
 
 .scheduler-skeleton-choice-button {
-  height: 72px;
+  height: 48px;
   border-radius: 18px;
+  width: 168px;
+  max-width: 220px;
+}
+
+.scheduler-skeleton-choice-button-compact {
+  width: 148px;
 }
 
 .scheduler-skeleton-target-grid {
@@ -4401,21 +4608,48 @@ code,
   gap: 14px;
 }
 
+.scheduler-skeleton-helper-chip {
+  padding: 10px 14px;
+}
+
+.scheduler-skeleton-helper-text {
+  width: min(100%, 520px);
+  height: 14px;
+  border-radius: 999px;
+}
+
 .scheduler-skeleton-upload-dropzone {
-  height: 136px;
-  border-radius: 22px;
-}
-
-.scheduler-skeleton-upload-preview-row {
-  display: flex;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.scheduler-skeleton-upload-thumb {
-  width: 86px;
-  height: 86px;
+  width: 100%;
+  min-height: 136px;
   border-radius: 18px;
+  border-color: transparent;
+  background: transparent;
+  cursor: default;
+  pointer-events: none;
+}
+
+.scheduler-skeleton-dropzone-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 16px;
+  flex: 0 0 48px;
+}
+
+.scheduler-skeleton-dropzone-copy {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  width: 100%;
+}
+
+.scheduler-skeleton-dropzone-title {
+  width: min(100%, 320px);
+  height: 16px;
+}
+
+.scheduler-skeleton-dropzone-subtitle {
+  width: min(100%, 520px);
+  height: 14px;
 }
 
 .publications-toolbar-right-skeleton {
@@ -6844,6 +7078,13 @@ code,
   opacity: 0.8;
 }
 
+.home-calendar-icon-skeleton {
+  width: 18px;
+  height: 18px;
+  border-radius: 6px;
+  flex: 0 0 18px;
+}
+
 .home-calendar-title-skeleton {
   width: 148px;
   height: 18px;
@@ -7482,6 +7723,36 @@ button {
   align-items: center;
   justify-content: center;
   gap: 10px;
+}
+
+/* Bee Up: thread list buttons should look like plain text rows (no button chrome). */
+body .bee-up-thread-button {
+  width: 100% !important;
+  padding: 10px 10px !important;
+  border-radius: 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+  color: inherit !important;
+  box-shadow: none !important;
+  display: grid !important;
+  justify-content: initial !important;
+}
+
+body .bee-up-thread-button:hover,
+body .bee-up-thread-button:active,
+body .bee-up-thread-button:focus,
+body .bee-up-thread-button:focus-visible {
+  background: #f3f4f6 !important;
+  border: 0 !important;
+  border-radius: 12px !important;
+  box-shadow: none !important;
+}
+
+body .bee-up-thread-button-active {
+  background: transparent !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
 }
 
 .button-spinner {
@@ -8309,6 +8580,25 @@ button {
   gap: 8px;
 }
 
+.account-page-tab-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  line-height: 1.05;
+}
+
+.account-page-tab-copy strong {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.account-page-tab-copy small {
+  margin-top: 2px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #64748b;
+}
+
 .account-page-tab svg {
   width: 15px;
   height: 15px;
@@ -8319,6 +8609,10 @@ button {
   background: #ffffff;
   color: #db2777;
   box-shadow: inset 0 0 0 1px rgba(219, 39, 119, 0.12);
+}
+
+.account-page-tab-active .account-page-tab-copy small {
+  color: #db2777;
 }
 
 .account-page-grid {
@@ -16913,4 +17207,26 @@ body.theme-dark .emoji-chip:hover:not(:disabled) {
     flex-direction: column;
     align-items: stretch;
   }
+}
+
+/* Bee Up thread popover: final overrides (must be last). */
+.bee-up-dropdown-panel .bee-up-thread-button,
+.bee-up-dropdown-panel .bee-up-thread-button-active {
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  background: transparent !important;
+  background-image: none !important;
+  padding: 10px 10px !important;
+}
+
+.bee-up-dropdown-panel .bee-up-thread-button:hover,
+.bee-up-dropdown-panel .bee-up-thread-button:active,
+.bee-up-dropdown-panel .bee-up-thread-button:focus,
+.bee-up-dropdown-panel .bee-up-thread-button:focus-visible {
+  border: 0 !important;
+  border-radius: 12px !important;
+  box-shadow: none !important;
+  background: #f3f4f6 !important;
+  background-image: none !important;
 }

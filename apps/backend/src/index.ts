@@ -4935,7 +4935,9 @@ async function buildAuthUserPayload(user: {
   billingIsBlocked: boolean;
   billingBlockMessage: string | null;
   billingEndsAt: Date | null;
+  billingTrialStartsAt: Date | null;
   billingTrialEndsAt: Date | null;
+  serverNow: Date;
 }> {
   // Evita rajadas paralelas durante auth (DB externa pode encerrar conexão).
   const billing = user.username === "root" ? null : await resolveUserBillingAccess(user.id);
@@ -4989,7 +4991,9 @@ async function buildAuthUserPayload(user: {
       billingIsBlocked: false,
       billingBlockMessage: null,
       billingEndsAt: null,
+      billingTrialStartsAt: null,
       billingTrialEndsAt: null,
+      serverNow: new Date(),
     };
   }
 
@@ -5016,7 +5020,9 @@ async function buildAuthUserPayload(user: {
     billingIsBlocked: billing.isBlocked,
     billingBlockMessage: billing.blockMessage,
     billingEndsAt: billing.endsAt,
+    billingTrialStartsAt: billing.billingModel === "TRIAL" ? billing.startsAt : null,
     billingTrialEndsAt: billing.trialEndsAt,
+    serverNow: new Date(),
   };
 }
 
