@@ -65,7 +65,17 @@ type EvolutionFetchInstanceRecord = {
   instanceName?: string | null;
   connectionStatus?: string | null;
   ownerJid?: string | null;
+  number?: string | null;
   profileName?: string | null;
+  profileNameNotify?: string | null;
+  instance?: {
+    ownerJid?: string | null;
+    number?: string | null;
+    profileName?: string | null;
+    profileNameNotify?: string | null;
+    instanceName?: string | null;
+    name?: string | null;
+  } | null;
   integration?: string | null;
 };
 
@@ -94,7 +104,12 @@ type EvolutionFindMessagesResponse = {
 
 type EvolutionContactRecord = {
   remoteJid?: string | null;
+  id?: string | null;
+  ownerJid?: string | null;
+  number?: string | null;
   pushName?: string | null;
+  name?: string | null;
+  verifiedName?: string | null;
   isGroup?: boolean | null;
   type?: string | null;
 };
@@ -499,13 +514,21 @@ async function evolutionRequest<T>(
   }
 }
 
-async function markConnectionConnected(connectionId: string): Promise<void> {
+async function markConnectionConnected(
+  connectionId: string,
+  metadata?: { ownerJid?: string | null; profileName?: string | null },
+): Promise<void> {
   await prisma.socialConnection.updateMany({
     where: { id: connectionId, platform: "whatsapp" },
     data: {
       authStatus: "CONNECTED",
+      authLaunchUrl: null,
       lastAuthAt: new Date(),
       lastSeenAt: new Date(),
+      providerMetadata: {
+        whatsappOwnerJid: metadata?.ownerJid ?? null,
+        whatsappProfileName: metadata?.profileName ?? null,
+      },
     },
   });
 }
@@ -539,36 +562,55 @@ async function markConnectionAuthRequired(connectionId: string): Promise<void> {
 async function fetchInstanceRecord(credentials: EvolutionCredentials): Promise<EvolutionFetchInstanceRecord | null> {
   const query = encodeURIComponent(credentials.instanceName);
   const payload = await evolutionRequest<unknown>(credentials, `/instance/fetchInstances?instanceName=${query}`);
+  const matchesInstanceName = (entry: unknown): boolean => {
+    if (!entry || typeof entry !== "object") {
+      return false;
+    }
+    const record = entry as EvolutionFetchInstanceRecord;
+    const names = [
+      record.name,
+      record.instanceName,
+      record.instance?.name,
+      record.instance?.instanceName,
+    ];
+    return names.some((name) => typeof name === "string" && name === credentials.instanceName);
+  };
 
   if (Array.isArray(payload)) {
-    const first = payload.find(
-      (entry) =>
-        entry &&
-        typeof entry === "object" &&
-        typeof (entry as Record<string, unknown>).name === "string" &&
-        ((entry as Record<string, unknown>).name as string) === credentials.instanceName,
-    );
-    if (first && typeof first === "object") {
+    const first = payload.find(matchesInstanceName);
+    if (first) {
       return first as EvolutionFetchInstanceRecord;
     }
-    return null;
+    // Alguns provedores retornam array sem nome/instanceName; melhor esforço: usa o primeiro.
+    const fallback = payload.find((entry) => entry && typeof entry === "object") ?? null;
+    return fallback ? (fallback as EvolutionFetchInstanceRecord) : null;
   }
 
   if (payload && typeof payload === "object") {
     const record = payload as Record<string, unknown>;
+    if (matchesInstanceName(record)) {
+      return record as EvolutionFetchInstanceRecord;
+    }
+
     const instances = record.instances;
     if (Array.isArray(instances)) {
-      const first = instances.find(
-        (entry) =>
-          entry &&
-          typeof entry === "object" &&
-          (typeof (entry as Record<string, unknown>).name === "string" ||
-            typeof (entry as Record<string, unknown>).instanceName === "string"),
-      );
-      if (first && typeof first === "object") {
+      const first = instances.find(matchesInstanceName);
+      if (first) {
         return first as EvolutionFetchInstanceRecord;
       }
+      const fallback = instances.find((entry) => entry && typeof entry === "object") ?? null;
+      if (fallback) {
+        return fallback as EvolutionFetchInstanceRecord;
+      }
     }
+
+    const nestedInstance = record.instance;
+    if (nestedInstance && typeof nestedInstance === "object" && matchesInstanceName({ ...record, instance: nestedInstance })) {
+      return { ...record, instance: nestedInstance as EvolutionFetchInstanceRecord["instance"] } as EvolutionFetchInstanceRecord;
+    }
+
+    // Melhor esforço: se vier um objeto único, tenta usar como registro.
+    return record as EvolutionFetchInstanceRecord;
   }
 
   return null;
@@ -601,12 +643,40 @@ export async function resolveWhatsappConnectionRuntimeMetadata(input: {
       secretCipher: input.secretCipher,
     });
     const instance = await fetchInstanceRecord(credentials);
-    const profileName = typeof instance?.profileName === "string" && instance.profileName.trim().length > 0
-      ? instance.profileName.trim()
-      : null;
-    const ownerJid = typeof instance?.ownerJid === "string" && instance.ownerJid.trim().length > 0
-      ? instance.ownerJid.trim()
-      : null;
+    let profileName = resolveInstanceProfileName(instance);
+    let ownerJid = resolveInstanceOwnerJid(instance);
+    if (!ownerJid) {
+      try {
+        const payload = await evolutionRequest<unknown>(
+          credentials,
+          `/instance/connectionState/${encodeURIComponent(credentials.instanceName)}`,
+        );
+        const stateMetadata = resolveOwnerFromConnectionState(payload);
+        ownerJid = stateMetadata.ownerJid;
+        profileName = profileName ?? stateMetadata.profileName;
+      } catch {
+        // ignora
+      }
+    }
+    if (!ownerJid) {
+      try {
+        const contacts = await evolutionRequest<unknown>(
+          credentials,
+          `/chat/findContacts/${encodeURIComponent(credentials.instanceName)}`,
+          {
+            method: "POST",
+            jsonBody: {
+              where: {},
+            },
+          },
+        );
+        const contactOwner = pickOwnerFromContacts(contacts);
+        ownerJid = contactOwner.ownerJid;
+        profileName = profileName ?? contactOwner.profileName;
+      } catch {
+        // Mantem fallback vazio se contatos não estiverem disponíveis.
+      }
+    }
     return {
       profileName,
       ownerJid,
@@ -698,6 +768,120 @@ async function getConnectionState(credentials: EvolutionCredentials): Promise<st
 
 function normalizeState(state: string | null): string | null {
   return state?.trim().toLowerCase() ?? null;
+}
+
+function resolveInstanceOwnerJid(instance: EvolutionFetchInstanceRecord | null): string | null {
+  const direct = typeof instance?.ownerJid === "string" ? instance.ownerJid.trim() : "";
+  if (direct) {
+    return direct;
+  }
+  const nested = typeof instance?.instance?.ownerJid === "string" ? instance.instance.ownerJid.trim() : "";
+  if (nested) {
+    return nested;
+  }
+
+  const directNumber = typeof instance?.number === "string" ? instance.number.replace(/\D/g, "") : "";
+  if (directNumber) {
+    return `${directNumber}@s.whatsapp.net`;
+  }
+
+  const nestedNumber = typeof instance?.instance?.number === "string" ? instance.instance.number.replace(/\D/g, "") : "";
+  return nestedNumber ? `${nestedNumber}@s.whatsapp.net` : null;
+}
+
+function resolveInstanceProfileName(instance: EvolutionFetchInstanceRecord | null): string | null {
+  const candidates = [
+    instance?.profileName,
+    instance?.profileNameNotify,
+    instance?.instance?.profileName,
+    instance?.instance?.profileNameNotify,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return null;
+}
+
+function jidFromNumber(value: string | null | undefined): string | null {
+  const digits = typeof value === "string" ? value.replace(/\D/g, "") : "";
+  return digits ? `${digits}@s.whatsapp.net` : null;
+}
+
+function normalizeWhatsappJid(value: string | null | undefined): string | null {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  if (!normalized) {
+    return null;
+  }
+  if (normalized.endsWith("@s.whatsapp.net")) {
+    return normalized;
+  }
+  return jidFromNumber(normalized);
+}
+
+function pickOwnerFromContacts(rawContacts: unknown): { ownerJid: string | null; profileName: string | null } {
+  if (!Array.isArray(rawContacts)) {
+    return { ownerJid: null, profileName: null };
+  }
+
+  const candidates = rawContacts
+    .filter((entry): entry is EvolutionContactRecord => Boolean(entry && typeof entry === "object"))
+    .filter((contact) => {
+      const jid = normalizeWhatsappJid(contact.ownerJid ?? contact.remoteJid ?? contact.id ?? contact.number ?? null);
+      if (!jid || jid === "0@s.whatsapp.net" || jid.endsWith("@lid") || jid.endsWith("@g.us")) {
+        return false;
+      }
+      if (contact.isGroup === true || (typeof contact.type === "string" && contact.type.toLowerCase() === "group")) {
+        return false;
+      }
+      return true;
+    });
+
+  const namedCandidate = candidates.find((contact) => {
+    const name = contact.pushName || contact.verifiedName || contact.name;
+    return typeof name === "string" && name.trim().length > 0;
+  });
+  const candidate = namedCandidate ?? candidates[0] ?? null;
+  if (!candidate) {
+    return { ownerJid: null, profileName: null };
+  }
+
+  return {
+    ownerJid: normalizeWhatsappJid(candidate.ownerJid ?? candidate.remoteJid ?? candidate.id ?? candidate.number ?? null),
+    profileName:
+      typeof candidate.pushName === "string" && candidate.pushName.trim()
+        ? candidate.pushName.trim()
+        : typeof candidate.verifiedName === "string" && candidate.verifiedName.trim()
+          ? candidate.verifiedName.trim()
+          : typeof candidate.name === "string" && candidate.name.trim()
+            ? candidate.name.trim()
+            : null,
+  };
+}
+
+function resolveOwnerFromConnectionState(payload: unknown): { ownerJid: string | null; profileName: string | null } {
+  if (!payload || typeof payload !== "object") {
+    return { ownerJid: null, profileName: null };
+  }
+  const record = payload as Record<string, unknown>;
+  const instance = (record.instance && typeof record.instance === "object" ? (record.instance as Record<string, unknown>) : null) ?? null;
+  const ownerJid = normalizeWhatsappJid(
+    (typeof record.ownerJid === "string" ? record.ownerJid : null) ??
+      (typeof record.number === "string" ? record.number : null) ??
+      (instance ? (typeof instance.ownerJid === "string" ? instance.ownerJid : typeof instance.number === "string" ? instance.number : null) : null),
+  );
+  const profileName =
+    (typeof record.profileName === "string" && record.profileName.trim() ? record.profileName.trim() : null) ??
+    (typeof record.profileNameNotify === "string" && record.profileNameNotify.trim() ? record.profileNameNotify.trim() : null) ??
+    (instance
+      ? (typeof instance.profileName === "string" && instance.profileName.trim()
+          ? instance.profileName.trim()
+          : typeof instance.profileNameNotify === "string" && instance.profileNameNotify.trim()
+            ? instance.profileNameNotify.trim()
+            : null)
+      : null);
+  return { ownerJid, profileName };
 }
 
 async function getEffectiveConnectionState(credentials: EvolutionCredentials): Promise<string | null> {
@@ -902,12 +1086,8 @@ async function syncQrState(
     let profileName: string | null = null;
     try {
       const instance = await fetchInstanceRecord(credentials);
-      ownerJid = typeof instance?.ownerJid === "string" && instance.ownerJid.trim().length > 0
-        ? instance.ownerJid.trim()
-        : null;
-      profileName = typeof instance?.profileName === "string" && instance.profileName.trim().length > 0
-        ? instance.profileName.trim()
-        : null;
+      ownerJid = resolveInstanceOwnerJid(instance);
+      profileName = resolveInstanceProfileName(instance);
     } catch {
       // Mantém conectado mesmo se o metadata fetch falhar.
     }
@@ -920,7 +1100,7 @@ async function syncQrState(
       whatsappOwnerJid: ownerJid,
       whatsappProfileName: profileName,
     });
-    await markConnectionConnected(connectionId);
+    await markConnectionConnected(connectionId, { ownerJid, profileName });
     return "STOP";
   }
 
@@ -935,12 +1115,8 @@ async function syncQrState(
       let profileName: string | null = null;
       try {
         const instance = await fetchInstanceRecord(credentials);
-        ownerJid = typeof instance?.ownerJid === "string" && instance.ownerJid.trim().length > 0
-          ? instance.ownerJid.trim()
-          : null;
-        profileName = typeof instance?.profileName === "string" && instance.profileName.trim().length > 0
-          ? instance.profileName.trim()
-          : null;
+        ownerJid = resolveInstanceOwnerJid(instance);
+        profileName = resolveInstanceProfileName(instance);
       } catch {
         // melhor esforço
       }
@@ -953,7 +1129,7 @@ async function syncQrState(
         whatsappOwnerJid: ownerJid,
         whatsappProfileName: profileName,
       });
-      await markConnectionConnected(connectionId);
+      await markConnectionConnected(connectionId, { ownerJid, profileName });
       return "STOP";
     }
 
@@ -1146,7 +1322,7 @@ async function resolveStatusRecipients(credentials: EvolutionCredentials): Promi
   let ownerJid: string | null = null;
   try {
     const instance = await fetchInstanceRecord(credentials);
-    const candidateOwner = typeof instance?.ownerJid === "string" ? instance.ownerJid.trim() : "";
+    const candidateOwner = resolveInstanceOwnerJid(instance) ?? "";
     if (candidateOwner.endsWith("@s.whatsapp.net")) {
       ownerJid = candidateOwner;
     }
@@ -1433,64 +1609,71 @@ export async function requestWhatsappQr(connectionId: string, forceRegenerate: b
     qrMessage: "Preparando QR Code do WhatsApp...",
   });
 
-  await ensureInstanceExists(credentials);
+  try {
+    await ensureInstanceExists(credentials);
 
-  if (forceRegenerate) {
-    try {
-      await deleteInstance(credentials);
-      await waitForInstanceDeletion(credentials);
-    } catch (error) {
-      if (!errorHasHttpStatus(error, 400) && !errorHasHttpStatus(error, 404)) {
-        try {
+    if (forceRegenerate) {
+      try {
+        await deleteInstance(credentials);
+        await waitForInstanceDeletion(credentials);
+      } catch (error) {
+        if (!errorHasHttpStatus(error, 400) && !errorHasHttpStatus(error, 404)) {
           await logoutInstance(credentials);
           await waitForLogoutToInvalidateCurrentSession(credentials);
-        } catch (logoutError) {
-          throw logoutError;
         }
       }
+
+      await ensureInstanceExists(credentials);
     }
 
-    await ensureInstanceExists(credentials);
-  }
-
-  let running = false;
-  const tick = async () => {
-    if (running) {
-      return;
-    }
-    running = true;
-
-    try {
-      const stillActive = await isQrRequestStillActive(connectionId);
-      if (!stillActive) {
-        clearQrPoller(connectionId);
+    let running = false;
+    const tick = async () => {
+      if (running) {
         return;
       }
-      const outcome = await syncQrState(connectionId, credentials, !forceRegenerate);
-      if (outcome === "STOP") {
-        clearQrPoller(connectionId);
+      running = true;
+
+      try {
+        const stillActive = await isQrRequestStillActive(connectionId);
+        if (!stillActive) {
+          clearQrPoller(connectionId);
+          return;
+        }
+        const outcome = await syncQrState(connectionId, credentials, !forceRegenerate);
+        if (outcome === "STOP") {
+          clearQrPoller(connectionId);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "WHATSAPP_EVOLUTION_QR_ERROR";
+        setQrOverlay(connectionId, {
+          qrStatus: "ERROR",
+          qrImageDataUrl: null,
+          qrGeneratedAt: null,
+          qrMessage: message,
+        });
+      } finally {
+        running = false;
       }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "WHATSAPP_EVOLUTION_QR_ERROR";
-      setQrOverlay(connectionId, {
-        qrStatus: "ERROR",
-        qrImageDataUrl: null,
-        qrGeneratedAt: null,
-        qrMessage: message,
-      });
-    } finally {
-      running = false;
+    };
+
+    await tick();
+
+    const state = qrOverlayByConnectionId.get(connectionId)?.qrStatus ?? "IDLE";
+    if (state === "PREPARING" || state === "WAITING_QR_SCAN") {
+      const interval = setInterval(() => {
+        void tick();
+      }, EVOLUTION_QR_POLL_INTERVAL_MS);
+      qrPollersByConnectionId.set(connectionId, interval);
     }
-  };
-
-  await tick();
-
-  const state = qrOverlayByConnectionId.get(connectionId)?.qrStatus ?? "IDLE";
-  if (state === "PREPARING" || state === "WAITING_QR_SCAN") {
-    const interval = setInterval(() => {
-      void tick();
-    }, EVOLUTION_QR_POLL_INTERVAL_MS);
-    qrPollersByConnectionId.set(connectionId, interval);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "WHATSAPP_EVOLUTION_QR_ERROR";
+    setQrOverlay(connectionId, {
+      qrStatus: "ERROR",
+      qrImageDataUrl: null,
+      qrGeneratedAt: null,
+      qrMessage: message,
+    });
+    throw error;
   }
 }
 
@@ -1514,12 +1697,8 @@ export async function markWhatsappConnected(connectionId: string): Promise<void>
     try {
       const credentials = getConnectionCredentials(connection);
       const instance = await fetchInstanceRecord(credentials);
-      ownerJid = typeof instance?.ownerJid === "string" && instance.ownerJid.trim().length > 0
-        ? instance.ownerJid.trim()
-        : null;
-      profileName = typeof instance?.profileName === "string" && instance.profileName.trim().length > 0
-        ? instance.profileName.trim()
-        : null;
+      ownerJid = resolveInstanceOwnerJid(instance);
+      profileName = resolveInstanceProfileName(instance);
     } catch {
       // Mantem o conectado mesmo se a Evolution demorar para devolver metadados.
     }
@@ -1533,6 +1712,8 @@ export async function markWhatsappConnected(connectionId: string): Promise<void>
     whatsappOwnerJid: ownerJid,
     whatsappProfileName: profileName,
   });
+
+  await markConnectionConnected(connectionId, { ownerJid, profileName });
 }
 
 export async function disconnectWhatsappConnection(connectionId: string): Promise<void> {

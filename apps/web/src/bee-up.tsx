@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   FiAlertCircle,
   FiBookOpen,
@@ -33,6 +33,12 @@ type BeeUpAction =
       label: string;
     };
 
+type BeeUpToolIntent = "get_plan_limits" | "get_recent_failures" | "get_connection_status" | "generate_whatsapp_qr";
+
+type BeeUpToolParams = {
+  workspaceId?: string;
+};
+
 type BeeUpSource = {
   title: string;
   category: string;
@@ -54,6 +60,7 @@ type BeeUpMessagePayload = {
   sources?: BeeUpSource[];
   mode?: string;
   toolName?: string | null;
+  toolPayload?: unknown;
 };
 
 type BeeUpMessage = {
@@ -66,6 +73,7 @@ type BeeUpMessage = {
   actions: BeeUpAction[];
   sources: BeeUpSource[];
   mode: string | null;
+  payload: unknown;
   isPending?: boolean;
 };
 
@@ -186,7 +194,122 @@ function normalizeBeeUpMessage(message: {
     actions: Array.isArray(payload.actions) ? (payload.actions as BeeUpAction[]) : [],
     sources: Array.isArray(payload.sources) ? dedupeBeeUpSources(payload.sources as BeeUpSource[]) : [],
     mode: typeof payload.mode === "string" ? payload.mode : null,
+    payload: payload.toolPayload ?? message.toolPayload ?? null,
   };
+}
+
+function resolveQuickPromptToolIntent(prompt: string): BeeUpToolIntent | null {
+  const normalized = prompt.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  if (normalized.includes("limite") || normalized.includes("plano")) {
+    return "get_plan_limits";
+  }
+  if (normalized.includes("falha")) {
+    return "get_recent_failures";
+  }
+  if (normalized.includes("contas conectadas") || normalized.includes("conectadas")) {
+    return "get_connection_status";
+  }
+  if (normalized.includes("qr") && normalized.includes("whatsapp")) {
+    return "generate_whatsapp_qr";
+  }
+  return null;
+}
+
+function asBeeUpQrPayload(payload: unknown): {
+  connectionId?: string | null;
+  qrImageDataUrl?: string | null;
+  connectionName?: string | null;
+  workspaceName?: string | null;
+  authStatus?: string | null;
+  qrStatus?: string | null;
+  qrMessage?: string | null;
+  qrGeneratedAt?: string | null;
+  whatsappOwnerJid?: string | null;
+  whatsappProfileName?: string | null;
+} | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return null;
+  }
+
+  const record = payload as Record<string, unknown>;
+  const connectionId = typeof record.connectionId === "string" ? record.connectionId : null;
+  const qrImageDataUrl = typeof record.qrImageDataUrl === "string" ? record.qrImageDataUrl : null;
+  if (!connectionId && !qrImageDataUrl?.trim()) {
+    return null;
+  }
+
+  return {
+    connectionId,
+    qrImageDataUrl,
+    connectionName: typeof record.connectionName === "string" ? record.connectionName : null,
+    workspaceName: typeof record.workspaceName === "string" ? record.workspaceName : null,
+    authStatus: typeof record.authStatus === "string" ? record.authStatus : null,
+    qrStatus: typeof record.qrStatus === "string" ? record.qrStatus : null,
+    qrMessage: typeof record.qrMessage === "string" ? record.qrMessage : null,
+    qrGeneratedAt: typeof record.qrGeneratedAt === "string" ? record.qrGeneratedAt : null,
+    whatsappOwnerJid: typeof record.whatsappOwnerJid === "string" ? record.whatsappOwnerJid : null,
+    whatsappProfileName: typeof record.whatsappProfileName === "string" ? record.whatsappProfileName : null,
+  };
+}
+
+type BeeUpWhatsappQrStatusResponse = {
+  connectionId: string;
+  connectionName: string;
+  workspaceName: string | null;
+  authStatus: string;
+  qrStatus: string | null;
+  qrMessage: string | null;
+  whatsappOwnerJid: string | null;
+  whatsappProfileName: string | null;
+  lastAuthAt: string | null;
+  lastSeenAt: string | null;
+};
+
+function resolveWhatsappOwnerNumber(ownerJid?: string | null): string | null {
+  const digits = ownerJid?.match(/\d+/)?.[0] ?? "";
+  return digits || null;
+}
+
+function resolveBeeUpWhatsappConnectedLabel(input: {
+  connectionName?: string | null;
+  whatsappOwnerJid?: string | null;
+  whatsappProfileName?: string | null;
+}): string {
+  const connectionName = input.connectionName?.trim() || "";
+  const isGenericConnectionName = /^conta\s+whatsapp$/i.test(connectionName);
+  return (
+    resolveWhatsappOwnerNumber(input.whatsappOwnerJid) ||
+    input.whatsappProfileName?.trim() ||
+    (isGenericConnectionName ? "" : connectionName) ||
+    "número ainda não retornado"
+  );
+}
+
+function asBeeUpWorkspaceChoicesPayload(payload: unknown): Array<{ id: string; name: string }> {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return [];
+  }
+
+  const choices = (payload as Record<string, unknown>).workspaceChoices;
+  if (!Array.isArray(choices)) {
+    return [];
+  }
+
+  return choices
+    .map((choice) => {
+      if (!choice || typeof choice !== "object" || Array.isArray(choice)) {
+        return null;
+      }
+      const record = choice as Record<string, unknown>;
+      if (typeof record.id !== "string" || typeof record.name !== "string") {
+        return null;
+      }
+      return {
+        id: record.id,
+        name: record.name,
+      };
+    })
+    .filter((choice): choice is { id: string; name: string } => Boolean(choice));
 }
 
 function formatBeeUpDate(value: string | null): string {
@@ -222,9 +345,19 @@ function renderBeeUpFormattedText(content: string) {
   });
 }
 
-function BeeUpAnimatedMessageContent(props: { content: string; animate: boolean; isPending?: boolean }) {
-  const { content, animate, isPending } = props;
+function BeeUpAnimatedMessageContent(props: {
+  content: string;
+  animate: boolean;
+  isPending?: boolean;
+  onProgress?: () => void;
+}) {
+  const { content, animate, isPending, onProgress } = props;
   const [visibleContent, setVisibleContent] = useState(() => (animate ? "" : content));
+  const onProgressRef = useRef<(() => void) | undefined>(onProgress);
+
+  useEffect(() => {
+    onProgressRef.current = onProgress;
+  }, [onProgress]);
 
   useEffect(() => {
     if (isPending) {
@@ -243,6 +376,7 @@ function BeeUpAnimatedMessageContent(props: { content: string; animate: boolean;
     const step = () => {
       index = Math.min(content.length, index + Math.max(2, Math.ceil(content.length / 80)));
       setVisibleContent(content.slice(0, index));
+      onProgressRef.current?.();
       if (index < content.length) {
         timeoutId = window.setTimeout(step, 18);
       }
@@ -282,13 +416,17 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
   const messagesViewportRef = useRef<HTMLDivElement | null>(null);
   const animationTimeoutRef = useRef<number | null>(null);
 
-  function scrollMessagesToBottom(behavior: ScrollBehavior = "smooth") {
+  const scrollMessagesToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
     const element = messagesViewportRef.current;
     if (!element) {
       return;
     }
     element.scrollTo({ top: element.scrollHeight, behavior });
-  }
+  }, []);
+
+  const handleAnimatedProgress = useCallback(() => {
+    scrollMessagesToBottom("auto");
+  }, [scrollMessagesToBottom]);
 
   async function loadSummary() {
     setLoadingSummary(true);
@@ -321,6 +459,9 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
     try {
       const response = await api.get<BeeUpMessagesResponse>(`/bee-up/threads/${threadId}/messages`);
       setMessages((response.items ?? []).map(normalizeBeeUpMessage));
+      window.requestAnimationFrame(() => {
+        scrollMessagesToBottom("auto");
+      });
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Falha ao carregar mensagens do Bee Up.");
     } finally {
@@ -345,6 +486,16 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
     }
     void loadMessages(activeThreadId);
   }, [activeThreadId, isOpen]);
+
+  useEffect(() => {
+    if (!isOpen || loadingMessages || messages.length === 0) {
+      return;
+    }
+
+    window.requestAnimationFrame(() => {
+      scrollMessagesToBottom("auto");
+    });
+  }, [isOpen, loadingMessages, messages.length]);
 
   useEffect(() => {
     if (!isOpen) {
@@ -377,7 +528,103 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
     };
   }, []);
 
-  async function sendMessage(nextMessage: string) {
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+
+    const pendingConnectionIds = Array.from(
+      new Set(
+        messages
+          .map((message) => asBeeUpQrPayload(message.payload))
+          .filter((payload) => {
+            if (!payload?.connectionId) {
+              return false;
+            }
+            const hasResolvedWhatsappIdentity = Boolean(
+              resolveWhatsappOwnerNumber(payload.whatsappOwnerJid) || payload.whatsappProfileName?.trim(),
+            );
+            return payload.authStatus !== "CONNECTED" || payload.qrStatus !== "CONNECTED" || !hasResolvedWhatsappIdentity;
+          })
+          .map((payload) => payload!.connectionId!),
+      ),
+    );
+
+    if (pendingConnectionIds.length === 0) {
+      return;
+    }
+
+    let cancelled = false;
+    const poll = async () => {
+      const results = await Promise.allSettled(
+        pendingConnectionIds.map((connectionId) =>
+          api.get<BeeUpWhatsappQrStatusResponse>(`/bee-up/whatsapp-qr-status/${connectionId}`),
+        ),
+      );
+
+      if (cancelled) {
+        return;
+      }
+
+      const statusByConnectionId = new Map<string, BeeUpWhatsappQrStatusResponse>();
+      for (const result of results) {
+        if (result.status === "fulfilled") {
+          statusByConnectionId.set(result.value.connectionId, result.value);
+        }
+      }
+
+      if (statusByConnectionId.size === 0) {
+        return;
+      }
+
+      setMessages((current) =>
+        current.map((message) => {
+          const qrPayload = asBeeUpQrPayload(message.payload);
+          if (!qrPayload?.connectionId) {
+            return message;
+          }
+
+          const status = statusByConnectionId.get(qrPayload.connectionId);
+          if (!status) {
+            return message;
+          }
+
+          return {
+            ...message,
+            content:
+              status.authStatus === "CONNECTED"
+                ? `Conta WhatsApp conectada com sucesso: ${resolveBeeUpWhatsappConnectedLabel(status)}${status.workspaceName ? ` no workspace ${status.workspaceName}` : ""}.`
+                : message.content,
+            payload: {
+              ...(message.payload && typeof message.payload === "object" && !Array.isArray(message.payload) ? message.payload : {}),
+              connectionId: status.connectionId,
+              connectionName: status.connectionName,
+              workspaceName: status.workspaceName,
+              authStatus: status.authStatus,
+              qrStatus: status.qrStatus,
+              qrMessage: status.qrMessage,
+              whatsappOwnerJid: status.whatsappOwnerJid,
+              whatsappProfileName: status.whatsappProfileName,
+              lastAuthAt: status.lastAuthAt,
+              lastSeenAt: status.lastSeenAt,
+            },
+          };
+        }),
+      );
+    };
+
+    void poll();
+    const intervalId = window.setInterval(() => {
+      void poll();
+    }, 3000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [isOpen, messages]);
+
+  async function sendMessage(nextMessage: string, toolIntent?: BeeUpToolIntent | null, toolParams?: BeeUpToolParams | null) {
     const trimmed = nextMessage.trim();
     if (!trimmed || sending) {
       return;
@@ -398,6 +645,7 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
       actions: [],
       sources: [],
       mode: null,
+      payload: null,
     };
     const optimisticAssistant: BeeUpMessage = {
       id: tempAssistantId,
@@ -409,6 +657,7 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
       actions: [],
       sources: [],
       mode: "PENDING",
+      payload: null,
       isPending: true,
     };
     setMessages((current) => [...current, optimisticUser, optimisticAssistant]);
@@ -422,6 +671,8 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
         threadId: activeThreadId ?? undefined,
         message: trimmed,
         currentView,
+        toolIntent: toolIntent ?? undefined,
+        toolParams: toolParams ?? undefined,
       });
 
       const normalizedAssistant = normalizeBeeUpMessage(response.assistantMessage);
@@ -625,7 +876,7 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
                   className="bee-up-chip"
                   onClick={() => {
                     setOpenPanel(null);
-                    void sendMessage(prompt);
+                    void sendMessage(prompt, resolveQuickPromptToolIntent(prompt));
                   }}
                 >
                   {prompt}
@@ -721,36 +972,82 @@ export function BeeUpDrawer(props: BeeUpDrawerProps) {
                 <span>Use o chat para entender erros, limites do plano, cobrança, QR do WhatsApp e navegação do painel.</span>
               </div>
             ) : (
-              messages.map((message) => (
-                <article
-                  key={message.id}
-                  className={`bee-up-message bee-up-message-${message.role === "user" ? "user" : "assistant"}`}
-                >
-                  <div className="bee-up-message-head">
-                    <strong>{message.role === "user" ? "Você" : "Bee Up"}</strong>
-                    <small>{formatBeeUpDate(message.createdAt)}</small>
-                  </div>
-                  <BeeUpAnimatedMessageContent
-                    content={message.content}
-                    animate={message.id === animatedMessageId}
-                    isPending={message.isPending}
-                  />
-                  {message.actions.length > 0 ? (
-                    <div className="bee-up-message-actions">
-                      {message.actions.map((action) => (
-                        <button
-                          key={`${message.id}-${action.label}`}
-                          type="button"
-                          className="bee-up-message-action-button"
-                          onClick={() => void handleAction(action)}
-                        >
-                          {action.label}
-                        </button>
-                      ))}
+              messages.map((message) => {
+                const qrPayload = asBeeUpQrPayload(message.payload);
+                const workspaceChoices = asBeeUpWorkspaceChoicesPayload(message.payload);
+                return (
+                  <article
+                    key={message.id}
+                    className={`bee-up-message bee-up-message-${message.role === "user" ? "user" : "assistant"}`}
+                  >
+                    <div className="bee-up-message-head">
+                      <strong>{message.role === "user" ? "Você" : "Bee Up"}</strong>
+                      <small>{formatBeeUpDate(message.createdAt)}</small>
                     </div>
-                  ) : null}
-                </article>
-              ))
+                    <BeeUpAnimatedMessageContent
+                      content={message.content}
+                      animate={message.id === animatedMessageId}
+                      isPending={message.isPending}
+                      onProgress={handleAnimatedProgress}
+                    />
+                    {qrPayload ? (
+                      <div className="bee-up-qr-preview">
+                        {qrPayload.authStatus === "CONNECTED" || qrPayload.qrStatus === "CONNECTED" ? (
+                          <div className="bee-up-qr-connected">
+                            <strong>WhatsApp conectado</strong>
+                            <span>
+                              {resolveBeeUpWhatsappConnectedLabel(qrPayload)}
+                            </span>
+                            {qrPayload.whatsappProfileName ? <small>{qrPayload.whatsappProfileName}</small> : null}
+                            {qrPayload.workspaceName ? <small>Workspace: {qrPayload.workspaceName}</small> : null}
+                          </div>
+                        ) : qrPayload.qrImageDataUrl ? (
+                          <img src={qrPayload.qrImageDataUrl} alt="QR Code do WhatsApp" />
+                        ) : null}
+                        {qrPayload.authStatus !== "CONNECTED" && qrPayload.qrStatus !== "CONNECTED" ? (
+                          <span>{qrPayload.qrMessage || "Escaneie o QR Code no WhatsApp do celular."}</span>
+                        ) : null}
+                        {qrPayload.qrGeneratedAt ? <small>Gerado em {formatBeeUpDate(qrPayload.qrGeneratedAt)}</small> : null}
+                      </div>
+                    ) : null}
+                    {workspaceChoices.length > 0 ? (
+                      <div className="bee-up-workspace-choice-list">
+                        {workspaceChoices.map((workspace) => (
+                          <button
+                            key={workspace.id}
+                            type="button"
+                            className="bee-up-workspace-choice-button"
+                            onClick={() =>
+                              void sendMessage(
+                                `Gerar QR do WhatsApp no workspace ${workspace.name}`,
+                                "generate_whatsapp_qr",
+                                { workspaceId: workspace.id },
+                              )
+                            }
+                            disabled={sending}
+                          >
+                            {workspace.name}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                    {message.actions.length > 0 ? (
+                      <div className="bee-up-message-actions">
+                        {message.actions.map((action) => (
+                          <button
+                            key={`${message.id}-${action.label}`}
+                            type="button"
+                            className="bee-up-message-action-button"
+                            onClick={() => void handleAction(action)}
+                          >
+                            {action.label}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                  </article>
+                );
+              })
             )}
           </div>
 

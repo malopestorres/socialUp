@@ -4,6 +4,7 @@ import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import type { AdminUserAuth } from "./admin-auth.js";
 import { prisma } from "./prisma.js";
+import { resolveWhatsappConnectionRuntimeMetadata } from "./whatsapp-evolution-api.js";
 
 type BeeUpAuthRequest = Request & { adminUser?: AdminUserAuth };
 
@@ -39,11 +40,21 @@ type BeeUpDependencyLogInput = {
   screenshotPath?: string | null;
 };
 
+type BeeUpDependencyAvisoInput = {
+  userId: string;
+  title: string;
+  message: string;
+  kind?: string;
+  createdByUserId?: string | null;
+};
+
 type BeeUpRegisterDependencies = {
   isRootUser: (request: BeeUpAuthRequest) => boolean;
   resolveUserBillingAccess: (userId: string) => Promise<BeeUpBillingSnapshot>;
   requestWhatsappQr: (connectionId: string, forceRegenerate: boolean) => Promise<void>;
+  getWhatsappConnectionOverlay?: (connectionId: string) => Partial<Record<string, unknown>>;
   appendLog: (input: BeeUpDependencyLogInput) => Promise<void>;
+  appendAviso?: (input: BeeUpDependencyAvisoInput) => Promise<void>;
 };
 
 type BeeUpKnowledgeDocInput = {
@@ -98,6 +109,7 @@ const BEE_UP_LOCAL_EMBEDDING_DIMENSIONS = 96;
 const BEE_UP_SEARCH_LIMIT = 4;
 const BEE_UP_DEFAULT_RESCHEDULE_MINUTES = 20;
 const BEE_UP_MAX_RESCHEDULE_MINUTES = 60 * 24 * 30;
+const BEE_UP_QR_REUSE_WINDOW_MS = Number.parseInt(process.env.EVOLUTION_QR_REUSE_WINDOW_MS || "45000", 10) || 45_000;
 const BEE_UP_GEMINI_API_KEY = trimNullable(process.env.BEE_UP_GEMINI_API_KEY) || trimNullable(process.env.GEMINI_API_KEY);
 const BEE_UP_GEMINI_MODEL = trimNullable(process.env.BEE_UP_GEMINI_MODEL) || "gemini-2.5-flash";
 const BEE_UP_GEMINI_API_BASE =
@@ -116,6 +128,14 @@ const beeUpChatSchema = z.object({
   threadId: z.string().trim().min(1).max(64).optional(),
   message: z.string().trim().min(2).max(4_000),
   currentView: z.string().trim().min(1).max(64).optional(),
+  toolIntent: z
+    .enum(["get_plan_limits", "get_recent_failures", "get_connection_status", "generate_whatsapp_qr"])
+    .optional(),
+  toolParams: z
+    .object({
+      workspaceId: z.string().trim().min(1).max(80).optional(),
+    })
+    .optional(),
 });
 
 const beeUpBuiltInDocuments: Array<{ title: string; category: string; content: string }> = [
@@ -141,7 +161,7 @@ const beeUpBuiltInDocuments: Array<{ title: string; category: string; content: s
     title: "Planos e limites",
     category: "BILLING",
     content:
-      "O limite mensal considera publicacoes do estado publicado dentro do ciclo atual. Se a conta estiver sem plano ativo, expirada ou bloqueada por cobranca, o backend impede novas operacoes de agendamento. O root pode ter um plano de exibicao proprio no painel para testes e administracao. Trial automatico pode ser ligado ou desligado nas configuracoes basicas de planos.",
+      "O limite mensal considera publicacoes do estado publicado dentro do ciclo atual. Se a conta estiver sem plano ativo, expirada ou bloqueada por cobranca, o backend impede novas operacoes de agendamento. A conta administrativa interna pode ter um plano de exibicao proprio no painel para testes e administracao. Trial automatico pode ser ligado ou desligado nas configuracoes basicas de planos.",
   },
   {
     title: "Assistente Bee Up",
@@ -421,6 +441,23 @@ function buildKnowledgeChunks(content: string): string[] {
 
 function buildThreadTitle(message: string): string {
   const normalized = normalizeText(message);
+  const normalizedCompact = normalized.replace(/\s+/g, " ").trim();
+  const greetingTokens = new Set([
+    "oi",
+    "ola",
+    "olá",
+    "bom dia",
+    "boa tarde",
+    "boa noite",
+    "hey",
+    "hi",
+    "hello",
+  ]);
+
+  // Evita criar threads com titulo "Oi" e similares.
+  if (normalizedCompact.length <= 12 && greetingTokens.has(normalizedCompact)) {
+    return "Nova conversa";
+  }
   const topicRules: Array<{ matches: (value: string) => boolean; title: string }> = [
     {
       matches: (value) => value.includes("instagram") && (value.includes("autenticacao") || value.includes("login")),
@@ -493,6 +530,23 @@ function shouldRefreshThreadTitle(currentTitle: string | null | undefined, messa
     return true;
   }
 
+  const normalizedCurrentKey = normalizeText(normalizedCurrent).replace(/\s+/g, " ").trim();
+  if (
+    normalizedCurrent.length <= 14 &&
+    (normalizedCurrentKey === "nova conversa" ||
+      normalizedCurrentKey === "oi" ||
+      normalizedCurrentKey === "ola" ||
+      normalizedCurrentKey === "olá" ||
+      normalizedCurrentKey === "bom dia" ||
+      normalizedCurrentKey === "boa tarde" ||
+      normalizedCurrentKey === "boa noite" ||
+      normalizedCurrentKey === "hey" ||
+      normalizedCurrentKey === "hi" ||
+      normalizedCurrentKey === "hello")
+  ) {
+    return true;
+  }
+
   if (normalizedCurrent.length > BEE_UP_THREAD_TITLE_MAX_LENGTH) {
     return true;
   }
@@ -541,7 +595,7 @@ function hasBeeUpGeminiEnabled(): boolean {
 function actionLabelForView(view: BeeUpOpenView): string {
   const actionLabelByView: Record<BeeUpOpenView, string> = {
     dashboard: "Abrir Dashboard",
-    companies: "Abrir Perfis",
+    companies: "Abrir Workspaces",
     agents: "Abrir Conectar contas",
     scheduler: "Abrir Agendar",
     history: "Abrir Histórico",
@@ -589,6 +643,30 @@ function buildBeeUpActions(message: string, toolResult: BeeUpToolExecutionResult
   return actions;
 }
 
+function buildBeeUpActionsFromReplyText(
+  message: string,
+  replyContent: string,
+  toolResult: BeeUpToolExecutionResult | null,
+): BeeUpAction[] {
+  const actions = buildBeeUpActions(message, toolResult);
+  if (actions.length > 0) {
+    return actions;
+  }
+
+  const view = inferViewFromMessage(replyContent);
+  if (!view) {
+    return actions;
+  }
+
+  return [
+    {
+      type: "OPEN_VIEW",
+      label: actionLabelForView(view),
+      view,
+    },
+  ];
+}
+
 function buildBeeUpGeminiSystemInstruction(request: BeeUpAuthRequest, isFirstTurn: boolean): string {
   const currentUser = request.adminUser;
   const userLabel = currentUser ? `${currentUser.name || currentUser.username} (@${currentUser.username})` : "usuário autenticado";
@@ -603,6 +681,8 @@ function buildBeeUpGeminiSystemInstruction(request: BeeUpAuthRequest, isFirstTur
     "Nunca invente status, limites, falhas ou conexões. Quando a informação depender do estado real do sistema ou exigir ação, use uma tool disponível.",
     "Quando a base Bee Up trouxer contexto suficiente, use esse material sem chamar tool desnecessária.",
     "Se uma tool retornar falha ou ambiguidade, explique isso com naturalidade e sugira o próximo passo mais seguro.",
+    "Quando o usuário relatar algo que depende de acesso administrativo interno, da equipe técnica, do produto ou de investigação manual para resolver, chame a tool open_support_incident e diga que a equipe técnica já foi acionada.",
+    "Nunca use a palavra root em respostas para usuário final. Quando precisar desse conceito, diga administração interna ou acesso administrativo interno.",
     "Não diga que você é um modelo de linguagem. Você é o assistente do sistema.",
     "Quando citar uma action possível, combine isso com o contexto da própria resposta, sem virar lista gigante.",
     "Para assuntos de Instagram, WhatsApp, autenticação, login, QR ou conta conectada, a rota preferida é Conectar contas.",
@@ -812,6 +892,10 @@ function inferViewFromMessage(message: string): BeeUpOpenView | null {
     return "dashboard";
   }
   if (
+    normalized.includes("workspace") ||
+    normalized.includes("workspaces") ||
+    normalized.includes("criar workspace") ||
+    normalized.includes("novo workspace") ||
     normalized.includes("perfil da empresa") ||
     normalized.includes("unidade") ||
     normalized.includes("perfil de postagem") ||
@@ -996,11 +1080,25 @@ async function resolveVisibleWhatsappConnections(
   request: BeeUpAuthRequest,
   dependencies: BeeUpRegisterDependencies,
 ) {
+  const userId = request.adminUser?.id;
+  if (!dependencies.isRootUser(request) && !userId) {
+    return [];
+  }
+
+  const where: Prisma.SocialConnectionWhereInput = {
+    platform: "whatsapp",
+  };
+
+  if (!dependencies.isRootUser(request)) {
+    where.OR = [
+      { createdByUserId: userId },
+      { company: { createdByUserId: userId } },
+      { company: { members: { some: { userId } } } },
+    ];
+  }
+
   return prisma.socialConnection.findMany({
-    where: {
-      platform: "whatsapp",
-      createdByUserId: ownedByUserId(request, dependencies),
-    },
+    where,
     orderBy: {
       updatedAt: "desc",
     },
@@ -1011,6 +1109,132 @@ async function resolveVisibleWhatsappConnections(
       authStatus: true,
       loginIdentifier: true,
       createdByUserId: true,
+      company: {
+        select: {
+          name: true,
+        },
+      },
+    },
+  });
+}
+
+function resolveBeeUpWorkspaceRole(
+  workspace: {
+    createdByUserId: string | null;
+    members: Array<{ userId: string; role: string }>;
+  },
+  userId: string,
+): string | null {
+  const membershipRole = workspace.members.find((member) => member.userId === userId)?.role ?? null;
+  return membershipRole || (workspace.createdByUserId === userId ? "CENTRAL" : null);
+}
+
+function canBeeUpConnectWorkspaceAccounts(
+  request: BeeUpAuthRequest,
+  dependencies: BeeUpRegisterDependencies,
+  workspace: {
+    createdByUserId: string | null;
+    kind: string;
+    status: string;
+    members: Array<{ userId: string; role: string }>;
+  },
+): boolean {
+  if (dependencies.isRootUser(request)) {
+    return true;
+  }
+
+  if (workspace.status !== "ACTIVE") {
+    return false;
+  }
+
+  const userId = request.adminUser?.id;
+  if (!userId) {
+    return false;
+  }
+
+  const currentRole = resolveBeeUpWorkspaceRole(workspace, userId);
+  if (workspace.kind === "AGENCY_BONUS") {
+    return currentRole === "CENTRAL" || currentRole === "AGENCY";
+  }
+
+  if (currentRole === "CLIENT") {
+    return true;
+  }
+
+  const hasClientMember = workspace.members.some((member) => member.role === "CLIENT");
+  return currentRole === "CENTRAL" && !hasClientMember;
+}
+
+async function resolveWhatsappEligibleWorkspaces(
+  request: BeeUpAuthRequest,
+  dependencies: BeeUpRegisterDependencies,
+) {
+  const userId = request.adminUser?.id;
+  if (!dependencies.isRootUser(request) && !userId) {
+    return [];
+  }
+
+  const where: Prisma.CompanyWhereInput = {
+    status: "ACTIVE",
+  };
+
+  if (!dependencies.isRootUser(request)) {
+    where.OR = [
+      { createdByUserId: userId },
+      { members: { some: { userId } } },
+    ];
+  }
+
+  const workspaces = await prisma.company.findMany({
+    where,
+    orderBy: {
+      createdAt: "asc",
+    },
+    select: {
+      id: true,
+      name: true,
+      createdByUserId: true,
+      kind: true,
+      status: true,
+      members: {
+        select: {
+          userId: true,
+          role: true,
+        },
+      },
+      connections: {
+        where: {
+          platform: "whatsapp",
+        },
+        select: {
+          id: true,
+        },
+        take: 1,
+      },
+    },
+  });
+
+  return workspaces.filter(
+    (workspace) =>
+      workspace.connections.length === 0 &&
+      canBeeUpConnectWorkspaceAccounts(request, dependencies, workspace),
+  );
+}
+
+async function createWhatsappConnectionForWorkspace(workspaceId: string, userId?: string | null) {
+  return prisma.socialConnection.create({
+    data: {
+      companyId: workspaceId,
+      createdByUserId: userId,
+      platform: "whatsapp",
+      provider: "NATIVE",
+      displayName: "Conta WhatsApp",
+      loginIdentifier: null,
+      secretCipher: null,
+      authStatus: "AUTH_REQUIRED",
+      automationMode: "VISUAL",
+      authLaunchUrl: "https://web.whatsapp.com/",
+      tokenExpiresAt: null,
     },
   });
 }
@@ -1032,8 +1256,8 @@ async function executePlanLimitsTool(
   if (dependencies.isRootUser(request)) {
     return {
       name: "get_plan_limits",
-      summary: "Você está usando a conta root. O Bee Up vai considerar o maior plano ativo para exibição administrativa.",
-      details: ["A conta root não fica bloqueada por billing no painel administrativo."],
+      summary: "Você está usando a conta administrativa interna. O Bee Up vai considerar o maior plano ativo para exibição administrativa.",
+      details: ["A conta administrativa interna não fica bloqueada por billing no painel administrativo."],
       actions: [
         {
           type: "OPEN_VIEW",
@@ -1166,6 +1390,44 @@ async function executeConnectionStatusTool(
     take: 20,
   });
 
+  const labelForPlatform = (platform: string): string => {
+    switch ((platform || "").trim().toLowerCase()) {
+      case "instagram":
+        return "Instagram";
+      case "facebook":
+        return "Facebook";
+      case "threads":
+        return "Threads";
+      case "tiktok":
+        return "TikTok";
+      case "x":
+        return "X";
+      case "whatsapp":
+        return "WhatsApp";
+      default:
+        return platform || "Conta";
+    }
+  };
+
+  const labelForAuthStatus = (status: string): string => {
+    switch ((status || "").trim().toUpperCase()) {
+      case "CONNECTED":
+        return "Conectada";
+      case "AUTH_REQUIRED":
+        return "Não conectada";
+      case "AUTH_IN_PROGRESS":
+        // Estado transitório; Bee Up nao deve expor como status final.
+        return "Autenticando";
+      default:
+        return "Não conectada";
+    }
+  };
+
+  // Bee Up nao lista AUTH_IN_PROGRESS (ruido/transitorio).
+  const stableConnections = connections.filter((connection) => connection.authStatus !== "AUTH_IN_PROGRESS");
+  // Para este atalho, listamos somente contas realmente conectadas (o painel ja mostra o resto).
+  const connectedConnections = stableConnections.filter((connection) => connection.authStatus === "CONNECTED");
+
   if (connections.length === 0) {
     return {
       name: "get_connection_status",
@@ -1181,15 +1443,34 @@ async function executeConnectionStatusTool(
     };
   }
 
-  const connectedCount = connections.filter((connection) => connection.authStatus === "CONNECTED").length;
-  const waitingCount = connections.filter((connection) => connection.authStatus !== "CONNECTED").length;
+  const connectedCount = connectedConnections.length;
+
+  if (connectedCount === 0) {
+    return {
+      name: "get_connection_status",
+      summary: "Você ainda não tem contas conectadas.",
+      actions: [
+        {
+          type: "OPEN_VIEW",
+          label: "Abrir Conectar contas",
+          view: "agents",
+        },
+      ],
+      payload: {
+        total: 0,
+        connectedCount: 0,
+        waitingCount: 0,
+      },
+      logStatus: "SUCCESS",
+    };
+  }
 
   return {
     name: "get_connection_status",
-    summary: `Você tem ${connectedCount} conta(s) conectada(s) e ${waitingCount} conta(s) que ainda precisam de atenção.`,
-    details: connections.slice(0, 6).map(
+    summary: `Você tem ${connectedCount} conta(s) conectada(s).`,
+    details: connectedConnections.slice(0, 6).map(
       (connection) =>
-        `${connection.platform === "instagram" ? "Instagram" : "WhatsApp"} · ${connection.displayName} · ${connection.authStatus} · ${formatToolDate(connection.updatedAt)}`,
+        `${labelForPlatform(connection.platform)} · ${connection.displayName} · ${labelForAuthStatus(connection.authStatus)} · ${formatToolDate(connection.updatedAt)}`,
     ),
     actions: [
       {
@@ -1199,9 +1480,9 @@ async function executeConnectionStatusTool(
       },
     ],
     payload: {
-      total: connections.length,
+      total: connectedConnections.length,
       connectedCount,
-      waitingCount,
+      waitingCount: 0,
     },
     logStatus: "SUCCESS",
   };
@@ -1223,16 +1504,324 @@ function pickBestConnectionMatch(message: string, connections: Awaited<ReturnTyp
   return connections[0] ?? null;
 }
 
+function buildWhatsappWorkspaceChoices(input: {
+  connections: Awaited<ReturnType<typeof resolveVisibleWhatsappConnections>>;
+  eligibleWorkspaces: Awaited<ReturnType<typeof resolveWhatsappEligibleWorkspaces>>;
+}) {
+  const choices = [
+    ...input.connections
+      .filter((connection) => connection.authStatus !== "CONNECTED")
+      .map((connection) => ({
+        id: connection.companyId,
+        name: connection.company?.name || connection.displayName || "Workspace",
+        connectionId: connection.id,
+      })),
+    ...input.eligibleWorkspaces.map((workspace) => ({
+      id: workspace.id,
+      name: workspace.name,
+      connectionId: null,
+    })),
+  ];
+
+  const seenWorkspaceIds = new Set<string>();
+  return choices.filter((choice) => {
+    if (seenWorkspaceIds.has(choice.id)) {
+      return false;
+    }
+    seenWorkspaceIds.add(choice.id);
+    return true;
+  });
+}
+
+function readWhatsappMetadata(value: Prisma.JsonValue | null | undefined): {
+  whatsappOwnerJid: string | null;
+  whatsappProfileName: string | null;
+} {
+  const metadata = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+
+  return {
+    whatsappOwnerJid: typeof metadata.whatsappOwnerJid === "string" ? metadata.whatsappOwnerJid : null,
+    whatsappProfileName: typeof metadata.whatsappProfileName === "string" ? metadata.whatsappProfileName : null,
+  };
+}
+
+async function ensureBeeUpWhatsappMetadata(connection: {
+  id: string;
+  companyId: string;
+  displayName: string;
+  authStatus: string;
+  loginIdentifier: string | null;
+  secretCipher?: string | null;
+  providerMetadata?: Prisma.JsonValue | null;
+}) {
+  const storedMetadata = readWhatsappMetadata(connection.providerMetadata);
+  if (connection.authStatus !== "CONNECTED" || storedMetadata.whatsappOwnerJid || storedMetadata.whatsappProfileName) {
+    return storedMetadata;
+  }
+
+  try {
+    const metadata = await resolveWhatsappConnectionRuntimeMetadata({
+      id: connection.id,
+      companyId: connection.companyId,
+      displayName: connection.displayName,
+      platform: "whatsapp",
+      loginIdentifier: connection.loginIdentifier,
+      secretCipher: connection.secretCipher ?? null,
+    });
+    const nextMetadata = {
+      whatsappOwnerJid: metadata.ownerJid,
+      whatsappProfileName: metadata.profileName,
+    };
+    if (nextMetadata.whatsappOwnerJid || nextMetadata.whatsappProfileName) {
+      await prisma.socialConnection.update({
+        where: { id: connection.id },
+        data: {
+          providerMetadata: nextMetadata,
+        },
+      });
+    }
+    return nextMetadata;
+  } catch {
+    return storedMetadata;
+  }
+}
+
+function normalizeOverlayDate(value: unknown): Date | null {
+  if (value instanceof Date && Number.isFinite(value.getTime())) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = new Date(value);
+    return Number.isFinite(parsed.getTime()) ? parsed : null;
+  }
+  return null;
+}
+
+function resolveReusableWhatsappQrOverlay(overlay: Partial<Record<string, unknown>>, nowMs = Date.now()) {
+  const qrStatus = typeof overlay.qrStatus === "string" ? overlay.qrStatus : null;
+  if (qrStatus !== "WAITING_QR_SCAN" && qrStatus !== "PREPARING") {
+    return null;
+  }
+
+  const qrImageDataUrl = typeof overlay.qrImageDataUrl === "string" ? overlay.qrImageDataUrl : null;
+  const qrMessage = typeof overlay.qrMessage === "string" ? overlay.qrMessage : null;
+  const qrGeneratedAtDate = normalizeOverlayDate(overlay.qrGeneratedAt);
+  const workerLastSeenAtDate = normalizeOverlayDate(overlay.workerLastSeenAt);
+  const referenceDate = qrGeneratedAtDate ?? workerLastSeenAtDate;
+  if (!referenceDate) {
+    return null;
+  }
+
+  if (nowMs - referenceDate.getTime() > BEE_UP_QR_REUSE_WINDOW_MS) {
+    return null;
+  }
+
+  return {
+    qrImageDataUrl,
+    qrStatus,
+    qrMessage,
+    qrGeneratedAt: qrGeneratedAtDate?.toISOString() ?? null,
+  };
+}
+
+async function resolveVisibleWhatsappConnectionById(
+  connectionId: string,
+  request: BeeUpAuthRequest,
+  dependencies: BeeUpRegisterDependencies,
+) {
+  const userId = request.adminUser?.id;
+  if (!dependencies.isRootUser(request) && !userId) {
+    return null;
+  }
+
+  const where: Prisma.SocialConnectionWhereInput = {
+    id: connectionId,
+    platform: "whatsapp",
+  };
+
+  if (!dependencies.isRootUser(request)) {
+    where.OR = [
+      { createdByUserId: userId },
+      { company: { createdByUserId: userId } },
+      { company: { members: { some: { userId } } } },
+    ];
+  }
+
+  const connection = await prisma.socialConnection.findFirst({
+    where,
+    select: {
+      id: true,
+      companyId: true,
+      displayName: true,
+      authStatus: true,
+      loginIdentifier: true,
+      secretCipher: true,
+      providerMetadata: true,
+      lastAuthAt: true,
+      lastSeenAt: true,
+      company: {
+        select: {
+          name: true,
+        },
+      },
+    },
+  });
+
+  if (!connection) {
+    return null;
+  }
+
+  const overlay = dependencies.getWhatsappConnectionOverlay?.(connection.id) ?? {};
+  const overlayStatus = typeof overlay.qrStatus === "string" ? overlay.qrStatus : null;
+  const overlayOwnerJid = typeof overlay.whatsappOwnerJid === "string" ? overlay.whatsappOwnerJid : null;
+  const overlayProfileName = typeof overlay.whatsappProfileName === "string" ? overlay.whatsappProfileName : null;
+  const storedMetadata = readWhatsappMetadata(connection.providerMetadata);
+
+  if (overlayStatus === "CONNECTED" && connection.authStatus !== "CONNECTED") {
+    return prisma.socialConnection.update({
+      where: { id: connection.id },
+      data: {
+        authStatus: "CONNECTED",
+        authLaunchUrl: null,
+        lastAuthAt: connection.lastAuthAt ?? new Date(),
+        lastSeenAt: new Date(),
+        providerMetadata: {
+          whatsappOwnerJid: overlayOwnerJid ?? storedMetadata.whatsappOwnerJid,
+          whatsappProfileName: overlayProfileName ?? storedMetadata.whatsappProfileName,
+        },
+      },
+      select: {
+        id: true,
+        companyId: true,
+        displayName: true,
+        authStatus: true,
+        loginIdentifier: true,
+        secretCipher: true,
+        providerMetadata: true,
+        lastAuthAt: true,
+        lastSeenAt: true,
+        company: {
+          select: {
+            name: true,
+          },
+        },
+      },
+    });
+  }
+
+  return connection;
+}
+
 async function executeGenerateWhatsappQrTool(
   request: BeeUpAuthRequest,
   message: string,
   dependencies: BeeUpRegisterDependencies,
+  params?: { workspaceId?: string },
 ): Promise<BeeUpToolExecutionResult> {
-  const connections = await resolveVisibleWhatsappConnections(request, dependencies);
-  if (connections.length === 0) {
+  let connections = await resolveVisibleWhatsappConnections(request, dependencies);
+  const eligibleWorkspaces = await resolveWhatsappEligibleWorkspaces(request, dependencies);
+  const workspaceChoices = buildWhatsappWorkspaceChoices({ connections, eligibleWorkspaces });
+
+  if (!params?.workspaceId && workspaceChoices.length > 1) {
     return {
       name: "generate_whatsapp_qr",
-      summary: "Não encontrei nenhuma conta de WhatsApp disponível para gerar QR.",
+      summary: "Encontrei mais de um workspace disponível. Escolha em qual workspace você quer gerar o QR do WhatsApp.",
+      payload: {
+        workspaceChoices: workspaceChoices.map((workspace) => ({
+          id: workspace.id,
+          name: workspace.name,
+        })),
+      },
+      logStatus: "SKIPPED",
+    };
+  }
+
+  const selectedWorkspaceId = params?.workspaceId || workspaceChoices[0]?.id || null;
+  if (selectedWorkspaceId) {
+    const selectedExistingConnection = connections.find(
+      (connection) => connection.companyId === selectedWorkspaceId && connection.authStatus !== "CONNECTED",
+    );
+    const selectedNewWorkspace = eligibleWorkspaces.find((workspace) => workspace.id === selectedWorkspaceId);
+
+    if (!selectedExistingConnection && selectedNewWorkspace) {
+      const createdConnection = await createWhatsappConnectionForWorkspace(selectedNewWorkspace.id, request.adminUser?.id);
+      connections = [
+        {
+          id: createdConnection.id,
+          companyId: createdConnection.companyId,
+          displayName: createdConnection.displayName,
+          authStatus: createdConnection.authStatus,
+          loginIdentifier: createdConnection.loginIdentifier,
+          createdByUserId: createdConnection.createdByUserId,
+          company: {
+            name: selectedNewWorkspace.name,
+          },
+        },
+      ];
+    } else if (selectedExistingConnection) {
+      connections = [selectedExistingConnection];
+    } else if (params?.workspaceId) {
+      return {
+        name: "generate_whatsapp_qr",
+        summary: "Não consegui usar esse workspace para gerar o QR do WhatsApp.",
+        details: ["Talvez ele já tenha uma conta WhatsApp conectada, esteja inativo ou você não tenha permissão para conectar contas nele."],
+        actions: [
+          {
+            type: "OPEN_VIEW",
+            label: "Abrir Conectar contas",
+            view: "agents",
+          },
+        ],
+        logStatus: "FAILED",
+        errorMessage: "Workspace inválido para WhatsApp.",
+      };
+    }
+  }
+
+  if (connections.length === 0) {
+    const selectedWorkspace = eligibleWorkspaces.length === 1 ? eligibleWorkspaces[0] : null;
+    const createdConnection = selectedWorkspace
+      ? await createWhatsappConnectionForWorkspace(selectedWorkspace.id, request.adminUser?.id)
+      : null;
+    if (!createdConnection) {
+      return {
+        name: "generate_whatsapp_qr",
+        summary: "Não encontrei um workspace disponível para criar a conta de WhatsApp e gerar o QR.",
+        details: ["Crie um workspace primeiro ou verifique se você tem permissão para conectar contas nele."],
+        actions: [
+          {
+            type: "OPEN_VIEW",
+            label: "Abrir Workspaces",
+            view: "companies",
+          },
+        ],
+        logStatus: "FAILED",
+        errorMessage: "Nenhum workspace elegível para criar WhatsApp.",
+      };
+    }
+
+    connections = [
+      {
+        id: createdConnection.id,
+        companyId: createdConnection.companyId,
+        displayName: createdConnection.displayName,
+        authStatus: createdConnection.authStatus,
+        loginIdentifier: createdConnection.loginIdentifier,
+        createdByUserId: createdConnection.createdByUserId,
+        company: {
+          name: selectedWorkspace?.name ?? "Workspace",
+        },
+      },
+    ];
+  }
+
+  const qrEligibleConnections = connections.filter((connection) => connection.authStatus !== "CONNECTED");
+  if (qrEligibleConnections.length === 0) {
+    return {
+      name: "generate_whatsapp_qr",
+      summary: "Suas contas de WhatsApp já aparecem como conectadas. Para trocar de aparelho, desconecte a conta primeiro e depois gere outro QR.",
       actions: [
         {
           type: "OPEN_VIEW",
@@ -1240,12 +1829,14 @@ async function executeGenerateWhatsappQrTool(
           view: "agents",
         },
       ],
-      logStatus: "FAILED",
-      errorMessage: "Nenhuma conta de WhatsApp encontrada.",
+      payload: {
+        total: connections.length,
+      },
+      logStatus: "SKIPPED",
     };
   }
 
-  const connection = pickBestConnectionMatch(message, connections);
+  const connection = pickBestConnectionMatch(message, qrEligibleConnections);
   if (!connection) {
     return {
       name: "generate_whatsapp_qr",
@@ -1262,6 +1853,32 @@ async function executeGenerateWhatsappQrTool(
     };
   }
 
+  const reusableOverlay = resolveReusableWhatsappQrOverlay(dependencies.getWhatsappConnectionOverlay?.(connection.id) ?? {});
+  if (reusableOverlay) {
+    return {
+      name: "generate_whatsapp_qr",
+      summary: "Já gerei um QR Code para esse workspace há pouco tempo. Use o QR que está logo acima no chat.",
+      details: ["Para evitar limite da Evolution, o Bee Up não gera outro QR enquanto o anterior ainda está dentro da janela de uso."],
+      actions: [
+        {
+          type: "OPEN_VIEW",
+          label: "Abrir Conectar contas",
+          view: "agents",
+        },
+      ],
+      payload: {
+        connectionId: connection.id,
+        connectionName: connection.displayName,
+        workspaceName: connection.company?.name ?? null,
+        qrImageDataUrl: reusableOverlay.qrImageDataUrl,
+        qrStatus: reusableOverlay.qrStatus,
+        qrMessage: reusableOverlay.qrMessage,
+        qrGeneratedAt: reusableOverlay.qrGeneratedAt,
+      },
+      logStatus: "SKIPPED",
+    };
+  }
+
   const updatedConnection = await prisma.socialConnection.update({
     where: { id: connection.id },
     data: {
@@ -1270,14 +1887,61 @@ async function executeGenerateWhatsappQrTool(
     },
   });
 
-  void dependencies.requestWhatsappQr(updatedConnection.id, true).catch(async (error) => {
+  try {
+    await dependencies.requestWhatsappQr(updatedConnection.id, false);
+  } catch (error) {
+    const rawMessage = error instanceof Error && error.message ? error.message : "Falha ao gerar um novo QR do WhatsApp.";
+    const humanMessage = humanizeBeeUpWhatsappQrErrorMessage(rawMessage);
+
     await dependencies.appendLog({
       companyId: updatedConnection.companyId,
       level: "ERROR",
       errorCode: "BEE_UP_QR_REQUEST_FAILED",
-      message: error instanceof Error && error.message ? error.message : "Bee Up não conseguiu gerar um novo QR do WhatsApp.",
+      message: humanMessage,
     });
-  });
+
+    await prisma.socialConnection.update({
+      where: { id: updatedConnection.id },
+      data: {
+        authStatus: "AUTH_REQUIRED",
+        lastSeenAt: null,
+        authLaunchUrl: null,
+      },
+    });
+
+    return {
+      name: "generate_whatsapp_qr",
+      summary: "Nao consegui gerar o QR do WhatsApp agora.",
+      details: [humanMessage],
+      actions: [
+        {
+          type: "OPEN_VIEW",
+          label: "Abrir Conectar contas",
+          view: "agents",
+        },
+      ],
+      payload: {
+        connectionId: updatedConnection.id,
+        connectionName: updatedConnection.displayName,
+        workspaceName: connection.company?.name ?? null,
+        qrStatus: "ERROR",
+        qrMessage: humanMessage,
+      },
+      logStatus: "FAILED",
+      errorMessage: humanMessage,
+    };
+  }
+
+  const overlay = dependencies.getWhatsappConnectionOverlay?.(updatedConnection.id) ?? {};
+  const qrImageDataUrl = typeof overlay.qrImageDataUrl === "string" ? overlay.qrImageDataUrl : null;
+  const qrStatus = typeof overlay.qrStatus === "string" ? overlay.qrStatus : null;
+  const qrMessage = typeof overlay.qrMessage === "string" ? overlay.qrMessage : null;
+  const qrGeneratedAt =
+    overlay.qrGeneratedAt instanceof Date
+      ? overlay.qrGeneratedAt.toISOString()
+      : typeof overlay.qrGeneratedAt === "string"
+        ? overlay.qrGeneratedAt
+        : null;
 
   await dependencies.appendLog({
     companyId: updatedConnection.companyId,
@@ -1287,9 +1951,13 @@ async function executeGenerateWhatsappQrTool(
 
   return {
     name: "generate_whatsapp_qr",
-    summary: `Solicitei um novo QR para a conta ${updatedConnection.displayName}.`,
+    summary: qrImageDataUrl
+      ? `Gerei o QR do WhatsApp para a conta ${updatedConnection.displayName}. Escaneie pelo celular.`
+      : `Solicitei um novo QR para a conta ${updatedConnection.displayName}.`,
     details: [
-      "Abra a tela Conectar contas para acompanhar a imagem do QR em tempo real.",
+      qrImageDataUrl
+        ? "O QR está disponível aqui no chat e também na tela Conectar contas."
+        : "Abra a tela Conectar contas para acompanhar a imagem do QR em tempo real.",
       "Se o QR expirar, você pode pedir outro pelo próprio Bee Up.",
     ],
     actions: [
@@ -1306,9 +1974,63 @@ async function executeGenerateWhatsappQrTool(
     payload: {
       connectionId: updatedConnection.id,
       connectionName: updatedConnection.displayName,
+      workspaceName: connection.company?.name ?? null,
+      qrImageDataUrl,
+      qrStatus,
+      qrMessage,
+      qrGeneratedAt,
     },
     logStatus: "SUCCESS",
   };
+}
+
+function humanizeBeeUpWhatsappQrErrorMessage(message: string): string {
+  const normalized = message.trim();
+  if (!normalized) {
+    return "Falha ao iniciar a geracao do QR do WhatsApp.";
+  }
+
+  if (normalized.includes("WHATSAPP_EVOLUTION_API_KEY_MISSING")) {
+    return "A integracao do WhatsApp nao esta configurada no backend. Revise a chave da Evolution API.";
+  }
+
+  if (normalized.includes("WHATSAPP_EVOLUTION_API_HTTP_401:")) {
+    return "A Evolution API recusou a autenticacao. Revise a chave configurada no backend e na Evolution.";
+  }
+
+  if (normalized.includes("WHATSAPP_EVOLUTION_API_HTTP_403:")) {
+    return "A Evolution API bloqueou esta operacao. Revise as permissoes e a configuracao da instancia.";
+  }
+
+  if (normalized.includes("WHATSAPP_EVOLUTION_API_HTTP_404:")) {
+    return "A instancia do WhatsApp nao foi encontrada na Evolution. Tente gerar o QR novamente.";
+  }
+
+  if (normalized.includes("WHATSAPP_EVOLUTION_API_HTTP_409:")) {
+    return "A instancia do WhatsApp esta em conflito de sessao. Tente gerar um novo QR.";
+  }
+
+  if (normalized.includes("LOGIN_REQUIRED_WHATSAPP")) {
+    return "A conta do WhatsApp precisa ser autenticada para continuar.";
+  }
+
+  if (normalized.includes("WHATSAPP_INSTANCE_STARTING")) {
+    return "A instancia do WhatsApp esta iniciando. Aguarde alguns segundos e tente novamente.";
+  }
+
+  if (normalized.includes("WHATSAPP_INSTANCE_LOGOUT_PENDING")) {
+    return "A sessao anterior do WhatsApp ainda nao foi encerrada na Evolution. Aguarde alguns segundos e tente gerar um novo QR.";
+  }
+
+  if (normalized.includes("WHATSAPP_INSTANCE_DELETE_PENDING")) {
+    return "A Evolution ainda esta removendo a sessao anterior do WhatsApp. Aguarde alguns segundos e tente novamente.";
+  }
+
+  if (normalized.includes("WHATSAPP_INSTANCE_REUSE_BLOCKED")) {
+    return "A Evolution ainda esta reaproveitando a sessao anterior do WhatsApp. O novo QR so sera liberado quando essa sessao for encerrada.";
+  }
+
+  return normalized;
 }
 
 async function executeRescheduleJobTool(
@@ -1399,11 +2121,16 @@ async function executeRescheduleJobTool(
 async function executeOpenSupportIncidentTool(
   request: BeeUpAuthRequest,
   message: string,
+  dependencies: BeeUpRegisterDependencies,
 ): Promise<BeeUpToolExecutionResult> {
+  const reporter = request.adminUser;
+  const reporterLabel = reporter
+    ? `${reporter.name || reporter.username} (@${reporter.username})`
+    : "Usuário autenticado";
   const incident = await prisma.aiIncident.create({
     data: {
-      userId: request.adminUser?.id ?? null,
-      createdByUserId: request.adminUser?.id ?? null,
+      userId: reporter?.id ?? null,
+      createdByUserId: reporter?.id ?? null,
       severity: "MEDIUM",
       status: "OPEN",
       source: "BEE_UP",
@@ -1415,32 +2142,65 @@ async function executeOpenSupportIncidentTool(
           type: "USER_REQUEST",
           message: truncateText(message, 1_000),
           payload: {
-            username: request.adminUser?.username ?? null,
+            username: reporter?.username ?? null,
           } satisfies Prisma.InputJsonValue,
         },
       },
     },
   });
 
-  await prisma.aiUserAlert.create({
-    data: {
-      userId: request.adminUser?.id ?? "",
-      kind: "BEE_UP_INCIDENT",
-      title: "Bee Up abriu um incidente interno",
-      message: "O pedido foi registrado para acompanhamento técnico.",
-      payload: {
-        incidentId: incident.id,
-      } satisfies Prisma.InputJsonValue,
-    },
+  const rootUser = await prisma.user.findUnique({
+    where: { username: "root" },
+    select: { id: true },
   });
+
+  if (rootUser) {
+    const alertTitle = `Bee Up: ${reporterLabel} relatou um problema`;
+    const alertMessage = truncateText(`Relato: ${message}`, 900);
+
+    await prisma.aiUserAlert.create({
+      data: {
+        userId: rootUser.id,
+        kind: "BEE_UP_INCIDENT",
+        title: alertTitle,
+        message: alertMessage,
+        payload: {
+          incidentId: incident.id,
+          reporterUserId: reporter?.id ?? null,
+          reporterUsername: reporter?.username ?? null,
+        } satisfies Prisma.InputJsonValue,
+      },
+    });
+
+    if (dependencies.appendAviso) {
+      await dependencies.appendAviso({
+        userId: rootUser.id,
+        kind: "BEE_UP_INCIDENT",
+        title: alertTitle,
+        message: alertMessage,
+        createdByUserId: reporter?.id ?? null,
+      });
+    } else {
+      await prisma.aviso.create({
+        data: {
+          userId: rootUser.id,
+          kind: "BEE_UP_INCIDENT",
+          title: alertTitle,
+          message: alertMessage,
+          createdByUserId: reporter?.id ?? null,
+        },
+      });
+    }
+  }
 
   return {
     name: "open_support_incident",
-    summary: "Registrei um incidente interno para acompanhamento técnico.",
+    summary: "A equipe técnica já foi acionada para acompanhar isso.",
     details: [`ID do incidente: ${incident.id}`],
     logStatus: "SUCCESS",
     payload: {
       incidentId: incident.id,
+      notifiedRoot: Boolean(rootUser),
     },
   };
 }
@@ -1496,6 +2256,7 @@ async function executeToolByIntent(input: {
   request: BeeUpAuthRequest;
   message: string;
   dependencies: BeeUpRegisterDependencies;
+  params?: { workspaceId?: string };
 }): Promise<BeeUpToolExecutionResult> {
   switch (input.intent) {
     case "get_plan_limits":
@@ -1505,11 +2266,11 @@ async function executeToolByIntent(input: {
     case "get_connection_status":
       return executeConnectionStatusTool(input.request, input.dependencies);
     case "generate_whatsapp_qr":
-      return executeGenerateWhatsappQrTool(input.request, input.message, input.dependencies);
+      return executeGenerateWhatsappQrTool(input.request, input.message, input.dependencies, input.params);
     case "reschedule_job":
       return executeRescheduleJobTool(input.request, input.message, input.dependencies);
     case "open_support_incident":
-      return executeOpenSupportIncidentTool(input.request, input.message);
+      return executeOpenSupportIncidentTool(input.request, input.message, input.dependencies);
     case "open_view":
       return executeOpenViewTool(input.message);
     default:
@@ -1526,18 +2287,10 @@ function buildFallbackHelpReply(message: string, currentView?: string | null): s
   return `${viewHint}Eu consigo te ajudar com limites do plano, falhas recentes, status das contas, geração de QR do WhatsApp, reagendamento e navegação do painel. Se quiser, pode me pedir algo como "veja minhas falhas recentes" ou "gere um novo QR do WhatsApp".`;
 }
 
-function buildBeeUpToolFallbackReply(toolResult: BeeUpToolExecutionResult, sources: BeeUpSource[]): string {
+function buildBeeUpToolFallbackReply(toolResult: BeeUpToolExecutionResult, _sources: BeeUpSource[]): string {
   const paragraphs = [toolResult.summary];
   if (toolResult.details?.length) {
     paragraphs.push(toolResult.details.map((detail) => `- ${detail}`).join("\n"));
-  }
-  if (sources.length > 0) {
-    paragraphs.push(
-      `Também encontrei contexto útil na base Bee Up:\n${sources
-        .slice(0, 2)
-        .map((source) => `- ${source.title}: ${source.content}`)
-        .join("\n")}`,
-    );
   }
   return paragraphs.join("\n\n");
 }
@@ -1575,7 +2328,7 @@ async function executeToolByGeminiFunctionCall(input: {
     }
     case "open_support_incident": {
       const summary = parseOptionalString(functionCall.args.summary) || originalMessage;
-      return executeOpenSupportIncidentTool(request, summary);
+      return executeOpenSupportIncidentTool(request, summary, dependencies);
     }
     case "open_view": {
       const requestedView = parseOptionalString(functionCall.args.view);
@@ -1746,8 +2499,8 @@ function buildChatReply(input: {
     }
   }
 
-  if (input.sources.length > 0) {
-    const sourceLead = input.toolResult ? "Também encontrei contexto útil na base Bee Up:" : "Encontrei isto na base Bee Up:";
+  if (!input.toolResult && input.sources.length > 0) {
+    const sourceLead = "Encontrei isto na base Bee Up:";
     const sourceBody = input.sources
       .slice(0, 2)
       .map((source) => `- ${source.title}: ${source.content}`)
@@ -2049,6 +2802,39 @@ export function registerBeeUpRoutes(app: Express, dependencies: BeeUpRegisterDep
     });
   });
 
+  router.get("/whatsapp-qr-status/:connectionId", async (request, response) => {
+    const authRequest = request as BeeUpAuthRequest;
+    const connection = await resolveVisibleWhatsappConnectionById(request.params.connectionId, authRequest, dependencies);
+
+    if (!connection) {
+      response.status(404).json({ error: "Conta de WhatsApp não encontrada." });
+      return;
+    }
+
+    const overlay = dependencies.getWhatsappConnectionOverlay?.(connection.id) ?? {};
+    const runtimeMetadata = await ensureBeeUpWhatsappMetadata(connection);
+    const metadata = readWhatsappMetadata(connection.providerMetadata);
+    const qrStatus = typeof overlay.qrStatus === "string" ? overlay.qrStatus : null;
+    const qrMessage = typeof overlay.qrMessage === "string" ? overlay.qrMessage : null;
+    const whatsappOwnerJid =
+      typeof overlay.whatsappOwnerJid === "string" ? overlay.whatsappOwnerJid : runtimeMetadata.whatsappOwnerJid ?? metadata.whatsappOwnerJid;
+    const whatsappProfileName =
+      typeof overlay.whatsappProfileName === "string" ? overlay.whatsappProfileName : runtimeMetadata.whatsappProfileName ?? metadata.whatsappProfileName;
+
+    response.json({
+      connectionId: connection.id,
+      connectionName: connection.displayName,
+      workspaceName: connection.company?.name ?? null,
+      authStatus: connection.authStatus,
+      qrStatus,
+      qrMessage,
+      whatsappOwnerJid,
+      whatsappProfileName,
+      lastAuthAt: connection.lastAuthAt,
+      lastSeenAt: connection.lastSeenAt,
+    });
+  });
+
   router.post("/chat", async (request, response) => {
     const authRequest = request as BeeUpAuthRequest;
     const payload = beeUpChatSchema.parse(request.body || {});
@@ -2106,7 +2892,26 @@ export function registerBeeUpRoutes(app: Express, dependencies: BeeUpRegisterDep
     let geminiAttempted = false;
     let geminiErrorMessage: string | null = null;
 
-    if (hasBeeUpGeminiEnabled()) {
+    if (payload.toolIntent) {
+      toolResult = await executeToolByIntent({
+        intent: payload.toolIntent,
+        request: authRequest,
+        message: payload.message,
+        dependencies,
+        params: payload.toolParams,
+      });
+
+      reply = buildChatReply({
+        message: payload.message,
+        currentView: payload.currentView ?? null,
+        sources,
+        toolResult,
+        userFirstName: getFirstName(authRequest.adminUser?.name || authRequest.adminUser?.username),
+        isFirstTurn: recentConversation.length === 0,
+      });
+    }
+
+    if (!reply && hasBeeUpGeminiEnabled()) {
       geminiAttempted = true;
       try {
         const geminiReply = await generateBeeUpReplyWithGemini({
@@ -2125,7 +2930,7 @@ export function registerBeeUpRoutes(app: Express, dependencies: BeeUpRegisterDep
           toolResult = geminiReply.toolResult;
           reply = {
             content: geminiReply.content,
-            actions: buildBeeUpActions(payload.message, geminiReply.toolResult),
+            actions: buildBeeUpActionsFromReplyText(payload.message, geminiReply.content, geminiReply.toolResult),
             sources,
             mode: geminiReply.mode,
             toolName: geminiReply.toolName,
@@ -2145,6 +2950,7 @@ export function registerBeeUpRoutes(app: Express, dependencies: BeeUpRegisterDep
             request: authRequest,
             message: payload.message,
             dependencies,
+            params: payload.toolParams,
           })
         : null;
 
@@ -2168,6 +2974,8 @@ export function registerBeeUpRoutes(app: Express, dependencies: BeeUpRegisterDep
           inputPayload: toJsonInputValue({
             message: payload.message,
             currentView: payload.currentView ?? null,
+            toolIntent: payload.toolIntent ?? null,
+            toolParams: payload.toolParams ?? null,
           }),
           outputPayload: toolResult.payload
             ? toJsonInputValue(toolResult.payload)
@@ -2199,6 +3007,7 @@ export function registerBeeUpRoutes(app: Express, dependencies: BeeUpRegisterDep
           sources: reply.sources,
           mode: reply.mode,
           toolName: reply.toolName,
+          toolPayload: toolResult?.payload ?? null,
         }),
       },
     });
