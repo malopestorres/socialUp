@@ -2,9 +2,11 @@
 
 Sistema centralizado para automacao de postagens:
 
-- `apps/backend`: API Express + Prisma + SQLite + Playwright (Instagram) + Evolution API (WhatsApp)
+- `apps/backend`: API Express + Prisma + PostgreSQL + Instagram Graph API + Evolution API (WhatsApp)
 - `apps/web`: painel web em React + TypeScript
 - `packages/shared`: tipos compartilhados
+
+O backend usa PostgreSQL (`DATABASE_URL`), a API oficial do Instagram Graph com OAuth e a Evolution API para WhatsApp.
 
 ## Requisitos
 
@@ -35,8 +37,8 @@ npm run dev:web
 
 Se voce abrir o painel por um dominio/tunnel (nao localhost), configure a API do frontend:
 
-1) Copie `apps/web/.env.example` para `apps/web/.env.local`
-2) Preencha `VITE_API_URL` com a URL do backend (ex: seu tunnel do backend)
+1. Copie `apps/web/.env.example` para `apps/web/.env.local`
+2. Preencha `VITE_API_URL` com a URL do backend (ex: seu tunnel do backend)
 
 Atalho para stack WhatsApp local (Evolution API + Postgres local):
 
@@ -56,13 +58,12 @@ npm run stop:whatsapp
 2. Crie uma Company vinculada.
 3. Conecte uma conta do Instagram ou WhatsApp para a unidade.
 4. Faça upload da midia e crie Jobs no painel escolhendo a Company.
-5. O backend executa Instagram com Playwright e WhatsApp com Evolution API, atualizando o status no painel.
+5. O backend publica no Instagram pela Graph API e envia status do WhatsApp pela Evolution API, atualizando o status no painel.
 
 ## Observacoes
 
-- Todo armazenamento e local no servidor.
-- O backend e a fonte da verdade.
-- Instagram usa navegadores persistidos com Playwright.
+- O backend e a fonte da verdade para autenticacao, uploads, jobs e agendamentos.
+- Configure `DATABASE_URL` com uma instancia PostgreSQL antes de iniciar o backend.
 - WhatsApp usa uma instancia autenticada na Evolution API.
 
 ## WhatsApp (Evolution API)
